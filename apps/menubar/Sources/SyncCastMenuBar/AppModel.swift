@@ -16,8 +16,9 @@ final class AppModel {
     var wholeHouseEnabled: Bool = false
     var streamingState: StreamingState = .idle
     var lastError: String?
-    var blackHoleAvailable: Bool = false
-    var blackHoleUID: String?
+    /// Screen Recording TCC permission state. We replaced the old
+    /// "BlackHole microphone" gate with this.
+    var screenRecordingGranted: Bool = false
 
     enum StreamingState: String, Sendable {
         case idle, starting, running, error
@@ -50,7 +51,32 @@ final class AppModel {
     }
 
     private func bootstrap() async {
-        SyncCastLog.log("[SyncCast] bootstrap start".replacingOccurrences(of: "[SyncCast] ", with: ""))
+        SyncCastLog.log("bootstrap start")
+        // Check Screen Recording permission state. SyncCast captures system
+        // audio via ScreenCaptureKit; Screen Recording is the TCC gate.
+        screenRecordingGranted = (ScreenRecordingTCC.current == .granted)
+        SyncCastLog.log("screen-recording status: \(ScreenRecordingTCC.current.rawValue)")
+        // Tahoe sometimes lies: the System Settings switch shows ON but
+        // CGPreflightScreenCaptureAccess returns false. Poll every 2s
+        // and update the model when the state flips, so the user doesn't
+        // have to manually quit-and-reopen.
+        Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                let now = (ScreenRecordingTCC.current == .granted)
+                let was = await MainActor.run { self.screenRecordingGranted }
+                if now != was {
+                    await MainActor.run { self.screenRecordingGranted = now }
+                    SyncCastLog.log("screen-recording state changed: \(was) → \(now)")
+                    if now {
+                        // Just got granted. Trigger reconcile so a previously
+                        // queued toggle takes effect without app restart.
+                        await MainActor.run { self.reconcileEngine() }
+                    }
+                }
+            }
+        }
         // 1. Spawn the bundled sidecar (which in turn spawns OwnTone).
         do {
             let paths = try sidecarLauncher.start()
@@ -121,19 +147,8 @@ final class AppModel {
         }
     }
 
-    /// BlackHole exposes itself as a CoreAudio device whose UID contains
-    /// "BlackHole". We pick the first one we see and remember it. Users
-    /// with multiple BlackHole channel counts (2ch / 16ch / 64ch) get the
-    /// 2ch one because that's what we asked for in bootstrap.sh.
-    private func detectBlackHole(in dev: Device) {
-        guard dev.transport == .coreAudio,
-              let uid = dev.coreAudioUID,
-              uid.contains("BlackHole") else { return }
-        if blackHoleUID == nil {
-            blackHoleUID = uid
-            blackHoleAvailable = true
-        }
-    }
+    // BlackHole detection removed — SCK doesn't need it.
+    private func detectBlackHole(in dev: Device) { /* no-op, retained for call-site compat */ }
 
     /// When the set of enabled devices changes (or whole-house mode flips),
     /// reconcile the audio engine: start it if we have BlackHole + at least
@@ -143,20 +158,34 @@ final class AppModel {
     }
 
     private func reconcileEngineAsync() async {
-        guard blackHoleAvailable, let uid = blackHoleUID else {
-            if streamingState == .running {
-                await router.stop()
-                streamingState = .idle
-            }
-            return
-        }
+        SyncCastLog.log("reconcile: scrRec=\(screenRecordingGranted) state=\(streamingState.rawValue) hasEnabled=\(hasEnabledOutputs) wholeHouse=\(wholeHouseEnabled)")
+        // We DON'T gate on screenRecordingGranted any more.
+        // Reason: the only way to make macOS show the user-facing
+        // Screen Recording prompt on Tahoe is to actually attempt SCK
+        // (SCShareableContent / SCStream.startCapture). If we refuse to
+        // try capture until "granted=true", the prompt never appears,
+        // and the user is stuck. Instead we let router.start try; if it
+        // throws .permissionDenied, we surface the message in lastError.
         let shouldRun = hasEnabledOutputs || wholeHouseEnabled
         switch (streamingState, shouldRun) {
         case (.idle, true), (.error, true):
             streamingState = .starting
+            lastError = nil
+            SyncCastLog.log("reconcile: starting router (SCK capture)")
             do {
                 let snapshot = devices
-                try await router.start(blackHoleUID: uid, devices: snapshot)
+                try await router.start(devices: snapshot)
+                SyncCastLog.log("reconcile: router.start OK")
+                // After 1.5s, log the IOProc tick count to confirm CoreAudio
+                // is actually pumping data. If still 0 → TCC denied mic.
+                Task { [weak self] in
+                    for delay in [1, 2, 4, 6] as [UInt64] {
+                        try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                        guard let self else { return }
+                        let report = await self.router.diagnosticSCKReport()
+                        SyncCastLog.log("SCK report @ \(delay)s: \(report)")
+                    }
+                }
                 for (id, r) in routing {
                     if r.enabled { await router.enable(deviceID: id) }
                     else         { await router.disable(deviceID: id) }
@@ -164,21 +193,26 @@ final class AppModel {
                 }
                 await pushAirplayState()
                 streamingState = .running
+                SyncCastLog.log("reconcile: state=running")
             } catch {
-                lastError = "\(error)"
+                SyncCastLog.log("reconcile: router.start FAILED: \(error)")
+                lastError = "engine: \(error.localizedDescription)"
                 streamingState = .error
             }
         case (.running, false):
+            SyncCastLog.log("reconcile: stopping (no enabled outputs)")
             await router.setActiveAirplayDevices([])
             await router.stop()
             streamingState = .idle
         case (.running, true):
-            // Push current routing to the running engine.
+            SyncCastLog.log("reconcile: pushing routing updates + syncing local outputs")
+            await router.syncLocalOutputs(devices: devices)
             for (_, r) in routing {
                 await router.setRouting(r)
             }
             await pushAirplayState()
         default:
+            SyncCastLog.log("reconcile: no-op (state=\(streamingState.rawValue) shouldRun=\(shouldRun))")
             break
         }
     }
@@ -207,8 +241,7 @@ final class AppModel {
     func toggleWholeHouse() {
         wholeHouseEnabled.toggle()
         if wholeHouseEnabled {
-            // Enable every output that's not the BlackHole capture itself.
-            for dev in devices where dev.coreAudioUID != blackHoleUID {
+            for dev in devices {
                 var r = routing[dev.id] ?? DeviceRouting(deviceID: dev.id)
                 r.enabled = true
                 routing[dev.id] = r
@@ -221,6 +254,8 @@ final class AppModel {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         r.enabled.toggle()
         routing[id] = r
+        let name = devices.first(where: { $0.id == id })?.name ?? id
+        SyncCastLog.log("toggleDevice: \(name) → enabled=\(r.enabled)")
         reconcileEngine()
     }
 
@@ -242,7 +277,10 @@ final class AppModel {
     /// capture device (it's the *source*, not an output) and any virtual
     /// aggregate / multi-output devices the system already exposes.
     private func isUserSelectableOutput(_ d: Device) -> Bool {
-        if let uid = d.coreAudioUID, uid == blackHoleUID { return false }
+        // BlackHole is a virtual sink; never list it as a target. SCK
+        // captures system audio without needing BlackHole installed, but
+        // the user may still have it from before — hide it.
+        if let uid = d.coreAudioUID, uid.contains("BlackHole") { return false }
         let lower = d.name.lowercased()
         if lower.contains("blackhole") { return false }
         if lower.contains("aggregate") { return false }

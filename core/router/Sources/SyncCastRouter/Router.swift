@@ -17,7 +17,7 @@ public actor Router {
     public private(set) var state: RouterState = .idle
     public private(set) var lastError: String?
 
-    private let capture: Capture
+    private let sckCapture: SCKCapture
     private let scheduler: Scheduler
     private var localOutputs: [String: LocalOutput] = [:]   // SyncCast device ID → AUHAL
     private var routing: [String: DeviceRouting] = [:]
@@ -37,7 +37,12 @@ public actor Router {
     }
 
     public init(sampleRate: Double = 48_000, channelCount: Int = 2) {
-        self.capture = Capture(sampleRate: sampleRate, channelCount: channelCount)
+        if #available(macOS 13.0, *) {
+            self.sckCapture = SCKCapture(sampleRate: sampleRate, channelCount: channelCount)
+        } else {
+            // We require macOS 14 anyway; this branch never executes.
+            fatalError("SyncCast requires macOS 13+")
+        }
         self.scheduler = Scheduler(sampleRate: sampleRate)
     }
 
@@ -54,7 +59,7 @@ public actor Router {
         }
         _ = try await client.call("sidecar.hello", params: ["v": 1, "router_pid": ProcessInfo.processInfo.processIdentifier])
         self.ipc = client
-        let writer = AudioSocketWriter(ring: capture.ringBuffer, socketPath: sockets.audio)
+        let writer = AudioSocketWriter(ring: sckCapture.ringBuffer, socketPath: sockets.audio)
         self.audioWriter = writer
     }
 
@@ -77,20 +82,31 @@ public actor Router {
         replan()
     }
 
-    public func start(blackHoleUID: String, devices: [Device]) async throws {
+    public func start(devices: [Device]) async throws {
         state = .starting
         do {
-            try capture.start(uid: blackHoleUID)
-            for dev in devices where dev.transport == .coreAudio && (routing[dev.id]?.enabled ?? true) {
+            try await sckCapture.start()
+            // Open AUHAL for every enabled local CoreAudio output. SCK
+            // captures system audio at the OS level — we don't need to
+            // skip a "capture device" the way we did with BlackHole.
+            // Still skip aggregates and the system multi-output to avoid
+            // routing audio into a sink that itself includes one of our
+            // outputs (potential feedback / double-play).
+            for dev in devices where dev.transport == .coreAudio && (routing[dev.id]?.enabled ?? false) {
                 guard let uid = dev.coreAudioUID else { continue }
+                let lower = dev.name.lowercased()
+                if lower.contains("blackhole") || lower.contains("aggregate") ||
+                   lower.contains("multi-output") || dev.name.contains("多输出") {
+                    continue
+                }
                 let coreAudioID = (try? Capture.deviceID(forUID: uid)) ?? 0
                 if coreAudioID == 0 { continue }
                 let out = LocalOutput(
                     deviceID: coreAudioID,
                     deviceUID: uid,
-                    ring: capture.ringBuffer,
-                    sampleRate: capture.sampleRate,
-                    channelCount: capture.channelCount
+                    ring: sckCapture.ringBuffer,
+                    sampleRate: sckCapture.sampleRate,
+                    channelCount: sckCapture.channelCount
                 )
                 try out.start()
                 localOutputs[dev.id] = out
@@ -100,6 +116,9 @@ public actor Router {
         } catch {
             state = .error
             lastError = "\(error)"
+            for (_, out) in localOutputs { out.stop() }
+            localOutputs.removeAll()
+            sckCapture.stop()
             throw error
         }
     }
@@ -115,7 +134,7 @@ public actor Router {
         ipc = nil
         for (_, out) in localOutputs { out.stop() }
         localOutputs.removeAll()
-        capture.stop()
+        sckCapture.stop()
         state = .idle
     }
 
@@ -136,6 +155,59 @@ public actor Router {
             "format": "pcm_s16le",
         ])
         try audioWriter.start()
+    }
+
+    /// Diagnostic: how many SCK audio sample buffers have been processed?
+    /// Zero after a few seconds with system audio playing ⇒ Screen Recording
+    /// permission denied or SCK stream silently failed.
+    public func diagnosticTickCount() -> UInt64 {
+        sckCapture.tickCount
+    }
+
+    /// Returns a one-line diagnostic snapshot of the SCK capture pipeline.
+    public func diagnosticSCKReport() -> String {
+        let s = sckCapture
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) last=\(s.debugLastReason) asbd=[\(s.debugLastASBD)]"
+    }
+
+    /// Reconcile the open AUHAL set against the current routing snapshot.
+    /// Called whenever the user toggles a local device while the engine
+    /// is already running — ensures LocalOutput is created for newly-
+    /// enabled devices and torn down for newly-disabled ones.
+    public func syncLocalOutputs(devices: [Device]) async {
+        // Open AUHAL for newly-enabled local devices.
+        for dev in devices where dev.transport == .coreAudio && (routing[dev.id]?.enabled ?? false) {
+            if localOutputs[dev.id] != nil { continue }
+            guard let uid = dev.coreAudioUID else { continue }
+            let lower = dev.name.lowercased()
+            if lower.contains("blackhole") || lower.contains("aggregate") ||
+               lower.contains("multi-output") || dev.name.contains("多输出") {
+                continue
+            }
+            let coreAudioID = (try? Capture.deviceID(forUID: uid)) ?? 0
+            if coreAudioID == 0 { continue }
+            let out = LocalOutput(
+                deviceID: coreAudioID,
+                deviceUID: uid,
+                ring: sckCapture.ringBuffer,
+                sampleRate: sckCapture.sampleRate,
+                channelCount: sckCapture.channelCount
+            )
+            do {
+                try out.start()
+                localOutputs[dev.id] = out
+            } catch {
+                lastError = "open output \(dev.name) failed: \(error)"
+            }
+        }
+        // Close AUHAL for newly-disabled local devices.
+        for (id, out) in localOutputs {
+            if !(routing[id]?.enabled ?? false) {
+                out.stop()
+                localOutputs.removeValue(forKey: id)
+            }
+        }
+        replan()
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {

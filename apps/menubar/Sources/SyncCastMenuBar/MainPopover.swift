@@ -195,12 +195,16 @@ private struct DeviceRow: View {
                     }
                 }
             }
-            .contentShape(Rectangle())
-            .onTapGesture { model.toggleDevice(device.id) }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(routing.enabled ? Color.accentColor.opacity(0.06) : Color.clear)
+        // Make the WHOLE row a tap target — clicking anywhere on the row
+        // (icon, name, badge, sync dot, blank space) toggles the device.
+        // Previously the tap target was only on the inner VStack and many
+        // pixels (icon column, trailing space) didn't react to clicks.
+        .contentShape(Rectangle())
+        .onTapGesture { model.toggleDevice(device.id) }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text("\(device.name), \(routing.enabled ? "enabled" : "disabled")"))
         .accessibilityHint(Text("Double-tap to \(routing.enabled ? "disable" : "enable")"))

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreGraphics
 import Foundation
 import SyncCastDiscovery
 import SyncCastRouter
@@ -39,8 +40,18 @@ struct SyncCastApp: App {
 
     init() {
         SyncCastLog.log("=== SyncCast process starting (pid \(getpid())) ===")
-        // Hide from Dock — menubar-only app.
         NSApp?.setActivationPolicy(.accessory)
+
+        // Trigger Screen Recording permission. SyncCast captures system
+        // audio via ScreenCaptureKit, which lives behind the Screen
+        // Recording TCC class. Mic permission is no longer required.
+        let pre = CGPreflightScreenCaptureAccess()
+        SyncCastLog.log("screen-recording preflight: \(pre)")
+        if !pre {
+            SyncCastLog.log("requesting screen-recording access — expect a system prompt")
+            let granted = CGRequestScreenCaptureAccess()
+            SyncCastLog.log("screen-recording request immediate=\(granted) (Tahoe: real grant requires app restart)")
+        }
     }
 
     var body: some Scene {

@@ -29,6 +29,13 @@ public final class Capture {
     /// `channelCount`.
     private let channelPtrs: UnsafeMutablePointer<UnsafePointer<Float>?>
     private let channelPtrsCount: Int
+    /// IOProc tick counter — incremented on every callback. Diagnostic
+    /// only; if this stays at zero after AudioDeviceStart succeeds, the
+    /// IOProc is being silently starved (typically TCC mic permission).
+    let ioTickCounter: UnsafeMutablePointer<UInt64>
+
+    /// External read accessor for diagnostic polling.
+    public var tickCount: UInt64 { ioTickCounter.pointee }
 
     public init(
         sampleRate: Double = 48_000,
@@ -45,6 +52,9 @@ public final class Capture {
         ptrs.initialize(repeating: nil, count: channelCount)
         self.channelPtrs = ptrs
         self.channelPtrsCount = channelCount
+        let tick = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        tick.initialize(to: 0)
+        self.ioTickCounter = tick
     }
 
 
@@ -52,6 +62,10 @@ public final class Capture {
         let id = try Self.deviceID(forUID: uid)
         try Self.assertNominalSampleRate(id, expected: sampleRate)
         deviceID = id
+        // Lightweight tick counter the IOProc bumps on every callback.
+        // Read by the diagnostic Task in Router so we can detect "AudioDeviceStart
+        // returned OK but IOProc never fires" — typically TCC denying mic access.
+        let tickCounterPtr = self.ioTickCounter
         var procID: AudioDeviceIOProcID?
         let ringRef = ringBuffer
         let chanCount = channelCount
@@ -87,6 +101,8 @@ public final class Capture {
                         ringRef.write(channels: rebound, frames: frames)
                     }
                 }
+                // Increment tick counter (fast, lock-free, RT-safe).
+                tickCounterPtr.pointee &+= 1
             }
         )
         if status != noErr || procID == nil {
@@ -112,6 +128,8 @@ public final class Capture {
         stop()
         channelPtrs.deinitialize(count: channelPtrsCount)
         channelPtrs.deallocate()
+        ioTickCounter.deinitialize(count: 1)
+        ioTickCounter.deallocate()
     }
 
     // MARK: - Helpers
