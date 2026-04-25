@@ -36,6 +36,12 @@ public final class LocalOutput {
     /// don't allocate a Swift Array on every render tick.
     private let outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
     private let outPtrsCount: Int
+    /// Diagnostic — incremented on every AUHAL render callback.
+    public private(set) var renderTickCount: UInt64 = 0
+    /// Peak abs sample of the most recent rendered frame block.
+    public private(set) var lastRenderPeak: Float = 0
+    /// Phase counter for SYNCAST_TONE diagnostic mode.
+    private var toneSampleIndex: UInt64 = 0
 
     public init(
         deviceID: AudioObjectID,
@@ -178,12 +184,11 @@ public final class LocalOutput {
         }
 
         let writePos = ring.writePosition
-        let startFrame: Int64 = {
-            var s = writePos - Int64(snapshot.backoff) - Int64(frames)
-            if s > writePos - Int64(frames) { s = writePos - Int64(frames) }
-            if s < snapshot.cursor { s = snapshot.cursor }
-            return s
-        }()
+        // DIAGNOSTIC: bypass scheduler/cursor — always read the most recent
+        // `frames` samples. If this produces audible sound but the schedule-
+        // based path doesn't, the scheduler logic is where audio is being
+        // dropped. TODO: re-enable scheduler-based read after verification.
+        let startFrame: Int64 = max(0, writePos - Int64(frames))
 
         // Use the pre-allocated outPtrs slot — no Swift runtime allocation.
         var allOk = true
@@ -196,7 +201,21 @@ public final class LocalOutput {
             }
         }
         if !allOk { return noErr }
+
+        // Restored production path — read from ring. Tone diagnostic
+        // confirmed AUHAL→device path works (user heard the 440Hz).
         ring.read(at: startFrame, frames: frames, into: outPtrs)
+
+        // Per-render diagnostics: bump tick count + sample peak so the
+        // engine can tell whether AUHAL is firing AND emitting non-zero
+        // audio. Done before gain is applied (so we measure actual
+        // captured audio, not gain-attenuated).
+        renderTickCount &+= 1
+        var pk: Float = 0
+        let n = min(frames, 128)
+        let p0 = outPtrs[0]
+        for i in 0..<n { pk = max(pk, abs(p0[i])) }
+        lastRenderPeak = pk
 
         // Apply gain / mute. Also zero on negative backoff condition.
         let effectiveGain = snapshot.muted ? Float(0) : snapshot.gain

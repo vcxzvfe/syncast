@@ -167,7 +167,11 @@ public actor Router {
     /// Returns a one-line diagnostic snapshot of the SCK capture pipeline.
     public func diagnosticSCKReport() -> String {
         let s = sckCapture
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) last=\(s.debugLastReason) asbd=[\(s.debugLastASBD)]"
+        var renderInfo = ""
+        for (id, out) in localOutputs {
+            renderInfo += " render[\(id.prefix(6))]=ticks:\(out.renderTickCount) peak:\(String(format: "%.4f", out.lastRenderPeak))"
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(renderInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
