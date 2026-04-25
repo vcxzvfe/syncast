@@ -760,9 +760,65 @@ public final class AggregateDevice {
     /// on every slider drag wedges the UI for >100 ms per frame. With the
     /// cache, slider drags hit a 1-2 element loop every time after the
     /// first probe.
+    ///
+    /// An empty array `[]` means "we probed and found NO writable
+    /// elements" — the caller should treat that as the device being
+    /// unable to accept hardware volume at all (typical for DP / HDMI
+    /// monitors that route their output level through the panel's OSD,
+    /// not through a CoreAudio property). This is a different state
+    /// from "we haven't probed yet" (cache miss); the latter triggers
+    /// a probe, the former short-circuits straight to the software-gain
+    /// fallback path in the Router.
     private static let writableElementsLock = OSAllocatedUnfairLock()
     private static var writableElementsCache:
         [AudioObjectID: [AudioObjectPropertyElement]] = [:]
+
+    /// Public read-only check the Router uses to decide whether to skip
+    /// hardware volume entirely on subsequent replans. True iff we've
+    /// already probed this UID and found zero writable elements. Lookup
+    /// resolves UID → AudioObjectID — the cache is keyed on the
+    /// physical device's AudioObjectID, not the UID, because hot-plugs
+    /// renumber the ID and we want a fresh probe in that case.
+    public static func isHardwareVolumeKnownUnsupported(uid: String) -> Bool {
+        guard let physicalID = try? deviceIDForUID(uid) else { return false }
+        return writableElementsLock.withLock {
+            writableElementsCache[physicalID]?.isEmpty == true
+        }
+    }
+
+    /// Returns the FIRST output-channel index of the given subdevice in
+    /// the aggregate's output stream, assuming the kernel exposes
+    /// subdevice channels in the order they were composed. With 2-ch
+    /// subdevices and N subdevices in `subDeviceUIDs`, the K'th
+    /// subdevice owns channels `K*perSubdeviceChannels ..
+    /// K*perSubdeviceChannels + perSubdeviceChannels - 1`.
+    ///
+    /// Used by the software-gain fallback in LocalOutput when a
+    /// subdevice's hardware volume is unsupported (DP / HDMI monitors).
+    /// The render loop multiplies just that pair of output channels by
+    /// the gain so the user's per-device slider still attenuates the
+    /// affected speaker without touching the master's pair.
+    ///
+    /// Caveat: this assumes the kernel concatenates subdevice channels
+    /// in `subDeviceUIDs` order, which matches what we observe with
+    /// stacked=0 aggregates on Sonoma+ (the same ordering that motivated
+    /// the splat path in `LocalOutput.render`). If the kernel reorders
+    /// streams under us, the gain lands on the wrong pair — we'd
+    /// notice in field reports as "wrong speaker dims".
+    ///
+    /// Returns nil if `uid` isn't a subdevice of this aggregate.
+    public func subdeviceChannelOffset(uid: String) -> Int? {
+        guard let index = subDeviceUIDs.firstIndex(of: uid) else { return nil }
+        // Per-subdevice channel count, derived from the aggregate's
+        // total output channel count and the subdevice count. This
+        // mirrors how the splat path in LocalOutput slices output
+        // pairs — a subdevice contributes outputChannelCount /
+        // subDeviceUIDs.count channels (typically 2). Floor at 2 so
+        // even on a degenerate 1-channel aggregate we still produce
+        // a sensible (per-pair) index.
+        let perSubdeviceChannels = max(2, outputChannelCount / max(1, subDeviceUIDs.count))
+        return index * perSubdeviceChannels
+    }
 
     /// Static so it can be unit-tested in isolation. Tries master
     /// element first; falls back to per-channel iteration. Returns
