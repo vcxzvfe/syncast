@@ -98,6 +98,11 @@ class DeviceManager:
         # out. `_mode` is the latched state — single source of truth.
         self._mode: str = "stereo"
         self._broadcaster: LocalFifoBroadcaster | None = None
+        # OwnTone REST id of the fifo output, cached on first
+        # `set_mode("whole_home")` lookup. Reset on OwnTone respawn
+        # (see `_ensure_owntone` health-check path) since the id
+        # changes per OwnTone process.
+        self._fifo_output_id: str | None = None
         self._local_fifo_socket_path: Path = default_local_fifo_socket_path()
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
@@ -276,6 +281,30 @@ class DeviceManager:
             if mode == "whole_home":
                 await self._ensure_owntone()
                 self._ensure_broadcaster()
+                # CRITICAL: explicitly enable the FIFO output so OwnTone's
+                # player actually writes PCM into output.fifo for the
+                # broadcaster to read. Without this, OwnTone treats the
+                # fifo output as just-another-device that nobody asked for
+                # and never routes audio to it (`_reconcile_outputs`
+                # below only enables outputs whose name matches a
+                # registered AirPlay device). Result before this fix:
+                # broadcaster ran with 0 bytes_broadcast, every Swift
+                # bridge received 0 packets, and any user enabling local
+                # speakers in whole-home mode without ALSO enabling an
+                # AirPlay receiver heard pure silence — a confusing UX.
+                self._enable_fifo_output_unlocked()
+                # Prime the player so it enters PLAY state immediately and
+                # stays there for the lifetime of whole-home mode. Without
+                # this, the player only starts when the audio reader
+                # writes to audio.fifo (which only happens once Swift
+                # actually starts streaming after `stream.start`). With
+                # an always-priming play_pipe call, local-only-receivers
+                # produce audio the moment audio.fifo gets bytes.
+                if self._owntone is not None:
+                    try:
+                        self._owntone.play_pipe()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("play_pipe_priming_failed")
             else:  # stereo
                 if self._broadcaster is not None:
                     try:
@@ -285,6 +314,47 @@ class DeviceManager:
                     self._broadcaster = None
             self._mode = mode
         return {"applied": True, "mode": self._mode}
+
+    def _enable_fifo_output_unlocked(self) -> None:
+        """Find OwnTone's `fifo` output via the REST `/api/outputs` list
+        and enable it. Caches the output id on `self._fifo_output_id` so
+        we only do the lookup once per OwnTone session.
+
+        Caller must hold ``self._lock``. OwnTone must be alive.
+
+        Idempotent: re-calling is a no-op once the id is cached.
+        """
+        if self._owntone is None:
+            return
+        if getattr(self, "_fifo_output_id", None) is not None:
+            # Already located + enabled this session.
+            try:
+                self._owntone.set_output_enabled(self._fifo_output_id, True)
+            except Exception:  # noqa: BLE001
+                logger.exception("fifo_output_re_enable_failed")
+            return
+        try:
+            outputs = self._owntone.list_outputs()
+        except Exception:  # noqa: BLE001
+            logger.exception("list_outputs_failed_in_set_mode")
+            return
+        for o in outputs:
+            # OwnTone's REST surfaces fifo as type="fifo" (or
+            # name == nickname-from-conf). Match either; the nickname is
+            # set in owntone_backend._write_config.
+            if o.get("type") == "fifo" or o.get("name") == "SyncCast Local Bridge":
+                fid = str(o.get("id", ""))
+                if not fid:
+                    continue
+                try:
+                    self._owntone.set_output_enabled(fid, True)
+                    self._fifo_output_id = fid
+                    logger.info("fifo_output_enabled", extra={"output_id": fid})
+                except Exception:  # noqa: BLE001
+                    logger.exception("fifo_output_enable_failed", extra={"id": fid})
+                return
+        logger.warning("fifo_output_not_found_in_list",
+                       extra={"output_count": len(outputs)})
 
     def get_local_fifo_path(self) -> dict[str, Any]:
         """Return the broadcast-socket path Swift bridges connect to.
@@ -339,6 +409,9 @@ class DeviceManager:
             # them on each launch, so the cached IDs are stale.
             for dev in self._devices.values():
                 dev.owntone_output_id = None
+            # Same reasoning for the fifo output id we cached for
+            # whole-home mode — it's per-OwnTone-process.
+            self._fifo_output_id = None
         if self._owntone is not None:
             return
         try:
