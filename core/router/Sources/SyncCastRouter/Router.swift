@@ -841,7 +841,38 @@ public actor Router {
             lastError = "ipc not attached, cannot start AirPlay stream"
             return
         }
+        // Mode-specific empty-list handling.
+        //
+        // .stereo:    no AirPlay devices means we don't need OwnTone running
+        //             at all — stop the stream and the writer.
+        // .wholeHome: even with ZERO AirPlay receivers selected, OwnTone's
+        //             player must keep running so its `fifo` output writes
+        //             PCM into output.fifo for the local LocalAirPlayBridge
+        //             instances. Stopping the stream here would silence
+        //             every local speaker — observed user-reported bug:
+        //             "在全屋模式下只选 MBP+显示器也没声音".
         if ids.isEmpty {
+            if mode == .wholeHome {
+                // Tell sidecar "no AirPlay receivers selected" but keep
+                // the stream itself active. start_stream now accepts an
+                // empty device_ids list in whole-home mode and disables
+                // every AirPlay output while leaving fifo + audio reader
+                // running.
+                let anchor = Clock.nowNs() + UInt64(measuredAirplayLatencyMs) * 1_000_000
+                _ = try? await ipc.call("stream.start", params: [
+                    "device_ids": ids,
+                    "anchor_time_ns": Int(anchor),
+                    "sample_rate": 48_000,
+                    "channels": 2,
+                    "format": "pcm_s16le",
+                ])
+                do {
+                    try audioWriter?.start()
+                } catch {
+                    lastError = "audioWriter.start failed: \(error)"
+                }
+                return
+            }
             _ = try? await ipc.call("stream.stop", params: [:])
             audioWriter?.stop()
             return

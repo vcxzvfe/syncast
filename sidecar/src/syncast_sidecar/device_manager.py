@@ -273,7 +273,16 @@ class DeviceManager:
             extra={"device_ids": device_ids,
                    "known_device_count": len(self._devices)},
         )
-        if not device_ids:
+        # Whole-home mode allows an empty device_ids: the bridges still
+        # need OwnTone running with its fifo output selected so they can
+        # read PCM. We accept the call and just disable every AirPlay
+        # output (via _reconcile_outputs with empty enabled set), leaving
+        # the fifo output enabled and the audio reader running.
+        # Stereo mode rejects empty device_ids — the engine has no use
+        # for OwnTone in that mode. Router.setActiveAirplayDevices is
+        # responsible for not calling stream.start with empty ids in
+        # stereo mode (it calls stream.stop instead).
+        if not device_ids and self._mode != "whole_home":
             raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_ids empty")
         async with self._get_lock():
             missing = [d for d in device_ids if d not in self._devices]
@@ -504,6 +513,28 @@ class DeviceManager:
             fifo_path=self._owntone.output_fifo_path,
         )
         broadcaster.start()
+        # CRITICAL: wait until the broadcaster thread has finished the
+        # blocking O_RDONLY open on output.fifo BEFORE we tell OwnTone
+        # to enable the fifo output via REST.
+        #
+        # Why: OwnTone's fifo OUTPUT module (build/owntone-server/src/
+        # outputs/fifo.c:201) opens the output fifo with
+        # `O_WRONLY | O_NONBLOCK`. On macOS, that returns ENXIO if
+        # there's no reader at the time of the open. If we enable the
+        # fifo output before the broadcaster has its O_RDONLY fd, the
+        # OwnTone open fails, OwnTone marks the output as failed, and
+        # the player never produces a single byte for the bridges.
+        # `lsof` confirmed the failure mode: OwnTone had output.fifo
+        # open for READ (its own input_fd from line 193 of fifo.c) but
+        # NOT for write — the write open had ENXIO'd.
+        #
+        # `broadcaster._fifo_ready` is set inside `_run_broadcaster`
+        # after `_open_fifo_blocking` returns. The Event object is
+        # idle-cheap to wait on. 5 s deadline matches the broadcaster's
+        # own retry budget.
+        if not broadcaster._fifo_ready.wait(timeout=5.0):
+            logger.warning("broadcaster_fifo_open_timeout",
+                           extra={"fifo": str(self._owntone.output_fifo_path)})
         self._broadcaster = broadcaster
         logger.info(
             "broadcaster_started",
