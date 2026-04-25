@@ -43,6 +43,19 @@ public final class AudioSocketWriter: @unchecked Sendable {
     /// start() refuses to spawn while it's true.
     private var writerActive: Bool = false
 
+    /// Monotonically increasing generation counter. Bumped by `start()`
+    /// each time a new Task is spawned, AND by `stop()` to invalidate
+    /// any in-flight Task cleanup. The Task captures its generation at
+    /// spawn time and only clears `writerActive` if the generation still
+    /// matches — preventing a stale cancelled-Task cleanup from wiping
+    /// the flag of a NEWER Task that was legitimately started after a
+    /// stop(). Without this, stop()+start() in rapid succession would
+    /// allow the old cancelled Task's exit handler to clear the flag
+    /// owned by the new generation, letting a third start() spawn a
+    /// second concurrent writer — the same 2.2× over-rate bug feb56ca
+    /// originally fixed.
+    private var writerGeneration: UInt64 = 0
+
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
         self.socketPath = socketPath
@@ -60,12 +73,13 @@ public final class AudioSocketWriter: @unchecked Sendable {
         // Reservation is a single compare-and-set under `lock` so the
         // check-and-claim is atomic. On connect() failure we clear the
         // flag before re-throwing.
-        let didReserve = lock.withLock { () -> Bool in
-            guard !writerActive else { return false }
+        let myGeneration: UInt64? = lock.withLock { () -> UInt64? in
+            guard !writerActive else { return nil }
             writerActive = true
-            return true
+            writerGeneration &+= 1
+            return writerGeneration
         }
-        guard didReserve else { return }
+        guard let myGeneration else { return }
         do {
             try connect()
         } catch {
@@ -75,7 +89,15 @@ public final class AudioSocketWriter: @unchecked Sendable {
         task = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runLoop()
             guard let self else { return }
-            self.lock.withLock { self.writerActive = false }
+            // Only clear the flag if our generation still matches.
+            // If stop() ran after we started (or another start() bumped
+            // the generation), this stale cleanup would otherwise wipe
+            // the NEW writer's flag and allow a double-spawn next time.
+            self.lock.withLock {
+                if self.writerGeneration == myGeneration {
+                    self.writerActive = false
+                }
+            }
         }
     }
 
@@ -85,6 +107,10 @@ public final class AudioSocketWriter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if fd >= 0 { Darwin.close(fd); fd = -1 }
         writerActive = false
+        // Invalidate any in-flight Task cleanup from a previous
+        // generation so a stop()+start() cycle's stale Task exit
+        // cannot clobber the new generation's `writerActive`.
+        writerGeneration &+= 1
     }
 
     private func connect() throws {
