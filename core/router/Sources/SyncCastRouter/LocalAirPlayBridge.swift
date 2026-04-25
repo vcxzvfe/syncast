@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 import CoreAudio
 import AudioToolbox
 import Darwin
@@ -129,6 +130,21 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// nothing else needs to be atomic here.
     private var readCursor: Int64 = 0
 
+    /// Per-bridge software-gain multiplier applied in the render
+    /// callback. Mirrors the per-channel-pair fallback in
+    /// `LocalOutput` for the stereo-mode aggregate path: many DP/HDMI
+    /// display speakers (e.g. PG27UCDM) expose no writable
+    /// `kAudioDevicePropertyVolumeScalar`, so the user's slider would
+    /// otherwise have no audible effect on those devices in whole-
+    /// home mode. Lock-protected because the slider runs on
+    /// MainActor while render() runs on a CoreAudio RT thread; the
+    /// unfair lock has to be brief and uncontended on the RT side
+    /// (single Float read).
+    ///
+    /// Default 1.0 means "no attenuation"; setting to 0 mutes the
+    /// device. Clamped to [0, 1] in `setVolume`.
+    private var _volumeGain: Float = 1.0
+
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
@@ -174,6 +190,23 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             p.deinitialize(count: scratchFramesPerPacket)
             p.deallocate()
         }
+    }
+
+    // MARK: - Volume
+
+    /// Apply the user's slider value to this bridge. Clamped to [0, 1].
+    /// The render callback applies the multiplier to every Float32
+    /// sample it writes to AUHAL; takes effect on the next render
+    /// block (≤ 10 ms in practice).
+    ///
+    /// This is the whole-home-mode counterpart to
+    /// `LocalOutput.setSoftwareGain(pair:gain:)` — same rationale
+    /// (DP/HDMI displays expose no writable hardware volume), same
+    /// digital-attenuation trade-off (very low values lose effective
+    /// bit depth).
+    public func setVolume(_ v: Float) {
+        let clamped = max(0, min(1, v))
+        stateLock.withLock { _volumeGain = clamped }
     }
 
     // MARK: - Lifecycle
@@ -531,10 +564,14 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         if bufList.count < channelCount { return noErr }
         if frames <= 0 { return noErr }
 
-        // Snapshot the cursor under the lock; advance it after we've
-        // copied frames out (so a concurrent stop() observing the
-        // cursor sees a consistent value).
-        let cursor = stateLock.withLock { self.readCursor }
+        // Snapshot the cursor + volume gain under the lock; advance the
+        // cursor after we've copied frames out (so a concurrent stop()
+        // observing the cursor sees a consistent value). One lock
+        // acquisition per render block.
+        let snapshot = stateLock.withLock {
+            (cursor: self.readCursor, gain: self._volumeGain)
+        }
+        let cursor = snapshot.cursor
         let writePos = ring.writePosition
         // Default target: trail the writer by `baselineBackoffFrames`
         // (~100 ms) PLUS one render block. That gives every read full
@@ -571,6 +608,24 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             }
         }
         ring.read(at: startFrame, frames: frames, into: outPtrs)
+
+        // Apply per-bridge software gain. Skip the multiply when gain
+        // is exactly 1.0 (the common case) so we don't burn vDSP
+        // cycles for a no-op. `vDSP_vsmul` is a real-time-safe
+        // hand-vectorized scalar-multiply that's been stable since
+        // 10.4; preferred over an inline scalar loop because AUHAL's
+        // block size (typically 256–1024 frames per channel) is well
+        // above the threshold where vDSP wins. The diagnostic peak
+        // below is read AFTER the multiply so it reflects what's
+        // actually leaving the AUHAL.
+        if snapshot.gain != 1.0 {
+            var g = snapshot.gain
+            let frameCount = vDSP_Length(frames)
+            for ch in 0..<channelCount {
+                let p = outPtrs[ch]
+                vDSP_vsmul(p, 1, &g, p, 1, frameCount)
+            }
+        }
 
         // Diagnostics + tail accounting. Done on the RT thread but
         // they're just simple writes, no allocation.

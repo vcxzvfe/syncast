@@ -660,6 +660,13 @@ public actor Router {
                 deviceUID: t.uid,
                 socketPath: socketURL
             )
+            // Seed the bridge with the user's current slider value so a
+            // device that comes up MID-session (e.g. enabled while the
+            // user already moved the slider for a different device)
+            // doesn't briefly play at full volume before the next
+            // replan() snaps it to the right level.
+            let r = routing[t.deviceID] ?? DeviceRouting(deviceID: t.deviceID)
+            bridge.setVolume(r.muted ? 0 : r.volume)
             do {
                 try bridge.start()
                 localBridges[t.deviceID] = bridge
@@ -1084,6 +1091,20 @@ public actor Router {
                     target: target
                 )
             }
+        }
+
+        // Whole-home mode: push the user's slider to each per-bridge
+        // software gain. Hardware-volume control on DP / HDMI display
+        // speakers (e.g. PG27UCDM) is unavailable for the same reason
+        // it's unavailable in stereo mode — the device exposes no
+        // writable VolumeScalar. The bridge's render callback applies
+        // the gain digitally to every Float32 sample it writes to
+        // AUHAL. Without this loop the slider would silently no-op
+        // for any bridge-driven device (the user-reported regression).
+        for (devID, bridge) in localBridges {
+            let r = routing[devID] ?? DeviceRouting(deviceID: devID)
+            let target = r.muted ? Float(0) : r.volume
+            bridge.setVolume(target)
         }
     }
 
