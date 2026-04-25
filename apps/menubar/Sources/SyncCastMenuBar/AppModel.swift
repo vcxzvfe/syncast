@@ -269,8 +269,22 @@ final class AppModel {
                 // id. Far worse than cosmetic: an orphan stuck at
                 // enabled=true keeps `hasEnabledOutputs` true after every
                 // physical device is gone, so the engine never quiesces.
+                let wasEnabled = routing[id]?.enabled ?? false
                 if routing.removeValue(forKey: id) != nil {
                     SyncCastLog.log("device disappeared: dropping routing entry [id=\(id.prefix(8))]")
+                    // CRITICAL: trigger a reconcile so the engine actually
+                    // observes the routing change. Without this, removing
+                    // the dict entry alone is insufficient — the Router
+                    // actor's mirror of `routing` still has the gone id at
+                    // enabled=true, the AUHAL/bridge for the dead device
+                    // keeps rendering to a stale AudioObjectID, and if it
+                    // was the ONLY enabled output the engine fails to
+                    // notice `hasEnabledOutputs` flipped false and never
+                    // takes the (.running, false) → stop arm. Reviewer-
+                    // flagged ship-blocker.
+                    if wasEnabled {
+                        reconcileEngine()
+                    }
                 }
             case .error(let msg):
                 SyncCastLog.log("[SyncCast] discovery error: \(msg)".replacingOccurrences(of: "[SyncCast] ", with: ""))
