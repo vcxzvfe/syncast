@@ -63,6 +63,17 @@ class OwnToneBackend:
             / "owntone"
         )
         self.fifo_path = self.state_dir / "audio.fifo"
+        # OUTPUT fifo: this is the OTHER half of OwnTone's pipe plumbing.
+        # While `fifo_path` (audio.fifo) is the INPUT pipe — Swift writes
+        # captured PCM into it for OwnTone to consume — `output_fifo_path`
+        # is configured via OwnTone's `fifo {}` config section as a SINK:
+        # OwnTone duplicates the player stream into it as 44.1 kHz s16le 2ch
+        # (hardcoded in owntone-server/src/outputs/fifo.c:64). The Python
+        # `LocalFifoBroadcaster` reads this fifo and fans the bytes out to
+        # any number of Swift `LocalAirPlayBridge` clients so they stay in
+        # lockstep with the AirPlay receivers (all driven by OwnTone's
+        # single player clock). See ADR for "whole-home AirPlay mode".
+        self.output_fifo_path = self.state_dir / "output.fifo"
         self.config_path = self.state_dir / "owntone.conf"
         self.config_template = config_template
         self.rest_port = rest_port
@@ -273,11 +284,26 @@ class OwnToneBackend:
     # ---------- internals ----------
 
     def _ensure_fifo(self) -> None:
+        # INPUT fifo: Swift → OwnTone (captured system audio).
         if self.fifo_path.exists():
-            if self.fifo_path.is_fifo():
-                return
-            self.fifo_path.unlink()
-        os.mkfifo(self.fifo_path, 0o600)
+            if not self.fifo_path.is_fifo():
+                self.fifo_path.unlink()
+                os.mkfifo(self.fifo_path, 0o600)
+        else:
+            os.mkfifo(self.fifo_path, 0o600)
+        # OUTPUT fifo: OwnTone → LocalFifoBroadcaster (player-clock PCM).
+        # OwnTone's fifo output module insists on creating its own pipe if
+        # the path is missing (it calls mkfifo with mode 0666 on first
+        # write). Pre-creating with 0o600 is fine: same uid, OwnTone's
+        # `fifo_check` accepts an existing FIFO. We only delete + recreate
+        # if a non-fifo file is squatting at the path (e.g. a leftover
+        # regular file from a botched prior session).
+        if self.output_fifo_path.exists():
+            if not self.output_fifo_path.is_fifo():
+                self.output_fifo_path.unlink()
+                os.mkfifo(self.output_fifo_path, 0o600)
+        else:
+            os.mkfifo(self.output_fifo_path, 0o600)
 
     def _write_config(self) -> None:
         # OwnTone resolves `uid` via getpwnam — must be a USERNAME, not a
@@ -314,6 +340,19 @@ library {{
   # observed exactly that: "卡顿以及非常低质量音频的感觉" on
   # Xiaomi Sound after the FIFO retry fix landed.
   pipe_sample_rate = 48000
+}}
+# Whole-home AirPlay mode: emit the player stream into a named pipe so
+# `LocalFifoBroadcaster` can fan it out to N Swift LocalAirPlayBridge
+# clients. The fifo output is ALWAYS configured (cheap when nobody is
+# listening); when stereo mode is active the broadcaster simply has zero
+# clients and the sidecar's reader thread keeps the pipe drained so
+# OwnTone never blocks on full-pipe write. Output format is hardcoded
+# in owntone-server/src/outputs/fifo.c:64 to 44.1 kHz s16le 2ch — Swift
+# bridges decode that and let CoreAudio handle SRC up to the device's
+# nominal rate.
+fifo {{
+  nickname = "SyncCast Local Bridge"
+  path = "{self.output_fifo_path}"
 }}
 """
         self.config_path.write_text(cfg, encoding="utf-8")
