@@ -70,6 +70,10 @@ class AudioSocketReader:
         self._path = socket_path
         self._sink = sink
         self._packet_bytes = packet_bytes
+        # Optional tee callback the device manager can install when
+        # whole-home mode is active; receives every PCM chunk just
+        # after the OwnTone fifo write. None in stereo mode.
+        self._broadcaster_tee: Callable[[bytes], None] | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._listen_sock: socket.socket | None = None
@@ -83,6 +87,20 @@ class AudioSocketReader:
             target=self._run, name="syncast-audio-socket", daemon=True,
         )
         self._thread.start()
+
+    def set_broadcaster_tee(
+        self, tee: Callable[[bytes], None] | None
+    ) -> None:
+        """Install or remove the whole-home broadcaster tee callback.
+
+        Called by `device_manager.set_mode("whole_home")` after
+        constructing a `LocalFifoBroadcaster`, with `tee=broadcaster.feed`.
+        On switch back to stereo, called with `tee=None` to remove the
+        link cleanly. The reader thread reads `_broadcaster_tee` once
+        per recv and invokes it (if non-None); race-free because Python
+        attribute writes are atomic w.r.t. the GIL.
+        """
+        self._broadcaster_tee = tee
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -151,6 +169,29 @@ class AudioSocketReader:
             if written < len(data):
                 logger.debug("fifo_short_write",
                              extra={"received": len(data), "written": written})
+            # Tee the same PCM to the whole-home broadcaster (if any).
+            # This is the post-b0543d5 architecture: bridges no longer
+            # read OwnTone's fifo OUTPUT module (which had unfixable
+            # multi-reader / self-flushing problems). Instead we deliver
+            # Swift's native PCM straight to the bridges from here. Both
+            # paths get the same bytes; AirPlay receivers go through
+            # OwnTone (their PTP-anchored playout naturally aligns the
+            # network destinations), bridges go through this tee.
+            #
+            # NB: this means local-bridge audio is roughly real-time
+            # (~50 ms behind capture) while AirPlay receivers are ~1.8 s
+            # behind. They're NOT in lockstep. Synchronization across
+            # local + AirPlay in whole-home mode requires a separate
+            # delay-line in the broadcaster (TODO P2). For now: bridges
+            # get audio reliably, which is the user's primary ask.
+            tee = self._broadcaster_tee
+            if tee is not None:
+                try:
+                    tee(data)
+                except Exception:  # noqa: BLE001
+                    # Never let a broadcaster failure kill the OwnTone
+                    # pipe writer — that would silence AirPlay too.
+                    logger.exception("broadcaster_tee_failed")
 
 
 class _BroadcastClient:
@@ -406,50 +447,44 @@ class LocalFifoBroadcaster:
                 extra={"clients": len(self._clients)},
             )
 
-    def _run_broadcaster(self) -> None:
-        # Open the OwnTone output fifo as the first action on this
-        # thread. Was previously called from start() under the device-
-        # manager asyncio lock, where the 5-second deadline could freeze
-        # the whole sidecar control plane. Doing it here means start()
-        # returns immediately and other JSON-RPC handlers stay
-        # responsive even if OwnTone is slow to come up.
-        self._open_fifo_blocking()
-        self._fifo_ready.set()
-        fd = self._fifo_fd
-        if fd is None:
-            # Fifo open failed (deadline expired or stop() set). Nothing
-            # to broadcast; thread exits cleanly. fifo_open_failures has
-            # already been bumped by _open_fifo_blocking.
+    def feed(self, packet: bytes) -> None:
+        """Push one PCM chunk to every connected bridge client.
+
+        Called by `AudioSocketReader` immediately after writing the
+        chunk to OwnTone's input fifo (the AirPlay-bound copy). This
+        is the post-b0543d5 architecture: bridges receive Swift's
+        native PCM directly, NOT via OwnTone's fifo OUTPUT module
+        (which had unfixable multi-reader semantics — see fifo.c
+        patch in build/owntone-server/src/outputs/fifo.c).
+
+        Thread-safe: `_broadcast` does its own locking. Any chunk
+        size is acceptable — bridge clients accumulate to their own
+        packet boundary on the receive side.
+        """
+        if self._stop_event.is_set():
             return
-        # Short reads are normal on fifos; we accumulate to one logical
-        # OwnTone packet (LOCAL_FIFO_CHUNK_BYTES) before broadcasting so
-        # every client receives whole packets. This matches the contract
-        # documented at the head of this module.
-        buf = bytearray()
-        target = LOCAL_FIFO_CHUNK_BYTES
-        while not self._stop_event.is_set():
-            try:
-                chunk = os.read(fd, target - len(buf))
-            except OSError as e:
-                if e.errno == errno.EINTR:
-                    continue
-                # Any other read failure → fifo gone. Log + bail; stop()
-                # will reset state.
-                logger.warning(
-                    "local_fifo_read_failed",
-                    extra={"errno": e.errno},
-                )
-                return
-            if not chunk:
-                # EOF: OwnTone closed the writer side, or stop() closed
-                # our fd. Either way, bail.
-                return
-            buf.extend(chunk)
-            if len(buf) < target:
-                continue
-            packet = bytes(buf)
-            buf.clear()
+        try:
             self._broadcast(packet)
+        except Exception:  # noqa: BLE001
+            logger.exception("local_fifo_broadcast_failed")
+
+    def _run_broadcaster(self) -> None:
+        """Idle thread placeholder.
+
+        Pre-tee architecture: this thread opened OwnTone's output fifo
+        and read packets in a loop. Post-tee (b0543d5+1): bridges
+        receive Swift's PCM directly via `feed()` from
+        AudioSocketReader; the OwnTone fifo OUTPUT module is no longer
+        consulted (its multi-reader / self-flushing semantics made it
+        unusable for our broadcast use case).
+
+        We keep the thread spawned so `start()` / `stop()` ordering and
+        `_fifo_ready` semantics are preserved for callers; it just
+        sleeps until stop. A future cleanup can drop the thread entirely.
+        """
+        self._fifo_ready.set()
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=1.0)
 
     def _broadcast(self, packet: bytes) -> None:
         """Send one OwnTone packet to every connected client.

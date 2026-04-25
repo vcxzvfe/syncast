@@ -337,31 +337,39 @@ class DeviceManager:
             if mode == "whole_home":
                 await self._ensure_owntone()
                 self._ensure_broadcaster()
-                # CRITICAL: explicitly enable the FIFO output so OwnTone's
-                # player actually writes PCM into output.fifo for the
-                # broadcaster to read. Without this, OwnTone treats the
-                # fifo output as just-another-device that nobody asked for
-                # and never routes audio to it (`_reconcile_outputs`
-                # below only enables outputs whose name matches a
-                # registered AirPlay device). Result before this fix:
-                # broadcaster ran with 0 bytes_broadcast, every Swift
-                # bridge received 0 packets, and any user enabling local
-                # speakers in whole-home mode without ALSO enabling an
-                # AirPlay receiver heard pure silence — a confusing UX.
+                # POST-TEE ARCHITECTURE (b0543d5+1):
+                # The fifo OUTPUT enable + play_pipe priming below is a
+                # belt-and-suspenders for AirPlay-capable receivers — it
+                # keeps OwnTone's player loop active even with no AirPlay
+                # receivers selected, so the AirPlay-bound input fifo
+                # keeps draining and Swift's audioWriter doesn't back up.
+                # The local LocalAirPlayBridge clients now receive PCM
+                # via a direct tee from AudioSocketReader, NOT from
+                # OwnTone's fifo OUTPUT module (which had unfixable
+                # multi-reader / self-flushing problems — see
+                # build/owntone-server/src/outputs/fifo.c patch).
                 self._enable_fifo_output_unlocked()
-                # Prime the player so it enters PLAY state immediately and
-                # stays there for the lifetime of whole-home mode. Without
-                # this, the player only starts when the audio reader
-                # writes to audio.fifo (which only happens once Swift
-                # actually starts streaming after `stream.start`). With
-                # an always-priming play_pipe call, local-only-receivers
-                # produce audio the moment audio.fifo gets bytes.
                 if self._owntone is not None:
                     try:
                         self._owntone.play_pipe()
                     except Exception:  # noqa: BLE001
                         logger.exception("play_pipe_priming_failed")
+                # Wire the broadcaster tee. AudioSocketReader (which
+                # already exists for AirPlay PCM forwarding to OwnTone)
+                # will now also call broadcaster.feed(packet) for every
+                # chunk it writes. Bridge clients receive Swift's
+                # native 48 kHz s16le 2ch packets directly.
+                if self._audio_reader is not None and self._broadcaster is not None:
+                    self._audio_reader.set_broadcaster_tee(
+                        self._broadcaster.feed
+                    )
             else:  # stereo
+                # Detach the tee BEFORE stopping the broadcaster — the
+                # AudioSocketReader thread might still be in a recv()
+                # holding the GIL and would call .feed() on a
+                # half-stopped broadcaster otherwise.
+                if self._audio_reader is not None:
+                    self._audio_reader.set_broadcaster_tee(None)
                 if self._broadcaster is not None:
                     try:
                         self._broadcaster.stop()
@@ -546,6 +554,16 @@ class DeviceManager:
 
     async def _ensure_audio_reader(self, audio_socket: Path) -> None:
         if self._audio_reader is not None:
+            # Already running. If we're in whole-home mode and the
+            # broadcaster came up after the reader, attach the tee now
+            # so feed() starts firing.
+            if (
+                self._mode == "whole_home"
+                and self._broadcaster is not None
+            ):
+                self._audio_reader.set_broadcaster_tee(
+                    self._broadcaster.feed
+                )
             return
         if self._owntone is None:
             return
@@ -556,6 +574,12 @@ class DeviceManager:
         )
         reader.start()
         self._audio_reader = reader
+        # Tee wiring: in whole-home mode, the audio reader's PCM also
+        # needs to fan out to bridge clients. Set this here (vs in
+        # set_mode) so the tee is correct regardless of which order
+        # set_mode and stream.start arrive.
+        if self._mode == "whole_home" and self._broadcaster is not None:
+            reader.set_broadcaster_tee(self._broadcaster.feed)
 
     async def _reconcile_outputs(self, enabled_ids: list[str]) -> None:
         """Tell OwnTone which of its known outputs to send to.
