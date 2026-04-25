@@ -92,6 +92,14 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// Sized to one packet's worth of frames (352).
     private let scratchFloat: [UnsafeMutablePointer<Float>]
     private let scratchFramesPerPacket: Int
+    /// Pre-allocated 2-slot channel-pointer buffer for the ring-write
+    /// call. RingBuffer.write expects a `UnsafePointer<UnsafePointer<Float>>`
+    /// pointing at exactly `channelCount` channel pointers. Allocating
+    /// it per-iteration was burning ~31 alloc/dealloc cycles per second
+    /// per bridge — not real-time-thread, but still wasteful and the
+    /// header above the call site claimed "no heap allocation". Now that
+    /// claim is correct.
+    private let chansPtr: UnsafeMutablePointer<UnsafePointer<Float>>
 
     /// Diagnostic — every successful socket read of one full packet
     /// bumps this. Should advance at ~31 Hz (44.1 kHz / 1408 B per
@@ -132,16 +140,28 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // 352 frames per OwnTone packet (1408 B / 4 B-per-frame).
         let framesPerPacket = 1408 / (2 * MemoryLayout<Int16>.size)
         self.scratchFramesPerPacket = framesPerPacket
-        self.scratchFloat = (0..<2).map { _ in
+        let scratch: [UnsafeMutablePointer<Float>] = (0..<2).map { _ in
             let p = UnsafeMutablePointer<Float>.allocate(capacity: framesPerPacket)
             p.initialize(repeating: 0, count: framesPerPacket)
             return p
         }
+        self.scratchFloat = scratch
+        // chansPtr holds two `UnsafePointer<Float>` slots that the reader
+        // populates with addresses of `scratchFloat[0]` / `scratchFloat[1]`
+        // each iteration. The pointed-to pointers don't change since
+        // `scratchFloat` is `let` — we could in principle initialize once
+        // here, but populating each iteration keeps the read loop's
+        // intent obvious and the cost is two stores per packet.
+        let chans = UnsafeMutablePointer<UnsafePointer<Float>>.allocate(capacity: 2)
+        chans[0] = UnsafePointer(scratch[0])
+        chans[1] = UnsafePointer(scratch[1])
+        self.chansPtr = chans
     }
 
     deinit {
         stop()
         outPtrs.deallocate()
+        chansPtr.deallocate()
         for p in scratchFloat {
             p.deinitialize(count: scratchFramesPerPacket)
             p.deallocate()
@@ -279,18 +299,13 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             // Publish to the ring buffer. RingBuffer.write does its own
             // release-store on the cursor so the render callback sees
             // both the new cursor and the new audio data.
-            let lPtr = UnsafePointer(scratchFloat[0])
-            let rPtr = UnsafePointer(scratchFloat[1])
-            let chans = UnsafeMutablePointer<UnsafePointer<Float>>.allocate(capacity: 2)
-            // RingBuffer.write expects a `UnsafePointer<UnsafePointer<Float>>`
-            // pointing at exactly `channelCount` channel pointers. We'd
-            // ideally pre-allocate this, but `withUnsafeBufferPointer`
-            // on a stack array works just as well per-iteration with
-            // no heap allocation.
-            chans[0] = lPtr
-            chans[1] = rPtr
-            ring.write(channels: chans, frames: n)
-            chans.deallocate()
+            //
+            // chansPtr is pre-allocated in init (capacity 2) and freed in
+            // deinit, so the read loop runs with zero heap traffic — see
+            // the field declaration for rationale.
+            chansPtr[0] = UnsafePointer(scratchFloat[0])
+            chansPtr[1] = UnsafePointer(scratchFloat[1])
+            ring.write(channels: chansPtr, frames: n)
             packetsReceived &+= 1
         }
     }
