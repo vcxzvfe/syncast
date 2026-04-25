@@ -118,6 +118,28 @@ final class AppModel {
             }
         }
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
+
+        // SYNCAST_AUTO_TEST=mbp triggers an automated toggle of the MBP
+        // built-in speaker 4 seconds after bootstrap. Used for shell-driven
+        // end-to-end audio verification — strictly dev only.
+        if let target = ProcessInfo.processInfo.environment["SYNCAST_AUTO_TEST"] {
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard let self else { return }
+                await MainActor.run {
+                    let match = self.devices.first { d in
+                        d.name.localizedCaseInsensitiveContains(target) ||
+                        (target == "mbp" && d.name.contains("MacBook Pro扬声器"))
+                    }
+                    if let dev = match {
+                        SyncCastLog.log("AUTO_TEST: toggling \(dev.name) ON")
+                        self.toggleDevice(dev.id)
+                    } else {
+                        SyncCastLog.log("AUTO_TEST: no device matched '\(target)'")
+                    }
+                }
+            }
+        }
     }
 
     private func applyEvent(_ event: DiscoveryEvent) async {
@@ -174,6 +196,16 @@ final class AppModel {
             SyncCastLog.log("reconcile: starting router (SCK capture)")
             do {
                 let snapshot = devices
+                // Push routing BEFORE start so Router.start's "for dev
+                // where routing[dev.id].enabled" loop actually opens
+                // AUHAL for the user's selections. Without this push,
+                // Router.start would see an empty routing dict and skip
+                // every device — causing the engine to capture audio
+                // but never render it to any output.
+                for (id, r) in routing {
+                    await router.setRouting(r)
+                    if r.enabled { await router.enable(deviceID: id) }
+                }
                 try await router.start(devices: snapshot)
                 SyncCastLog.log("reconcile: router.start OK")
                 // After 1.5s, log the IOProc tick count to confirm CoreAudio

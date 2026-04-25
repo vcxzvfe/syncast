@@ -143,6 +143,11 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
     /// 0.0 = silence (SCK delivering empty data). > 0.001 = real audio.
     public private(set) var debugLastPeak: Float = 0
     public private(set) var debugMaxPeak: Float = 0
+    /// Write→Read self-test: peak of data read back from ring immediately
+    /// after writing. If this stays 0 while debugMaxPeak > 0, ring.read
+    /// is broken.
+    public private(set) var debugReadbackPeak: Float = 0
+    public private(set) var debugReadbackPos: Int64 = -1
     private var debugLoggedFirstFormat = false
 
     fileprivate func handle(sampleBuffer sb: CMSampleBuffer) {
@@ -352,16 +357,33 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
                 }
                 chPtrs[c] = UnsafePointer(m.assumingMemoryBound(to: Float.self))
             }
-            // Sample peak from channel 0 BEFORE writing to ring — avoids
-            // a separate read-back path. Reads at most 256 samples,
-            // bounded by available frames.
+            // Sample peak from channel 0 BEFORE writing to ring.
             let sampleN = min(frames, 256)
             var pk: Float = 0
             let p = chPtrs[0]
             for i in 0..<sampleN { pk = max(pk, abs(p[i])) }
             debugLastPeak = pk
             if pk > debugMaxPeak { debugMaxPeak = pk }
+            // Capture writePos BEFORE write
+            let posBefore = ringBuffer.writePosition
             ringBuffer.write(channels: chPtrs, frames: frames)
+            // Read-back self-test: read what we just wrote and verify peak
+            // matches. Catches "write doesn't actually copy" bugs vs
+            // "read can't find data" bugs.
+            if pk > 0.01 && debugReadbackPeak == 0 {
+                let scratch = UnsafeMutablePointer<Float>.allocate(capacity: sampleN)
+                let scratchB = UnsafeMutablePointer<Float>.allocate(capacity: sampleN)
+                defer { scratch.deallocate(); scratchB.deallocate() }
+                let rbPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: 2)
+                rbPtrs[0] = scratch
+                rbPtrs[1] = scratchB
+                defer { rbPtrs.deallocate() }
+                _ = ringBuffer.read(at: posBefore, frames: sampleN, into: rbPtrs)
+                var rbPk: Float = 0
+                for i in 0..<sampleN { rbPk = max(rbPk, abs(scratch[i])) }
+                debugReadbackPeak = rbPk
+                debugReadbackPos = posBefore
+            }
         } else {
             guard let m = buffers[0].mData else {
                 debugLastReason = "fast_il_nil_data"
