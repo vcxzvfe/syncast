@@ -44,6 +44,13 @@ final class AppModel {
     private let sidecarLauncher = SidecarLauncher()
     var sidecarRunning: Bool = false
 
+    /// Debounce guard for `reconcileEngine`. Each call cancels the
+    /// previous timer; only the last call within an 80 ms quiet window
+    /// actually fires the reconciler. Keeps "user mashes toggle rows" from
+    /// generating 30+ reconcile passes in 2 seconds (observed in
+    /// launch.log before this guard was added).
+    private var reconcileTimer: Task<Void, Never>?
+
     init() {
         self.discovery = DiscoveryService()
         self.router = Router()
@@ -182,7 +189,16 @@ final class AppModel {
     /// reconcile the audio engine: start it if we have BlackHole + at least
     /// one enabled output, stop it otherwise.
     private func reconcileEngine() {
-        Task { await self.reconcileEngineAsync() }
+        // Coalesce rapid-fire callers (toggleDevice / setVolume / toggleMute /
+        // permission watcher). 80 ms is below the user-perceptible threshold
+        // for UI feedback but enough to absorb a flurry of taps. Each new
+        // call cancels the pending timer — only the last wins.
+        reconcileTimer?.cancel()
+        reconcileTimer = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            if Task.isCancelled { return }
+            await self?.reconcileEngineAsync()
+        }
     }
 
     private func reconcileEngineAsync() async {

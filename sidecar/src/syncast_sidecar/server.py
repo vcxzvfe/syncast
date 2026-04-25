@@ -122,7 +122,20 @@ class ControlServer:
                 await writer.wait_closed()
             except Exception:  # noqa: BLE001
                 pass
-            await self._devices.shutdown()
+            # Don't tear down OwnTone or the device registry here — the
+            # menubar app may reconnect (e.g. after system sleep, or when
+            # the user toggles a permission and the IpcClient reconnects).
+            # Killing OwnTone on every disconnect is wrong: it makes the
+            # next stream.start fail and forces a costly cold start
+            # (DB vacuum, mDNS re-register, RTSP reconnect to receivers).
+            # Instead, just stop the active stream — `stream.start` on
+            # reconnect will spin a new audio reader.
+            # Sidecar-level cleanup (stop OwnTone, clear devices) only
+            # happens on real shutdown via SIGTERM/SIGINT (see __main__).
+            try:
+                await self._devices.stop_stream()
+            except Exception:  # noqa: BLE001
+                logger.exception("disconnect_stop_stream_failed")
 
     async def _read_loop(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,

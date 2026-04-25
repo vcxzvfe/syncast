@@ -112,6 +112,16 @@ class OwnToneBackend:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
 
+    def is_alive(self) -> bool:
+        """True if the OwnTone child process is still running. Cheap; uses
+        Popen.poll(). When this flips to False unexpectedly (crash, OOM,
+        external SIGTERM) the device_manager should clear its reference so
+        the next request triggers a fresh start()."""
+        proc = self._proc
+        if proc is None:
+            return False
+        return proc.poll() is None
+
     # ---------- audio path ----------
 
     def write_pcm(self, data: bytes) -> int:
@@ -196,8 +206,11 @@ class OwnToneBackend:
             )
 
     def flush(self) -> None:
+        # OwnTone registers /api/queue/clear as PUT-only (verified in
+        # owntone-server/src/httpd_jsonapi.c:4713 — HTTPD_METHOD_PUT only).
+        # POSTing here gets "Unrecognized JSON API request: '/api/queue/clear'".
         with contextlib.suppress(OwnToneError):
-            self._post("/api/queue/clear", None)
+            self._put("/api/queue/clear", None)
 
     # ---------- internals ----------
 
