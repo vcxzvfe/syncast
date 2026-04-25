@@ -9,7 +9,7 @@ struct MainPopover: View {
         VStack(spacing: 0) {
             header
             Divider().padding(.horizontal, 12)
-            wholeHouseToggle
+            modePicker
             Divider().padding(.horizontal, 12)
             debugStrip
             Divider().padding(.horizontal, 12)
@@ -72,22 +72,34 @@ struct MainPopover: View {
         }
     }
 
-    private var wholeHouseToggle: some View {
-        @Bindable var model = model
-        return Toggle(isOn: $model.wholeHouseEnabled) {
-            HStack(spacing: 8) {
-                Image(systemName: "house.fill").foregroundStyle(.tint)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Whole-house mode").fontWeight(.medium)
-                    Text("Stream to every selected speaker")
-                        .font(.caption2).foregroundStyle(.secondary)
+    /// Mode picker: the user's fundamental architectural choice. Switching
+    /// tears down and rebuilds the audio pipeline; SwiftUI handles the
+    /// state binding, AppModel.setMode handles the engine teardown.
+    ///
+    /// Why two segmented choices and not a hidden toggle: in a multi-room
+    /// audio app the latency tradeoff is the most important user-facing
+    /// concept (~50 ms vs ~1.8 s). Burying it behind a switch was the
+    /// previous design, and the user repeatedly hit the resulting
+    /// "AirPlay-vs-local can't sync" failure mode without realising why.
+    private var modePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("", selection: Binding(
+                get: { model.mode },
+                set: { model.setMode($0) }
+            )) {
+                ForEach(AppModel.Mode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
                 }
             }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("modePicker")
+            Text(model.mode.subtitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
-        .toggleStyle(.switch)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .accessibilityIdentifier("wholeHouseToggle")
     }
 
     private var deviceList: some View {

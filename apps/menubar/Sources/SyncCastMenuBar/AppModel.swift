@@ -13,12 +13,53 @@ import SyncCastRouter
 final class AppModel {
     var devices: [Device] = []
     var routing: [String: DeviceRouting] = [:]
-    var wholeHouseEnabled: Bool = false
+    /// The fundamental architectural choice: which audio path is active.
+    /// These are mutually exclusive. Switching requires a full pipeline
+    /// teardown + rebuild (a few hundred ms of silence on transition,
+    /// well under user-perceptible UI latency).
+    ///
+    /// Why two modes — the latency budgets are incompatible. AirPlay 2's
+    /// PTP-anchored playback runs ~1.8 s behind realtime. Local AUHAL
+    /// runs ~50 ms. There is no useful middle ground because the only way
+    /// to sync them is to delay the local path by 1.8 s, which destroys
+    /// the reason to use it. Every commercial multi-room product
+    /// (Sonos, Apple Music + AirPlay 2, Roon) makes this same split.
+    var mode: Mode = .stereo
     var streamingState: StreamingState = .idle
     var lastError: String?
     /// Screen Recording TCC permission state. We replaced the old
     /// "BlackHole microphone" gate with this.
     var screenRecordingGranted: Bool = false
+
+    enum Mode: String, Sendable, CaseIterable, Identifiable {
+        /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
+        /// AirPlay receivers are hidden / unselectable in this mode.
+        /// Drives audio through a private CoreAudio Aggregate Device with
+        /// kernel-level drift correction so the physical speakers stay
+        /// sample-accurately aligned.
+        case stereo
+        /// All outputs go through OwnTone's player at AirPlay 2's
+        /// ~1.8 s latency. Local CoreAudio outputs participate by
+        /// receiving PCM from OwnTone's "fifo" output via a sidecar
+        /// broadcast → Swift LocalAirPlayBridge. AirPlay 2 receivers
+        /// receive the same audio over the network. Everything PTP-
+        /// synced. Video sync is impossible in this mode.
+        case wholeHome
+
+        public var id: String { rawValue }
+        public var displayName: String {
+            switch self {
+            case .stereo:    return "立体声 (本地, 低延迟)"
+            case .wholeHome: return "全屋同步 (AirPlay)"
+            }
+        }
+        public var subtitle: String {
+            switch self {
+            case .stereo:    return "本地扬声器, ≈50ms 延迟, 适合视频"
+            case .wholeHome: return "全设备同步, ≈1.8s 延迟, 仅适合音乐"
+            }
+        }
+    }
 
     enum StreamingState: String, Sendable {
         case idle, starting, running, error
@@ -276,7 +317,7 @@ final class AppModel {
     }
 
     private func reconcileEngineAsync() async {
-        SyncCastLog.log("reconcile: scrRec=\(screenRecordingGranted) state=\(streamingState.rawValue) hasEnabled=\(hasEnabledOutputs) wholeHouse=\(wholeHouseEnabled)")
+        SyncCastLog.log("reconcile: scrRec=\(screenRecordingGranted) state=\(streamingState.rawValue) hasEnabled=\(hasEnabledOutputs) mode=\(mode.rawValue)")
         // We DON'T gate on screenRecordingGranted any more.
         // Reason: the only way to make macOS show the user-facing
         // Screen Recording prompt on Tahoe is to actually attempt SCK
@@ -284,7 +325,11 @@ final class AppModel {
         // try capture until "granted=true", the prompt never appears,
         // and the user is stuck. Instead we let router.start try; if it
         // throws .permissionDenied, we surface the message in lastError.
-        let shouldRun = hasEnabledOutputs || wholeHouseEnabled
+        // Engine should run when at least one output is enabled. The mode
+        // determines WHICH path runs (stereo = local aggregate; wholeHome
+        // = SCK → OwnTone → AirPlay receivers + local FIFO bridges), not
+        // WHETHER it runs.
+        let shouldRun = hasEnabledOutputs
         switch (streamingState, shouldRun) {
         case (.idle, true), (.error, true):
             streamingState = .starting
@@ -380,12 +425,28 @@ final class AppModel {
 
     // MARK: - Intents
 
-    func toggleWholeHouse() {
-        wholeHouseEnabled.toggle()
-        if wholeHouseEnabled {
-            for dev in devices {
-                var r = routing[dev.id] ?? DeviceRouting(deviceID: dev.id)
-                r.enabled = true
+    /// Switch between stereo and whole-home modes. Tears down the current
+    /// pipeline (silence for ~200 ms during transition is acceptable),
+    /// disables every device that's not selectable in the new mode, then
+    /// reconciles the engine so the new mode's path comes up.
+    ///
+    /// Why disable non-selectable devices automatically: if the user had
+    /// MBP扬声器 enabled in stereo mode and switches to whole-home, that
+    /// device is still selectable (whole-home covers everything). But if
+    /// they had Xiaomi enabled in whole-home and switch to stereo, Xiaomi
+    /// is no longer reachable — leaving its routing.enabled=true would
+    /// surface as `lastError` on every reconcile. Cleaner to flip it off
+    /// at mode-switch time and let the user re-pick the next time they
+    /// switch back.
+    func setMode(_ newMode: Mode) {
+        guard newMode != mode else { return }
+        SyncCastLog.log("setMode: \(mode.rawValue) → \(newMode.rawValue)")
+        mode = newMode
+        // Disable any device that the new mode can't drive.
+        for dev in devices {
+            if !isSelectableInMode(dev, mode: newMode),
+               var r = routing[dev.id], r.enabled {
+                r.enabled = false
                 routing[dev.id] = r
             }
         }
@@ -449,11 +510,32 @@ final class AppModel {
         return true
     }
 
+    /// Whether this device is reachable in a given mode.
+    /// - .stereo  : only local CoreAudio outputs are usable (low-latency path)
+    /// - .wholeHome : every output is usable (AirPlay receivers natively;
+    ///   local CoreAudio outputs participate via the FIFO bridge)
+    func isSelectableInMode(_ d: Device, mode: Mode) -> Bool {
+        guard isUserSelectableOutput(d) else { return false }
+        switch mode {
+        case .stereo:
+            return d.transport == .coreAudio
+        case .wholeHome:
+            return true
+        }
+    }
+
+    /// Devices visible in the UI for the CURRENT mode. Filters by both
+    /// the global "is targetable at all" check and the mode-specific
+    /// reachability.
     var localDevices: [Device] {
-        devices.filter { $0.transport == .coreAudio && isUserSelectableOutput($0) }
+        devices.filter {
+            $0.transport == .coreAudio && isSelectableInMode($0, mode: mode)
+        }
     }
     var airPlayDevices: [Device] {
-        devices.filter { $0.transport == .airplay2 && isUserSelectableOutput($0) }
+        devices.filter {
+            $0.transport == .airplay2 && isSelectableInMode($0, mode: mode)
+        }
     }
     var enabledDeviceCount: Int { routing.values.filter(\.enabled).count }
 }
