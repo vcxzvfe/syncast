@@ -50,21 +50,39 @@ final class AppModel {
     }
 
     private func bootstrap() async {
+        NSLog("[SyncCast] bootstrap start")
         // 1. Spawn the bundled sidecar (which in turn spawns OwnTone).
         do {
             let paths = try sidecarLauncher.start()
             sidecarRunning = true
-            // Give the sidecar a moment to bind its sockets before the
-            // Router tries to connect.
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            try await router.attachSidecar(.init(
-                control: paths.controlSocket,
-                audio:   paths.audioSocket
-            ))
+            NSLog("[SyncCast] sidecar started, control=\(paths.controlSocket.path)")
+            // Retry attach with exponential backoff. The PyInstaller
+            // onefile binary can need up to a couple of seconds on first
+            // run to extract its archive before the Python interpreter
+            // gets to asyncio.start_unix_server.
+            var lastErr: Error?
+            for attempt in 0..<10 {
+                do {
+                    try await router.attachSidecar(.init(
+                        control: paths.controlSocket,
+                        audio:   paths.audioSocket
+                    ))
+                    NSLog("[SyncCast] attachSidecar OK on attempt \(attempt + 1)")
+                    lastErr = nil
+                    break
+                } catch {
+                    lastErr = error
+                    NSLog("[SyncCast] attachSidecar attempt \(attempt + 1) failed: \(error)")
+                    try? await Task.sleep(nanoseconds: UInt64(200_000_000) << min(attempt, 4))
+                }
+            }
+            if let e = lastErr { throw e }
         } catch {
+            NSLog("[SyncCast] sidecar attach gave up: \(error)")
             lastError = "sidecar: \(error.localizedDescription)"
         }
         // 2. Start discovery (CoreAudio + Bonjour).
+        NSLog("[SyncCast] starting discovery")
         await discovery.start()
         let stream = await discovery.subscribe()
         Task { [weak self] in
@@ -73,12 +91,14 @@ final class AppModel {
                 await self.applyEvent(event)
             }
         }
+        NSLog("[SyncCast] bootstrap complete")
     }
 
     private func applyEvent(_ event: DiscoveryEvent) async {
         await MainActor.run {
             switch event {
             case .appeared(let dev):
+                NSLog("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))")
                 if !devices.contains(where: { $0.id == dev.id }) {
                     devices.append(dev)
                     devices.sort { $0.name < $1.name }
@@ -95,6 +115,7 @@ final class AppModel {
             case .disappeared(let id):
                 devices.removeAll { $0.id == id }
             case .error(let msg):
+                NSLog("[SyncCast] discovery error: \(msg)")
                 lastError = msg
             }
         }

@@ -20,7 +20,10 @@ public actor IpcClient {
     private var nextID: Int = 1
     private var pending: [Int: CheckedContinuation<Any, Error>] = [:]
     private var notificationHandler: (@Sendable (String, [String: Any]) -> Void)?
-    private var readerTask: Task<Void, Never>?
+    /// Background thread doing blocking read(2). NOT an `actor`-bound Task —
+    /// must run off-actor so it doesn't block IpcClient.call() from acquiring
+    /// the actor.
+    private var readerThread: Thread?
 
     public init(socketPath: URL) {
         self.socketPath = socketPath
@@ -55,13 +58,27 @@ public actor IpcClient {
             throw IpcError.socketConnectFailed(e)
         }
         self.fd = s
-        self.readerTask = Task { [weak self] in await self?.readLoop() }
+        // Spawn a real POSIX thread (not a Swift Task) so the blocking
+        // read(2) doesn't sit on the actor's serial executor and deadlock
+        // .call() waiters. We capture the fd by value — close() invalidates
+        // it via Darwin.close, after which read() returns EBADF/0 and the
+        // loop terminates.
+        let capturedFd = s
+        let thread = Thread { [weak self] in
+            IpcClient.readLoopOnThread(fd: capturedFd) { line in
+                guard let self else { return }
+                Task { await self.dispatchLine(line) }
+            }
+        }
+        thread.name = "syncast.ipc.reader"
+        thread.qualityOfService = .utility
+        thread.start()
+        self.readerThread = thread
     }
 
     public func close() {
-        readerTask?.cancel()
-        readerTask = nil
         if fd >= 0 { Darwin.close(fd); fd = -1 }
+        readerThread = nil
     }
 
     @discardableResult
@@ -101,13 +118,19 @@ public actor IpcClient {
         }
     }
 
-    private func readLoop() async {
+    /// Runs on the dedicated `readerThread`. The fd is captured by value at
+    /// thread spawn time; when the actor closes the socket, read returns 0
+    /// or -1 EBADF and the loop exits cleanly.
+    private static func readLoopOnThread(
+        fd: Int32,
+        onLine: @escaping (Data) -> Void
+    ) {
         var buffer = Data()
         let chunkSize = 4096
         var tmp = [UInt8](repeating: 0, count: chunkSize)
-        while !Task.isCancelled, fd >= 0 {
+        while true {
             let n = tmp.withUnsafeMutableBytes { rawPtr -> Int in
-                let p = rawPtr.baseAddress!
+                guard let p = rawPtr.baseAddress else { return -1 }
                 return Darwin.read(fd, p, chunkSize)
             }
             if n <= 0 { break }
@@ -115,12 +138,12 @@ public actor IpcClient {
             while let nlIdx = buffer.firstIndex(of: 0x0a) {
                 let line = buffer.subdata(in: 0..<nlIdx)
                 buffer.removeSubrange(0...nlIdx)
-                handleLine(line)
+                onLine(line)
             }
         }
     }
 
-    private func handleLine(_ data: Data) {
+    fileprivate func dispatchLine(_ data: Data) {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         if let method = obj["method"] as? String {
             let params = (obj["params"] as? [String: Any]) ?? [:]
@@ -137,3 +160,4 @@ public actor IpcClient {
         }
     }
 }
+
