@@ -45,6 +45,13 @@ public actor Router {
     /// audio out to. Used to decide if a routing change requires destroy +
     /// recreate (different set) or is a no-op (same set).
     private var aggregateCoveredUIDs: Set<String> = []
+    /// Cached stream-format diagnostic from the most recent aggregate
+    /// build. Surfaced by `diagnosticSCKReport()` so field logs show the
+    /// actual channel layout of the kernel-level fan-out — invaluable
+    /// for diagnosing the "only one speaker plays" symptom (which is
+    /// almost always a channel-count mismatch between AUHAL stream
+    /// format and the aggregate's exposed stream layout).
+    private var aggregateStreamDiagnostic: AggregateDevice.StreamDiagnostic?
     private var routing: [String: DeviceRouting] = [:]
     private var measuredAirplayLatencyMs: Int = 1800
     private var ipc: IpcClient?
@@ -225,7 +232,18 @@ public actor Router {
         } else {
             driverInfo = " driver=idle"
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(renderInfo)\(awInfo)"
+        // Aggregate stream-format diagnostic: surfaces the actual channel
+        // layout so field logs make the "only one speaker plays" bug
+        // unambiguous. Format:
+        //   streamChannelCount=streams=1 ch=[2] total=2 master=2  (good)
+        //   streamChannelCount=streams=1 ch=[4] total=4 master=2  (bug)
+        let streamInfo: String
+        if let diag = aggregateStreamDiagnostic {
+            streamInfo = " streamChannelCount=\(diag.summary)"
+        } else {
+            streamInfo = ""
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
@@ -364,6 +382,20 @@ public actor Router {
             return
         }
 
+        // Diagnose the aggregate's actual output-stream layout BEFORE
+        // opening AUHAL. This reads kAudioDevicePropertyStreamConfiguration
+        // and lets us correlate AUHAL's mChannelsPerFrame=2 against the
+        // aggregate's real channel count. If they mismatch (e.g. 4 ch
+        // because the kernel exposed both subdevices' channels via one
+        // stream), only the first 2 channels get audio and the second
+        // physical speaker is silent — the user-reported bug.
+        let diag = agg.diagnoseStreamConfig()
+        // stderr — Router has no SyncCastLog dependency.
+        FileHandle.standardError.write(Data(
+            "[Router] aggregate stream diag: \(diag.summary)\n".utf8
+        ))
+        aggregateStreamDiagnostic = diag
+
         let out = LocalOutput(
             deviceID: agg.deviceID, deviceUID: agg.aggregateUID,
             ring: sckCapture.ringBuffer,
@@ -405,6 +437,7 @@ public actor Router {
             aggregateDevice = nil
         }
         aggregateCoveredUIDs = []
+        aggregateStreamDiagnostic = nil
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {
