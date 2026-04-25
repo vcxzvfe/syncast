@@ -392,15 +392,22 @@ public actor Router {
         let diag = agg.diagnoseStreamConfig()
         // stderr — Router has no SyncCastLog dependency.
         FileHandle.standardError.write(Data(
-            "[Router] aggregate stream diag: \(diag.summary)\n".utf8
+            "[Router] aggregate stream diag: \(diag.summary) outputCh=\(agg.outputChannelCount)\n".utf8
         ))
         aggregateStreamDiagnostic = diag
 
+        // AUHAL is configured for the aggregate's REAL channel count.
+        // If approach (A) succeeded in narrowing every stream to 2-ch,
+        // outputChannelCount == 2 and render() emits a clean stereo pair.
+        // If (A) was rejected and outputChannelCount is wider (typically
+        // 2*subdeviceCount), render() splats the source stereo into
+        // every channel pair so all subdevices play.
         let out = LocalOutput(
             deviceID: agg.deviceID, deviceUID: agg.aggregateUID,
             ring: sckCapture.ringBuffer,
             sampleRate: sckCapture.sampleRate,
-            channelCount: sckCapture.channelCount
+            channelCount: sckCapture.channelCount,
+            outputChannelCount: agg.outputChannelCount
         )
         do {
             try out.start()
