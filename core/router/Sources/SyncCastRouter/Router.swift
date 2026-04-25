@@ -24,8 +24,28 @@ public actor Router {
         case error
     }
 
+    /// Top-level data-plane mode.
+    ///
+    /// - ``stereo``     — legacy: SCK-captured PCM is fed through the
+    ///                    sidecar to AirPlay 2 receivers, while local
+    ///                    CoreAudio outputs render from the same SCK
+    ///                    ring directly. Two clocks: SCK for local,
+    ///                    AirPlay's RTSP anchor for remote.
+    /// - ``wholeHome``  — Strategy 1: bundled OwnTone produces ONE
+    ///                    player-clock stream that fans out to AirPlay
+    ///                    receivers (via OwnTone's existing AirPlay
+    ///                    output) AND to local CoreAudio devices via
+    ///                    `LocalAirPlayBridge` instances reading the
+    ///                    sidecar's fifo broadcast socket. Single
+    ///                    clock everywhere.
+    public enum Mode: String, Sendable {
+        case stereo
+        case wholeHome = "whole_home"
+    }
+
     public private(set) var state: RouterState = .idle
     public private(set) var lastError: String?
+    public private(set) var mode: Mode = .stereo
 
     private let sckCapture: SCKCapture
     private let scheduler: Scheduler
@@ -61,6 +81,16 @@ public actor Router {
     private var measuredAirplayLatencyMs: Int = 1800
     private var ipc: IpcClient?
     private var audioWriter: AudioSocketWriter?
+    /// Whole-home AirPlay mode bridges, keyed by SyncCast device ID.
+    /// Each entry owns one Unix-socket connection to the sidecar's
+    /// broadcast listener and one AUHAL on a physical CoreAudio device.
+    /// Empty in stereo mode and after teardown. Fully replaces the
+    /// `localOutputs` set while in whole-home mode — the two are never
+    /// active at the same time on the same physical device.
+    private var localBridges: [String: LocalAirPlayBridge] = [:]
+    /// Cached path returned by `local_fifo.path` IPC — fetched once on
+    /// the first whole-home transition and reused for all bridges.
+    private var localFifoSocketPath: URL?
 
     /// Sockets used to talk to the Python sidecar. May be nil in unit tests
     /// or when running without AirPlay support.
@@ -152,6 +182,12 @@ public actor Router {
 
     public func stop() async {
         state = .stopping
+        // 0. Tear down whole-home bridges first (if any). They hold
+        //    Unix sockets pointing at the sidecar and AUHALs on
+        //    physical devices; both need to release before the rest of
+        //    the local driver shutdown sequence.
+        for (_, b) in localBridges { b.stop() }
+        localBridges.removeAll()
         // 1. Stop the audio writer's send loop, but DO NOT nil it. The
         //    instance holds the ring + socket-path; .start() can reconnect
         //    cleanly on the next reconcile. Nilling this and `ipc` below
@@ -230,25 +266,34 @@ public actor Router {
         // Driver mode: most useful in field reports — tells us instantly
         // if the kernel-level synchronized aggregate is engaged or not.
         let driverInfo: String
-        if aggregateDevice != nil {
+        if mode == .wholeHome {
+            driverInfo = " driver=wholeHome(\(localBridges.count))"
+        } else if aggregateDevice != nil {
             driverInfo = " driver=aggregate(\(aggregateCoveredUIDs.count))"
         } else if !localOutputs.isEmpty {
             driverInfo = " driver=individual(\(localOutputs.count))"
         } else {
             driverInfo = " driver=idle"
         }
-        // Aggregate stream-format diagnostic: surfaces the actual channel
-        // layout so field logs make the "only one speaker plays" bug
-        // unambiguous. Format:
+        // Aggregate stream-format diagnostic (Strategy 2 fix): surfaces
+        // the actual channel layout so field logs make the "only one
+        // speaker plays" bug unambiguous. Format:
         //   streamChannelCount=streams=1 ch=[2] total=2 master=2  (good)
-        //   streamChannelCount=streams=1 ch=[4] total=4 master=2  (bug)
+        //   streamChannelCount=streams=1 ch=[4] total=4 master=2  (was bug)
         let streamInfo: String
         if let diag = aggregateStreamDiagnostic {
             streamInfo = " streamChannelCount=\(diag.summary)"
         } else {
             streamInfo = ""
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)"
+        // Whole-home bridges (Strategy 1): one line per active bridge
+        // with packet + render counters. Empty when not in wholeHome
+        // mode or no bridges are active.
+        var bridgeInfo = ""
+        for (id, b) in localBridges {
+            bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) err:\(b.lastError.isEmpty ? "none" : b.lastError)"
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
@@ -257,6 +302,155 @@ public actor Router {
     public func syncLocalOutputs(devices: [Device]) async {
         reconcileLocalDriver(devices: devices)
         replan()
+    }
+
+    // MARK: - Whole-home AirPlay mode (Strategy 1)
+    //
+    // Two public entry points the menubar app drives:
+    //
+    //   setMode(_:)         — round-trip the mode change with the
+    //                          sidecar via `mode.set`. Tearing down
+    //                          existing local bridges happens here so
+    //                          the SCK driver path is clean before any
+    //                          subsequent stereo `start(devices:)`.
+    //
+    //   startWholeHome(devices:) — for each enabled local CoreAudio
+    //                          device in `devices`, open one
+    //                          LocalAirPlayBridge against the sidecar's
+    //                          broadcast socket.
+    //
+    // The two are separate because the menubar may want to set the mode
+    // FIRST (so OwnTone has time to spin up) and bring the bridges up
+    // only after the user has chosen which devices participate.
+
+    /// Tell the sidecar to switch data planes, and synchronize our
+    /// local state with the result. In stereo→whole_home, this is a
+    /// prerequisite for `startWholeHome`. In whole_home→stereo, this
+    /// also tears down any active bridges so the next stereo start has
+    /// a clean slate.
+    public func setMode(_ newMode: Mode) async {
+        guard let ipc else {
+            lastError = "ipc not attached, cannot set mode"
+            return
+        }
+        do {
+            _ = try await ipc.call("mode.set", params: ["mode": newMode.rawValue])
+        } catch {
+            lastError = "mode.set(\(newMode.rawValue)): \(error)"
+            return
+        }
+        // Mode change accepted by sidecar. Local cleanup:
+        if newMode == .stereo {
+            // Drop every bridge — they're useless without the sidecar
+            // broadcaster on the other end. Local outputs (LocalOutput
+            // /aggregate) are NOT touched here; if the user restarts
+            // stereo streaming via `start(devices:)` they'll be opened
+            // by reconcileLocalDriver.
+            for (_, b) in localBridges { b.stop() }
+            localBridges.removeAll()
+        }
+        // Stash the new mode AFTER the IPC succeeds so a failed call
+        // doesn't lie about our state.
+        self.mode = newMode
+    }
+
+    /// Open `LocalAirPlayBridge` instances for every enabled local
+    /// CoreAudio device in `devices`. The bridge connects to the
+    /// sidecar's broadcast socket and renders OwnTone's player-clock
+    /// PCM through AUHAL on the device.
+    ///
+    /// Preconditions:
+    ///   * `setMode(.wholeHome)` has already returned successfully.
+    ///   * The IPC connection is up (otherwise we cannot resolve the
+    ///     broadcast socket path).
+    ///
+    /// Idempotent: re-calling with the same `devices` is a no-op for
+    /// existing bridges. Devices not enabled or not local-CoreAudio are
+    /// skipped silently. Devices that USED to have a bridge but are no
+    /// longer enabled get their bridge stopped + removed.
+    public func startWholeHome(devices: [Device]) async {
+        guard mode == .wholeHome else {
+            lastError = "startWholeHome called outside whole_home mode"
+            return
+        }
+        guard let ipc else {
+            lastError = "ipc not attached, cannot start whole_home"
+            return
+        }
+        // Resolve the broadcast socket path once per session.
+        if localFifoSocketPath == nil {
+            do {
+                let any = try await ipc.call("local_fifo.path", params: [:])
+                if let dict = any as? [String: Any],
+                   let pathStr = dict["socket_path"] as? String {
+                    localFifoSocketPath = URL(fileURLWithPath: pathStr)
+                } else {
+                    lastError = "local_fifo.path returned malformed result"
+                    return
+                }
+            } catch {
+                lastError = "local_fifo.path failed: \(error)"
+                return
+            }
+        }
+        guard let socketURL = localFifoSocketPath else { return }
+
+        // Build the target set of (deviceID, uid) tuples from `devices`,
+        // honouring the same "enabled and local-coreaudio" predicate as
+        // reconcileLocalDriver. We deliberately do NOT filter out our
+        // own private aggregates here — in whole-home mode we don't use
+        // them, but if the user has a third-party aggregate they want
+        // to drive, that's fine.
+        struct Target { let deviceID: String; let uid: String; let name: String }
+        let targets: [Target] = devices.compactMap { dev in
+            guard dev.transport == .coreAudio else { return nil }
+            guard routing[dev.id]?.enabled ?? false else { return nil }
+            guard let uid = dev.coreAudioUID else { return nil }
+            // Skip our own private aggregates — they're an artifact of
+            // stereo mode's reconciliation and would re-open the SCK
+            // driver path, defeating the purpose.
+            if uid.hasPrefix(AggregateDevice.uidPrefix) { return nil }
+            // Same blackhole filter as stereo mode — never route audio
+            // back into the loopback source.
+            if dev.name.lowercased().contains("blackhole") { return nil }
+            return Target(deviceID: dev.id, uid: uid, name: dev.name)
+        }
+        let targetIDs = Set(targets.map { $0.deviceID })
+
+        // Tear down bridges that are no longer in the target set.
+        for (id, b) in localBridges where !targetIDs.contains(id) {
+            b.stop()
+            localBridges.removeValue(forKey: id)
+        }
+
+        // Bring up bridges for new targets.
+        for t in targets {
+            if localBridges[t.deviceID] != nil { continue }
+            // Resolve UID → AudioObjectID. Failure here is per-device,
+            // not fatal for the whole call — log and skip.
+            let coreAudioID: AudioObjectID
+            do {
+                coreAudioID = try Capture.deviceID(forUID: t.uid)
+            } catch {
+                lastError = "bridge: device \(t.name) not found: \(error)"
+                continue
+            }
+            guard coreAudioID != 0 else {
+                lastError = "bridge: device \(t.name) resolved to id 0"
+                continue
+            }
+            let bridge = LocalAirPlayBridge(
+                deviceID: coreAudioID,
+                deviceUID: t.uid,
+                socketPath: socketURL
+            )
+            do {
+                try bridge.start()
+                localBridges[t.deviceID] = bridge
+            } catch {
+                lastError = "bridge \(t.name) start failed: \(error)"
+            }
+        }
     }
 
     // MARK: - Local driver reconciliation

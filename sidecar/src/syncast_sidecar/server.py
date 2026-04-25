@@ -55,6 +55,10 @@ class ControlServer:
             "stream.start": self._on_stream_start,
             "stream.stop": self._on_stream_stop,
             "stream.flush": self._on_stream_flush,
+            # Whole-home AirPlay mode (Strategy 1). See ../proto/ipc-schema.md.
+            "mode.set": self._on_mode_set,
+            "local_fifo.path": self._on_local_fifo_path,
+            "local_fifo.diagnostics": self._on_local_fifo_diagnostics,
         }
 
     async def run(self) -> None:
@@ -194,6 +198,10 @@ class ControlServer:
                 "airplay2.multi_target",
                 "airplay2.volume",
                 "airplay2.metadata",
+                # Strategy 1: bundled OwnTone outputs PCM into a fifo
+                # broadcast socket so local CoreAudio outputs and AirPlay
+                # receivers all ride OwnTone's single player clock.
+                "whole_home.local_fifo",
             ],
         }
 
@@ -220,3 +228,33 @@ class ControlServer:
 
     async def _on_stream_flush(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self._devices.flush()
+
+    async def _on_mode_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Switch the data plane between stereo and whole-home modes.
+
+        Whole-home brings up OwnTone (if not already running) AND opens
+        the local-fifo broadcast listener; stereo tears the listener
+        down. See `proto/ipc-schema.md` and DeviceManager.set_mode().
+        """
+        mode = params.get("mode")
+        if not isinstance(mode, str):
+            raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "mode must be string")
+        return await self._devices.set_mode(mode)
+
+    async def _on_local_fifo_path(
+        self, params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the broadcast Unix socket path Swift bridges connect to.
+
+        Synchronous in spirit (no I/O), but kept async to match the
+        handler signature contract.
+        """
+        return self._devices.get_local_fifo_path()
+
+    async def _on_local_fifo_diagnostics(
+        self, params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Diagnostic counters for the broadcast plane (for `state.report`
+        / log dumps). Returns zero-valued payload when broadcaster is off.
+        """
+        return self._devices.broadcaster_diagnostics()
