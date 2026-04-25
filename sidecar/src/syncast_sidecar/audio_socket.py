@@ -214,6 +214,12 @@ class LocalFifoBroadcaster:
         self._listener_thread: threading.Thread | None = None
         self._broadcast_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Set by the broadcaster thread once the OwnTone fifo open
+        # succeeds (or fails). `start()` does NOT wait on this — see
+        # docstring on start() for why we want non-blocking start.
+        # Diagnostic readers can poll `is_set()` to learn whether the
+        # broadcaster is actually pumping bytes yet.
+        self._fifo_ready = threading.Event()
         # Client registry. Mutated only under `_clients_lock`. The
         # broadcaster takes a *snapshot* (list copy) under the lock and
         # then sends without holding the lock — keeps accept() unblocked
@@ -249,11 +255,23 @@ class LocalFifoBroadcaster:
     # ---------- lifecycle ----------
 
     def start(self) -> None:
+        """Spin up the listener + broadcaster threads. Non-blocking.
+
+        The OwnTone output-fifo open used to happen synchronously here,
+        but `start()` is called from `device_manager.set_mode("whole_home")`
+        while the device manager holds its asyncio lock. The fifo open
+        has a 5-second deadline (in case OwnTone has crashed), and
+        blocking the asyncio task for 5 s freezes every other JSON-RPC
+        request the sidecar is handling. We now defer the open into the
+        broadcaster thread's first iteration. `start()` returns as soon
+        as the threads have been spawned; readers that need to know
+        whether the open succeeded can poll `_fifo_ready`.
+        """
         if self._listener_thread is not None and self._listener_thread.is_alive():
             return
         self._stop_event.clear()
+        self._fifo_ready.clear()
         self._open_listener()
-        self._open_fifo_blocking()
         self._listener_thread = threading.Thread(
             target=self._run_listener,
             name="syncast-localfifo-listener",
@@ -389,8 +407,19 @@ class LocalFifoBroadcaster:
             )
 
     def _run_broadcaster(self) -> None:
+        # Open the OwnTone output fifo as the first action on this
+        # thread. Was previously called from start() under the device-
+        # manager asyncio lock, where the 5-second deadline could freeze
+        # the whole sidecar control plane. Doing it here means start()
+        # returns immediately and other JSON-RPC handlers stay
+        # responsive even if OwnTone is slow to come up.
+        self._open_fifo_blocking()
+        self._fifo_ready.set()
         fd = self._fifo_fd
         if fd is None:
+            # Fifo open failed (deadline expired or stop() set). Nothing
+            # to broadcast; thread exits cleanly. fifo_open_failures has
+            # already been bumped by _open_fifo_blocking.
             return
         # Short reads are normal on fifos; we accumulate to one logical
         # OwnTone packet (LOCAL_FIFO_CHUNK_BYTES) before broadcasting so
