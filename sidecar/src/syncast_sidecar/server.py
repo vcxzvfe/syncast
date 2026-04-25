@@ -35,7 +35,11 @@ class ControlServer:
         self._audio_path = audio_socket
         self._writer: asyncio.StreamWriter | None = None
         self._server: asyncio.AbstractServer | None = None
-        self._stopping = asyncio.Event()
+        # NOTE: asyncio.Event/Lock must NOT be constructed before the event
+        # loop runs. PyInstaller-built binaries trigger
+        # "Future attached to a different loop" if we create them here.
+        # We lazy-init them inside run() / first-use methods.
+        self._stopping: asyncio.Event | None = None
         self._devices = DeviceManager(
             notify=self._notify,
             owntone_binary=owntone_binary,
@@ -54,6 +58,10 @@ class ControlServer:
         }
 
     async def run(self) -> None:
+        # Lazy-init asyncio primitives inside the running loop. PyInstaller
+        # builds blow up with "Future attached to a different loop" if these
+        # are constructed in __init__ before the loop exists.
+        self._stopping = asyncio.Event()
         self._unlink(self._control_path)
         # Pre-set restrictive umask so the socket file is created with mode
         # 0600 atomically — closes the TOCTOU window between start_unix_server
@@ -77,7 +85,8 @@ class ControlServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-        self._stopping.set()
+        if self._stopping is not None:
+            self._stopping.set()
 
     @staticmethod
     def _unlink(path: Path) -> None:

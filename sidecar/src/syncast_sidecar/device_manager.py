@@ -58,15 +58,22 @@ class DeviceManager:
         self._notify = notify
         self._devices: dict[str, Device] = {}
         self._streaming: bool = False
-        self._lock = asyncio.Lock()
+        # asyncio.Lock created lazily on first use (must be inside the loop;
+        # see the same note in server.py).
+        self._lock: asyncio.Lock | None = None
         self._owntone: Any = None      # OwnToneBackend, lazily started
         self._audio_reader: AudioSocketReader | None = None
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
         self._state_dir = state_dir
 
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def shutdown(self) -> None:
-        async with self._lock:
+        async with self._get_lock():
             await self._stop_streaming_unlocked()
             self._devices.clear()
             if self._owntone is not None:
@@ -105,7 +112,7 @@ class DeviceManager:
                 jsonrpc.CAPABILITY_UNSUPPORTED,
                 f"unsupported transport: {transport}",
             )
-        async with self._lock:
+        async with self._get_lock():
             if device_id in self._devices:
                 raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_id already exists")
             dev = Device(
@@ -123,7 +130,7 @@ class DeviceManager:
             return {"connected": True, "reported_latency_ms": 1800}
 
     async def remove(self, device_id: str) -> dict[str, Any]:
-        async with self._lock:
+        async with self._get_lock():
             dev = self._devices.pop(device_id, None)
         if dev is None:
             raise jsonrpc.RpcError(jsonrpc.DEVICE_NOT_FOUND, device_id)
@@ -156,7 +163,7 @@ class DeviceManager:
         device_ids = list(params.get("device_ids", []))
         if not device_ids:
             raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_ids empty")
-        async with self._lock:
+        async with self._get_lock():
             missing = [d for d in device_ids if d not in self._devices]
             if missing:
                 raise jsonrpc.RpcError(
@@ -174,7 +181,7 @@ class DeviceManager:
         return {"started": True, "device_count": len(device_ids)}
 
     async def stop_stream(self) -> dict[str, Any]:
-        async with self._lock:
+        async with self._get_lock():
             await self._stop_streaming_unlocked()
         return {"stopped": True}
 
