@@ -43,9 +43,17 @@ class ControlServer:
 
     async def run(self) -> None:
         self._unlink(self._control_path)
-        self._server = await asyncio.start_unix_server(
-            self._on_client, path=str(self._control_path),
-        )
+        # Pre-set restrictive umask so the socket file is created with mode
+        # 0600 atomically — closes the TOCTOU window between start_unix_server
+        # creating the file and a follow-up chmod.
+        old_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(
+                self._on_client, path=str(self._control_path),
+            )
+        finally:
+            os.umask(old_umask)
+        # Defensive belt-and-braces: enforce 0600 even if umask was overridden.
         os.chmod(self._control_path, 0o600)
         logger.info("listening", extra={"socket": str(self._control_path)})
         async with self._server:

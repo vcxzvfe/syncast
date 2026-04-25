@@ -114,16 +114,31 @@ class OwnToneBackend:
 
     def write_pcm(self, data: bytes) -> int:
         """Best-effort write of PCM bytes into OwnTone's FIFO. Returns bytes
-        written. If OwnTone isn't reading yet, returns 0 (caller drops)."""
-        if self._fifo_fd is None:
+        written. If OwnTone isn't reading yet, returns 0 (caller drops).
+
+        Threading note: this is called from the audio-socket reader thread.
+        We snapshot the fd into a local under the GIL so a concurrent
+        `stop()` cannot close the fd between our `is None` check and
+        `os.write` — closing the global is atomic w.r.t. our local copy.
+        """
+        fd = self._fifo_fd
+        if fd is None:
             return 0
         try:
-            return os.write(self._fifo_fd, data)
+            return os.write(fd, data)
         except BlockingIOError:
             return 0
         except BrokenPipeError:
             logger.warning("fifo_broken_pipe")
+            # Best-effort; if a concurrent caller already cleared this we
+            # don't care.
             self._fifo_fd = None
+            return 0
+        except OSError as e:
+            # fd might have been reused by another part of the process; in
+            # that case writes are silently sent elsewhere, but we cannot
+            # detect it. The snapshot at the top minimizes the window.
+            logger.warning("fifo_write_failed", extra={"errno": e.errno})
             return 0
 
     # ---------- REST helpers ----------
@@ -185,11 +200,14 @@ airplay_shared {{
         self.config_path.write_text(cfg, encoding="utf-8")
 
     async def _wait_for_rest(self, timeout_s: float) -> None:
+        loop = asyncio.get_running_loop()
         deadline = time.monotonic() + timeout_s
         last_err: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                self._get("/api/config")
+                # Run the blocking urllib call on the default executor to
+                # avoid stalling the event loop on slow startups.
+                await loop.run_in_executor(None, self._get, "/api/config")
                 return
             except Exception as e:  # noqa: BLE001
                 last_err = e

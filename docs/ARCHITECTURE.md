@@ -28,26 +28,40 @@
                    └─────────────┬──────────────┘
                                  │ CoreAudio IOProc
                                  ▼
-   ┌────────────────────────────────────────────────────────┐
-   │                  SyncCast Router (Swift)                │
+   ┌─────────────────────────────────────────────────────────┐
+   │                  SyncCast Router (Swift)                 │
    │                                                          │
    │  Capture ─▶ RingBuffer ─▶ Scheduler ─▶ per-device read   │
    │                                                          │
    │  Transports:                                             │
    │   • CoreAudio AUHAL (one per local output)               │
-   │   • IPC bridge ─▶ pyatv sidecar (one stream per AP recv) │
-   └─┬────────────────┬─────────────────┬────────────────────┘
-     │                │                 │
-   AUHAL            AUHAL          Unix socket (control + audio)
-     │                │                 │
-     ▼                ▼                 ▼
-  MBP built-in   Display speaker   ┌──────────────────────────┐
-                                   │  syncast-sidecar (Py)    │
-                                   │  pyatv ▶ AirPlay 2 RTSP  │
-                                   └─┬────────────┬───────────┘
-                                     ▼            ▼
-                                Xiaomi Sound   Mac mini (AirPlay Recv)
+   │   • AudioSocketWriter ─▶ Unix SOCK_SEQPACKET (PCM)       │
+   │   • IpcClient JSON-RPC ─▶ Unix SOCK_STREAM (control)     │
+   └─┬────────────────┬───────────────────┬──────────────────┘
+     │                │                   │
+   AUHAL            AUHAL                 │ Unix sockets
+     │                │                   ▼
+     ▼                ▼          ┌──────────────────────────────┐
+  MBP built-in   Display          │   syncast-sidecar (Python)   │
+                                  │   • pyatv (discover + pair)  │
+                                  │   • AudioSocketReader thread │
+                                  │   • OwnToneBackend (REST + FIFO)
+                                  └──────────────┬───────────────┘
+                                                 │ spawns + REST + FIFO pipe
+                                                 ▼
+                                       ┌─────────────────────┐
+                                       │   OwnTone (GPL-2.0) │
+                                       │   PTP + RTSP + ALAC │
+                                       └────┬─────────────┬──┘
+                                            │             │
+                                            ▼             ▼
+                                       Xiaomi Sound   Mac mini
+                                                    (AirPlay Receiver)
 ```
+
+> **Note**: Streaming is performed by OwnTone, spawned and orchestrated by
+> the Python sidecar. pyatv is retained inside the sidecar for discovery
+> and pairing only — see [ADR-006](adr/ADR-006-owntone-streaming.md).
 
 ## 3. Module map
 
@@ -55,7 +69,7 @@
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
 | `core/router` | Swift Package | Capture from BlackHole, ring buffer, scheduler, AUHAL fan-out, IPC client to sidecar. |
-| `sidecar/` | Python | Multi-target AirPlay 2 streamer using pyatv. Lives in a child process. |
+| `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
 | `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes "Whole-house mode" + per-device controls. |
@@ -66,7 +80,7 @@
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
 4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, applies the per-device gain, writes into AUHAL's output buffer.
-5. **AirPlay fan-out**: the IPC client streams PCM packets to the Python sidecar over a SOCK_SEQPACKET audio socket. Sidecar dispatches per-device streams to pyatv.
+5. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
 
 ## 5. Sync model
 
@@ -86,7 +100,9 @@ See [research/sync-brief.md](research/sync-brief.md) for the full discussion. He
 | `DiscoveryService` actor | Swift concurrency | Aggregates events from CoreAudio + Bonjour. UI reads via subscribe(). |
 | `Router` actor | Swift concurrency | Owns Scheduler state, plans, IPC. Mutated only inside the actor. |
 | IPC reader task | Swift concurrency | Reads sidecar JSON-RPC notifications, forwards to Router. |
-| Sidecar asyncio loop | Python | Single-threaded. PCM read thread pushes frames via `loop.call_soon_threadsafe`. |
+| Sidecar asyncio loop | Python | Single-threaded. JSON-RPC + REST control. Blocking REST calls run on the executor thread pool. |
+| Sidecar audio reader thread | Python (`AudioSocketReader`) | Blocking SEQPACKET reads → write into OwnTone FIFO. Snapshot fd under GIL. |
+| OwnTone process | C | Owns PTP, RTSP, ALAC encode, multi-target sync. We treat as a black box. |
 
 ## 7. IPC
 

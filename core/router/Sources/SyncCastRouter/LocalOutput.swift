@@ -32,6 +32,10 @@ public final class LocalOutput {
     private var _muted: Bool = false
     private var _readCursor: Int64 = 0
     private var initialized = false
+    /// Pre-allocated channel pointer slot for the render callback so we
+    /// don't allocate a Swift Array on every render tick.
+    private let outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    private let outPtrsCount: Int
 
     public init(
         deviceID: AudioObjectID,
@@ -45,9 +49,22 @@ public final class LocalOutput {
         self.ring = ring
         self.sampleRate = sampleRate
         self.channelCount = channelCount
+        // Allocate a single buffer for the render-callback channel pointers.
+        let ptrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
+        // Initialize to a placeholder; will be overwritten on every render.
+        let placeholder = UnsafeMutablePointer<Float>.allocate(capacity: 1)
+        placeholder.initialize(to: 0)
+        ptrs.initialize(repeating: placeholder, count: channelCount)
+        self.outPtrs = ptrs
+        self.outPtrsCount = channelCount
+        // We deliberately leak the placeholder; deinit deallocates outPtrs.
+        // The actual pointers used are owned by CoreAudio.
     }
 
-    deinit { stop() }
+    deinit {
+        stop()
+        outPtrs.deallocate()
+    }
 
     public func setRouting(readBackoffFrames: Int, gain: Float, muted: Bool) {
         stateLock.withLock {
@@ -168,24 +185,27 @@ public final class LocalOutput {
             return s
         }()
 
-        var out: [UnsafeMutablePointer<Float>] = []
-        out.reserveCapacity(channelCount)
+        // Use the pre-allocated outPtrs slot — no Swift runtime allocation.
+        var allOk = true
         for ch in 0..<channelCount {
             if let raw = bufList[ch].mData {
-                out.append(raw.assumingMemoryBound(to: Float.self))
+                outPtrs[ch] = raw.assumingMemoryBound(to: Float.self)
+            } else {
+                allOk = false
+                break
             }
         }
-        if out.count != channelCount { return noErr }
-
-        ring.read(at: startFrame, frames: frames, into: out)
+        if !allOk { return noErr }
+        ring.read(at: startFrame, frames: frames, into: outPtrs)
 
         // Apply gain / mute. Also zero on negative backoff condition.
-        let effectiveGain = snapshot.muted ? 0 : snapshot.gain
+        let effectiveGain = snapshot.muted ? Float(0) : snapshot.gain
         if effectiveGain != 1.0 {
             for ch in 0..<channelCount {
+                let p = outPtrs[ch]
                 var i = 0
                 while i < frames {
-                    out[ch][i] *= effectiveGain
+                    p[i] *= effectiveGain
                     i += 1
                 }
             }

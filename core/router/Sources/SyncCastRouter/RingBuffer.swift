@@ -1,22 +1,32 @@
 import Foundation
-import os.lock
+import SyncCastAtomic
 
 /// Single-producer / multi-consumer lock-free PCM ring buffer.
 ///
 /// Layout: planar Float32, `channelCount` channels of `capacityFrames` each.
-/// The producer is the BlackHole IOProc; consumers are the per-device AUHAL
-/// render callbacks, each holding its own read cursor at a frame offset that
-/// implements per-device delay compensation.
+/// The producer is the BlackHole IOProc (real-time CoreAudio thread); the
+/// consumers are (a) the per-device AUHAL render callbacks, also real-time,
+/// and (b) the audio-socket writer, a non-RT background task. To avoid
+/// priority inversion the cursor is published with C11 atomic
+/// release/acquire semantics — no Darwin lock is ever held by the IOProc.
 ///
-/// Thread-safety: `write` is single-producer. `read(at:into:)` is safe for
-/// many consumers as long as `at` is a stable per-consumer cursor and the
-/// producer has not lapped the consumer.
+/// Write rules:
+///   * exactly one thread calls `write` (the IOProc); calling from multiple
+///     threads is undefined.
+///   * after copying the frames into storage, the writer publishes the new
+///     cursor with `sc_atomic_store_release`. Readers observing the new
+///     cursor with acquire ordering are guaranteed to also see the new
+///     frames in storage.
+///
+/// Read rules:
+///   * any thread may call `read(at:frames:into:)` and `writePosition`.
+///   * the consumer's `at` is its own monotonic cursor; the buffer
+///     zero-fills frames outside the valid window.
 public final class RingBuffer: @unchecked Sendable {
     public let channelCount: Int
     public let capacityFrames: Int
     private let storage: [UnsafeMutablePointer<Float>]
-    private var writeCursor: Int64 = 0          // monotonic, in frames
-    private let writeLock = OSAllocatedUnfairLock()
+    private let writeCursorAtom: UnsafeMutablePointer<SCAtomicInt64>
 
     public init(channelCount: Int, capacityFrames: Int) {
         precondition(channelCount > 0)
@@ -30,6 +40,9 @@ public final class RingBuffer: @unchecked Sendable {
             p.initialize(repeating: 0, count: capacityFrames)
             return p
         }
+        let atom = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
+        sc_atomic_init(atom, 0)
+        self.writeCursorAtom = atom
     }
 
     deinit {
@@ -37,61 +50,84 @@ public final class RingBuffer: @unchecked Sendable {
             p.deinitialize(count: capacityFrames)
             p.deallocate()
         }
+        writeCursorAtom.deallocate()
     }
 
-    /// Current write cursor (frames since start). Read once per consumer call.
+    /// Current write cursor (frames since start). Acquire ordering: any
+    /// frames committed before this cursor are visible to the reader.
     public var writePosition: Int64 {
-        writeLock.withLock { writeCursor }
+        sc_atomic_load_acquire(writeCursorAtom)
     }
 
-    /// Producer: append `frames` to the ring. Wraps automatically.
-    public func write(channels: [UnsafePointer<Float>], frames: Int) {
-        precondition(channels.count == channelCount)
+    /// Producer: append `frames` to the ring. The producer reads the
+    /// current cursor with relaxed ordering (it owns the cursor) and
+    /// publishes the new value with release ordering after the copy.
+    public func write(channels: UnsafePointer<UnsafePointer<Float>>, frames: Int) {
         let cap = capacityFrames
-        writeLock.withLock {
-            let start = Int(writeCursor & Int64(cap - 1))
-            let firstChunk = min(frames, cap - start)
-            let secondChunk = frames - firstChunk
-            for ch in 0..<channelCount {
-                storage[ch].advanced(by: start).update(from: channels[ch], count: firstChunk)
-                if secondChunk > 0 {
-                    storage[ch].update(from: channels[ch].advanced(by: firstChunk), count: secondChunk)
-                }
+        let cursor = sc_atomic_load_acquire(writeCursorAtom)  // relaxed-equivalent for sole writer
+        let start = Int(cursor & Int64(cap - 1))
+        let firstChunk = min(frames, cap - start)
+        let secondChunk = frames - firstChunk
+        for ch in 0..<channelCount {
+            let src = channels[ch]
+            storage[ch].advanced(by: start).update(from: src, count: firstChunk)
+            if secondChunk > 0 {
+                storage[ch].update(from: src.advanced(by: firstChunk), count: secondChunk)
             }
-            writeCursor &+= Int64(frames)
         }
+        sc_atomic_store_release(writeCursorAtom, cursor &+ Int64(frames))
     }
 
-    /// Consumer: read `frames` ending at the absolute frame `at` (inclusive of
-    /// the lower edge). Out-of-range frames are zero-filled. Returns the
-    /// number of frames that were genuinely backed by ring data.
+    /// Consumer: read `frames` starting at the absolute frame `at`.
+    /// Out-of-window frames are zero-filled. Returns the number of frames
+    /// genuinely backed by ring data.
     @discardableResult
     public func read(
         at startFrame: Int64,
         frames: Int,
-        into out: [UnsafeMutablePointer<Float>]
+        into out: UnsafePointer<UnsafeMutablePointer<Float>>
     ) -> Int {
-        precondition(out.count == channelCount)
         let cap = capacityFrames
-        let writePos = writePosition
+        let writePos = sc_atomic_load_acquire(writeCursorAtom)
         let lowerValid = max(0, writePos - Int64(cap))
         let upperValid = writePos
-        var filled = 0
+        // Compute the intersection of [startFrame, startFrame + frames)
+        // with [lowerValid, upperValid).
+        let validStart = max(startFrame, lowerValid)
+        let validEnd = min(startFrame &+ Int64(frames), upperValid)
+        let validFrames = max(0, Int(validEnd - validStart))
+        let leadingZeros = Int(max(0, validStart - startFrame))
+        let trailingZeros = frames - leadingZeros - validFrames
 
-        for f in 0..<frames {
-            let abs = startFrame &+ Int64(f)
-            if abs >= lowerValid && abs < upperValid {
-                let idx = Int(abs & Int64(cap - 1))
-                for ch in 0..<channelCount {
-                    out[ch][f] = storage[ch][idx]
-                }
-                filled += 1
-            } else {
-                for ch in 0..<channelCount {
-                    out[ch][f] = 0
+        // Zero-fill leading.
+        if leadingZeros > 0 {
+            for ch in 0..<channelCount {
+                out[ch].update(repeating: 0, count: leadingZeros)
+            }
+        }
+        // Copy the valid window in up to two chunks (handle wrap once).
+        if validFrames > 0 {
+            let absStart = validStart
+            let bufStart = Int(absStart & Int64(cap - 1))
+            let firstChunk = min(validFrames, cap - bufStart)
+            for ch in 0..<channelCount {
+                out[ch].advanced(by: leadingZeros)
+                    .update(from: storage[ch].advanced(by: bufStart),
+                            count: firstChunk)
+                if validFrames > firstChunk {
+                    out[ch].advanced(by: leadingZeros + firstChunk)
+                        .update(from: storage[ch],
+                                count: validFrames - firstChunk)
                 }
             }
         }
-        return filled
+        // Zero-fill trailing.
+        if trailingZeros > 0 {
+            for ch in 0..<channelCount {
+                out[ch].advanced(by: leadingZeros + validFrames)
+                    .update(repeating: 0, count: trailingZeros)
+            }
+        }
+        return validFrames
     }
 }
