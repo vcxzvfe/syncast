@@ -23,12 +23,11 @@
     <!-- Hide from Dock — menubar-only -->
     <key>LSUIElement</key>
     <true/>
-    <!-- We capture system audio via ScreenCaptureKit, which uses the
-         Screen Recording TCC class. Mic access is no longer required. -->
-    <!-- A microphone usage description is kept for backwards-compat with
-         users who already granted it — harmless to leave. -->
+    <!-- System audio capture goes through ScreenCaptureKit (Screen
+         Recording TCC class). The microphone is used only by the
+         optional auto-calibration flow described below. -->
     <key>NSMicrophoneUsageDescription</key>
-    <string>(Legacy — SyncCast no longer needs microphone access.) </string>
+    <string>SyncCast plays brief click sounds and listens with the microphone to measure how far behind your AirPlay receivers are versus your local speakers, so audio plays in sync. The microphone is only accessed when you explicitly tap "Auto-calibrate".</string>
     <!-- Required since macOS Sequoia for any app that browses mDNS / Bonjour
          services. Without this key the OS denies the browse silently. -->
     <key>NSLocalNetworkUsageDescription</key>
