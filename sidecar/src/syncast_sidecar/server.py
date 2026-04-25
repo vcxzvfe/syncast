@@ -157,6 +157,15 @@ class ControlServer:
         try:
             req = jsonrpc.parse_request(line.decode("utf-8"))
             req_id = req.id
+            # Diagnostic: every incoming method. Info level (rather than
+            # debug) since the sidecar runs with `--log-level info` in
+            # production and we need this in field logs to triage the
+            # Xiaomi-never-selected class of bugs. The volume is bounded
+            # — a few dozen RPCs per session, well below noise threshold.
+            logger.info(
+                "rpc_request",
+                extra={"method": req.method, "id": req_id},
+            )
             handler = self._handlers.get(req.method)
             if handler is None:
                 raise jsonrpc.RpcError(jsonrpc.METHOD_NOT_FOUND, req.method)
