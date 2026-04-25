@@ -45,6 +45,7 @@ from typing import Any, Callable
 from . import jsonrpc, log
 from .audio_socket import (
     DEFAULT_LOCAL_FIFO_DELAY_MS,
+    MAX_LOCAL_FIFO_DELAY_MS,
     AudioSocketReader,
     LocalFifoBroadcaster,
 )
@@ -475,7 +476,10 @@ class DeviceManager:
         plus the running broadcaster's report so the caller can verify
         the in-flight queue depth after a delay change.
         """
-        applied = max(0, int(delay_ms))
+        # Defense-in-depth: server.py also clamps, but treat untrusted
+        # values as untrusted at every layer. Negative -> 0; absurd
+        # positive values are capped to MAX_LOCAL_FIFO_DELAY_MS.
+        applied = max(0, min(int(delay_ms), MAX_LOCAL_FIFO_DELAY_MS))
         self._local_fifo_delay_ms = applied
         if self._broadcaster is not None:
             try:
