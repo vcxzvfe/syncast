@@ -241,6 +241,21 @@ private struct DeviceRow: View {
                         )
                     }
                 }
+                // One-line failure breadcrumb. Only shown when the
+                // sidecar has reported `failed` for this device, so a
+                // healthy connection produces no extra row chrome.
+                // Why this matters: before the connection-state pipe
+                // landed, OwnTone could silently fail to wire up a
+                // receiver and the UI cheerfully showed a green dot;
+                // the user's only signal was "no audio". The failure
+                // reason from the sidecar (e.g. "OwnTone never
+                // discovered receiver") gives them a real direction.
+                if connectionState == .failed {
+                    Text(failureMessage)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -249,7 +264,7 @@ private struct DeviceRow: View {
         .contentShape(Rectangle())
         .onTapGesture { model.toggleDevice(deviceID) }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text("\(device.name), \(routing.enabled ? "enabled" : "disabled")"))
+        .accessibilityLabel(Text("\(device.name), \(routing.enabled ? "enabled" : "disabled"), \(syncLabel)"))
         .accessibilityHint(Text("Double-tap to \(routing.enabled ? "disable" : "enable")"))
     }
 
@@ -272,6 +287,32 @@ private struct DeviceRow: View {
             .foregroundStyle(.secondary)
     }
 
+    /// The most recent connection state for THIS row's device, polled
+    /// from the Router actor by AppModel. Falls back to `.unknown`
+    /// before the first event arrives — the UI renders that as grey.
+    private var connectionState: DeviceConnectionState {
+        // For a row whose user-facing toggle is OFF we want the dot to
+        // go grey regardless of the cached state, so a stale "connected"
+        // from before the user toggled off doesn't keep the dot green.
+        // We DON'T overwrite the cache itself — the sidecar will emit
+        // `disconnected` shortly after and reconcile. This is purely a
+        // render-time override.
+        if !routing.enabled { return .disconnected }
+        return model.connectionStates[deviceID] ?? .unknown
+    }
+
+    /// Human-readable failure message shown under the row when the
+    /// state is `.failed`. Pulls the sidecar's reason if present, falls
+    /// back to a generic copy. Kept short — full diagnostic detail
+    /// goes to the system log via SyncCastLog.
+    private var failureMessage: String {
+        if let reason = model.connectionFailureReasons[deviceID],
+           !reason.isEmpty {
+            return "Connection failed — \(reason)"
+        }
+        return "Connection failed — check device"
+    }
+
     private var syncDot: some View {
         Circle()
             .fill(syncColor)
@@ -279,13 +320,34 @@ private struct DeviceRow: View {
             .accessibilityLabel(Text(syncLabel))
     }
 
+    /// Maps the per-device connection state to the dot colour.
+    /// Connected → green, connecting → yellow, failed → red,
+    /// disconnected (or row toggled off) → grey, unknown → grey-ish.
+    /// Replaces the previous always-green-when-enabled stub; see
+    /// MainPopover commit history for the design rationale.
     private var syncColor: Color {
-        if !routing.enabled { return .secondary.opacity(0.3) }
-        return .green   // P3 will compute real status from RouterSnapshot
+        switch connectionState {
+        case .connected:    return .green
+        case .connecting:   return .yellow
+        case .failed:       return .red
+        case .disconnected: return .secondary.opacity(0.3)
+        case .unknown:
+            // If the row is enabled but no event has come back yet,
+            // show a soft yellow rather than dead-grey so the user
+            // sees that something is in flight. After the 1-second
+            // poll the cache fills in and the colour locks in.
+            return routing.enabled ? .yellow : .secondary.opacity(0.3)
+        }
     }
 
     private var syncLabel: String {
-        routing.enabled ? "in sync" : "disabled"
+        switch connectionState {
+        case .connected:    return "connected"
+        case .connecting:   return "connecting"
+        case .failed:       return "connection failed"
+        case .disconnected: return "disconnected"
+        case .unknown:      return routing.enabled ? "connecting" : "disabled"
+        }
     }
 }
 

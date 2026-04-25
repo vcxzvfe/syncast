@@ -13,6 +13,20 @@ import SyncCastRouter
 final class AppModel {
     var devices: [Device] = []
     var routing: [String: DeviceRouting] = [:]
+    /// Per-device connection state, mirrored from the Router's actor
+    /// state. Populated by `subscribeConnectionStates` polling the
+    /// router every second; SwiftUI invalidates dependent views
+    /// (DeviceRow.syncDot) when this dict mutates.
+    ///
+    /// v1 polls instead of pushing — sufficient for "user clicks
+    /// device, sees state move grey → yellow → green within 1-2 sec".
+    /// We can switch to an event push model later if the latency
+    /// becomes user-visible; the Router actor's recordConnectionState
+    /// is already the single source of truth for that future migration.
+    var connectionStates: [String: DeviceConnectionState] = [:]
+    /// Per-device "last_error" string from the most recent failed
+    /// event. Surfaced as a one-line message under failed device rows.
+    var connectionFailureReasons: [String: String] = [:]
     /// The fundamental architectural choice: which audio path is active.
     /// These are mutually exclusive. Switching requires a full pipeline
     /// teardown + rebuild (a few hundred ms of silence on transition,
@@ -178,6 +192,17 @@ final class AppModel {
                 await self.applyEvent(event)
             }
         }
+        // 3. Poll the router for per-device connection state once a
+        //    second. The router caches what the sidecar has emitted
+        //    via event.device_state; the UI's sync-dot depends on the
+        //    cached value. v1 polls — see AppModel.connectionStates.
+        Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                await self.refreshConnectionStates()
+            }
+        }
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
 
         // SYNCAST_INITIAL_MODE=wholehome|stereo flips the engine into the
@@ -314,6 +339,17 @@ final class AppModel {
                 SyncCastLog.log("[SyncCast] discovery error: \(msg)".replacingOccurrences(of: "[SyncCast] ", with: ""))
                 lastError = msg
             }
+        }
+    }
+
+    /// Refresh the cached per-device connection states from the router.
+    /// Pull-based: see `connectionStates` doc + the AppModel.bootstrap
+    /// 1-second poller for the rationale.
+    private func refreshConnectionStates() async {
+        let snap = await router.connectionStatesSnapshot()
+        await MainActor.run {
+            self.connectionStates = snap.states
+            self.connectionFailureReasons = snap.reasons
         }
     }
 

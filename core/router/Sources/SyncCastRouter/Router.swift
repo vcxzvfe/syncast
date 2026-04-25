@@ -101,6 +101,25 @@ public actor Router {
     private var aggregateHwVolumeUnsupportedUIDs: Set<String> = []
     private var ipc: IpcClient?
     private var audioWriter: AudioSocketWriter?
+    /// Per-device connection state, keyed by SyncCast device ID. Updated
+    /// in the sidecar-notification handler on every `event.device_state`
+    /// arrival (see `attachSidecar`). Surfaced to the UI via
+    /// `connectionState(deviceID:)` + `connectionStatesSnapshot()`.
+    ///
+    /// Why the actor owns this rather than AppModel: AppModel runs on
+    /// the MainActor, so funnelling per-event notifications all the way
+    /// up to the UI thread for every device-state event would generate
+    /// dozens of MainActor hops per session start (the sidecar emits
+    /// connecting+connected+occasional failed for every device). The
+    /// actor keeps the latest cache and AppModel polls every second
+    /// (see `AppModel.subscribeConnectionStates`). v1 is intentionally
+    /// poll-based — pushing every event to MainActor can be added later
+    /// when we have a need (e.g. instant-failure UI animation).
+    private var connectionStates: [String: DeviceConnectionState] = [:]
+    /// Per-device "last_error" string from the most recent failed
+    /// event. Surfaced in the UI as a one-line under-row message.
+    /// Nil for any device whose state is not currently `.failed`.
+    private var connectionFailureReasons: [String: String] = [:]
     /// Whole-home AirPlay mode bridges, keyed by SyncCast device ID.
     /// Each entry owns one Unix-socket connection to the sidecar's
     /// broadcast listener and one AUHAL on a physical CoreAudio device.
@@ -148,11 +167,20 @@ public actor Router {
         let client = IpcClient(socketPath: sockets.control)
         try await client.connect { method, params in
             // Notifications from sidecar: parse device latency events to
-            // re-plan. Other events are observed by the UI layer via a
-            // separate subscription mechanism (TODO P3).
+            // re-plan, and per-device connection-state events to drive
+            // the UI sync dots. Other events are observed by the UI
+            // layer via a separate subscription mechanism (TODO P3).
             if method == "event.measured_latency",
                let measured = params["measured_ms"] as? Int {
                 Task { await self.updateAirplayLatency(measured) }
+            }
+            if method == "event.device_state",
+               let deviceID = params["device_id"] as? String,
+               let stateStr = params["state"] as? String {
+                let reason = params["last_error"] as? String
+                Task { await self.recordConnectionState(
+                    deviceID: deviceID, stateStr: stateStr, reason: reason,
+                ) }
             }
         }
         _ = try await client.call("sidecar.hello", params: ["v": 1, "router_pid": ProcessInfo.processInfo.processIdentifier])
@@ -713,6 +741,51 @@ public actor Router {
         loggedHwVolumeRejectionUIDs.removeAll()
         aggregateHwVolumeRejectionCounts.removeAll()
         aggregateHwVolumeUnsupportedUIDs.removeAll()
+    }
+
+    /// Record a per-device connection-state event from the sidecar.
+    /// Called from the IPC notification handler closure (off-actor)
+    /// via a `Task { await ... }` hop, so it lands inside the actor.
+    ///
+    /// Translates the sidecar's wire `state` string into a
+    /// `DeviceConnectionState`. The legacy `streaming` and `added`
+    /// states are mapped to `.unknown` so they don't override a fresh
+    /// `connecting` / `connected` flag — the UI cares about the
+    /// receiver-wiring lifecycle, not the internal stream lifecycle.
+    public func recordConnectionState(
+        deviceID: String, stateStr: String, reason: String?,
+    ) {
+        let state: DeviceConnectionState
+        switch stateStr {
+        case "connecting", "connected", "failed", "disconnected":
+            state = .fromWire(stateStr)
+        default:
+            // legacy / informational states (added, streaming): leave
+            // any prior wiring-state untouched and ignore this event.
+            return
+        }
+        connectionStates[deviceID] = state
+        if state == .failed, let reason = reason {
+            connectionFailureReasons[deviceID] = reason
+        } else if state != .failed {
+            connectionFailureReasons.removeValue(forKey: deviceID)
+        }
+    }
+
+    /// Query the most recent connection state for a single device.
+    /// Returns `.unknown` if no event has been received for it yet.
+    public func connectionState(deviceID: String) -> DeviceConnectionState {
+        connectionStates[deviceID] ?? .unknown
+    }
+
+    /// Snapshot the entire connection-state map (states + failure
+    /// reasons) for the UI poll loop. Returned as plain Sendable
+    /// dictionaries so MainActor consumers can copy them off-actor.
+    public func connectionStatesSnapshot() -> (
+        states: [String: DeviceConnectionState],
+        reasons: [String: String]
+    ) {
+        (connectionStates, connectionFailureReasons)
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {
