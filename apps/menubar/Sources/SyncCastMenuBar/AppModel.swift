@@ -262,6 +262,16 @@ final class AppModel {
                 detectBlackHole(in: dev)
             case .disappeared(let id):
                 devices.removeAll { $0.id == id }
+                // Drop the routing entry for the gone device too. Otherwise
+                // it sits orphan in the dict and shows up as "?=on/off" in
+                // every routingSummary() because routingSummary's name
+                // lookup goes through `devices`, which no longer has this
+                // id. Far worse than cosmetic: an orphan stuck at
+                // enabled=true keeps `hasEnabledOutputs` true after every
+                // physical device is gone, so the engine never quiesces.
+                if routing.removeValue(forKey: id) != nil {
+                    SyncCastLog.log("device disappeared: dropping routing entry [id=\(id.prefix(8))]")
+                }
             case .error(let msg):
                 SyncCastLog.log("[SyncCast] discovery error: \(msg)".replacingOccurrences(of: "[SyncCast] ", with: ""))
                 lastError = msg
