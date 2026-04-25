@@ -16,6 +16,8 @@ final class AppModel {
     var wholeHouseEnabled: Bool = false
     var streamingState: StreamingState = .idle
     var lastError: String?
+    var blackHoleAvailable: Bool = false
+    var blackHoleUID: String?
 
     enum StreamingState: String, Sendable {
         case idle, starting, running, error
@@ -28,6 +30,12 @@ final class AppModel {
         case .running:  return "speaker.wave.3.fill"
         case .error:    return "speaker.slash"
         }
+    }
+
+    /// Is at least one local-output device enabled? Used to decide whether
+    /// the audio engine should be running.
+    var hasEnabledOutputs: Bool {
+        routing.values.contains { $0.enabled }
     }
 
     private let discovery: DiscoveryService
@@ -61,10 +69,12 @@ final class AppModel {
                 if routing[dev.id] == nil {
                     routing[dev.id] = DeviceRouting(deviceID: dev.id, enabled: false)
                 }
+                detectBlackHole(in: dev)
             case .updated(let dev):
                 if let idx = devices.firstIndex(where: { $0.id == dev.id }) {
                     devices[idx] = dev
                 }
+                detectBlackHole(in: dev)
             case .disappeared(let id):
                 devices.removeAll { $0.id == id }
             case .error(let msg):
@@ -73,38 +83,119 @@ final class AppModel {
         }
     }
 
+    /// BlackHole exposes itself as a CoreAudio device whose UID contains
+    /// "BlackHole". We pick the first one we see and remember it. Users
+    /// with multiple BlackHole channel counts (2ch / 16ch / 64ch) get the
+    /// 2ch one because that's what we asked for in bootstrap.sh.
+    private func detectBlackHole(in dev: Device) {
+        guard dev.transport == .coreAudio,
+              let uid = dev.coreAudioUID,
+              uid.contains("BlackHole") else { return }
+        if blackHoleUID == nil {
+            blackHoleUID = uid
+            blackHoleAvailable = true
+        }
+    }
+
+    /// When the set of enabled devices changes (or whole-house mode flips),
+    /// reconcile the audio engine: start it if we have BlackHole + at least
+    /// one enabled output, stop it otherwise.
+    private func reconcileEngine() {
+        Task { await self.reconcileEngineAsync() }
+    }
+
+    private func reconcileEngineAsync() async {
+        guard blackHoleAvailable, let uid = blackHoleUID else {
+            if streamingState == .running {
+                await router.stop()
+                streamingState = .idle
+            }
+            return
+        }
+        let shouldRun = hasEnabledOutputs || wholeHouseEnabled
+        switch (streamingState, shouldRun) {
+        case (.idle, true), (.error, true):
+            streamingState = .starting
+            do {
+                let snapshot = devices
+                try await router.start(blackHoleUID: uid, devices: snapshot)
+                for (id, r) in routing {
+                    if r.enabled { await router.enable(deviceID: id) }
+                    else         { await router.disable(deviceID: id) }
+                    await router.setRouting(r)
+                }
+                streamingState = .running
+            } catch {
+                lastError = "\(error)"
+                streamingState = .error
+            }
+        case (.running, false):
+            await router.stop()
+            streamingState = .idle
+        case (.running, true):
+            // Push current routing to the running engine.
+            for (_, r) in routing {
+                await router.setRouting(r)
+            }
+        default:
+            break
+        }
+    }
+
     // MARK: - Intents
 
     func toggleWholeHouse() {
         wholeHouseEnabled.toggle()
         if wholeHouseEnabled {
-            for dev in devices {
+            // Enable every output that's not the BlackHole capture itself.
+            for dev in devices where dev.coreAudioUID != blackHoleUID {
                 var r = routing[dev.id] ?? DeviceRouting(deviceID: dev.id)
                 r.enabled = true
                 routing[dev.id] = r
             }
         }
+        reconcileEngine()
     }
 
     func toggleDevice(_ id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         r.enabled.toggle()
         routing[id] = r
+        reconcileEngine()
     }
 
     func setVolume(_ value: Float, for id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         r.volume = max(0, min(1, value))
         routing[id] = r
+        reconcileEngine()
     }
 
     func toggleMute(_ id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         r.muted.toggle()
         routing[id] = r
+        reconcileEngine()
     }
 
-    var localDevices: [Device] { devices.filter { $0.transport == .coreAudio } }
-    var airPlayDevices: [Device] { devices.filter { $0.transport == .airplay2 } }
+    /// Devices the user can plausibly target. Excludes the BlackHole
+    /// capture device (it's the *source*, not an output) and any virtual
+    /// aggregate / multi-output devices the system already exposes.
+    private func isUserSelectableOutput(_ d: Device) -> Bool {
+        if let uid = d.coreAudioUID, uid == blackHoleUID { return false }
+        let lower = d.name.lowercased()
+        if lower.contains("blackhole") { return false }
+        if lower.contains("aggregate") { return false }
+        if lower.contains("multi-output") || lower.contains("multioutput") { return false }
+        if d.name.contains("多输出") { return false }
+        return true
+    }
+
+    var localDevices: [Device] {
+        devices.filter { $0.transport == .coreAudio && isUserSelectableOutput($0) }
+    }
+    var airPlayDevices: [Device] {
+        devices.filter { $0.transport == .airplay2 && isUserSelectableOutput($0) }
+    }
     var enabledDeviceCount: Int { routing.values.filter(\.enabled).count }
 }
