@@ -11,11 +11,40 @@ struct MainPopover: View {
             Divider().padding(.horizontal, 12)
             wholeHouseToggle
             Divider().padding(.horizontal, 12)
+            debugStrip
+            Divider().padding(.horizontal, 12)
             deviceList
             Divider().padding(.horizontal, 12)
             footer
         }
         .padding(.vertical, 8)
+    }
+
+    /// Single-line live debug strip — visible to the user, lets us diagnose
+    /// the "0 devices in UI even though discovery saw them" class of bugs
+    /// without needing Console.app.
+    private var debugStrip: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 10) {
+                Label("\(model.devices.count)", systemImage: "speaker.wave.2.bubble")
+                Label("\(model.localDevices.count)", systemImage: "hifispeaker")
+                Label("\(model.airPlayDevices.count)", systemImage: "airplayaudio")
+                Label(model.sidecarRunning ? "OK" : "DOWN",
+                      systemImage: model.sidecarRunning ? "bolt.fill" : "bolt.slash")
+                    .foregroundStyle(model.sidecarRunning ? .green : .red)
+                Spacer()
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let err = model.lastError {
+                Text(err)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
     }
 
     private var header: some View {
@@ -62,8 +91,22 @@ struct MainPopover: View {
     }
 
     private var deviceList: some View {
-        ScrollView {
-            VStack(spacing: 0) {
+        // Plain VStack — no ScrollView. Inside MenuBarExtra(.window) on
+        // macOS 14/15, ScrollView often collapses to zero height when
+        // the popover doesn't propagate a parent frame, hiding rows even
+        // though they exist in the view tree. We accept a tall popover
+        // for now; if the device count grows beyond ~10 we'll revisit.
+        VStack(spacing: 0) {
+            if model.devices.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "speaker.wave.2.bubble")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.tertiary)
+                    Text("Looking for speakers…")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 24)
+            } else {
                 if !model.localDevices.isEmpty {
                     sectionHeader("Local")
                     ForEach(model.localDevices) { dev in
@@ -76,19 +119,8 @@ struct MainPopover: View {
                         DeviceRow(device: dev)
                     }
                 }
-                if model.devices.isEmpty {
-                    VStack(spacing: 6) {
-                        Image(systemName: "speaker.wave.2.bubble")
-                            .font(.system(size: 22))
-                            .foregroundStyle(.tertiary)
-                        Text("Looking for speakers…")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity).padding(.vertical, 24)
-                }
             }
         }
-        .frame(maxHeight: 320)
     }
 
     private func sectionHeader(_ title: String) -> some View {

@@ -87,14 +87,14 @@ public final class SidecarLauncher {
     @discardableResult
     public func start() throws -> Paths {
         guard let bins = Self.resolveBinaries() else {
-            NSLog("[SyncCast] no sidecar binary found")
+            SyncCastLog.log("[SyncCast] no sidecar binary found".replacingOccurrences(of: "[SyncCast] ", with: ""))
             throw NSError(
                 domain: "SidecarLauncher", code: 1,
                 userInfo: [NSLocalizedDescriptionKey:
                     "syncast-sidecar binary not found in the .app bundle or the dev fallback path"]
             )
         }
-        NSLog("[SyncCast] sidecar binary: \(bins.sidecar.path), bundled=\(bins.usingBundle)")
+        SyncCastLog.log("[SyncCast] sidecar binary: \(bins.sidecar.path), bundled=\(bins.usingBundle)".replacingOccurrences(of: "[SyncCast] ", with: ""))
         // Best-effort cleanup of stale sockets from a previous crash.
         for url in [paths.controlSocket, paths.audioSocket] {
             try? FileManager.default.removeItem(at: url)
@@ -123,14 +123,14 @@ public final class SidecarLauncher {
         self.stderrPipe = errPipe
         try proc.run()
         self.process = proc
-        NSLog("[SyncCast] sidecar pid=\(proc.processIdentifier) launched, waiting for socket…")
+        SyncCastLog.log("[SyncCast] sidecar pid=\(proc.processIdentifier) launched, waiting for socket…".replacingOccurrences(of: "[SyncCast] ", with: ""))
         // Block briefly until the socket actually exists. PyInstaller's
         // onefile bootstrap can take 1-3s on first run while it extracts
         // bundled libs to /var/folders/...
         let deadline = Date().addingTimeInterval(8.0)
         while Date() < deadline {
             if FileManager.default.fileExists(atPath: paths.controlSocket.path) {
-                NSLog("[SyncCast] sidecar socket appeared after \(Date().timeIntervalSince(deadline.addingTimeInterval(-8))) s")
+                SyncCastLog.log("[SyncCast] sidecar socket appeared after \(Date().timeIntervalSince(deadline.addingTimeInterval(-8))) s".replacingOccurrences(of: "[SyncCast] ", with: ""))
                 break
             }
             Thread.sleep(forTimeInterval: 0.1)

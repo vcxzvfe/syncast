@@ -50,12 +50,12 @@ final class AppModel {
     }
 
     private func bootstrap() async {
-        NSLog("[SyncCast] bootstrap start")
+        SyncCastLog.log("[SyncCast] bootstrap start".replacingOccurrences(of: "[SyncCast] ", with: ""))
         // 1. Spawn the bundled sidecar (which in turn spawns OwnTone).
         do {
             let paths = try sidecarLauncher.start()
             sidecarRunning = true
-            NSLog("[SyncCast] sidecar started, control=\(paths.controlSocket.path)")
+            SyncCastLog.log("[SyncCast] sidecar started, control=\(paths.controlSocket.path)".replacingOccurrences(of: "[SyncCast] ", with: ""))
             // Retry attach with exponential backoff. The PyInstaller
             // onefile binary can need up to a couple of seconds on first
             // run to extract its archive before the Python interpreter
@@ -67,22 +67,22 @@ final class AppModel {
                         control: paths.controlSocket,
                         audio:   paths.audioSocket
                     ))
-                    NSLog("[SyncCast] attachSidecar OK on attempt \(attempt + 1)")
+                    SyncCastLog.log("[SyncCast] attachSidecar OK on attempt \(attempt + 1)".replacingOccurrences(of: "[SyncCast] ", with: ""))
                     lastErr = nil
                     break
                 } catch {
                     lastErr = error
-                    NSLog("[SyncCast] attachSidecar attempt \(attempt + 1) failed: \(error)")
+                    SyncCastLog.log("[SyncCast] attachSidecar attempt \(attempt + 1) failed: \(error)".replacingOccurrences(of: "[SyncCast] ", with: ""))
                     try? await Task.sleep(nanoseconds: UInt64(200_000_000) << min(attempt, 4))
                 }
             }
             if let e = lastErr { throw e }
         } catch {
-            NSLog("[SyncCast] sidecar attach gave up: \(error)")
+            SyncCastLog.log("[SyncCast] sidecar attach gave up: \(error)".replacingOccurrences(of: "[SyncCast] ", with: ""))
             lastError = "sidecar: \(error.localizedDescription)"
         }
         // 2. Start discovery (CoreAudio + Bonjour).
-        NSLog("[SyncCast] starting discovery")
+        SyncCastLog.log("[SyncCast] starting discovery".replacingOccurrences(of: "[SyncCast] ", with: ""))
         await discovery.start()
         let stream = await discovery.subscribe()
         Task { [weak self] in
@@ -91,14 +91,14 @@ final class AppModel {
                 await self.applyEvent(event)
             }
         }
-        NSLog("[SyncCast] bootstrap complete")
+        SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
     }
 
     private func applyEvent(_ event: DiscoveryEvent) async {
         await MainActor.run {
             switch event {
             case .appeared(let dev):
-                NSLog("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))")
+                SyncCastLog.log("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))".replacingOccurrences(of: "[SyncCast] ", with: ""))
                 if !devices.contains(where: { $0.id == dev.id }) {
                     devices.append(dev)
                     devices.sort { $0.name < $1.name }
@@ -115,7 +115,7 @@ final class AppModel {
             case .disappeared(let id):
                 devices.removeAll { $0.id == id }
             case .error(let msg):
-                NSLog("[SyncCast] discovery error: \(msg)")
+                SyncCastLog.log("[SyncCast] discovery error: \(msg)".replacingOccurrences(of: "[SyncCast] ", with: ""))
                 lastError = msg
             }
         }
