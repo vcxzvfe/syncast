@@ -54,9 +54,8 @@ final class AppModel {
     // round-trip latency. The user picks WHICH input to listen with via
     // the picker driven by these fields. The actual capture / DSP
     // pipeline lives in `Calibration.swift` and `CalibrationRunner.swift`
-    // (owned by other agents) — this view-model only surfaces the
-    // available devices, the user's choice, and the TCC permission
-    // status.
+    // — this view-model only surfaces the available devices, the user's
+    // choice, and the TCC permission status.
 
     /// Live list of input-capable CoreAudio devices, refreshed on hot-plug.
     /// Populated by `refreshInputDevices()`; the first refresh runs at
@@ -108,6 +107,36 @@ final class AppModel {
     /// on the main queue so re-resolution of `selectedMicID` and
     /// `availableInputDevices` happens on `@MainActor`.
     private var inputDeviceListener: InputDeviceListener?
+
+    // MARK: - Whole-home delay-line tuning
+    //
+    // User-tunable broadcast-side delay aligning local bridges with
+    // AirPlay 2's PTP-anchored playout (~1.8 s). The slider in the
+    // popover writes into `airplayDelayMs`; a debounced setter pushes
+    // the change to the sidecar via JSON-RPC `local_fifo.set_delay_ms`.
+    // The auto-calibration flow above writes here too with its
+    // `recommendedDelayMs` result.
+
+    /// User-tunable broadcast-side delay (ms) for the whole-home FIFO,
+    /// aligning local bridges with AirPlay 2's ~1.8 s PTP playout.
+    /// Persisted to `UserDefaults` so user-dialed drift survives launches.
+    var airplayDelayMs: Int = AppModel.loadPersistedDelayMs()
+    /// Last sidecar `actual_delivery_lag_ms` reading; nil before first
+    /// sample or outside whole-home. Drives the slider's caption.
+    var measuredLagMs: Int? = nil
+
+    static let airplayDelayMsKey = "syncast.airplayDelayMs"
+    static let defaultAirplayDelayMs: Int = 1750
+    /// UI cap — sidecar still clamps to [0, 10000] ms; >3 s is user error.
+    static let airplayDelayMsRange: ClosedRange<Int> = 0...3000
+
+    private static func loadPersistedDelayMs() -> Int {
+        guard let raw = UserDefaults.standard.object(forKey: airplayDelayMsKey) as? Int
+        else { return defaultAirplayDelayMs }
+        return min(max(raw, airplayDelayMsRange.lowerBound),
+                   airplayDelayMsRange.upperBound)
+    }
+
 
     enum Mode: String, Sendable, CaseIterable, Identifiable {
         /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
@@ -183,6 +212,10 @@ final class AppModel {
     /// current transition finishes". Security Review C2.
     private var modeTransitioning: Bool = false
 
+    /// Debounce coalescer for `setAirplayDelay` — only the value 200 ms
+    /// after the last drag fires the IPC + UserDefaults write.
+    private var airplayDelayCommitTask: Task<Void, Never>?
+
     init() {
         self.discovery = DiscoveryService()
         self.router = Router()
@@ -247,6 +280,14 @@ final class AppModel {
                 }
             }
             if let e = lastErr { throw e }
+            // Push persisted FIFO delay before the user can hit play.
+            // Skip when default, to keep launch logs quiet.
+            if airplayDelayMs != AppModel.defaultAirplayDelayMs {
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.commitAirplayDelay(self.airplayDelayMs)
+                }
+            }
         } catch {
             SyncCastLog.log("[SyncCast] sidecar attach gave up: \(error)".replacingOccurrences(of: "[SyncCast] ", with: ""))
             lastError = "sidecar: \(error.localizedDescription)"
@@ -265,11 +306,15 @@ final class AppModel {
         //    second. The router caches what the sidecar has emitted
         //    via event.device_state; the UI's sync-dot depends on the
         //    cached value. v1 polls — see AppModel.connectionStates.
+        //    Same loop also samples the sidecar's `actual_delivery_lag_ms`
+        //    so the Sync slider's "Measured lag" caption stays live
+        //    without spinning a second timer.
         Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
                 await self.refreshConnectionStates()
+                await self.refreshLocalFifoLag()
             }
         }
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
@@ -419,6 +464,23 @@ final class AppModel {
         await MainActor.run {
             self.connectionStates = snap.states
             self.connectionFailureReasons = snap.reasons
+        }
+    }
+
+    /// Sample the sidecar's `actual_delivery_lag_ms` for the Sync caption.
+    /// Only meaningful in whole-home + broadcaster running; everywhere
+    /// else we clear the published value so the caption shows "—".
+    private func refreshLocalFifoLag() async {
+        guard mode == .wholeHome,
+              let diag = await router.localFifoDiagnostics(),
+              (diag["running"] as? Bool) == true else {
+            if measuredLagMs != nil { measuredLagMs = nil }
+            return
+        }
+        if let lag = diag["actual_delivery_lag_ms"] as? Double {
+            measuredLagMs = Int(lag.rounded())
+        } else if let lagInt = diag["actual_delivery_lag_ms"] as? Int {
+            measuredLagMs = lagInt  // JSON sometimes ships int when float is exact
         }
     }
 
@@ -718,6 +780,38 @@ final class AppModel {
         r.muted.toggle()
         routing[id] = r
         reconcileEngine()
+    }
+
+    /// Live-tune the whole-home FIFO delay. In-memory update is immediate
+    /// (snappy UI); IPC + UserDefaults write is debounced 200 ms so a
+    /// continuous drag doesn't spam either subsystem.
+    func setAirplayDelay(_ ms: Int) {
+        let clamped = min(max(ms, AppModel.airplayDelayMsRange.lowerBound),
+                          AppModel.airplayDelayMsRange.upperBound)
+        airplayDelayMs = clamped
+        airplayDelayCommitTask?.cancel()
+        airplayDelayCommitTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            if Task.isCancelled { return }
+            await self?.commitAirplayDelay(clamped)
+        }
+    }
+
+    /// Push the debounced value, then persist on success. On failure we
+    /// leave the in-memory value as-is so the next drag retries.
+    private func commitAirplayDelay(_ ms: Int) async {
+        do {
+            let applied = try await router.setLocalFifoDelayMs(ms)
+            if applied != airplayDelayMs { airplayDelayMs = applied }
+            UserDefaults.standard.set(applied, forKey: AppModel.airplayDelayMsKey)
+        } catch {
+            lastError = "set delay: \(error.localizedDescription)"
+        }
+    }
+
+    /// Reset the slider to the canonical default — same path as a drag.
+    func resetAirplayDelayToDefault() {
+        setAirplayDelay(AppModel.defaultAirplayDelayMs)
     }
 
     /// Devices the user can plausibly target. Excludes:

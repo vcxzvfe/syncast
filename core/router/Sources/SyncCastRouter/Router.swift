@@ -1016,4 +1016,33 @@ public actor Router {
         aggregateOutput.setSoftwareGain(pair: pair, gain: target)
         _ = deviceID  // intentionally unused — kept in signature for future per-device diagnostics
     }
+
+    // MARK: - Sync Settings (whole-home delay tuning)
+    // Thin passthroughs to the sidecar's `local_fifo.*` JSON-RPC methods,
+    // surfaced for the menubar UI's live sync slider.
+
+    /// Push a FIFO delay (ms); returns the sidecar-applied value
+    /// (sidecar clamps to [0, 10000] ms). Throws if IPC isn't attached.
+    public func setLocalFifoDelayMs(_ ms: Int) async throws -> Int {
+        guard let ipc else {
+            throw NSError(domain: "SyncCastRouter", code: 101, userInfo: [
+                NSLocalizedDescriptionKey: "sidecar not attached"
+            ])
+        }
+        let result = try await ipc.call(
+            "local_fifo.set_delay_ms", params: ["delay_ms": ms]
+        )
+        if let dict = result as? [String: Any], let applied = dict["delay_ms"] as? Int {
+            return applied
+        }
+        return ms
+    }
+
+    /// Broadcaster diagnostics (running flag, actual_delivery_lag_ms, etc.)
+    /// or nil if IPC is unavailable / the call errors.
+    public func localFifoDiagnostics() async -> [String: Any]? {
+        guard let ipc else { return nil }
+        let result = try? await ipc.call("local_fifo.diagnostics", params: [:])
+        return result as? [String: Any]
+    }
 }
