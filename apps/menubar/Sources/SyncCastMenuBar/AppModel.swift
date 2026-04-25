@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreAudio
 import Foundation
 import Observation
 import SyncCastDiscovery
@@ -44,6 +46,68 @@ final class AppModel {
     /// Screen Recording TCC permission state. We replaced the old
     /// "BlackHole microphone" gate with this.
     var screenRecordingGranted: Bool = false
+
+    // MARK: - Calibration mic plumbing
+    //
+    // The auto-calibration flow plays brief click sounds through each
+    // configured output and listens with a microphone to measure the
+    // round-trip latency. The user picks WHICH input to listen with via
+    // the picker driven by these fields. The actual capture / DSP
+    // pipeline lives in `Calibration.swift` and `CalibrationRunner.swift`
+    // (owned by other agents) — this view-model only surfaces the
+    // available devices, the user's choice, and the TCC permission
+    // status.
+
+    /// Live list of input-capable CoreAudio devices, refreshed on hot-plug.
+    /// Populated by `refreshInputDevices()`; the first refresh runs at
+    /// bootstrap and a `kAudioHardwarePropertyDevices` listener keeps it
+    /// current. Sort order: system default first, then alphabetical.
+    var availableInputDevices: [InputDeviceInfo] = []
+
+    /// User-selected calibration mic. `nil` means "use system default
+    /// input" — that is the bootstrap value if `userDefaultsMicUID` is
+    /// unset OR if the persisted UID no longer maps to an attached
+    /// device (e.g. user unplugged that USB mic). The resolution is
+    /// done by `effectiveMicID`, which falls back to the system default
+    /// when this is nil or unresolvable.
+    ///
+    /// Persisted via `UserDefaults` key `"syncast.calibrationMicID"` —
+    /// stored as the device UID (a stable string set by the kernel),
+    /// NOT the live `AudioDeviceID` (a UInt32 that changes on replug).
+    /// `selectedMicID` itself is the LIVE id, resolved at refresh time.
+    var selectedMicID: AudioDeviceID? {
+        didSet { persistSelectedMic() }
+    }
+
+    /// Effective mic id used by the calibration runner: either
+    /// `selectedMicID` if set + still attached, or the current system
+    /// default input. Returns `nil` only on a system with no input
+    /// device at all (vanishingly rare).
+    var effectiveMicID: AudioDeviceID? {
+        if let chosen = selectedMicID,
+           availableInputDevices.contains(where: { $0.id == chosen }) {
+            return chosen
+        }
+        return InputDeviceEnumerator.defaultInputDeviceID()
+    }
+
+    /// Synchronous read of `AVCaptureDevice.authorizationStatus(for:.audio)`.
+    /// Cheap; safe to call from view body. Drives the "Auto-calibrate"
+    /// button's enabled / "Grant access…" affordance.
+    var hasMicrophonePermission: Bool {
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+
+    /// UserDefaults key for the persisted calibration-mic preference.
+    /// Stored as the device UID string, not the live AudioDeviceID.
+    private static let micUIDDefaultsKey = "syncast.calibrationMicID"
+
+    /// CoreAudio HAL listener that fires on `kAudioHardwarePropertyDevices`
+    /// changes (device hot-plug). Held strongly here so it survives until
+    /// the AppModel itself is torn down. Calls back to `refreshInputDevices`
+    /// on the main queue so re-resolution of `selectedMicID` and
+    /// `availableInputDevices` happens on `@MainActor`.
+    private var inputDeviceListener: InputDeviceListener?
 
     enum Mode: String, Sendable, CaseIterable, Identifiable {
         /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
@@ -131,6 +195,11 @@ final class AppModel {
         // audio via ScreenCaptureKit; Screen Recording is the TCC gate.
         screenRecordingGranted = (ScreenRecordingTCC.current == .granted)
         SyncCastLog.log("screen-recording status: \(ScreenRecordingTCC.current.rawValue)")
+        // Populate the calibration-mic picker. We do NOT prompt for TCC
+        // here — enumeration is read-only HAL property work and does not
+        // require microphone access; the actual TCC prompt is deferred
+        // until the user explicitly taps "Auto-calibrate".
+        startInputDeviceWatch()
         // Tahoe sometimes lies: the System Settings switch shows ON but
         // CGPreflightScreenCaptureAccess returns false. Poll every 2s
         // and update the model when the state flips, so the user doesn't
@@ -709,4 +778,129 @@ final class AppModel {
         }
     }
     var enabledDeviceCount: Int { routing.values.filter(\.enabled).count }
+
+    // MARK: - Calibration mic intents
+
+    /// Re-query CoreAudio for the current set of input-capable devices
+    /// and update `availableInputDevices`. Also resolves the persisted
+    /// UID preference back to a live `AudioDeviceID` and assigns it to
+    /// `selectedMicID` if the device is still attached. Idempotent and
+    /// cheap (only HAL property reads, no IOProc work).
+    ///
+    /// Called at bootstrap, on hot-plug events from the HAL listener,
+    /// and any time the UI wants a manual refresh (the calibration sheet
+    /// can call this when it appears).
+    func refreshInputDevices() {
+        let fresh = InputDeviceEnumerator.enumerate()
+        availableInputDevices = fresh
+        // Resolve persisted UID → live AudioDeviceID.
+        let persistedUID = UserDefaults.standard.string(
+            forKey: AppModel.micUIDDefaultsKey
+        )
+        let resolvedFromPersist = persistedUID.flatMap { uid in
+            fresh.first(where: { $0.uid == uid })
+        }
+        // Drop any selection that no longer matches an attached device.
+        // The didSet for selectedMicID re-persists, so set the underlying
+        // value carefully — assigning resolvedFromPersist?.id rewrites
+        // the same UID back to UserDefaults, which is fine. Assigning nil
+        // when persistedUID is set but the device is gone DELIBERATELY
+        // leaves the persisted UID alone (so replug restores selection).
+        if let resolved = resolvedFromPersist {
+            if selectedMicID != resolved.id {
+                // Bypass the didSet — this is a refresh-driven re-binding,
+                // not a user choice. Re-persisting the same UID is a no-op
+                // but we still want the assignment to flow through observers.
+                selectedMicID = resolved.id
+            }
+        } else if persistedUID == nil {
+            // No persisted preference at all → fall through to default.
+            // Leave selectedMicID == nil; effectiveMicID handles fallback.
+            if selectedMicID != nil { selectedMicID = nil }
+        } else {
+            // Persisted UID set but device not attached. Surface as nil
+            // (effectiveMicID falls back to system default), but DO NOT
+            // wipe the persisted UID — replug should restore selection.
+            if selectedMicID != nil {
+                // Suppress the persistence side-effect for this path so
+                // we don't overwrite the saved UID with nil.
+                suppressMicPersist = true
+                selectedMicID = nil
+                suppressMicPersist = false
+            }
+        }
+    }
+
+    /// User picked a specific input device. Pass `nil` to clear the
+    /// override and revert to the system default. The choice is persisted
+    /// by UID so it survives replug / restart.
+    func setSelectedMic(_ id: AudioDeviceID?) {
+        // Validate: if a non-nil id was passed but it's not in the live
+        // list, treat it as "clear". Avoids storing a junk id.
+        if let id, !availableInputDevices.contains(where: { $0.id == id }) {
+            selectedMicID = nil
+            return
+        }
+        selectedMicID = id
+    }
+
+    /// Request mic access (TCC class `kTCCServiceMicrophone`). Returns
+    /// `true` if the user has granted access (already-authorized counts
+    /// as `true` and does NOT re-prompt). Returns `false` if denied or
+    /// restricted. Wraps `AVCaptureDevice.requestAccess(for:.audio)`,
+    /// which blocks until the user dismisses the prompt — call from
+    /// the calibrate-button handler, not from view body.
+    func requestMicrophonePermission() async -> Bool {
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch status {
+        case .authorized:
+            return true
+        case .denied, .restricted:
+            // Already a hard "no". Don't prompt again — the OS won't
+            // show a second prompt once the user has denied. The UI is
+            // expected to surface a "Open System Settings → Privacy"
+            // affordance in this state.
+            return false
+        case .notDetermined:
+            return await AVCaptureDevice.requestAccess(for: .audio)
+        @unknown default:
+            return false
+        }
+    }
+
+    /// Persist `selectedMicID` as a UID string. UID, not AudioDeviceID:
+    /// the live id is reassigned by CoreAudio on every hot-plug, so
+    /// storing it would silently lose the user's pick. UID survives.
+    private func persistSelectedMic() {
+        if suppressMicPersist { return }
+        let defaults = UserDefaults.standard
+        if let id = selectedMicID,
+           let info = availableInputDevices.first(where: { $0.id == id }),
+           !info.uid.isEmpty {
+            defaults.set(info.uid, forKey: AppModel.micUIDDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: AppModel.micUIDDefaultsKey)
+        }
+    }
+
+    /// One-shot suppression flag for `persistSelectedMic`. Used by
+    /// `refreshInputDevices` to clear the live id when a previously-
+    /// selected USB mic is unplugged WITHOUT discarding the persisted
+    /// UID (so replug restores the selection automatically).
+    private var suppressMicPersist: Bool = false
+
+    /// Install the CoreAudio device-list listener and run the first
+    /// refresh. Called from `bootstrap`. The listener is held on
+    /// `inputDeviceListener` so it lives for the AppModel's lifetime.
+    fileprivate func startInputDeviceWatch() {
+        refreshInputDevices()
+        inputDeviceListener = InputDeviceListener(queue: .main) { [weak self] in
+            // HAL callback runs on .main (DispatchQueue). MainActor
+            // requires explicit hop because we're in a Sendable closure
+            // outside any actor context.
+            Task { @MainActor [weak self] in
+                self?.refreshInputDevices()
+            }
+        }
+    }
 }
