@@ -17,8 +17,8 @@ import signal
 import sys
 from pathlib import Path
 
-from . import __version__, log
-from .server import ControlServer
+from syncast_sidecar import __version__, log
+from syncast_sidecar.server import ControlServer
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

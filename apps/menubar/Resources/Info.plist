@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>SyncCast</string>
+    <key>CFBundleDisplayName</key>
+    <string>SyncCast</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.syncast.menubar</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>SyncCastMenuBar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <!-- Hide from Dock — menubar-only -->
+    <key>LSUIElement</key>
+    <true/>
+    <!-- Required for capturing audio from BlackHole; macOS treats virtual
+         audio devices as microphones for TCC purposes. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SyncCast captures audio from BlackHole (a virtual audio driver) so it can re-emit the same stream to your local speakers and AirPlay 2 receivers in sync.</string>
+    <!-- Bonjour service types we actively browse for -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_airplay._tcp</string>
+        <string>_raop._tcp</string>
+    </array>
+    <!-- We start child processes (sidecar + OwnTone) and read/write under
+         ~/Library/Application Support; no sandbox entitlements requested. -->
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 SyncCast Contributors. MIT license. Bundles OwnTone (GPL-2.0).</string>
+</dict>
+</plist>
