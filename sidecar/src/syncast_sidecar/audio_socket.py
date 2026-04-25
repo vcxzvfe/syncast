@@ -96,6 +96,12 @@ class AudioSocketReader:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Mirror _listen()'s startup cleanup: remove the socket file we
+        # bound to. Otherwise a re-start in the same sidecar process
+        # would fail with EADDRINUSE on bind, AND a subsequent restart
+        # of the whole sidecar would inherit a stale path that confuses
+        # the Swift router's connect attempts.
+        Path(self._path).unlink(missing_ok=True)
 
     def _listen(self) -> None:
         if self._path.exists():
@@ -292,6 +298,13 @@ class LocalFifoBroadcaster:
                 except OSError:
                     pass
             self._clients.clear()
+        # Mirror _open_listener's startup cleanup: remove the broadcaster
+        # listening-socket file. Otherwise a stop()/start() cycle in the
+        # same sidecar process re-binds via _open_listener (which already
+        # unlinks at start), but a clean shutdown leaves the path on disk
+        # — which we want to avoid because it litters /tmp and confuses
+        # anything that lists the directory.
+        Path(self._socket_path).unlink(missing_ok=True)
 
     # ---------- internals ----------
 
