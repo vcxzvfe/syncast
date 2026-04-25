@@ -95,8 +95,29 @@ if [[ -f "$OWNTONE_PREFIX/etc/owntone.conf" ]]; then
 fi
 
 # ---- 5) ad-hoc codesign ---------------------------------------------------
-log "Ad-hoc codesigning…"
-codesign --force --deep --sign - --options runtime "$APP" || true
+# NOTE: do NOT pass --options runtime for ad-hoc dev builds. On macOS Tahoe
+# the combination "ad-hoc + hardened runtime" causes TCC to auto-deny
+# microphone / screen-recording requests without showing a prompt. For a
+# real distribution build we'd sign with a Developer ID + notarize, which
+# does NEED hardened runtime. Track that for the v1 .pkg release.
+# Pick the strongest stable signing identity we have.
+#
+# 1) Apple Developer ID — best, but most users don't have one.
+# 2) "SyncCast Dev" — a self-signed Code Signing cert from Keychain
+#    Assistant. With this, TCC anchors permission grants to the cert
+#    identity (not per-build CDHash), so Screen Recording, Microphone,
+#    etc. survive every rebuild. Strongly recommended for development.
+# 3) Ad-hoc (-) — the fallback. Works once but TCC re-prompts on every
+#    rebuild because each ad-hoc CDHash is treated as a fresh app.
+SIGN_IDENTITY="-"
+SIGN_LABEL="ad-hoc (TCC will re-prompt every rebuild)"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q '"SyncCast Dev"'; then
+    SIGN_IDENTITY="SyncCast Dev"
+    SIGN_LABEL="self-signed cert: SyncCast Dev (TCC stable across rebuilds)"
+fi
+
+log "Codesigning with $SIGN_LABEL"
+codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$APP" || true
 
 log "Done: $APP"
 ls -la "$APP/Contents/MacOS"
