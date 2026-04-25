@@ -168,16 +168,32 @@ class OwnToneBackend:
 
     def write_pcm(self, data: bytes) -> int:
         """Best-effort write of PCM bytes into OwnTone's FIFO. Returns bytes
-        written. If OwnTone isn't reading yet, returns 0 (caller drops).
+        written. If OwnTone isn't reading yet, attempts to (re)open the
+        FIFO write side; on persistent failure, drops the data and returns 0.
 
         Threading note: this is called from the audio-socket reader thread.
         We snapshot the fd into a local under the GIL so a concurrent
         `stop()` cannot close the fd between our `is None` check and
         `os.write` — closing the global is atomic w.r.t. our local copy.
+
+        Why we retry the open on every call when fd is None: OwnTone opens
+        the FIFO read end LAZILY on the first `play_pipe` REST call. On
+        cold start, our initial `_open_fifo_nonblocking` from `start()`
+        races OwnTone's open and usually loses (ENXIO, "no reader yet").
+        Without retry, every PCM packet was silently dropped from then
+        on, OwnTone read 0 bytes from its pipe, hit "Source is not
+        providing sufficient data, temporarily suspending playback", and
+        the AirPlay receiver got no audio — exact match for "Xiaomi
+        Sound 没有声音" after stream.start. The retry is one cheap
+        non-blocking syscall per packet while disconnected; once
+        connected it's a single null-check.
         """
         fd = self._fifo_fd
         if fd is None:
-            return 0
+            self._open_fifo_nonblocking()
+            fd = self._fifo_fd
+            if fd is None:
+                return 0
         try:
             return os.write(fd, data)
         except BlockingIOError:
@@ -310,11 +326,21 @@ library {{
         try:
             fd = os.open(str(self.fifo_path), os.O_WRONLY | os.O_NONBLOCK)
         except OSError as e:
-            # ENXIO = no reader yet. We'll retry on first write attempt.
-            logger.info("fifo_no_reader_yet", extra={"errno": e.errno})
+            # ENXIO = no reader yet — OwnTone hasn't called play_pipe.
+            # write_pcm now retries this open, so we'd hit ENXIO 100×/sec
+            # during the gap between stream.start and OwnTone's pipe-read
+            # priming (~1-2 sec on cold start). Log only the FIRST miss
+            # per disconnect, plus a single "connected" line on success
+            # below, to keep the log readable.
+            if not getattr(self, "_fifo_logged_miss", False):
+                logger.info("fifo_no_reader_yet", extra={"errno": e.errno})
+                self._fifo_logged_miss = True
             self._fifo_fd = None
             return
         self._fifo_fd = fd
+        if getattr(self, "_fifo_logged_miss", False):
+            logger.info("fifo_reader_attached")
+            self._fifo_logged_miss = False
 
     def _url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.rest_port}{path}"
