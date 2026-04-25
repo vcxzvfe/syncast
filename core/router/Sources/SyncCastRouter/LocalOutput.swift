@@ -45,6 +45,37 @@ public final class LocalOutput {
     private var _muted: Bool = false
     private var _readCursor: Int64 = 0
     private var initialized = false
+    /// Per-output-channel-pair software gain. Used as a fallback when
+    /// hardware volume control is unavailable (e.g. DP/HDMI displays that
+    /// don't expose kAudioDevicePropertyVolumeScalar). Indexed by
+    /// channel-pair (0 = first pair, 1 = second pair, ...). Default
+    /// 1.0 for every pair. Updated atomically via `setSoftwareGain`.
+    ///
+    /// Sized to `pairCount` (== outputChannelCount / channelCount). In
+    /// individual mode the array has one entry and the value stays at
+    /// 1.0 unless the Router applies a fallback (which it won't in
+    /// individual mode — there's only one device, so the existing
+    /// `_gain` field already covers it). In aggregate mode each entry
+    /// targets one physical subdevice's stereo pair.
+    ///
+    /// Stored in a heap-allocated UnsafeMutableBufferPointer rather
+    /// than a Swift Array because the render callback reads it on
+    /// the RT thread; a Swift array's COW copy could heap-allocate
+    /// under high contention. The pointer is allocated once at init,
+    /// freed in deinit, and indexed directly under stateLock.
+    ///
+    /// `_softwareGainsAllOnes` is the fast-path flag the render
+    /// callback uses to skip the per-pair multiplier loop entirely
+    /// when no fallback is active. Maintained by setSoftwareGain.
+    ///
+    /// `_softwareGainsScratch` is a per-LocalOutput scratch buffer
+    /// the render callback memcpy's into under lock so the per-pair
+    /// multiply loop can read without holding stateLock across the
+    /// whole iteration. Allocated once at init.
+    private let _softwareGains: UnsafeMutablePointer<Float>
+    private let _softwareGainsCount: Int
+    private var _softwareGainsAllOnes: Bool = true
+    private let _softwareGainsScratch: UnsafeMutablePointer<Float>
     /// Pre-allocated channel pointer slot for the render callback so we
     /// don't allocate a Swift Array on every render tick. Sized to
     /// `outputChannelCount`, NOT `channelCount`.
@@ -127,6 +158,20 @@ public final class LocalOutput {
         let stagingPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
         for i in 0..<channelCount { stagingPtrs[i] = slabs[i] }
         self.stagingChannels = stagingPtrs
+        // Per-pair software gain — one entry per output channel pair.
+        // Default 1.0 (no attenuation). Heap-allocated so the render
+        // callback can index it without going through a Swift Array
+        // (which would COW under contention).
+        let pairCount = max(1, self.outputChannelCount / channelCount)
+        let gainsBuf = UnsafeMutablePointer<Float>.allocate(capacity: pairCount)
+        gainsBuf.initialize(repeating: 1.0, count: pairCount)
+        self._softwareGains = gainsBuf
+        self._softwareGainsCount = pairCount
+        // Scratch buffer the render callback memcpy's into under
+        // stateLock so the per-pair multiply doesn't hold the lock.
+        let scratchBuf = UnsafeMutablePointer<Float>.allocate(capacity: pairCount)
+        scratchBuf.initialize(repeating: 1.0, count: pairCount)
+        self._softwareGainsScratch = scratchBuf
         // We deliberately leak the placeholder; deinit deallocates outPtrs
         // and the staging slabs. The actual outPtrs used per-render are
         // owned by CoreAudio.
@@ -140,6 +185,10 @@ public final class LocalOutput {
             slab.deinitialize(count: Self.stagingFrameCapacity)
             slab.deallocate()
         }
+        _softwareGains.deinitialize(count: _softwareGainsCount)
+        _softwareGains.deallocate()
+        _softwareGainsScratch.deinitialize(count: _softwareGainsCount)
+        _softwareGainsScratch.deallocate()
     }
 
     // MARK: - Hardware latency probing
@@ -196,6 +245,50 @@ public final class LocalOutput {
             _readBackoffFrames = max(0, readBackoffFrames)
             _gain = max(0, min(1, gain))
             _muted = muted
+        }
+    }
+
+    /// Apply a per-channel-pair software gain. Used as a fallback when a
+    /// physical subdevice (typically a DP/HDMI display speaker) has no
+    /// writable kAudioDevicePropertyVolumeScalar — the Router computes
+    /// the channel-pair offset via `AggregateDevice.subdeviceChannelOffset`
+    /// and routes the user's slider value here instead.
+    ///
+    /// `pair` is the channel-pair index (0 = first pair = channels 0..1,
+    /// 1 = second pair = channels 2..3, ...). Out-of-range pair indices
+    /// are silently ignored — keeps the call site simple when the
+    /// aggregate's subdevice ordering doesn't line up with what we
+    /// expected (we'd rather NOT apply gain than crash). Gain is
+    /// clamped to [0, 1].
+    ///
+    /// Real-time safety: writes through `stateLock`, which the render
+    /// callback only takes briefly with `withLock`. The lock is
+    /// non-reentrant and never held across a CoreAudio call, so the
+    /// render callback can't observe a partial update.
+    public func setSoftwareGain(pair: Int, gain: Float) {
+        let clamped = max(0, min(1, gain))
+        stateLock.withLock {
+            guard pair >= 0, pair < _softwareGainsCount else { return }
+            _softwareGains[pair] = clamped
+            // Recompute the all-ones flag so the render callback can
+            // skip the per-pair loop on the common (no-fallback) path.
+            var allOnes = true
+            for i in 0..<_softwareGainsCount where _softwareGains[i] != 1.0 {
+                allOnes = false
+                break
+            }
+            _softwareGainsAllOnes = allOnes
+        }
+    }
+
+    /// Reset every pair's software gain back to 1.0. Called by the
+    /// Router when a device's hardware-volume probe succeeds (we no
+    /// longer need the fallback) or when the aggregate is torn down.
+    /// Safe to call when no fallback is active — it's a no-op.
+    public func resetSoftwareGains() {
+        stateLock.withLock {
+            for i in 0..<_softwareGainsCount { _softwareGains[i] = 1.0 }
+            _softwareGainsAllOnes = true
         }
     }
 
@@ -356,9 +449,17 @@ public final class LocalOutput {
         guard bufList.count >= outputChannelCount else { return noErr }
         guard frames > 0, frames <= Self.stagingFrameCapacity else { return noErr }
 
-        // Read state once.
+        // Read state once. softwareGainsAllOnes lets the render path
+        // skip the per-pair multiply loop on the common case where
+        // no fallback is in use; if false, we re-acquire the lock
+        // below to copy the per-pair values into a small stack
+        // scratch (avoids holding the lock across the whole loop).
         let snapshot = stateLock.withLock {
-            (gain: _gain, muted: _muted, backoff: _readBackoffFrames, cursor: _readCursor)
+            (gain: _gain,
+             muted: _muted,
+             backoff: _readBackoffFrames,
+             cursor: _readCursor,
+             swGainsAllOnes: _softwareGainsAllOnes)
         }
 
         let writePos = ring.writePosition
@@ -460,19 +561,59 @@ public final class LocalOutput {
         for i in 0..<n { pk = max(pk, abs(p0[i])) }
         lastRenderPeak = pk
 
-        // Apply gain / mute across every written output channel pair.
+        // Apply gain / mute. Two paths:
+        //
+        //   FAST PATH — when softwareGainsAllOnes is true (no per-
+        //   subdevice fallback active), apply a single global multiplier
+        //   across every channel, just like the original code.
+        //
+        //   SLOW PATH — when at least one pair has a software-gain
+        //   fallback (DP / HDMI display whose hardware volume was
+        //   rejected), multiply each pair's two channels by
+        //   `globalGain * softwareGains[p]`. This lets the user's
+        //   per-device slider attenuate one physical speaker without
+        //   touching its peer.
+        //
         // Surplus channels were zeroed above; iterating to surplusStart
-        // skips them. In aggregate mode this is also where per-device
-        // volume should land (TODO P2 — currently a single global gain;
-        // hardware-volume handling is in AggregateDevice.setSubdeviceVolume).
+        // skips them.
         let effectiveGain = snapshot.muted ? Float(0) : snapshot.gain
-        if effectiveGain != 1.0 {
-            for ch in 0..<surplusStart {
-                let p = outPtrs[ch]
-                var i = 0
-                while i < frames {
-                    p[i] *= effectiveGain
-                    i += 1
+        if snapshot.swGainsAllOnes {
+            if effectiveGain != 1.0 {
+                for ch in 0..<surplusStart {
+                    let p = outPtrs[ch]
+                    var i = 0
+                    while i < frames {
+                        p[i] *= effectiveGain
+                        i += 1
+                    }
+                }
+            }
+        } else {
+            // Copy the per-pair gains into our pre-allocated scratch
+            // under a brief lock acquisition. No heap allocation —
+            // the scratch buffer is owned for the lifetime of this
+            // LocalOutput. We use self._softwareGains{,Scratch}
+            // directly inside the lock closure rather than capturing
+            // a let-binding to keep Swift 6 Sendable analysis happy
+            // (raw pointers are non-Sendable).
+            let n = min(pairCount, _softwareGainsCount)
+            stateLock.withLock {
+                for i in 0..<n {
+                    self._softwareGainsScratch[i] = self._softwareGains[i]
+                }
+            }
+            for p in 0..<pairCount {
+                let g: Float = (p < n) ? _softwareGainsScratch[p] : 1.0
+                let pairGain = effectiveGain * g
+                if pairGain == 1.0 { continue }
+                let base = p * channelCount
+                for ch in 0..<channelCount {
+                    let dst = outPtrs[base + ch]
+                    var i = 0
+                    while i < frames {
+                        dst[i] *= pairGain
+                        i += 1
+                    }
                 }
             }
         }
