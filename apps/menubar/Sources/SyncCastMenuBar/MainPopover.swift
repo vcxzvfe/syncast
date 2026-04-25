@@ -14,10 +14,62 @@ struct MainPopover: View {
             debugStrip
             Divider().padding(.horizontal, 12)
             deviceList
+            // Sync slider is only meaningful in whole-home mode.
+            if model.mode == .wholeHome {
+                Divider().padding(.horizontal, 12)
+                syncSection
+            }
             Divider().padding(.horizontal, 12)
             footer
         }
         .padding(.vertical, 8)
+    }
+
+    /// Live tuning for the whole-home FIFO delay (≈1.8 s by default,
+    /// matching AirPlay 2's PTP playout window). The "Measured lag"
+    /// caption surfaces the sidecar's actual_delivery_lag_ms so the user
+    /// can see whether their nudge took effect.
+    private var syncSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Sync")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: { model.resetAirplayDelayToDefault() }) {
+                    Text("Reset (\(AppModel.defaultAirplayDelayMs) ms)")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityIdentifier("syncResetButton")
+            }
+            HStack(spacing: 8) {
+                let lo = Double(AppModel.airplayDelayMsRange.lowerBound)
+                let hi = Double(AppModel.airplayDelayMsRange.upperBound)
+                let bound = Binding(
+                    get: { Double(model.airplayDelayMs) },
+                    set: { model.setAirplayDelay(Int($0.rounded())) }
+                )
+                Slider(value: bound, in: lo...hi, step: 25)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("airplayDelaySlider")
+                Text("\(model.airplayDelayMs) ms")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .trailing)
+            }
+            HStack(spacing: 6) {
+                Text("AirPlay delay: \(model.airplayDelayMs) ms")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("Measured lag: \(model.measuredLagMs.map { "\($0)" } ?? "—") ms")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 
     /// Single-line live debug strip — visible to the user, lets us diagnose
