@@ -198,22 +198,47 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// LocalOutput.stop() — we only release the +1 retain on `self`
     /// (handed to the AUHAL via inputProcRefCon) AFTER Dispose so the
     /// last in-flight render callback can't fire on a freed object.
+    ///
+    /// Ordering rationale (mirrors LocalOutput.stop):
+    ///   1. Cancel the reader task FIRST so it stops writing into the
+    ///      ring while we're tearing the AUHAL down.
+    ///   2. Close the socket — this unblocks the reader's `recv` if it
+    ///      was sleeping inside the kernel; recv returns -1 / EBADF and
+    ///      the loop exits via the cancellation check.
+    ///   3. AudioOutputUnitStop drains the in-flight render block
+    ///      synchronously. Apple's docs guarantee this; on Tahoe it's
+    ///      observably weaker, which is why the +1 retain on self
+    ///      handed to the render callback's refCon must outlive the
+    ///      Stop call. We release it AFTER Dispose, below.
+    ///   4. Uninitialize → Dispose. Reversing has been observed to
+    ///      deadlock coreaudiod (see BlackHole issue tracker).
+    ///   5. ONLY AFTER Dispose, release the refCon retain so a final
+    ///      stragler render callback can still safely call
+    ///      `takeUnretainedValue` against a live LocalAirPlayBridge.
     public func stop() {
+        // 1. Cancel reader. It may still be blocked in recv until we
+        //    close the socket below, but observing this flag once recv
+        //    returns is the fast-exit signal.
         readerTask?.cancel()
         readerTask = nil
+        // 2. Close the socket. This unblocks any in-flight recv() with
+        //    EBADF, letting the reader loop exit.
         closeSocket()
+        // 3-4. AUHAL teardown. Skip cleanly if start() failed before
+        //      assigning self.unit.
         if let unit = unit {
-            // Same strict order as LocalOutput.stop:
-            //   Stop (drains last render) → Uninitialize → Dispose.
-            // Reversing has been observed to deadlock coreaudiod.
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
             self.unit = nil
         }
+        // 5. Release the +1 retain we placed on self when handing the
+        //    opaque pointer to the AUHAL. Done AFTER Dispose so any
+        //    in-flight render callback can complete safely. Mark
+        //    consumed BEFORE releasing so a defensive re-entry sees
+        //    nil and skips the release (impossible in practice, but
+        //    cheap insurance against future refactors).
         if let opaque = refConOpaque {
-            // Mark consumed BEFORE releasing so any (impossible but
-            // defensive) re-entry sees nil and skips the release.
             refConOpaque = nil
             Unmanaged<LocalAirPlayBridge>.fromOpaque(opaque).release()
         }
@@ -378,6 +403,20 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         guard status == noErr, let unit = unitOut else {
             throw BridgeError.audioUnitInstantiationFailed(status)
         }
+        // From here on, EVERY error path must dispose `unit` —
+        // AudioComponentInstanceNew has already allocated kernel state.
+        // We track success with a sentinel; defer disposes the local
+        // unit when the function exits via an error path.
+        var unitInitialized = false
+        var unitStarted = false
+        var unitInstalled = false
+        defer {
+            if !unitInstalled {
+                if unitStarted { AudioOutputUnitStop(unit) }
+                if unitInitialized { AudioUnitUninitialize(unit) }
+                AudioComponentInstanceDispose(unit)
+            }
+        }
 
         // Bind to specific output device.
         var devID = deviceID
@@ -419,9 +458,9 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // LocalOutput.start — see that file for the rationale.
         let opaque = Unmanaged.passRetained(self).toOpaque()
         self.refConOpaque = opaque
-        var installed = false
+        var refConInstalled = false
         defer {
-            if !installed {
+            if !refConInstalled {
                 self.refConOpaque = nil
                 Unmanaged<LocalAirPlayBridge>.fromOpaque(opaque).release()
             }
@@ -445,11 +484,14 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
         status = AudioUnitInitialize(unit)
         guard status == noErr else { throw BridgeError.configurationFailed(status) }
+        unitInitialized = true
         status = AudioOutputUnitStart(unit)
         guard status == noErr else { throw BridgeError.startFailed(status) }
+        unitStarted = true
 
         self.unit = unit
-        installed = true   // Suppresses the rollback `defer` above.
+        unitInstalled = true   // Suppresses the AudioUnit-rollback defer.
+        refConInstalled = true // Suppresses the refCon-rollback defer.
         // Read cursor lags the writer by ~50 ms so the very first
         // renders see real data even before the broadcaster's first
         // packet has gone through SCK conversion. 2200 frames @ 44.1k.
