@@ -43,6 +43,16 @@ public final class LocalOutput {
     /// Phase counter for SYNCAST_TONE diagnostic mode.
     private var toneSampleIndex: UInt64 = 0
 
+    /// Per-process registry of each open LocalOutput's hardware output
+    /// latency in frames (deviceLatency + safetyOffset + streamLatency).
+    /// Used by every render() to determine the worst-case latency across
+    /// all currently active local outputs and compensate so they all emit
+    /// the same captured frame at the same wall-clock instant.
+    private static let latencyLock = OSAllocatedUnfairLock()
+    nonisolated(unsafe) private static var deviceLatencyFramesByDevID: [String: Int64] = [:]
+    /// This output's measured hardware latency in frames.
+    private var deviceLatencyFrames: Int64 = 0
+
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
@@ -70,6 +80,55 @@ public final class LocalOutput {
     deinit {
         stop()
         outPtrs.deallocate()
+    }
+
+    // MARK: - Hardware latency probing
+
+    /// Total output latency in frames for a CoreAudio device:
+    ///   device-level latency + safety offset + max stream latency.
+    /// Called once per LocalOutput at start time; values are stable for
+    /// the lifetime of an AUHAL binding.
+    private static func queryOutputLatencyFrames(deviceID: AudioObjectID) -> Int64 {
+        let dev = readUInt32Property(deviceID, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeOutput)
+        let safety = readUInt32Property(deviceID, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeOutput)
+        // Per-stream latency (output-stream side). We sum the largest one.
+        var streamAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &streamAddr, 0, nil, &size) == noErr else {
+            return Int64(dev + safety)
+        }
+        let count = Int(size) / MemoryLayout<AudioStreamID>.size
+        var streams = Array(repeating: AudioStreamID(0), count: count)
+        if AudioObjectGetPropertyData(deviceID, &streamAddr, 0, nil, &size, &streams) != noErr {
+            return Int64(dev + safety)
+        }
+        var maxStreamLat: UInt32 = 0
+        for s in streams {
+            let l = readUInt32Property(s, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal)
+            if l > maxStreamLat { maxStreamLat = l }
+        }
+        return Int64(dev + safety + maxStreamLat)
+    }
+
+    private static func readUInt32Property(
+        _ id: AudioObjectID,
+        _ selector: AudioObjectPropertySelector,
+        _ scope: AudioObjectPropertyScope
+    ) -> UInt32 {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector, mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) != noErr {
+            return 0
+        }
+        return value
     }
 
     public func setRouting(readBackoffFrames: Int, gain: Float, muted: Bool) {
@@ -159,6 +218,15 @@ public final class LocalOutput {
 
         self.unit = unit
         self.initialized = true
+        // Measure this device's hardware output latency NOW that it's
+        // initialized — kAudioDevicePropertyLatency is only stable after
+        // the AUHAL has bound. Store globally so peer LocalOutputs can
+        // compensate against the worst-case latency in the group.
+        let latencyFrames = Self.queryOutputLatencyFrames(deviceID: deviceID)
+        deviceLatencyFrames = latencyFrames
+        Self.latencyLock.withLock {
+            Self.deviceLatencyFramesByDevID[deviceUID] = latencyFrames
+        }
         // Initialize read cursor to lag the writer by a sane default (will be
         // re-set on first scheduler plan).
         stateLock.withLock { self._readCursor = max(0, ring.writePosition - 4_800) }
@@ -171,6 +239,9 @@ public final class LocalOutput {
         AudioComponentInstanceDispose(unit)
         self.unit = nil
         initialized = false
+        Self.latencyLock.withLock {
+            Self.deviceLatencyFramesByDevID.removeValue(forKey: deviceUID)
+        }
     }
 
     private func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
@@ -184,11 +255,17 @@ public final class LocalOutput {
         }
 
         let writePos = ring.writePosition
-        // DIAGNOSTIC: bypass scheduler/cursor — always read the most recent
-        // `frames` samples. If this produces audible sound but the schedule-
-        // based path doesn't, the scheduler logic is where audio is being
-        // dropped. TODO: re-enable scheduler-based read after verification.
-        let startFrame: Int64 = max(0, writePos - Int64(frames))
+        // Multi-device sync: every active output reads at the same
+        // absolute frame instant by padding the FAST outputs with extra
+        // wait so all of them play the SAME captured frame at the same
+        // physical time. compensation = (slowest_device_latency - my_latency).
+        // Floor base 50ms (2400 frames) so we never underrun.
+        let maxLatencyFrames: Int64 = Self.latencyLock.withLock {
+            Self.deviceLatencyFramesByDevID.values.max() ?? deviceLatencyFrames
+        }
+        let baselineFrames: Int64 = 2400  // 50ms floor at 48 kHz
+        let compensation = max(0, maxLatencyFrames - deviceLatencyFrames)
+        let startFrame: Int64 = max(0, writePos - baselineFrames - compensation - Int64(frames))
 
         // Use the pre-allocated outPtrs slot — no Swift runtime allocation.
         var allOk = true

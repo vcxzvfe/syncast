@@ -69,7 +69,12 @@ class AudioSocketReader:
                 self._path.unlink()
             except OSError:
                 pass
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        # macOS does NOT support SOCK_SEQPACKET on Unix domain sockets
+        # ([Errno 43] Protocol not supported). Use SOCK_STREAM and frame
+        # by reading exact packet sizes — the producer side sends
+        # `packet_bytes`-sized chunks, and we recv that many bytes per
+        # iteration.
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(str(self._path))
         os.chmod(self._path, 0o600)
         s.listen(1)

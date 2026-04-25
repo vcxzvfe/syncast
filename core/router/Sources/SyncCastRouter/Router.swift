@@ -171,7 +171,11 @@ public actor Router {
         for (id, out) in localOutputs {
             renderInfo += " render[\(id.prefix(6))]=ticks:\(out.renderTickCount) peak:\(String(format: "%.4f", out.lastRenderPeak))"
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(renderInfo)"
+        var awInfo = ""
+        if let aw = audioWriter {
+            awInfo = " airplayWriter=pkts:\(aw.packetsSent) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(renderInfo)\(awInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
@@ -225,7 +229,10 @@ public actor Router {
     /// the same device is a no-op on the sidecar side (returns
     /// `device_id already exists`, which we swallow).
     public func registerAirplayDevice(id: String, name: String, host: String, port: Int) async {
-        guard let ipc else { return }
+        guard let ipc else {
+            lastError = "ipc not attached, cannot register \(name)"
+            return
+        }
         do {
             _ = try await ipc.call("device.add", params: [
                 "device_id": id,
@@ -234,30 +241,41 @@ public actor Router {
                 "port": port,
                 "name": name,
             ])
+        } catch let IpcClient.IpcError.rpcError(code, message) {
+            // -32602 INVALID_PARAMS / "device_id already exists" is benign
+            if code != -32602 {
+                lastError = "device.add(\(name)): \(code) \(message)"
+            }
         } catch {
-            // INVALID_PARAMS = already exists. Ignore.
+            lastError = "device.add(\(name)): \(error)"
         }
     }
 
     /// Set per-device volume for an AirPlay device on the sidecar.
     public func setAirplayVolume(id: String, volume: Float) async {
         guard let ipc else { return }
-        _ = try? await ipc.call("device.set_volume", params: [
-            "device_id": id,
-            "volume": Double(volume),
-        ])
+        do {
+            _ = try await ipc.call("device.set_volume", params: [
+                "device_id": id,
+                "volume": Double(volume),
+            ])
+        } catch {
+            lastError = "set_volume(\(id.prefix(8))): \(error)"
+        }
     }
 
     /// Enabled AirPlay device IDs that should be in the active stream.
     /// Calling this with an empty list stops the AirPlay stream.
     public func setActiveAirplayDevices(_ ids: [String]) async {
-        guard let ipc else { return }
+        guard let ipc else {
+            lastError = "ipc not attached, cannot start AirPlay stream"
+            return
+        }
         if ids.isEmpty {
             _ = try? await ipc.call("stream.stop", params: [:])
             audioWriter?.stop()
             return
         }
-        // Anchor time = "now + master delay" so OwnTone can align.
         let anchor = Clock.nowNs() + UInt64(measuredAirplayLatencyMs) * 1_000_000
         do {
             _ = try await ipc.call("stream.start", params: [
@@ -267,9 +285,14 @@ public actor Router {
                 "channels": 2,
                 "format": "pcm_s16le",
             ])
+        } catch {
+            lastError = "stream.start failed: \(error)"
+            return
+        }
+        do {
             try audioWriter?.start()
         } catch {
-            lastError = "stream.start: \(error)"
+            lastError = "audioWriter.start failed: \(error)"
         }
     }
 

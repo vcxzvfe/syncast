@@ -18,6 +18,10 @@ public final class AudioSocketWriter: @unchecked Sendable {
     private var fd: Int32 = -1
     private var task: Task<Void, Never>?
     private let lock = NSLock()
+    /// Diagnostic — packets actually sent through the socket.
+    public private(set) var packetsSent: UInt64 = 0
+    public private(set) var bytesSent: UInt64 = 0
+    public private(set) var lastSendError: String = ""
 
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
@@ -25,6 +29,15 @@ public final class AudioSocketWriter: @unchecked Sendable {
     }
 
     public func start() throws {
+        // Idempotent: if we already have a running writer task with an
+        // open fd, do nothing. Calling start() twice (from successive
+        // pushAirplayState invocations) used to stomp the previous fd
+        // and kill the original task — which manifested as "AudioSocket
+        // sent 68 packets then stopped forever".
+        let existingFd = lock.withLock { fd }
+        if existingFd >= 0, let t = task, !t.isCancelled {
+            return
+        }
         try connect()
         task = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runLoop()
@@ -39,7 +52,12 @@ public final class AudioSocketWriter: @unchecked Sendable {
     }
 
     private func connect() throws {
-        let s = Darwin.socket(AF_UNIX, SOCK_SEQPACKET, 0)
+        // macOS Unix sockets don't support SOCK_SEQPACKET (returns
+        // EPROTONOSUPPORT). Use SOCK_STREAM. The wire format is naturally
+        // framed because both sender and receiver always operate on
+        // exactly one packet per send/recv (bytesPerPacket = 1920 bytes
+        // = 480 frames × 2 channels × 2 bytes).
+        let s = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         if s < 0 { throw IpcClient.IpcError.socketCreationFailed(errno) }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -102,9 +120,13 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 return Darwin.send(s, raw.baseAddress, bytesPerPacket, 0)
             }
             if sent < 0 {
-                if errno == EINTR { continue }
+                let e = errno
+                lastSendError = "send errno=\(e)"
+                if e == EINTR { continue }
                 break
             }
+            packetsSent &+= 1
+            bytesSent &+= UInt64(sent)
         }
     }
 }

@@ -122,20 +122,26 @@ final class AppModel {
         // SYNCAST_AUTO_TEST=mbp triggers an automated toggle of the MBP
         // built-in speaker 4 seconds after bootstrap. Used for shell-driven
         // end-to-end audio verification — strictly dev only.
-        if let target = ProcessInfo.processInfo.environment["SYNCAST_AUTO_TEST"] {
+        if let env = ProcessInfo.processInfo.environment["SYNCAST_AUTO_TEST"] {
+            // Comma-separated list. e.g.  mbp,xiaomi,display
+            // Each token is matched case-insensitively against device.name.
+            let targets = env.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 guard let self else { return }
                 await MainActor.run {
-                    let match = self.devices.first { d in
-                        d.name.localizedCaseInsensitiveContains(target) ||
-                        (target == "mbp" && d.name.contains("MacBook Pro扬声器"))
-                    }
-                    if let dev = match {
-                        SyncCastLog.log("AUTO_TEST: toggling \(dev.name) ON")
-                        self.toggleDevice(dev.id)
-                    } else {
-                        SyncCastLog.log("AUTO_TEST: no device matched '\(target)'")
+                    for target in targets {
+                        let match = self.devices.first { d in
+                            d.name.localizedCaseInsensitiveContains(target) ||
+                            (target == "mbp" && d.name.contains("MacBook Pro扬声器")) ||
+                            (target == "display" && d.name.contains("PG27"))
+                        }
+                        if let dev = match {
+                            SyncCastLog.log("AUTO_TEST: toggling \(dev.name) ON")
+                            self.toggleDevice(dev.id)
+                        } else {
+                            SyncCastLog.log("AUTO_TEST: no device matched '\(target)'")
+                        }
                     }
                 }
             }
@@ -198,14 +204,16 @@ final class AppModel {
                 let snapshot = devices
                 // Push routing BEFORE start so Router.start's "for dev
                 // where routing[dev.id].enabled" loop actually opens
-                // AUHAL for the user's selections. Without this push,
-                // Router.start would see an empty routing dict and skip
-                // every device — causing the engine to capture audio
-                // but never render it to any output.
+                // AUHAL for the user's selections.
                 for (id, r) in routing {
                     await router.setRouting(r)
                     if r.enabled { await router.enable(deviceID: id) }
                 }
+                // Push AirPlay state BEFORE SCK start. AirPlay activation
+                // (OwnTone spawn) is independent of SCK and must not be
+                // gated by it. If SCK is slow / failing / waiting on a
+                // TCC prompt, AirPlay should still kick off.
+                await pushAirplayState()
                 try await router.start(devices: snapshot)
                 SyncCastLog.log("reconcile: router.start OK")
                 // After 1.5s, log the IOProc tick count to confirm CoreAudio
@@ -254,7 +262,9 @@ final class AppModel {
         let enabledAirplay = devices.filter {
             $0.transport == .airplay2 && (routing[$0.id]?.enabled ?? false)
         }
+        SyncCastLog.log("pushAirplayState: enabledAirplay=\(enabledAirplay.map { $0.name })")
         for dev in enabledAirplay {
+            SyncCastLog.log("  registerAirplayDevice: \(dev.name) host=\(dev.host ?? "?") port=\(dev.port ?? 7000)")
             await router.registerAirplayDevice(
                 id: dev.id,
                 name: dev.name,
@@ -265,6 +275,7 @@ final class AppModel {
                 await router.setAirplayVolume(id: dev.id, volume: r.volume)
             }
         }
+        SyncCastLog.log("setActiveAirplayDevices: ids=\(enabledAirplay.map { $0.id.prefix(8) })")
         await router.setActiveAirplayDevices(enabledAirplay.map { $0.id })
     }
 
