@@ -137,6 +137,50 @@ final class AppModel {
                    airplayDelayMsRange.upperBound)
     }
 
+    // MARK: - Background passive calibration
+    // Continuous variant of Auto-calibrate; PassiveCalibrator engine
+    // (lands in router separately) emits a Sample every N seconds and
+    // we push its suggestedDelayMs through setAirplayDelay.
+    var backgroundCalibrationEnabled: Bool = AppModel.loadPersistedBgEnabled() {
+        didSet {
+            UserDefaults.standard.set(backgroundCalibrationEnabled, forKey: AppModel.bgEnabledKey)
+            reconcileBackgroundCalibration()
+        }
+    }
+    /// Sample interval (seconds, clamped to `bgIntervalRange`). Live
+    /// changes restart the engine.
+    var backgroundCalibrationIntervalS: Int = AppModel.loadPersistedBgInterval() {
+        didSet {
+            let r = AppModel.bgIntervalRange
+            let v = min(max(backgroundCalibrationIntervalS, r.lowerBound), r.upperBound)
+            if v != backgroundCalibrationIntervalS { backgroundCalibrationIntervalS = v; return }
+            UserDefaults.standard.set(v, forKey: AppModel.bgIntervalKey)
+            restartBackgroundCalibrationIfActive()
+        }
+    }
+    var lastCalibrationSample: BackgroundCalibrationSample? = nil
+    /// True iff the engine is running (toggle on + bad preconditions → false).
+    var backgroundCalibrationActive: Bool = false
+    /// Toggle on but mic permission denied/restricted.
+    var backgroundCalibrationMicDenied: Bool = false
+    /// Pause while a one-shot manual run is in flight, so the click
+    /// pulses don't pollute the continuous correlator.
+    private var continuousPausedForManual: Bool = false
+
+    static let bgEnabledKey = "syncast.bgCalibrationEnabled"
+    static let bgIntervalKey = "syncast.bgCalibrationIntervalS"
+    static let defaultBgIntervalS: Int = 30
+    static let bgIntervalRange: ClosedRange<Int> = 10...300
+
+    private static func loadPersistedBgEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: bgEnabledKey)
+    }
+    private static func loadPersistedBgInterval() -> Int {
+        guard let raw = UserDefaults.standard.object(forKey: bgIntervalKey) as? Int
+        else { return defaultBgIntervalS }
+        return min(max(raw, bgIntervalRange.lowerBound), bgIntervalRange.upperBound)
+    }
+
 
     enum Mode: String, Sendable, CaseIterable, Identifiable {
         /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
@@ -616,16 +660,19 @@ final class AppModel {
                 await pushAirplayState()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
+                reconcileBackgroundCalibration()
             } catch {
                 SyncCastLog.log("reconcile: router.start FAILED: \(error)")
                 lastError = "engine: \(error.localizedDescription)"
                 streamingState = .error
+                reconcileBackgroundCalibration()
             }
         case (.running, false):
             SyncCastLog.log("reconcile: stopping (no enabled outputs)")
             await router.setActiveAirplayDevices([])
             await router.stop()
             streamingState = .idle
+            reconcileBackgroundCalibration()
         case (.running, true):
             // ORDER MATTERS. Router holds its own copy of `routing`
             // (Router.routing) which `syncLocalOutputs` reads to decide
@@ -746,12 +793,14 @@ final class AppModel {
                     self.streamingState = .idle
                     self.modeTransitioning = false
                     self.reconcileEngine()
+                    self.reconcileBackgroundCalibration()
                 }
             }
         } else {
             // No engine to stop — the new mode just needs reconciliation.
             // No async work, so no need to flip the transition flag here.
             reconcileEngine()
+            reconcileBackgroundCalibration()
         }
     }
 
@@ -866,6 +915,13 @@ final class AppModel {
             return
         }
 
+        // Pause continuous calibration while the manual run plays click
+        // pulses; resume after (success OR failure).
+        if backgroundCalibrationActive || backgroundCalibrationEnabled {
+            continuousPausedForManual = true
+            reconcileBackgroundCalibration()
+        }
+
         calibrationStatus = .running
         let snapshot = devices  // immutable Sendable copy
         let micID = effectiveMicID
@@ -889,12 +945,107 @@ final class AppModel {
         } catch {
             calibrationStatus = .failed("\(error)")
         }
+
+        if continuousPausedForManual {
+            continuousPausedForManual = false
+            reconcileBackgroundCalibration()
+        }
     }
 
     /// Clear a non-idle status. Bound to the popover's "Dismiss" button
     /// on completed/failed states.
     func dismissCalibrationStatus() {
         calibrationStatus = .idle
+    }
+
+    // MARK: - Background passive calibration lifecycle
+
+    /// Drive the calibrator engine on or off. Idempotent. Wired into
+    /// mode/streamingState/permission/toggle observers. ACTIVE iff:
+    /// wholeHome AND running AND enabled AND mic-OK.
+    func reconcileBackgroundCalibration() {
+        // Pause for manual one-shot: stop engine, hold here.
+        if continuousPausedForManual {
+            if backgroundCalibrationActive { stopBackgroundCalibration(thenReconcile: false) }
+            return
+        }
+        let shouldRun = mode == .wholeHome && streamingState == .running
+            && backgroundCalibrationEnabled && hasMicrophonePermission
+
+        // Surface mic-denied separately so the UI can show Settings hint.
+        let permDenied: Bool = backgroundCalibrationEnabled && {
+            let a = AVCaptureDevice.authorizationStatus(for: .audio)
+            return a == .denied || a == .restricted
+        }()
+        if permDenied != backgroundCalibrationMicDenied {
+            backgroundCalibrationMicDenied = permDenied
+        }
+
+        switch (backgroundCalibrationActive, shouldRun) {
+        case (false, true):
+            backgroundCalibrationActive = true
+            let interval = backgroundCalibrationIntervalS
+            let micID = effectiveMicID
+            SyncCastLog.log("bgCalib: starting interval=\(interval)s mic=\(micID.map(String.init) ?? "default")")
+            Task { [weak self] in
+                guard let self else { return }
+                await self.router.startPassiveCalibration(
+                    intervalSeconds: interval, micID: micID
+                ) { sample in
+                    Task { @MainActor [weak self] in
+                        self?.handleBackgroundCalibrationSample(sample)
+                    }
+                }
+            }
+        case (true, false):
+            SyncCastLog.log("bgCalib: stopping (preconditions no longer hold)")
+            stopBackgroundCalibration(thenReconcile: false)
+        default:
+            break
+        }
+    }
+
+    /// Stop the engine. Optionally re-reconcile after — used when an
+    /// interval change requires a stop+start cycle.
+    private func stopBackgroundCalibration(thenReconcile: Bool) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.router.stopPassiveCalibration()
+            await MainActor.run {
+                self.backgroundCalibrationActive = false
+                self.lastCalibrationSample = nil
+                if thenReconcile { self.reconcileBackgroundCalibration() }
+            }
+        }
+    }
+
+    private func restartBackgroundCalibrationIfActive() {
+        guard backgroundCalibrationActive else { return }
+        stopBackgroundCalibration(thenReconcile: true)
+    }
+
+    private func handleBackgroundCalibrationSample(_ sample: BackgroundCalibrationSample) {
+        lastCalibrationSample = sample
+        SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDelayMs)ms suggested=\(sample.suggestedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
+        setAirplayDelay(sample.suggestedDelayMs)
+    }
+
+    /// Permission flow when the user toggles Continuous on. Mirrors
+    /// `runAutoCalibrate` — prompt if undetermined, surface denied banner.
+    func ensureMicPermissionForBackgroundCalibration() async {
+        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch auth {
+        case .authorized:
+            return
+        case .denied, .restricted:
+            backgroundCalibrationMicDenied = true
+        case .notDetermined:
+            let granted = await requestMicrophonePermission()
+            backgroundCalibrationMicDenied = !granted
+            reconcileBackgroundCalibration()
+        @unknown default:
+            return
+        }
     }
 
     /// Devices the user can plausibly target. Excludes:
