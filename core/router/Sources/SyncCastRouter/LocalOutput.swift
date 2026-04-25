@@ -205,12 +205,31 @@ public final class LocalOutput {
         // Render callback. We `passRetained(self)` so the AUHAL holds a
         // strong reference for its entire lifetime. The matching
         // `.release()` lives in `stop()` after the unit is disposed.
-        // Without this, `localOutputs.removeValue(forKey:)` could deallocate
-        // `self` while a render block was still in flight on the RT thread,
-        // and the next ABL access would land on freed memory — exactly the
-        // crash class the user hit when toggling Xiaomi off.
+        //
+        // CRITICAL leak window: if start() succeeds at passRetained but
+        // throws before reaching `self.unit = unit` below (e.g. a later
+        // `AudioUnitInitialize` failure), `refConOpaque` is set but
+        // `self.unit` is not — meaning stop()'s `guard let unit = unit
+        // else { return }` exits early and never invokes `.release()`,
+        // leaking a permanent +1 retain. To close that window, every
+        // error path between `passRetained` and `self.unit = unit` MUST
+        // release the opaque before throwing. We use a defer that fires
+        // only if `self.unit` is still nil at function exit (i.e. we
+        // didn't reach the success path), driven by a local `installed`
+        // sentinel.
         let opaque = Unmanaged.passRetained(self).toOpaque()
         self.refConOpaque = opaque
+        var installed = false
+        defer {
+            if !installed {
+                // start() is exiting via an error path. Roll back the
+                // retain we placed on `self`, otherwise stop() — which
+                // gates on `self.unit != nil` — will skip the release
+                // and leak a permanent retain.
+                self.refConOpaque = nil
+                Unmanaged<LocalOutput>.fromOpaque(opaque).release()
+            }
+        }
         var callback = AURenderCallbackStruct(
             inputProc: { (inRefCon, _, _, _, inNumberFrames, ioData) -> OSStatus in
                 let owner = Unmanaged<LocalOutput>.fromOpaque(inRefCon).takeUnretainedValue()
@@ -235,6 +254,7 @@ public final class LocalOutput {
 
         self.unit = unit
         self.initialized = true
+        installed = true   // Tells the rollback `defer` above NOT to release.
         // Measure this device's hardware output latency NOW that it's
         // initialized — kAudioDevicePropertyLatency is only stable after
         // the AUHAL has bound. Store globally so peer LocalOutputs can

@@ -2,6 +2,16 @@ import Foundation
 import CoreAudio
 import SyncCastDiscovery
 
+/// Helper struct used inside Router.reconcileLocalDriver to carry the
+/// (id, uid, name) triple for each enabled local CoreAudio output. Defined
+/// at file scope so it can cross from the reconcile entry point into the
+/// per-mode helpers without an extra indirection.
+private struct EnabledLocalOutput {
+    let deviceID: String
+    let uid: String
+    let name: String
+}
+
 /// The Router is the top-level coordinator: it owns the capture, the ring
 /// buffer, the local outputs, and the IPC client to the sidecar. The view
 /// layer talks to this actor; CoreAudio threads talk to its members directly.
@@ -19,7 +29,22 @@ public actor Router {
 
     private let sckCapture: SCKCapture
     private let scheduler: Scheduler
-    private var localOutputs: [String: LocalOutput] = [:]   // SyncCast device ID → AUHAL
+    /// Open AUHAL outputs. Keyed differently depending on driver mode:
+    ///   - In `.individual` mode: keyed by SyncCast device ID — one
+    ///     LocalOutput per enabled physical device.
+    ///   - In `.aggregate` mode: a single entry keyed by the aggregate
+    ///     device's UID. The kernel-side aggregate fans out audio to all
+    ///     constituent physical devices with sample-accurate drift
+    ///     correction; that's why we only need one AUHAL on top of it.
+    private var localOutputs: [String: LocalOutput] = [:]
+    /// Active synchronized aggregate, when 2+ local outputs are enabled.
+    /// `nil` in idle mode, in single-output mode, or after a transition
+    /// teardown. The teardown order is strict — see Router.stop().
+    private var aggregateDevice: AggregateDevice?
+    /// Set of physical device UIDs the active aggregate currently fans
+    /// audio out to. Used to decide if a routing change requires destroy +
+    /// recreate (different set) or is a no-op (same set).
+    private var aggregateCoveredUIDs: Set<String> = []
     private var routing: [String: DeviceRouting] = [:]
     private var measuredAirplayLatencyMs: Int = 1800
     private var ipc: IpcClient?
@@ -44,6 +69,17 @@ public actor Router {
             fatalError("SyncCast requires macOS 13+")
         }
         self.scheduler = Scheduler(sampleRate: sampleRate)
+        // Reap any private aggregate devices left behind by a prior crash
+        // BEFORE we ever try to create one in this run. Header docs say
+        // private aggregates auto-clean on process exit, but coreaudiod
+        // has been observed to leak them after SIGKILL or fast user
+        // switching. Sweep is keyed by the AggregateDevice.uidPrefix.
+        let reaped = AggregateDevice.sweepOrphans()
+        if reaped > 0 {
+            // Logged as a warning so we notice in the field if SIGKILL
+            // crashes start happening.
+            print("[Router] swept \(reaped) orphan aggregate device(s) at init")
+        }
     }
 
     public func attachSidecar(_ sockets: SidecarSockets) async throws {
@@ -86,38 +122,17 @@ public actor Router {
         state = .starting
         do {
             try await sckCapture.start()
-            // Open AUHAL for every enabled local CoreAudio output. SCK
-            // captures system audio at the OS level — we don't need to
-            // skip a "capture device" the way we did with BlackHole.
-            // Still skip aggregates and the system multi-output to avoid
-            // routing audio into a sink that itself includes one of our
-            // outputs (potential feedback / double-play).
-            for dev in devices where dev.transport == .coreAudio && (routing[dev.id]?.enabled ?? false) {
-                guard let uid = dev.coreAudioUID else { continue }
-                let lower = dev.name.lowercased()
-                if lower.contains("blackhole") || lower.contains("aggregate") ||
-                   lower.contains("multi-output") || dev.name.contains("多输出") {
-                    continue
-                }
-                let coreAudioID = (try? Capture.deviceID(forUID: uid)) ?? 0
-                if coreAudioID == 0 { continue }
-                let out = LocalOutput(
-                    deviceID: coreAudioID,
-                    deviceUID: uid,
-                    ring: sckCapture.ringBuffer,
-                    sampleRate: sckCapture.sampleRate,
-                    channelCount: sckCapture.channelCount
-                )
-                try out.start()
-                localOutputs[dev.id] = out
-            }
+            // Single entry point for opening local outputs. Picks individual
+            // AUHALs vs synchronized aggregate based on the enabled-output
+            // count (see reconcileLocalDriver). Used by both initial start
+            // and live retag via syncLocalOutputs.
+            reconcileLocalDriver(devices: devices)
             replan()
             state = .running
         } catch {
             state = .error
             lastError = "\(error)"
-            for (_, out) in localOutputs { out.stop() }
-            localOutputs.removeAll()
+            tearDownLocalDriver()
             sckCapture.stop()
             throw error
         }
@@ -141,10 +156,12 @@ public actor Router {
         if let ipc = ipc {
             _ = try? await ipc.call("stream.stop", params: [:])
         }
-        // 3. Tear down the AUHAL outputs. Each LocalOutput.stop() does
-        //    AudioOutputUnitStop/Uninitialize/Dispose synchronously.
-        for (_, out) in localOutputs { out.stop() }
-        localOutputs.removeAll()
+        // 3. Tear down local AUHALs and the synchronized aggregate (if any).
+        //    Strict order: stop AUHAL → Uninit + Dispose → destroy
+        //    aggregate. Reversing this deadlocks coreaudiod on some macOS
+        //    versions (per AggregateDevice.swift docstring + BlackHole
+        //    issue tracker).
+        tearDownLocalDriver()
         // 4. Stop the SCK capture stream. SCKCapture.stop() launches an
         //    unstructured Task to await the SCStream.stopCapture; that
         //    task finishes asynchronously but won't be re-entered here.
@@ -183,53 +200,211 @@ public actor Router {
         let s = sckCapture
         var renderInfo = ""
         for (id, out) in localOutputs {
-            renderInfo += " render[\(id.prefix(6))]=ticks:\(out.renderTickCount) peak:\(String(format: "%.4f", out.lastRenderPeak))"
+            // Aggregate driver mode keys its single LocalOutput by the
+            // aggregate's UID, which starts with our well-known prefix.
+            // Show "agg" + a short tail rather than the noisy prefix.
+            let label: String
+            if id.hasPrefix(AggregateDevice.uidPrefix) {
+                label = "agg:\(id.suffix(6))"
+            } else {
+                label = String(id.prefix(6))
+            }
+            renderInfo += " render[\(label)]=ticks:\(out.renderTickCount) peak:\(String(format: "%.4f", out.lastRenderPeak))"
         }
         var awInfo = ""
         if let aw = audioWriter {
             awInfo = " airplayWriter=pkts:\(aw.packetsSent) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(renderInfo)\(awInfo)"
+        // Driver mode: most useful in field reports — tells us instantly
+        // if the kernel-level synchronized aggregate is engaged or not.
+        let driverInfo: String
+        if aggregateDevice != nil {
+            driverInfo = " driver=aggregate(\(aggregateCoveredUIDs.count))"
+        } else if !localOutputs.isEmpty {
+            driverInfo = " driver=individual(\(localOutputs.count))"
+        } else {
+            driverInfo = " driver=idle"
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(renderInfo)\(awInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
     /// Called whenever the user toggles a local device while the engine
-    /// is already running — ensures LocalOutput is created for newly-
-    /// enabled devices and torn down for newly-disabled ones.
+    /// is already running.
     public func syncLocalOutputs(devices: [Device]) async {
-        // Open AUHAL for newly-enabled local devices.
-        for dev in devices where dev.transport == .coreAudio && (routing[dev.id]?.enabled ?? false) {
-            if localOutputs[dev.id] != nil { continue }
-            guard let uid = dev.coreAudioUID else { continue }
-            let lower = dev.name.lowercased()
-            if lower.contains("blackhole") || lower.contains("aggregate") ||
-               lower.contains("multi-output") || dev.name.contains("多输出") {
-                continue
-            }
-            let coreAudioID = (try? Capture.deviceID(forUID: uid)) ?? 0
-            if coreAudioID == 0 { continue }
-            let out = LocalOutput(
-                deviceID: coreAudioID,
-                deviceUID: uid,
-                ring: sckCapture.ringBuffer,
-                sampleRate: sckCapture.sampleRate,
-                channelCount: sckCapture.channelCount
-            )
-            do {
-                try out.start()
-                localOutputs[dev.id] = out
-            } catch {
-                lastError = "open output \(dev.name) failed: \(error)"
-            }
-        }
-        // Close AUHAL for newly-disabled local devices.
-        for (id, out) in localOutputs {
-            if !(routing[id]?.enabled ?? false) {
-                out.stop()
-                localOutputs.removeValue(forKey: id)
-            }
-        }
+        reconcileLocalDriver(devices: devices)
         replan()
+    }
+
+    // MARK: - Local driver reconciliation
+    //
+    // The core decision: how do we drive the user's enabled CoreAudio
+    // outputs? Two modes:
+    //
+    //   .individual  — count == 1. Open one AUHAL on the physical device.
+    //                  No aggregate; no SRC; lowest possible latency.
+    //
+    //   .aggregate   — count >= 2. Create a private CoreAudio Aggregate
+    //                  Device with all enabled outputs as subdevices, drift
+    //                  correction enabled on all non-master subdevices, and
+    //                  open ONE AUHAL on the aggregate. The kernel handles
+    //                  per-device sync with continuous SRC tuning. This is
+    //                  the only way to get sub-sample-accurate alignment
+    //                  between independent physical outputs (e.g. MBP
+    //                  built-in speaker + a DisplayPort monitor).
+    //
+    // count == 0 ⇒ tear everything down; the engine itself will be stopped
+    // by the AppModel reconciler one rung up.
+    //
+    // Transitions are "tear down then build up" rather than "patch the
+    // existing driver in place" — patching adds complexity for marginal
+    // benefit (a few ms of silence during transition, well under the
+    // user-perceptible threshold for a UI toggle).
+    private func reconcileLocalDriver(devices: [Device]) {
+        // Index name lookups so master picker can score by device name.
+        var nameByUID: [String: String] = [:]
+        for dev in devices {
+            if let u = dev.coreAudioUID { nameByUID[u] = dev.name }
+        }
+
+        // Compute the target enabled set: every CoreAudio device that the
+        // user has toggled on, minus a few classes that are unsafe to
+        // route into:
+        //   - BlackHole (it's a virtual sink that may be the system source
+        //     for SCK capture; routing audio TO it could feedback)
+        //   - any of OUR previously-spawned aggregates (UID prefix match)
+        //
+        // We deliberately DO NOT exclude user-created aggregates from
+        // Audio MIDI Setup any more. With our own private aggregate now
+        // a first-class concept, blanket-filtering aggregates would
+        // surprise users who set one up themselves.
+        let enabled: [EnabledLocalOutput] = devices.compactMap { dev in
+            guard dev.transport == .coreAudio else { return nil }
+            guard routing[dev.id]?.enabled ?? false else { return nil }
+            guard let uid = dev.coreAudioUID else { return nil }
+            if uid.hasPrefix(AggregateDevice.uidPrefix) { return nil }
+            let lower = dev.name.lowercased()
+            if lower.contains("blackhole") { return nil }
+            return EnabledLocalOutput(deviceID: dev.id, uid: uid, name: dev.name)
+        }
+        let targetUIDs = Set(enabled.map { $0.uid })
+
+        switch enabled.count {
+        case 0:
+            tearDownLocalDriver()
+        case 1:
+            // Switch to individual mode if we aren't already covering
+            // exactly this single device.
+            let only = enabled[0]
+            let alreadyCorrect =
+                aggregateDevice == nil &&
+                localOutputs.count == 1 &&
+                localOutputs.keys.first == only.deviceID
+            if !alreadyCorrect {
+                tearDownLocalDriver()
+                openIndividualAUHAL(deviceID: only.deviceID, uid: only.uid, name: only.name)
+            }
+        default:
+            // Switch to aggregate mode if we aren't already covering
+            // exactly this set.
+            let alreadyCorrect =
+                aggregateDevice != nil &&
+                aggregateCoveredUIDs == targetUIDs
+            if !alreadyCorrect {
+                tearDownLocalDriver()
+                openAggregateAUHAL(enabled: enabled, nameByUID: nameByUID)
+            }
+        }
+    }
+
+    private func openIndividualAUHAL(deviceID: String, uid: String, name: String) {
+        guard let coreAudioID = try? Capture.deviceID(forUID: uid),
+              coreAudioID != 0 else {
+            lastError = "device \(name) not found in CoreAudio"
+            return
+        }
+        let out = LocalOutput(
+            deviceID: coreAudioID, deviceUID: uid,
+            ring: sckCapture.ringBuffer,
+            sampleRate: sckCapture.sampleRate,
+            channelCount: sckCapture.channelCount
+        )
+        do {
+            try out.start()
+            localOutputs[deviceID] = out
+        } catch {
+            lastError = "open \(name) failed: \(error)"
+        }
+    }
+
+    private func openAggregateAUHAL(
+        enabled: [EnabledLocalOutput],
+        nameByUID: [String: String]
+    ) {
+        let candidateUIDs = Set(enabled.map { $0.uid })
+        guard let masterUID = AggregateDevice.pickMaster(
+            candidateUIDs: candidateUIDs, deviceNames: nameByUID
+        ) else {
+            lastError = "could not pick master device for aggregate"
+            return
+        }
+        let slaveUIDs = enabled.map { $0.uid }.filter { $0 != masterUID }
+
+        let agg: AggregateDevice
+        do {
+            agg = try AggregateDevice(masterUID: masterUID, slaveUIDs: slaveUIDs)
+        } catch {
+            lastError = "aggregate create failed: \(error). Falling back to first-only."
+            // Recovery: drive only the master device individually so we
+            // still produce SOME audio. Drift between physical speakers
+            // returns, but silence is worse.
+            if let master = enabled.first(where: { $0.uid == masterUID }) {
+                openIndividualAUHAL(deviceID: master.deviceID, uid: master.uid, name: master.name)
+            }
+            return
+        }
+
+        let out = LocalOutput(
+            deviceID: agg.deviceID, deviceUID: agg.aggregateUID,
+            ring: sckCapture.ringBuffer,
+            sampleRate: sckCapture.sampleRate,
+            channelCount: sckCapture.channelCount
+        )
+        do {
+            try out.start()
+            // Verify drift correction got applied (Apple Silicon has been
+            // observed to silently downgrade quality under low-power).
+            // This is read-only; doesn't fix it, but logs let us notice.
+            let drift = agg.verifyDriftCorrection()
+            let off = drift.filter { $0.key != masterUID && !$0.value.enabled }
+            if !off.isEmpty {
+                lastError = "aggregate built but drift OFF for: \(off.keys.joined(separator: ","))"
+            }
+            aggregateDevice = agg
+            aggregateCoveredUIDs = candidateUIDs
+            // Key the AUHAL by the aggregate UID so diagnostic dumps and
+            // setRouting iteration can find it without confusing it with
+            // a per-device entry.
+            localOutputs[agg.aggregateUID] = out
+        } catch {
+            lastError = "AUHAL on aggregate failed: \(error)"
+            agg.destroy()
+        }
+    }
+
+    /// Strict teardown order: stop every AUHAL first (synchronously waits
+    /// for the in-flight render block to drain), then destroy the
+    /// aggregate. Reversing this deadlocks coreaudiod on some macOS
+    /// versions — observed in BlackHole's issue tracker and confirmed by
+    /// our own crash report at the toggle-off path.
+    private func tearDownLocalDriver() {
+        for (_, out) in localOutputs { out.stop() }
+        localOutputs.removeAll()
+        if let agg = aggregateDevice {
+            agg.destroy()
+            aggregateDevice = nil
+        }
+        aggregateCoveredUIDs = []
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {

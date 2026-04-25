@@ -419,19 +419,33 @@ final class AppModel {
         reconcileEngine()
     }
 
-    /// Devices the user can plausibly target. Excludes the BlackHole
-    /// capture device (it's the *source*, not an output) and any virtual
-    /// aggregate / multi-output devices the system already exposes.
+    /// Devices the user can plausibly target. Excludes:
+    ///   - BlackHole (virtual capture sink — routing audio TO it could
+    ///     feedback into our SCK capture path).
+    ///   - Our own private aggregate devices (UID prefix
+    ///     `io.syncast.aggregate.v1.`) — these are created by the Router
+    ///     to drive multi-output sync; user must never see them.
+    ///
+    /// Notably we DO show user-created aggregate / multi-output devices
+    /// from Audio MIDI Setup. Earlier versions filtered these blanket-
+    /// style as a feedback safeguard, but with the Router now operating
+    /// its own aggregate, blanket-filtering would surprise users who
+    /// built their own. Routing into a USER-created aggregate that
+    /// happens to include the system input would feedback, so we still
+    /// rely on SCK's `excludesCurrentProcessAudio` defense at the
+    /// capture layer.
     private func isUserSelectableOutput(_ d: Device) -> Bool {
-        // BlackHole is a virtual sink; never list it as a target. SCK
-        // captures system audio without needing BlackHole installed, but
-        // the user may still have it from before — hide it.
         if let uid = d.coreAudioUID, uid.contains("BlackHole") { return false }
+        // Our own private aggregate (created by Router.reconcileLocalDriver)
+        // is invisible-by-construction (kAudioAggregateDeviceIsPrivateKey=1)
+        // but as a belt-and-braces filter in case macOS ever surfaces it,
+        // hide it by UID prefix.
+        if let uid = d.coreAudioUID,
+           uid.hasPrefix("io.syncast.aggregate.v1.") {
+            return false
+        }
         let lower = d.name.lowercased()
         if lower.contains("blackhole") { return false }
-        if lower.contains("aggregate") { return false }
-        if lower.contains("multi-output") || lower.contains("multioutput") { return false }
-        if d.name.contains("多输出") { return false }
         return true
     }
 
