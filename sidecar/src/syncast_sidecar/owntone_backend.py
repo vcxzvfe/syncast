@@ -73,7 +73,22 @@ class OwnToneBackend:
         # any number of Swift `LocalAirPlayBridge` clients so they stay in
         # lockstep with the AirPlay receivers (all driven by OwnTone's
         # single player clock). See ADR for "whole-home AirPlay mode".
-        self.output_fifo_path = self.state_dir / "output.fifo"
+        #
+        # CRITICAL: this MUST live OUTSIDE `library.directories`. OwnTone's
+        # `pipe_autostart` library scanner classifies any FIFO it finds in
+        # the library directory as a `data_kind=pipe` INPUT track. With
+        # `output.fifo` in state_dir alongside `audio.fifo`, the scanner
+        # was creating a phantom input track for the output fifo, and
+        # `play_pipe()` would non-deterministically queue THAT track
+        # (instead of the real input) — OwnTone would try to read from
+        # output.fifo while our broadcaster also held the read end, the
+        # player would stall in pause, and bridges would receive zero
+        # bytes. Symptom: whole-home mode silent for both local-only AND
+        # local+AirPlay scenarios. (Diagnosed by Ultra Review.)
+        # Solution: park output.fifo under /tmp where the library scanner
+        # cannot see it.
+        uid = os.geteuid()
+        self.output_fifo_path = Path(f"/tmp/syncast-{uid}.output.fifo")
         self.config_path = self.state_dir / "owntone.conf"
         self.config_template = config_template
         self.rest_port = rest_port
