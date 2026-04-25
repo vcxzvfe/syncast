@@ -343,7 +343,19 @@ library {{
   name = "SyncCast"
   port = {self.rest_port}
   directories = {{ "{media}" }}
-  pipe_autostart = true
+  # MUST be false. With autostart, OwnTone's pipe_watch_thread stamps
+  # `pipe_autostart_id = pipe->id` and `inputs/pipe.c:play()` flags the
+  # source as `is_autostarted=true`. On the first 0-byte read from
+  # `audio.fifo` (cold-start race: AudioSocketWriter not connected yet,
+  # or the source momentarily empty between SCK chunks) the player
+  # autostops the source with `INPUT_FLAG_EOF` BEFORE the RAOP outputs
+  # are spun up. Net effect: AirPlay session never starts even though
+  # `set_output_enabled` succeeded on REST. Symptom: owntone.log shows
+  # zero `raop` lines, AirPlay receivers play a single setup-burst
+  # ("pop") and then go silent. We queue + start playback explicitly
+  # via play_pipe(), so we don't need (and don't want) the library
+  # scanner to autostart on its own.
+  pipe_autostart = false
   # CRITICAL: must match the rate the Swift side writes into the FIFO.
   # SCKCapture delivers system audio at 48 kHz, AudioSocketWriter
   # converts Float32 → s16le and sends it through the unix socket to
