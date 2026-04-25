@@ -321,7 +321,7 @@ public actor Router {
         }
         var awInfo = ""
         if let aw = audioWriter {
-            awInfo = " airplayWriter=pkts:\(aw.packetsSent) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
+            awInfo = " airplayWriter=pkts:\(aw.packetsSent) underrun:\(aw.underrunPackets) partial:\(aw.partialSends) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
         }
         // Driver mode: most useful in field reports — tells us instantly
         // if the kernel-level synchronized aggregate is engaged or not.
