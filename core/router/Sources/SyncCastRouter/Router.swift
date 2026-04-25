@@ -23,10 +23,39 @@ public actor Router {
     private var routing: [String: DeviceRouting] = [:]
     private var measuredAirplayLatencyMs: Int = 1800
     private var ipc: IpcClient?
+    private var audioWriter: AudioSocketWriter?
+
+    /// Sockets used to talk to the Python sidecar. May be nil in unit tests
+    /// or when running without AirPlay support.
+    public struct SidecarSockets: Sendable {
+        public let control: URL
+        public let audio: URL
+        public init(control: URL, audio: URL) {
+            self.control = control
+            self.audio = audio
+        }
+    }
 
     public init(sampleRate: Double = 48_000, channelCount: Int = 2) {
         self.capture = Capture(sampleRate: sampleRate, channelCount: channelCount)
         self.scheduler = Scheduler(sampleRate: sampleRate)
+    }
+
+    public func attachSidecar(_ sockets: SidecarSockets) async throws {
+        let client = IpcClient(socketPath: sockets.control)
+        try await client.connect { method, params in
+            // Notifications from sidecar: parse device latency events to
+            // re-plan. Other events are observed by the UI layer via a
+            // separate subscription mechanism (TODO P3).
+            if method == "event.measured_latency",
+               let measured = params["measured_ms"] as? Int {
+                Task { await self.updateAirplayLatency(measured) }
+            }
+        }
+        _ = try await client.call("sidecar.hello", params: ["v": 1, "router_pid": ProcessInfo.processInfo.processIdentifier])
+        self.ipc = client
+        let writer = AudioSocketWriter(ring: capture.ringBuffer, socketPath: sockets.audio)
+        self.audioWriter = writer
     }
 
     public func setRouting(_ r: DeviceRouting) {
@@ -77,10 +106,36 @@ public actor Router {
 
     public func stop() async {
         state = .stopping
+        audioWriter?.stop()
+        audioWriter = nil
+        if let ipc = ipc {
+            _ = try? await ipc.call("stream.stop", params: [:])
+            await ipc.close()
+        }
+        ipc = nil
         for (_, out) in localOutputs { out.stop() }
         localOutputs.removeAll()
         capture.stop()
         state = .idle
+    }
+
+    /// Notify the sidecar to begin streaming, then start the audio-socket
+    /// writer that pumps PCM into the sidecar.
+    public func beginAirplayStream(deviceIDs: [String]) async throws {
+        guard let ipc, let audioWriter else {
+            throw NSError(domain: "SyncCastRouter", code: 100, userInfo: [
+                NSLocalizedDescriptionKey: "sidecar not attached"
+            ])
+        }
+        let anchorNs = Clock.nowNs() + UInt64(measuredAirplayLatencyMs) * 1_000_000
+        _ = try await ipc.call("stream.start", params: [
+            "device_ids": deviceIDs,
+            "anchor_time_ns": Int(anchorNs),
+            "sample_rate": 48_000,
+            "channels": 2,
+            "format": "pcm_s16le",
+        ])
+        try audioWriter.start()
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {

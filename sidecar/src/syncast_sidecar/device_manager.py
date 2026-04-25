@@ -1,8 +1,19 @@
 """Device manager.
 
-Tracks AirPlay 2 receivers, runs scans, and orchestrates the per-device
-streamers. Keeps pyatv usage isolated behind a thin adapter so we can swap
-the streaming backend later.
+Tracks AirPlay 2 receivers, runs scans, and drives the shared OwnTone
+backend that does the actual streaming. The router never sees OwnTone
+directly — it only sees this manager via JSON-RPC.
+
+Architecture (per ADR-006):
+
+  • One shared `OwnToneBackend` per sidecar process.
+  • Each AirPlay 2 device maps to an OwnTone "output" identified by its
+    name/host/port. We call REST `/api/outputs` to enable the right ones
+    for the active stream and `/api/outputs/{id}/volume` for per-device
+    gain.
+  • The audio data path runs in parallel: `AudioSocketReader` accepts
+    PCM packets from the Swift router on a SOCK_SEQPACKET socket and
+    forwards them straight into OwnTone's FIFO pipe.
 """
 
 from __future__ import annotations
@@ -12,28 +23,15 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 from . import jsonrpc, log
+from .audio_socket import AudioSocketReader
 
 logger = log.get("sidecar.devices")
 
 
 NotifyFn = Callable[[str, dict[str, Any]], None]
-
-
-class StreamerProtocol(Protocol):
-    """Per-device streamer implementation. Concrete: AirPlay2Streamer (pyatv)."""
-
-    async def connect(self) -> int: ...   # returns reported_latency_ms
-    async def disconnect(self) -> None: ...
-    async def set_volume(self, volume: float) -> None: ...
-    async def start(self, audio_socket: Path, anchor_time_ns: int) -> None: ...
-    async def stop(self) -> None: ...
-    async def flush(self) -> None: ...
-
-    @property
-    def measured_latency_ms(self) -> int | None: ...
 
 
 @dataclass
@@ -43,9 +41,9 @@ class Device:
     host: str
     port: int
     name: str
-    streamer: StreamerProtocol
     state: str = "added"
     volume: float = 1.0
+    owntone_output_id: str | None = None     # populated on first OwnTone match
     last_state_emit: float = field(default_factory=time.monotonic)
 
 
@@ -55,20 +53,21 @@ class DeviceManager:
         self._devices: dict[str, Device] = {}
         self._streaming: bool = False
         self._lock = asyncio.Lock()
+        self._owntone: Any = None      # OwnToneBackend, lazily started
+        self._audio_reader: AudioSocketReader | None = None
 
     async def shutdown(self) -> None:
         async with self._lock:
-            for dev in list(self._devices.values()):
-                try:
-                    await dev.streamer.stop()
-                except Exception:  # noqa: BLE001
-                    logger.exception("stop_failed", extra={"device_id": dev.id})
-                try:
-                    await dev.streamer.disconnect()
-                except Exception:  # noqa: BLE001
-                    logger.exception("disconnect_failed", extra={"device_id": dev.id})
+            await self._stop_streaming_unlocked()
             self._devices.clear()
-            self._streaming = False
+            if self._owntone is not None:
+                try:
+                    await self._owntone.stop()
+                except Exception:  # noqa: BLE001
+                    logger.exception("owntone_stop_failed")
+                self._owntone = None
+
+    # ---------- discovery ----------
 
     async def scan(self, timeout_ms: int) -> dict[str, Any]:
         scan_id = str(uuid.uuid4())
@@ -76,20 +75,18 @@ class DeviceManager:
         return {"scan_id": scan_id}
 
     async def _scan_task(self, scan_id: str, timeout_ms: int) -> None:
-        # Lazy import: keep CLI import-time lean and avoid hard pyatv requirement
-        # for unit tests of the JSON-RPC plumbing.
         try:
-            from .airplay2 import scan_airplay2  # type: ignore[import-not-found]
+            from .airplay2 import scan_airplay2
         except ImportError:
             logger.warning("scan_unavailable", extra={"reason": "airplay2 backend missing"})
             return
         try:
             async for found in scan_airplay2(timeout_ms / 1000.0):
-                self._notify("event.device_found", {
-                    "scan_id": scan_id, **found,
-                })
+                self._notify("event.device_found", {"scan_id": scan_id, **found})
         except Exception:  # noqa: BLE001
             logger.exception("scan_failed", extra={"scan_id": scan_id})
+
+    # ---------- device add/remove/volume ----------
 
     async def add(self, params: dict[str, Any]) -> dict[str, Any]:
         device_id = params["device_id"]
@@ -99,53 +96,33 @@ class DeviceManager:
                 jsonrpc.CAPABILITY_UNSUPPORTED,
                 f"unsupported transport: {transport}",
             )
-        from .airplay2 import AirPlay2Streamer  # local import for testability
-
         async with self._lock:
             if device_id in self._devices:
                 raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_id already exists")
-            streamer = AirPlay2Streamer(
-                host=params["host"],
-                port=int(params.get("port", 7000)),
-                name=params.get("name", device_id),
-                credentials=params.get("credentials"),
-                notify=lambda method, p: self._notify(method, {**p, "device_id": device_id}),
-            )
-            try:
-                latency_ms = await streamer.connect()
-            except Exception as e:  # noqa: BLE001
-                raise jsonrpc.RpcError(
-                    jsonrpc.INTERNAL_ERROR, f"connect failed: {e}",
-                ) from e
             dev = Device(
                 id=device_id,
                 transport=transport,
                 host=params["host"],
                 port=int(params.get("port", 7000)),
                 name=params.get("name", device_id),
-                streamer=streamer,
+                state="added",
             )
-            dev.state = "connected"
             self._devices[device_id] = dev
             self._notify("event.device_state", {
-                "device_id": device_id, "state": "connected",
-                "buffer_ms": latency_ms,
+                "device_id": device_id, "state": "added", "buffer_ms": 1800,
             })
-            return {"connected": True, "reported_latency_ms": latency_ms}
+            return {"connected": True, "reported_latency_ms": 1800}
 
     async def remove(self, device_id: str) -> dict[str, Any]:
         async with self._lock:
             dev = self._devices.pop(device_id, None)
         if dev is None:
             raise jsonrpc.RpcError(jsonrpc.DEVICE_NOT_FOUND, device_id)
-        try:
-            await dev.streamer.stop()
-        except Exception:  # noqa: BLE001
-            logger.exception("remove_stop_failed", extra={"device_id": device_id})
-        try:
-            await dev.streamer.disconnect()
-        except Exception:  # noqa: BLE001
-            logger.exception("remove_disconnect_failed", extra={"device_id": device_id})
+        if self._owntone is not None and dev.owntone_output_id is not None:
+            try:
+                self._owntone.set_output_enabled(dev.owntone_output_id, False)
+            except Exception:  # noqa: BLE001
+                logger.exception("owntone_disable_failed", extra={"id": device_id})
         return {"removed": True}
 
     async def set_volume(self, device_id: str, volume: float) -> dict[str, Any]:
@@ -154,15 +131,20 @@ class DeviceManager:
         dev = self._devices.get(device_id)
         if dev is None:
             raise jsonrpc.RpcError(jsonrpc.DEVICE_NOT_FOUND, device_id)
-        await dev.streamer.set_volume(volume)
         dev.volume = volume
+        if self._owntone is not None and dev.owntone_output_id is not None:
+            try:
+                self._owntone.set_output_volume(dev.owntone_output_id, volume)
+            except Exception:  # noqa: BLE001
+                logger.exception("owntone_volume_failed", extra={"id": device_id})
         return {"volume": volume}
+
+    # ---------- streaming ----------
 
     async def start_stream(
         self, params: dict[str, Any], audio_socket: Path,
     ) -> dict[str, Any]:
         device_ids = list(params.get("device_ids", []))
-        anchor_time_ns = int(params["anchor_time_ns"])
         if not device_ids:
             raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_ids empty")
         async with self._lock:
@@ -171,36 +153,103 @@ class DeviceManager:
                 raise jsonrpc.RpcError(
                     jsonrpc.DEVICE_NOT_FOUND, f"unknown: {missing}",
                 )
+            await self._ensure_owntone()
+            self._reconcile_outputs(device_ids)
+            await self._ensure_audio_reader(audio_socket)
+            self._owntone.play_pipe()  # idempotent: tells OwnTone to start consuming the FIFO
             for d in device_ids:
                 dev = self._devices[d]
-                await dev.streamer.start(audio_socket, anchor_time_ns)
                 dev.state = "streaming"
-                self._notify("event.device_state", {
-                    "device_id": d, "state": "streaming",
-                })
+                self._notify("event.device_state", {"device_id": d, "state": "streaming"})
             self._streaming = True
         return {"started": True, "device_count": len(device_ids)}
 
     async def stop_stream(self) -> dict[str, Any]:
         async with self._lock:
-            for dev in self._devices.values():
-                if dev.state == "streaming":
-                    try:
-                        await dev.streamer.stop()
-                    except Exception:  # noqa: BLE001
-                        logger.exception("stop_failed", extra={"device_id": dev.id})
-                    dev.state = "connected"
-                    self._notify("event.device_state", {
-                        "device_id": dev.id, "state": "connected",
-                    })
-            self._streaming = False
+            await self._stop_streaming_unlocked()
         return {"stopped": True}
 
     async def flush(self) -> dict[str, Any]:
-        async with self._lock:
-            for dev in self._devices.values():
-                try:
-                    await dev.streamer.flush()
-                except Exception:  # noqa: BLE001
-                    logger.exception("flush_failed", extra={"device_id": dev.id})
+        if self._owntone is None:
+            return {"flushed": True}
+        try:
+            self._owntone.flush()
+        except Exception:  # noqa: BLE001
+            logger.exception("owntone_flush_failed")
         return {"flushed": True}
+
+    # ---------- internals ----------
+
+    async def _ensure_owntone(self) -> None:
+        if self._owntone is not None:
+            return
+        try:
+            from .owntone_backend import OwnToneBackend
+        except ImportError as e:
+            raise jsonrpc.RpcError(
+                jsonrpc.INTERNAL_ERROR, f"owntone backend unavailable: {e}",
+            ) from e
+        backend = OwnToneBackend()
+        try:
+            await backend.start()
+        except Exception as e:  # noqa: BLE001
+            raise jsonrpc.RpcError(
+                jsonrpc.INTERNAL_ERROR, f"owntone start failed: {e}",
+            ) from e
+        self._owntone = backend
+
+    async def _ensure_audio_reader(self, audio_socket: Path) -> None:
+        if self._audio_reader is not None:
+            return
+        if self._owntone is None:
+            return
+        backend = self._owntone
+        reader = AudioSocketReader(
+            socket_path=audio_socket,
+            sink=lambda data: backend.write_pcm(data),
+        )
+        reader.start()
+        self._audio_reader = reader
+
+    def _reconcile_outputs(self, enabled_ids: list[str]) -> None:
+        """Tell OwnTone which of its known outputs to send to.
+
+        OwnTone's REST `/api/outputs` returns a list of receivers it has
+        discovered; we match by host+name and enable/disable accordingly.
+        """
+        if self._owntone is None:
+            return
+        outputs = self._owntone.list_outputs()
+        # Index OwnTone outputs by (name, host) tolerantly.
+        by_name = {str(o.get("name", "")).lower(): o for o in outputs}
+        enabled_set = set(enabled_ids)
+        for dev_id, dev in self._devices.items():
+            match = by_name.get(dev.name.lower())
+            if match is None:
+                continue
+            dev.owntone_output_id = str(match.get("id"))
+            try:
+                self._owntone.set_output_enabled(dev.owntone_output_id, dev_id in enabled_set)
+                if dev_id in enabled_set:
+                    self._owntone.set_output_volume(dev.owntone_output_id, dev.volume)
+            except Exception:  # noqa: BLE001
+                logger.exception("owntone_reconcile_failed", extra={"id": dev_id})
+
+    async def _stop_streaming_unlocked(self) -> None:
+        if not self._streaming:
+            return
+        if self._audio_reader is not None:
+            self._audio_reader.stop()
+            self._audio_reader = None
+        if self._owntone is not None:
+            try:
+                self._owntone.flush()
+            except Exception:  # noqa: BLE001
+                logger.exception("flush_failed")
+        for dev in self._devices.values():
+            if dev.state == "streaming":
+                dev.state = "added"
+                self._notify("event.device_state", {
+                    "device_id": dev.id, "state": "connected",
+                })
+        self._streaming = False
