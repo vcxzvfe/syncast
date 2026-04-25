@@ -255,17 +255,39 @@ public final class LocalOutput {
         }
 
         let writePos = ring.writePosition
-        // Multi-device sync: every active output reads at the same
-        // absolute frame instant by padding the FAST outputs with extra
-        // wait so all of them play the SAME captured frame at the same
-        // physical time. compensation = (slowest_device_latency - my_latency).
-        // Floor base 50ms (2400 frames) so we never underrun.
+        // Compensation target — the position the next read SHOULD land at
+        // for inter-device sync. compensation = (peerMaxLat − myLat) makes
+        // a fast device wait long enough to play the same captured frame
+        // at the same wall-clock instant as the slowest peer. Floor base
+        // 100 ms so we never underrun under SCK callback jitter.
         let maxLatencyFrames: Int64 = Self.latencyLock.withLock {
             Self.deviceLatencyFramesByDevID.values.max() ?? deviceLatencyFrames
         }
-        let baselineFrames: Int64 = 2400  // 50ms floor at 48 kHz
+        let baselineFrames: Int64 = 4800  // 100 ms floor at 48 kHz
         let compensation = max(0, maxLatencyFrames - deviceLatencyFrames)
-        let startFrame: Int64 = max(0, writePos - baselineFrames - compensation - Int64(frames))
+        let target: Int64 = max(0, writePos - baselineFrames - compensation - Int64(frames))
+
+        // CRITICAL: anchor reads on the previous render's end position.
+        // Recomputing startFrame from `writePos` every render meant
+        // adjacent render blocks could overlap or leave gaps in the
+        // captured stream — `writePos` advances by SCK's 1024-frame
+        // chunks while AUHAL pulls 512/1024 frames at its own clock.
+        // Even a 16-sample overlap repeats audio (audible doubling /
+        // "granularity"); a 16-sample gap drops audio (click). This
+        // was the primary source of user-reported 毛刺感 + 啸叫.
+        //
+        // Resync to `target` only on first call, on out-of-window
+        // (ring overwrote our cursor — only happens after a long stall),
+        // or on > 250 ms drift (safety net for clock divergence).
+        let cursor = snapshot.cursor
+        let driftLimitFrames: Int64 = Int64(sampleRate) / 4   // 250 ms
+        let lowerValid = max(0, writePos - Int64(ring.capacityFrames) + Int64(frames))
+        let needsResync =
+            cursor == 0 ||
+            cursor < lowerValid ||
+            cursor > writePos ||
+            abs(cursor - target) > driftLimitFrames
+        let startFrame: Int64 = needsResync ? target : cursor
 
         // Use the pre-allocated outPtrs slot — no Swift runtime allocation.
         var allOk = true
@@ -279,8 +301,6 @@ public final class LocalOutput {
         }
         if !allOk { return noErr }
 
-        // Restored production path — read from ring. Tone diagnostic
-        // confirmed AUHAL→device path works (user heard the 440Hz).
         ring.read(at: startFrame, frames: frames, into: outPtrs)
 
         // Per-render diagnostics: bump tick count + sample peak so the
@@ -307,6 +327,9 @@ public final class LocalOutput {
             }
         }
 
+        // Advance the cursor so the next render reads contiguously,
+        // never recomputing from `writePos` and never overlapping the
+        // previous block.
         stateLock.withLock { _readCursor = startFrame &+ Int64(frames) }
         return noErr
     }

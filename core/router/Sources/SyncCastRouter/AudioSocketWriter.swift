@@ -13,6 +13,7 @@ public final class AudioSocketWriter: @unchecked Sendable {
     public let socketPath: URL
     public let frameCount = 480
     public let channelCount = 2
+    public let sampleRate: Double = 48_000
 
     private let ring: RingBuffer
     private var fd: Int32 = -1
@@ -22,6 +23,9 @@ public final class AudioSocketWriter: @unchecked Sendable {
     public private(set) var packetsSent: UInt64 = 0
     public private(set) var bytesSent: UInt64 = 0
     public private(set) var lastSendError: String = ""
+    /// Diagnostic — packets that found the ring under-filled and emitted
+    /// silence to keep wall-clock pacing. Indicator of capture stalls.
+    public private(set) var underrunPackets: UInt64 = 0
 
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
@@ -92,28 +96,65 @@ public final class AudioSocketWriter: @unchecked Sendable {
             repeating: [Float](repeating: 0, count: frameCount),
             count: channelCount
         )
+
+        // CRITICAL: pace at exactly real-time rate. Without this, the
+        // previous version drained the ring at whatever rate the loop
+        // could iterate (observed: 218 pkts/sec vs the 100 pkts/sec
+        // playback rate — exactly 2x). OwnTone happily accepted the
+        // over-rate stream into its FIFO, and the AirPlay receiver
+        // (Xiaomi Sound) then accumulated 5+ seconds of lag because
+        // playback drains at 100 pkts/sec while the pipe fills at 218.
+        // Pacing on wall-clock guarantees the average rate matches the
+        // capture rate regardless of how SCK chunks its callbacks.
+        let packetIntervalNs: UInt64 = UInt64(
+            (Double(frameCount) / sampleRate) * 1_000_000_000
+        )
+
         var nextRead: Int64 = -1
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        var packetsConsumed: UInt64 = 0
+
         while !Task.isCancelled {
+            // 1. Wall-clock pacing. Sleep until our scheduled wake-up for
+            //    THIS packet. If we're already late (loop got behind),
+            //    we proceed without sleeping. The next iteration's sleep
+            //    will catch back up.
+            let targetNs = startNs &+ packetsConsumed &* packetIntervalNs
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            if nowNs < targetNs {
+                try? await Task.sleep(nanoseconds: targetNs &- nowNs)
+                if Task.isCancelled { return }
+            }
+
+            // 2. Pull one packet's worth of frames from the ring. If the
+            //    ring is starved (less than `frameCount` fresh frames),
+            //    emit silence rather than block — keeps the AirPlay
+            //    receiver's playout clock in lockstep with our wall clock.
+            //    Skipping packets instead would let the receiver drain
+            //    its jitter buffer to zero and audibly stutter.
             let writePos = ring.writePosition
             if nextRead < 0 { nextRead = max(0, writePos - Int64(frameCount)) }
+
             if writePos - nextRead < Int64(frameCount) {
-                try? await Task.sleep(nanoseconds: 5_000_000)  // 5 ms
-                continue
-            }
-            // Read from ring into planar Float32, convert to interleaved Int16.
-            let outPtrs = planar.indices.map { i in
-                planar[i].withUnsafeMutableBufferPointer { $0.baseAddress! }
-            }
-            ring.read(at: nextRead, frames: frameCount, into: outPtrs)
-            for f in 0..<frameCount {
-                for ch in 0..<channelCount {
-                    let v = planar[ch][f]
-                    let clamped = max(-1.0, min(1.0, v))
-                    packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
+                for i in 0..<packet.count { packet[i] = 0 }
+                nextRead &+= Int64(frameCount)
+                underrunPackets &+= 1
+            } else {
+                let outPtrs = planar.indices.map { i in
+                    planar[i].withUnsafeMutableBufferPointer { $0.baseAddress! }
                 }
+                ring.read(at: nextRead, frames: frameCount, into: outPtrs)
+                for f in 0..<frameCount {
+                    for ch in 0..<channelCount {
+                        let v = planar[ch][f]
+                        let clamped = max(-1.0, min(1.0, v))
+                        packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
+                    }
+                }
+                nextRead &+= Int64(frameCount)
             }
-            nextRead &+= Int64(frameCount)
-            // Send one SEQPACKET datagram.
+
+            // 3. Send one packet down the Unix socket to the sidecar.
             let sent = packet.withUnsafeBytes { raw -> Int in
                 let s = lock.withLock { fd }
                 guard s >= 0 else { return -1 }
@@ -127,6 +168,7 @@ public final class AudioSocketWriter: @unchecked Sendable {
             }
             packetsSent &+= 1
             bytesSent &+= UInt64(sent)
+            packetsConsumed &+= 1
         }
     }
 }
