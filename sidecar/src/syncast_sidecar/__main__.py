@@ -27,6 +27,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Path to the JSON-RPC control Unix socket")
     parser.add_argument("--audio-socket", required=True, type=Path,
                         help="Path to the SOCK_SEQPACKET audio Unix socket")
+    parser.add_argument("--owntone-binary", type=Path, default=None,
+                        help="Explicit path to the owntone executable. "
+                             "Defaults to PATH lookup.")
+    parser.add_argument("--owntone-config-template", type=Path, default=None,
+                        help="owntone.conf template to copy on first launch. "
+                             "Used when shipping owntone inside an app bundle.")
+    parser.add_argument("--state-dir", type=Path, default=None,
+                        help="Where owntone stores its config / cache / FIFO. "
+                             "Defaults to ~/Library/Application Support/SyncCast/owntone.")
     parser.add_argument("--log-level", default="info",
                         choices=["debug", "info", "warning", "error"])
     parser.add_argument("--version", action="version",
@@ -43,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     server = ControlServer(
         control_socket=args.socket,
         audio_socket=args.audio_socket,
+        owntone_binary=args.owntone_binary,
+        owntone_config_template=args.owntone_config_template,
+        state_dir=args.state_dir,
     )
 
     loop = asyncio.new_event_loop()

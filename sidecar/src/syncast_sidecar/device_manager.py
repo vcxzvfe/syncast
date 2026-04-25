@@ -48,13 +48,22 @@ class Device:
 
 
 class DeviceManager:
-    def __init__(self, notify: NotifyFn) -> None:
+    def __init__(
+        self,
+        notify: NotifyFn,
+        owntone_binary: Path | None = None,
+        owntone_config_template: Path | None = None,
+        state_dir: Path | None = None,
+    ) -> None:
         self._notify = notify
         self._devices: dict[str, Device] = {}
         self._streaming: bool = False
         self._lock = asyncio.Lock()
         self._owntone: Any = None      # OwnToneBackend, lazily started
         self._audio_reader: AudioSocketReader | None = None
+        self._owntone_binary = owntone_binary
+        self._owntone_config_template = owntone_config_template
+        self._state_dir = state_dir
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -189,7 +198,11 @@ class DeviceManager:
             raise jsonrpc.RpcError(
                 jsonrpc.INTERNAL_ERROR, f"owntone backend unavailable: {e}",
             ) from e
-        backend = OwnToneBackend()
+        backend = OwnToneBackend(
+            binary=str(self._owntone_binary) if self._owntone_binary else None,
+            state_dir=self._state_dir,
+            config_template=self._owntone_config_template,
+        )
         try:
             await backend.start()
         except Exception as e:  # noqa: BLE001

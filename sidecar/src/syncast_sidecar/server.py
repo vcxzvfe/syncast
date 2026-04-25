@@ -23,13 +23,25 @@ Handler = Callable[[dict[str, Any]], Awaitable[Any]]
 
 
 class ControlServer:
-    def __init__(self, control_socket: Path, audio_socket: Path) -> None:
+    def __init__(
+        self,
+        control_socket: Path,
+        audio_socket: Path,
+        owntone_binary: Path | None = None,
+        owntone_config_template: Path | None = None,
+        state_dir: Path | None = None,
+    ) -> None:
         self._control_path = control_socket
         self._audio_path = audio_socket
         self._writer: asyncio.StreamWriter | None = None
         self._server: asyncio.AbstractServer | None = None
         self._stopping = asyncio.Event()
-        self._devices = DeviceManager(notify=self._notify)
+        self._devices = DeviceManager(
+            notify=self._notify,
+            owntone_binary=owntone_binary,
+            owntone_config_template=owntone_config_template,
+            state_dir=state_dir,
+        )
         self._handlers: dict[str, Handler] = {
             "sidecar.hello": self._on_hello,
             "discovery.scan": self._on_scan,
