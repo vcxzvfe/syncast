@@ -40,6 +40,8 @@ final class AppModel {
 
     private let discovery: DiscoveryService
     private let router: Router
+    private let sidecarLauncher = SidecarLauncher()
+    var sidecarRunning: Bool = false
 
     init() {
         self.discovery = DiscoveryService()
@@ -48,6 +50,21 @@ final class AppModel {
     }
 
     private func bootstrap() async {
+        // 1. Spawn the bundled sidecar (which in turn spawns OwnTone).
+        do {
+            let paths = try sidecarLauncher.start()
+            sidecarRunning = true
+            // Give the sidecar a moment to bind its sockets before the
+            // Router tries to connect.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            try await router.attachSidecar(.init(
+                control: paths.controlSocket,
+                audio:   paths.audioSocket
+            ))
+        } catch {
+            lastError = "sidecar: \(error.localizedDescription)"
+        }
+        // 2. Start discovery (CoreAudio + Bonjour).
         await discovery.start()
         let stream = await discovery.subscribe()
         Task { [weak self] in

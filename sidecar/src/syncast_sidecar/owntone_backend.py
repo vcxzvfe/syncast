@@ -53,6 +53,7 @@ class OwnToneBackend:
         self,
         binary: str | None = None,
         state_dir: Path | None = None,
+        config_template: Path | None = None,
         rest_port: int = 3689,
     ) -> None:
         self.binary = binary or shutil.which("owntone") or shutil.which("forked-daapd")
@@ -63,6 +64,7 @@ class OwnToneBackend:
         )
         self.fifo_path = self.state_dir / "audio.fifo"
         self.config_path = self.state_dir / "owntone.conf"
+        self.config_template = config_template
         self.rest_port = rest_port
         self._proc: subprocess.Popen[bytes] | None = None
         self._fifo_fd: int | None = None
