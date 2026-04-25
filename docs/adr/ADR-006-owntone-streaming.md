@@ -28,6 +28,20 @@ ADR-003 picked **pyatv** as the AirPlay 2 sender. Deeper research (see `docs/res
 - We **bundle the OwnTone binary** in the SyncCast .app, alongside its own LICENSE and source-availability notice. README must include attribution and a link to OwnTone's source.
 - Distribution implication: every release must include an "OwnTone source" tarball or a clear pointer to the upstream tag we built from. Documented in `scripts/release.md` (TODO).
 
+## macOS install path (added 2026-04-25)
+
+OwnTone has **no Homebrew formula and no .pkg installer for macOS** as of 2026-04. We confirmed by `brew search owntone` / `brew search forked-daapd` and by reading the upstream installation docs (only Linux/BSD/Docker are listed there).
+
+The authoritative recipe for macOS comes from OwnTone's own CI:
+[`.github/workflows/macos.yml`](https://github.com/owntone/owntone-server/blob/master/.github/workflows/macos.yml). It:
+
+1. `brew install`s ~25 formulae (build tools + runtime libs).
+2. Symlinks the brew bison/flex into `/usr/local/bin/` (the build's `ylwrap` doesn't honour `$PATH`; macOS's bundled bison is too old).
+3. Builds `libinotify-kqueue` from source (no brew package; required by OwnTone's filesystem watcher even when no library is scanned).
+4. `autoreconf -fi && ./configure --prefix=$HOME/owntone_data/usr ... && make && make install` — installs under the user's home so the install step needs no sudo.
+
+We mirror this recipe in `scripts/build-owntone.sh`. It's idempotent and re-run-safe. The only sudo prompts are for steps 2 and 3 (one-time setup).
+
 ## Sidecar internals (revised)
 
 ```

@@ -29,11 +29,16 @@ else
 fi
 
 # 2. OwnTone — AirPlay 2 multi-target sender (ADR-006).
-if ! command -v owntone >/dev/null 2>&1; then
-  log "Installing OwnTone (forked-daapd) for AirPlay 2 streaming…"
-  brew install owntone
+# OwnTone has no Homebrew formula or .pkg installer for macOS as of 2026-04;
+# we build from source. The build itself is handled by build-owntone.sh.
+OWNTONE_BIN="$HOME/owntone_data/usr/sbin/owntone"
+if [[ ! -x "$OWNTONE_BIN" ]] && ! command -v owntone >/dev/null 2>&1; then
+  log "OwnTone not found. Running build-owntone.sh — this takes 5–10 minutes
+        and asks for sudo once (for /usr/local/bin symlinks of bison/flex
+        and for libinotify-kqueue install)."
+  "$REPO_ROOT/scripts/build-owntone.sh"
 else
-  log "OwnTone already installed."
+  log "OwnTone already present (looking for $OWNTONE_BIN or owntone in PATH)."
 fi
 
 # 3. Python 3.11+. The system /usr/bin/python3 on older macOS is 3.9; pyatv
