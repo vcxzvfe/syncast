@@ -1,3 +1,4 @@
+import CoreAudio
 import SwiftUI
 import SyncCastDiscovery
 import SyncCastRouter
@@ -67,9 +68,88 @@ struct MainPopover: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            // Auto-calibrate row: button + mic picker + status indicator.
+            HStack(spacing: 8) {
+                Button(action: {
+                    Task { await model.runAutoCalibrate() }
+                }) {
+                    HStack(spacing: 4) {
+                        if case .running = model.calibrationStatus {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .controlSize(.mini)
+                        } else if case .requestingPermission = model.calibrationStatus {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .controlSize(.mini)
+                        } else {
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 10))
+                        }
+                        Text(autoCalibrateLabel)
+                            .font(.system(size: 10))
+                    }
+                }
+                .buttonStyle(.borderless)
+                .disabled(autoCalibrateDisabled)
+                .accessibilityIdentifier("autoCalibrateButton")
+                Spacer()
+                if !model.availableInputDevices.isEmpty {
+                    Picker("Mic", selection: micPickerBinding) {
+                        ForEach(model.availableInputDevices, id: \.id) { dev in
+                            Text("\(dev.name) (\(dev.transportType))")
+                                .tag(Optional(dev.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.mini)
+                    .frame(maxWidth: 140)
+                    .accessibilityIdentifier("calibrationMicPicker")
+                }
+            }
+            // Per-status caption (result or error). Tap to dismiss.
+            if case let .completed(delta, confidence) = model.calibrationStatus {
+                let sign = delta >= 0 ? "+" : ""
+                let pct = Int((confidence * 100).rounded())
+                Text("Adjusted \(sign)\(delta) ms (confidence \(pct)%) — tap to dismiss")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .onTapGesture { model.dismissCalibrationStatus() }
+            } else if case let .failed(msg) = model.calibrationStatus {
+                Text(msg)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .onTapGesture { model.dismissCalibrationStatus() }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+    }
+
+    private var autoCalibrateLabel: String {
+        switch model.calibrationStatus {
+        case .idle:                  return "Auto-calibrate"
+        case .requestingPermission:  return "Asking…"
+        case .running:               return "Calibrating…"
+        case .completed:             return "Auto-calibrate"
+        case .failed:                return "Auto-calibrate"
+        }
+    }
+
+    private var autoCalibrateDisabled: Bool {
+        switch model.calibrationStatus {
+        case .running, .requestingPermission: return true
+        default: return false
+        }
+    }
+
+    private var micPickerBinding: Binding<AudioDeviceID?> {
+        Binding(
+            get: { model.selectedMicID },
+            set: { model.setSelectedMic($0) }
+        )
     }
 
     /// Single-line live debug strip — visible to the user, lets us diagnose

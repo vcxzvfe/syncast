@@ -12,6 +12,44 @@ private struct EnabledLocalOutput {
     let name: String
 }
 
+/// Injects `CalibrationSession.clickPulse` samples into the live SCK
+/// ringBuffer so they ride through the existing whole-home audio path.
+/// AirPlay receivers play the click after their PTP latency; local
+/// bridges play it after the broadcaster's delay-line. The mic in
+/// `CalibrationRunner` measures the per-output arrival time so we can
+/// compute the delta needed to align them.
+///
+/// We deliberately race with SCK's own write thread on this ring rather
+/// than pause SCK for calibration — the click is a 10 ms transient
+/// every couple seconds, the worst case is a single chunk of garbled
+/// audio in the user's actual playback (recoverable, barely audible),
+/// vs. interrupting their audio entirely. Acceptable for v1 calibration.
+private struct RingBufferClickEmitter: ClickEmitter {
+    let ringBuffer: RingBuffer
+
+    func emit(samples: [[Float]], at anchorNs: UInt64) async {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if anchorNs > nowNs {
+            try? await Task.sleep(nanoseconds: anchorNs - nowNs)
+        }
+        guard samples.count >= 2,
+              !samples[0].isEmpty,
+              samples[0].count == samples[1].count
+        else { return }
+        let frames = samples[0].count
+        samples[0].withUnsafeBufferPointer { ch0 in
+            samples[1].withUnsafeBufferPointer { ch1 in
+                let ptrArray: [UnsafePointer<Float>] = [
+                    ch0.baseAddress!, ch1.baseAddress!,
+                ]
+                ptrArray.withUnsafeBufferPointer { ptrs in
+                    ringBuffer.write(channels: ptrs.baseAddress!, frames: frames)
+                }
+            }
+        }
+    }
+}
+
 /// The Router is the top-level coordinator: it owns the capture, the ring
 /// buffer, the local outputs, and the IPC client to the sidecar. The view
 /// layer talks to this actor; CoreAudio threads talk to its members directly.
@@ -294,6 +332,101 @@ public actor Router {
             "format": "pcm_s16le",
         ])
         try audioWriter.start()
+    }
+
+    // MARK: - Auto-calibration
+    //
+    // Plays brief click pulses through the live whole-home audio path
+    // (SCK ringBuffer → AudioSocketWriter → sidecar → both AirPlay and
+    // local-bridge fan-outs) and listens via the chosen microphone to
+    // measure the relative arrival time at each output. Returns a
+    // signed *delta* (in ms) the caller should ADD to the current
+    // `airplayDelayMs` to align local bridges with the slowest AirPlay
+    // receiver.
+    //
+    // Note on click injection: we write directly to `sckCapture.ringBuffer`
+    // from a Task that races with SCK's own write thread. The ring's
+    // "single-writer" invariant is technically violated, but the click
+    // is a 10 ms burst once every couple seconds — even if it interleaves
+    // with an SCK callback, the resulting glitch is at most a single
+    // chunk, recoverable, and irrelevant for cross-correlation peak
+    // detection. Pausing SCK for calibration would interrupt user audio,
+    // which is worse UX. Acceptable for v1.
+    public struct CalibrationDelta: Sendable {
+        public let deltaMs: Int               // signed; ADD to current airplayDelayMs
+        public let confidence: Double         // 0.0–1.0
+        public let perDeviceOffsetMs: [String: Int]
+    }
+
+    public enum CalibrationFailure: Error {
+        case noEnabledDevices
+        case engineFailed(String)
+    }
+
+    public func runCalibration(
+        devices: [Device],
+        microphoneDeviceID: AudioDeviceID?,
+        pulseCount: Int = 5
+    ) async throws -> CalibrationDelta {
+        // Filter to outputs the user has enabled. Unprefixed deviceIDs are
+        // hex strings like "13a454c4" so CalibrationRunner's
+        // string-prefix classifier wouldn't recognise them as airplay/local.
+        // We prefix them here at the boundary so the runner classifies
+        // correctly; the unprefixed id is preserved as the suffix for the
+        // result map, which the caller can de-prefix.
+        let enabled = devices.filter { routing[$0.id]?.enabled == true }
+        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
+
+        let prefixedIDs = enabled.map { dev -> String in
+            switch dev.transport {
+            case .airplay2: return "airplay:\(dev.id)"
+            case .coreAudio: return "local:\(dev.id)"
+            }
+        }
+
+        let emitter = RingBufferClickEmitter(ringBuffer: sckCapture.ringBuffer)
+        let runner = CalibrationRunner(microphoneDeviceID: microphoneDeviceID)
+        do {
+            let result = try await runner.run(
+                emitClicksVia: emitter,
+                deviceIDs: prefixedIDs,
+                pulseCount: pulseCount
+            )
+
+            // Recompute the delta ourselves so we can express NEGATIVE
+            // corrections (delay-line currently too high). The runner's
+            // recommendedDelayMs is clamped to non-negative which is
+            // wrong for our use case: if local plays AFTER AirPlay,
+            // we need to REDUCE the delay-line, not zero it.
+            let airplayMax = result.perDeviceOffsetMs
+                .filter { $0.key.hasPrefix("airplay:") }.values.max()
+            let localMax = result.perDeviceOffsetMs
+                .filter { $0.key.hasPrefix("local:") }.values.max()
+            let delta: Int = {
+                switch (airplayMax, localMax) {
+                case let (a?, l?): return a - l
+                default:           return 0   // missing one side ⇒ no signal
+                }
+            }()
+
+            // Strip the prefix from the per-device map so callers see the
+            // original device IDs.
+            var stripped: [String: Int] = [:]
+            for (k, v) in result.perDeviceOffsetMs {
+                if let colon = k.firstIndex(of: ":") {
+                    stripped[String(k[k.index(after: colon)...])] = v
+                } else {
+                    stripped[k] = v
+                }
+            }
+            return CalibrationDelta(
+                deltaMs: delta,
+                confidence: result.confidence,
+                perDeviceOffsetMs: stripped
+            )
+        } catch {
+            throw CalibrationFailure.engineFailed("\(error)")
+        }
     }
 
     /// Diagnostic: how many SCK audio sample buffers have been processed?

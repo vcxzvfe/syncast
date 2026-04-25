@@ -814,6 +814,89 @@ final class AppModel {
         setAirplayDelay(AppModel.defaultAirplayDelayMs)
     }
 
+    // MARK: - Auto-calibration UI flow
+    //
+    // Pipeline: ensure mic permission → call Router.runCalibration →
+    // apply returned delta to airplayDelayMs (which already pushes via
+    // the debounced setter, including persistence). We surface progress
+    // and completion via the `calibrationStatus` enum so the popover
+    // can show a spinner / result text.
+
+    enum CalibrationStatus: Equatable, Sendable {
+        case idle
+        case requestingPermission
+        case running
+        case completed(deltaMs: Int, confidence: Double)
+        case failed(String)
+    }
+
+    var calibrationStatus: CalibrationStatus = .idle
+
+    /// Kick off auto-calibration. Safe to call from the main actor on a
+    /// button tap. Uses `effectiveMicID` (W3) as the input device.
+    func runAutoCalibrate() async {
+        guard mode == .wholeHome else {
+            calibrationStatus = .failed("Switch to whole-home mode first")
+            return
+        }
+        guard streamingState == .running else {
+            calibrationStatus = .failed("Audio capture isn't running")
+            return
+        }
+        // Permission gate. AVCaptureDevice never re-prompts after a deny,
+        // so on .denied we tell the user to open System Settings.
+        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch auth {
+        case .denied, .restricted:
+            calibrationStatus = .failed(
+                "Microphone access denied — open System Settings → Privacy → Microphone"
+            )
+            return
+        case .notDetermined:
+            calibrationStatus = .requestingPermission
+            let granted = await requestMicrophonePermission()
+            if !granted {
+                calibrationStatus = .failed("Microphone access not granted")
+                return
+            }
+        case .authorized:
+            break
+        @unknown default:
+            calibrationStatus = .failed("Unexpected microphone permission state")
+            return
+        }
+
+        calibrationStatus = .running
+        let snapshot = devices  // immutable Sendable copy
+        let micID = effectiveMicID
+        do {
+            let delta = try await router.runCalibration(
+                devices: snapshot,
+                microphoneDeviceID: micID,
+                pulseCount: 5
+            )
+            // Apply as a *delta* on top of the current value. The
+            // CalibrationRunner returns the signed correction needed:
+            // positive means local plays earlier than AirPlay (need
+            // more delay-line); negative means local plays after AirPlay
+            // (need less). Both are clamped by setAirplayDelay's range.
+            let next = airplayDelayMs + delta.deltaMs
+            setAirplayDelay(next)
+            calibrationStatus = .completed(
+                deltaMs: delta.deltaMs,
+                confidence: delta.confidence,
+            )
+        } catch {
+            calibrationStatus = .failed("\(error)")
+        }
+    }
+
+    /// Clear a non-idle status. Bound to the popover's "Dismiss" button
+    /// on completed/failed states.
+    func dismissCalibrationStatus() {
+        calibrationStatus = .idle
+    }
+
     /// Devices the user can plausibly target. Excludes:
     ///   - BlackHole (virtual capture sink — routing audio TO it could
     ///     feedback into our SCK capture path).
