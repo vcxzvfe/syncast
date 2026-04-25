@@ -112,15 +112,29 @@ class DeviceManager:
                 jsonrpc.CAPABILITY_UNSUPPORTED,
                 f"unsupported transport: {transport}",
             )
+        host = params["host"]
+        port = int(params.get("port", 7000))
+        name = params.get("name", device_id)
         async with self._get_lock():
-            if device_id in self._devices:
-                raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_id already exists")
+            existing = self._devices.get(device_id)
+            if existing is not None:
+                # Idempotent re-register. The Swift menubar's `pushAirplayState`
+                # is called on every `reconcileEngine`, which can fire dozens
+                # of times per second when the user mashes toggle rows.
+                # Treat re-registration as an upsert: refresh host/port/name
+                # in place and return success. Do NOT raise — the prior
+                # "device_id already exists" error spammed the warning log
+                # 100s of times per session.
+                existing.host = host
+                existing.port = port
+                existing.name = name
+                return {"connected": True, "reported_latency_ms": 1800}
             dev = Device(
                 id=device_id,
                 transport=transport,
-                host=params["host"],
-                port=int(params.get("port", 7000)),
-                name=params.get("name", device_id),
+                host=host,
+                port=port,
+                name=name,
                 state="added",
             )
             self._devices[device_id] = dev
@@ -197,6 +211,19 @@ class DeviceManager:
     # ---------- internals ----------
 
     async def _ensure_owntone(self) -> None:
+        # Health check: if we have a backend but the child died (crash,
+        # OOM, external SIGTERM), drop the stale reference so we respawn.
+        # Symptom this guards against: after one streaming session, OwnTone
+        # exits, sidecar still holds the dead Popen handle, the next
+        # `stream.start` calls play_pipe → urlopen fails → audio is silent.
+        if self._owntone is not None and not self._owntone.is_alive():
+            logger.warning("owntone_dead_will_respawn")
+            # Drop fd / state but don't await stop() — proc is already gone.
+            self._owntone = None
+            # Reset every device's owntone_output_id; OwnTone reassigns
+            # them on each launch, so the cached IDs are stale.
+            for dev in self._devices.values():
+                dev.owntone_output_id = None
         if self._owntone is not None:
             return
         try:
