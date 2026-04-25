@@ -141,12 +141,14 @@ final class AppModel {
                     else         { await router.disable(deviceID: id) }
                     await router.setRouting(r)
                 }
+                await pushAirplayState()
                 streamingState = .running
             } catch {
                 lastError = "\(error)"
                 streamingState = .error
             }
         case (.running, false):
+            await router.setActiveAirplayDevices([])
             await router.stop()
             streamingState = .idle
         case (.running, true):
@@ -154,9 +156,29 @@ final class AppModel {
             for (_, r) in routing {
                 await router.setRouting(r)
             }
+            await pushAirplayState()
         default:
             break
         }
+    }
+
+    /// Sync the enabled AirPlay devices over to the sidecar / OwnTone.
+    private func pushAirplayState() async {
+        let enabledAirplay = devices.filter {
+            $0.transport == .airplay2 && (routing[$0.id]?.enabled ?? false)
+        }
+        for dev in enabledAirplay {
+            await router.registerAirplayDevice(
+                id: dev.id,
+                name: dev.name,
+                host: dev.host ?? "",
+                port: dev.port ?? 7000
+            )
+            if let r = routing[dev.id] {
+                await router.setAirplayVolume(id: dev.id, volume: r.volume)
+            }
+        }
+        await router.setActiveAirplayDevices(enabledAirplay.map { $0.id })
     }
 
     // MARK: - Intents

@@ -145,6 +145,58 @@ public actor Router {
         }
     }
 
+    /// Tell the sidecar about an AirPlay 2 device. Idempotent — re-adding
+    /// the same device is a no-op on the sidecar side (returns
+    /// `device_id already exists`, which we swallow).
+    public func registerAirplayDevice(id: String, name: String, host: String, port: Int) async {
+        guard let ipc else { return }
+        do {
+            _ = try await ipc.call("device.add", params: [
+                "device_id": id,
+                "transport": "airplay2",
+                "host": host,
+                "port": port,
+                "name": name,
+            ])
+        } catch {
+            // INVALID_PARAMS = already exists. Ignore.
+        }
+    }
+
+    /// Set per-device volume for an AirPlay device on the sidecar.
+    public func setAirplayVolume(id: String, volume: Float) async {
+        guard let ipc else { return }
+        _ = try? await ipc.call("device.set_volume", params: [
+            "device_id": id,
+            "volume": Double(volume),
+        ])
+    }
+
+    /// Enabled AirPlay device IDs that should be in the active stream.
+    /// Calling this with an empty list stops the AirPlay stream.
+    public func setActiveAirplayDevices(_ ids: [String]) async {
+        guard let ipc else { return }
+        if ids.isEmpty {
+            _ = try? await ipc.call("stream.stop", params: [:])
+            audioWriter?.stop()
+            return
+        }
+        // Anchor time = "now + master delay" so OwnTone can align.
+        let anchor = Clock.nowNs() + UInt64(measuredAirplayLatencyMs) * 1_000_000
+        do {
+            _ = try await ipc.call("stream.start", params: [
+                "device_ids": ids,
+                "anchor_time_ns": Int(anchor),
+                "sample_rate": 48_000,
+                "channels": 2,
+                "format": "pcm_s16le",
+            ])
+            try audioWriter?.start()
+        } catch {
+            lastError = "stream.start: \(error)"
+        }
+    }
+
     private func replan() {
         var latencies: [Scheduler.DeviceLatency] = []
         for (id, _) in localOutputs {
