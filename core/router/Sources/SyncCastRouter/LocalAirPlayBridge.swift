@@ -62,13 +62,19 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     public let deviceID: AudioObjectID
     public let deviceUID: String
     public let socketPath: URL
-    /// Bridge feed format. Hardcoded by OwnTone's fifo output module
-    /// (build/owntone-server/src/outputs/fifo.c:64). DO NOT change without
-    /// also reconciling the sidecar's broadcaster framing.
-    public let inboundSampleRate: Double = 44_100
+    /// Bridge feed format. After the sidecar tee refactor (~b0543d5
+    /// follow-up), we no longer use OwnTone's fifo OUTPUT module —
+    /// instead the sidecar tees Swift's native PCM (matching
+    /// `AudioSocketWriter`'s wire format at SCKCapture's sample rate)
+    /// directly to bridge clients. So sample rate is now 48 kHz with
+    /// 480-frame packets (= 1920 bytes s16le 2ch). Opening AUHAL at
+    /// 48 kHz also skips CoreAudio's resampler.
+    public let inboundSampleRate: Double = 48_000
     public let channelCount: Int = 2
-    /// OwnTone fifo packet size, see fifo.c:41.
-    public let packetBytes: Int = 1408
+    /// 480 frames * 2 channels * 2 bytes = 1920 bytes per packet.
+    /// Same as Swift's `AudioSocketWriter.frameCount` (480) at
+    /// 48 kHz — matches the wire format the sidecar tees.
+    public let packetBytes: Int = 1920
 
     /// Internal ring buffer: ~200 ms of 44.1 kHz stereo, rounded up to
     /// the next power of two for cheap modulo arithmetic in
@@ -137,8 +143,10 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         placeholder.initialize(to: 0)
         ptrs.initialize(repeating: placeholder, count: 2)
         self.outPtrs = ptrs
-        // 352 frames per OwnTone packet (1408 B / 4 B-per-frame).
-        let framesPerPacket = 1408 / (2 * MemoryLayout<Int16>.size)
+        // 480 frames per Swift packet (1920 B / 4 B-per-frame for s16 stereo).
+        // Matches the sidecar tee's per-packet framing at 48 kHz, which in
+        // turn matches Swift's AudioSocketWriter.frameCount.
+        let framesPerPacket = 1920 / (2 * MemoryLayout<Int16>.size)
         self.scratchFramesPerPacket = framesPerPacket
         let scratch: [UnsafeMutablePointer<Float>] = (0..<2).map { _ in
             let p = UnsafeMutablePointer<Float>.allocate(capacity: framesPerPacket)
