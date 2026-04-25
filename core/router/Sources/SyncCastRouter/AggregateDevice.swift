@@ -65,6 +65,23 @@ public final class AggregateDevice {
     public let deviceID: AudioObjectID
     public let masterUID: String
     public let subDeviceUIDs: [String]
+
+    /// Per-instance snapshot of the volume each physical device had BEFORE
+    /// this aggregate first wrote to it. SyncCast writes
+    /// `kAudioDevicePropertyVolumeScalar` directly to the underlying DAC
+    /// (the aggregate doesn't intercept it), so the user-set system
+    /// volume persists across SyncCast quit unless we restore it. The
+    /// user is an audio engineer; they will hate finding their MBP
+    /// speaker stuck at whatever SyncCast last wrote.
+    ///
+    /// Keyed by physical-device UID so a hot-plug doesn't confuse the
+    /// snapshot. Values are per-element scalars covering both element 0
+    /// (master, when settable) and per-channel elements 1..N. Captured
+    /// once on the first write per session; subsequent writes don't
+    /// overwrite. Restored in `destroy()`.
+    private let originalVolumesLock = OSAllocatedUnfairLock()
+    private var originalVolumes:
+        [String: [AudioObjectPropertyElement: Float]] = [:]
     /// The channel count AUHAL must declare on its input scope to match
     /// what the aggregate's output stream actually exposes.
     ///
@@ -261,7 +278,32 @@ public final class AggregateDevice {
     /// Idempotent. Safe to call multiple times — only the first call asks
     /// CoreAudio to actually destroy. After this returns, `deviceID` is no
     /// longer a valid AudioObject.
+    ///
+    /// Best-effort volume restoration: every physical device we touched
+    /// via `setSubdeviceVolume` has its pre-SyncCast volume restored
+    /// before destroy. The restore is silent on failure (device may have
+    /// been unplugged between snapshot and destroy) — leaving the user's
+    /// MBP speaker stuck at whatever SyncCast last wrote would be much
+    /// worse than a single missed restore.
     public func destroy() {
+        // Take and clear the snapshot atomically — this guarantees the
+        // restore runs at most once even if destroy is called twice.
+        let snapshots: [String: [AudioObjectPropertyElement: Float]] =
+            originalVolumesLock.withLock {
+                let captured = originalVolumes
+                originalVolumes.removeAll()
+                return captured
+            }
+        for (uid, perElement) in snapshots {
+            // Resolve UID → physical AudioObjectID at restore time, NOT
+            // at snapshot time. The user might have hot-plugged a USB
+            // DAC and gotten a new AudioObjectID; UID is stable, ID is
+            // not. If the device is gone we silently skip.
+            guard let physicalID = try? Self.deviceIDForUID(uid) else { continue }
+            for (element, volume) in perElement {
+                _ = Self.writeVolume(physicalID, element: element, volume: volume)
+            }
+        }
         // Snapshot to avoid double-destroy from a deinit-after-explicit
         // call race.
         let id = self.deviceID
@@ -641,7 +683,74 @@ public final class AggregateDevice {
         } catch {
             return false
         }
+        // Snapshot the current per-element volumes BEFORE the first write
+        // of this session, so destroy() can restore the user's original
+        // levels. Keyed by UID so hot-plugs (which can change AudioObjectID)
+        // don't lose the snapshot.
+        snapshotOriginalVolumesIfNeeded(uid: uid, physicalID: physicalID)
         return Self.applyHardwareVolume(physicalID: physicalID, volume: clamped)
+    }
+
+    /// First-write-only snapshot of the per-element volume scalars for the
+    /// given physical device. Subsequent calls are no-ops. Captures every
+    /// element our writer would target — element 0 (if writable) and
+    /// elements 1..N up to the early-bail threshold used in
+    /// `applyHardwareVolume`. Tolerant of read failures: an element we
+    /// can't read won't be restored, which matches the best-effort
+    /// contract documented on `destroy()`.
+    private func snapshotOriginalVolumesIfNeeded(
+        uid: String,
+        physicalID: AudioObjectID
+    ) {
+        let alreadyCaptured = originalVolumesLock.withLock {
+            originalVolumes[uid] != nil
+        }
+        if alreadyCaptured { return }
+
+        var snapshot: [AudioObjectPropertyElement: Float] = [:]
+        if Self.isVolumeWritable(physicalID, element: 0),
+           let v = Self.readVolumeScalar(physicalID, element: 0) {
+            snapshot[0] = v
+        }
+        var consecutiveMisses = 0
+        for elem in 1...32 {
+            let element = AudioObjectPropertyElement(elem)
+            if Self.isVolumeWritable(physicalID, element: element) {
+                if let v = Self.readVolumeScalar(physicalID, element: element) {
+                    snapshot[element] = v
+                }
+                consecutiveMisses = 0
+            } else {
+                consecutiveMisses += 1
+                if consecutiveMisses >= 4 { break }
+            }
+        }
+        let frozen = snapshot
+        originalVolumesLock.withLock {
+            // Re-check inside the lock — concurrent first writes could
+            // race; first one wins.
+            if originalVolumes[uid] == nil {
+                originalVolumes[uid] = frozen
+            }
+        }
+    }
+
+    /// Read `kAudioDevicePropertyVolumeScalar` on a (device, element).
+    /// Returns nil if the property doesn't exist or read fails.
+    private static func readVolumeScalar(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement
+    ) -> Float? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return nil }
+        var value: Float = 0
+        var size = UInt32(MemoryLayout<Float>.size)
+        let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value)
+        return status == noErr ? value : nil
     }
 
     /// Per-physical-device cache of writable volume elements, populated
