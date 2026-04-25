@@ -202,8 +202,21 @@ public final class AudioSocketWriter: @unchecked Sendable {
             if nextRead < 0 { nextRead = max(0, writePos - Int64(frameCount)) }
 
             if writePos - nextRead < Int64(frameCount) {
+                // Underrun: ring doesn't have a full packet's worth of
+                // unread frames yet. Emit silence so the AirPlay receiver
+                // keeps its playout clock locked, but do NOT advance
+                // `nextRead` — the frames were never consumed and are
+                // still going to land in the ring shortly. Advancing here
+                // strands `nextRead` permanently AHEAD of `writePos`:
+                // SCK delivers in jittery ~10ms callbacks of variable
+                // size (sometimes 480 frames, sometimes 1024), and any
+                // single underrun would shift `nextRead` past the next
+                // SCK arrival, turning ONE missed callback into perpetual
+                // silence for the rest of the session. Symptom in the
+                // wild: airplayWriter=pkts:142 underrun:141 (99% silence
+                // on the wire) and AirPlay receivers playing one initial
+                // burst then going silent forever.
                 for i in 0..<packet.count { packet[i] = 0 }
-                nextRead &+= Int64(frameCount)
                 underrunPackets &+= 1
             } else {
                 let outPtrs = planar.indices.map { i in
