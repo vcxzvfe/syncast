@@ -146,14 +146,17 @@ class ControlServer:
             result = await handler(req.params)
             if req_id is not None:
                 writer.write(jsonrpc.encode_result(req_id, result))
+                await writer.drain()
         except jsonrpc.RpcError as e:
-            logger.warning("rpc_error", extra={"code": e.code, "msg": e.message})
+            logger.warning("rpc_error", extra={"code": e.code, "err_msg": e.message})
             writer.write(jsonrpc.encode_error(req_id, e))
+            await writer.drain()
         except Exception as e:  # noqa: BLE001
             logger.exception("handler_crash")
             writer.write(jsonrpc.encode_error(
                 req_id, jsonrpc.RpcError(jsonrpc.INTERNAL_ERROR, str(e)),
             ))
+            await writer.drain()
 
     # ---- handlers ----
 

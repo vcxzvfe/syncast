@@ -80,7 +80,7 @@ cp "$OWNTONE_BIN_SRC" "$OWNTONE_DIR/owntone"
 "$REPO_ROOT/scripts/_bundle-dylibs.sh" \
     "$OWNTONE_DIR/owntone" \
     "$FW_DIR" \
-    "@executable_path/../Frameworks"
+    "@executable_path/../../Frameworks"
 
 # Ship libinotify + the OwnTone resource files (htdocs, default config).
 if [[ -d "$OWNTONE_PREFIX/usr/share/owntone" ]]; then

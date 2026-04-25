@@ -92,13 +92,20 @@ public actor IpcClient {
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         var line = Data(); line.append(data); line.append(0x0a)
-        // Send the bytes BEFORE installing the continuation. If the write
-        // fails we throw without leaving a dangling pending entry, and the
-        // continuation only suspends on the response — it never owns the
-        // blocking write.
-        try writeAll(line)
+        // Register the continuation FIRST, then write. If we wrote first
+        // and the sidecar replied before we got back to register the
+        // continuation, dispatchLine would see pending[id] empty and
+        // drop the response — leaving call() hung forever. This is a
+        // real race we hit on local Unix sockets where round-trip is
+        // sub-millisecond.
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any, Error>) in
             self.pending[id] = cont
+            do {
+                try self.writeAll(line)
+            } catch {
+                self.pending.removeValue(forKey: id)
+                cont.resume(throwing: error)
+            }
         }
     }
 
