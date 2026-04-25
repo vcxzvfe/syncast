@@ -303,6 +303,17 @@ library {{
   port = {self.rest_port}
   directories = {{ "{media}" }}
   pipe_autostart = true
+  # CRITICAL: must match the rate the Swift side writes into the FIFO.
+  # SCKCapture delivers system audio at 48 kHz, AudioSocketWriter
+  # converts Float32 → s16le and sends it through the unix socket to
+  # the FIFO unchanged at 48 kHz. If pipe_sample_rate stayed at
+  # OwnTone's 44100 default, OwnTone would interpret the same bytes
+  # as a 44.1 kHz stream — pitched up 8.8% AND the rate-of-arrival
+  # vs rate-of-consumption mismatch would build a backlog that
+  # surfaces as audible stutter on the AirPlay receiver. User
+  # observed exactly that: "卡顿以及非常低质量音频的感觉" on
+  # Xiaomi Sound after the FIFO retry fix landed.
+  pipe_sample_rate = 48000
 }}
 """
         self.config_path.write_text(cfg, encoding="utf-8")
