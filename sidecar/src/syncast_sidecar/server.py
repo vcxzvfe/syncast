@@ -7,11 +7,13 @@ control clients — the router owns this sidecar.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import __version__, jsonrpc, log
+from .audio_socket import MAX_LOCAL_FIFO_DELAY_MS
 from .device_manager import DeviceManager
 
 logger = log.get("sidecar.server")
@@ -280,8 +282,15 @@ class ControlServer:
         the caller can re-render the UI from the canonical state.
         """
         raw = params.get("delay_ms")
-        if not isinstance(raw, (int, float)):
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             raise jsonrpc.RpcError(
                 jsonrpc.INVALID_PARAMS, "delay_ms must be a number",
             )
-        return self._devices.set_local_fifo_delay_ms(int(raw))
+        # bool is a subclass of int — exclude explicitly above so True/False
+        # don't sneak through as 1/0.
+        if math.isnan(raw) or math.isinf(raw):
+            raise jsonrpc.RpcError(
+                jsonrpc.INVALID_PARAMS, "delay_ms must be a finite number",
+            )
+        clamped = max(0, min(int(raw), MAX_LOCAL_FIFO_DELAY_MS))
+        return self._devices.set_local_fifo_delay_ms(clamped)

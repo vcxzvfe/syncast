@@ -56,10 +56,22 @@ public final class AudioSocketWriter: @unchecked Sendable {
         // await checkpoint. Two concurrent writers each pacing at 100/s
         // showed up downstream as 200+/s on the wire, overflowing the
         // 8 KB kernel pipe and corrupting s16le framing.
-        let active = lock.withLock { writerActive }
-        if active { return }
-        try connect()
-        lock.withLock { writerActive = true }
+        //
+        // Reservation is a single compare-and-set under `lock` so the
+        // check-and-claim is atomic. On connect() failure we clear the
+        // flag before re-throwing.
+        let didReserve = lock.withLock { () -> Bool in
+            guard !writerActive else { return false }
+            writerActive = true
+            return true
+        }
+        guard didReserve else { return }
+        do {
+            try connect()
+        } catch {
+            lock.withLock { writerActive = false }
+            throw error
+        }
         task = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runLoop()
             guard let self else { return }

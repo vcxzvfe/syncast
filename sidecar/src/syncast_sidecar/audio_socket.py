@@ -65,6 +65,15 @@ LOCAL_FIFO_CLIENT_SNDBUF = 16 * 1024
 # the SAME audio at the SAME wall-clock instant. Tuned empirically.
 DEFAULT_LOCAL_FIFO_DELAY_MS = 1750
 
+# Hard upper bound. Caller-supplied values larger than this are clamped
+# down. This protects the bounded-queue overflow check from losing
+# precision when `delay_seconds + LOCAL_FIFO_OVERFLOW_MARGIN_S` becomes
+# indistinguishable from `delay_seconds` due to floating-point precision
+# at extreme magnitudes — without the cap, a malicious or buggy caller
+# passing 1e308 would defeat the safety valve and accumulate packets
+# without bound. 10 s is far above any plausible AirPlay PTP latency.
+MAX_LOCAL_FIFO_DELAY_MS = 10_000
+
 # Overflow tolerance: if the delay queue accumulates more than
 # `delay + this margin` worth of pending audio, drop the OLDEST packets.
 # At 100 pkt/s input this should never trip; it's purely a safety valve
@@ -76,6 +85,12 @@ LOCAL_FIFO_OVERFLOW_MARGIN_S = 0.5
 # longer than this — keeps `stop_event` responsiveness sub-100ms even
 # when the queue is empty or the next due-time is far in the future.
 LOCAL_FIFO_PUMP_WAIT_CAP_S = 0.1
+
+# Maximum number of concurrent broadcaster clients. There's exactly one
+# bridge per active local CoreAudio output, so a few is plenty; this cap
+# keeps a buggy or runaway local process from exhausting fds before the
+# system's per-process limit.
+MAX_BROADCASTER_CLIENTS = 16
 
 
 class AudioSocketReader:
@@ -153,7 +168,15 @@ class AudioSocketReader:
         # `packet_bytes`-sized chunks, and we recv that many bytes per
         # iteration.
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.bind(str(self._path))
+        # Apply restrictive umask BEFORE bind so the kernel atomically
+        # creates the socket file with mode 0600. The subsequent chmod
+        # is defense-in-depth in case a filesystem layer didn't honor
+        # the umask (network-mounted /tmp, FUSE mounts, etc.).
+        old_umask = os.umask(0o177)
+        try:
+            s.bind(str(self._path))
+        finally:
+            os.umask(old_umask)
         os.chmod(self._path, 0o600)
         s.listen(1)
         self._listen_sock = s
@@ -378,9 +401,17 @@ class LocalFifoBroadcaster:
                 for c in self._clients
             ]
         with self._delay_cond:
+            # Read all delay-line state under the same lock that gates
+            # writes to it. Pulling `chunks_dropped_due_to_overflow` and
+            # `_actual_delivery_lag_ms` outside the lock would risk torn
+            # reads on platforms where these aren't single machine-word
+            # atomics — pragmatic on CPython today, but enforcing the
+            # locking discipline keeps us safe on PyPy / alternative
+            # interpreters and against future refactors.
             pending_packets = len(self._delay_queue)
             delay_ms = int(round(self._delay_seconds * 1000.0))
             actual_lag_ms = self._actual_delivery_lag_ms
+            chunks_dropped = self.chunks_dropped_due_to_overflow
         return {
             "bytes_broadcast": self.bytes_broadcast,
             "chunks_broadcast": self.chunks_broadcast,
@@ -389,9 +420,7 @@ class LocalFifoBroadcaster:
             "per_client": per_client,
             "delay_ms": delay_ms,
             "pending_packets": pending_packets,
-            "chunks_dropped_due_to_overflow": (
-                self.chunks_dropped_due_to_overflow
-            ),
+            "chunks_dropped_due_to_overflow": chunks_dropped,
             "actual_delivery_lag_ms": actual_lag_ms,
         }
 
@@ -501,7 +530,14 @@ class LocalFifoBroadcaster:
             except OSError:
                 pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.bind(str(self._socket_path))
+        # Same umask-then-chmod pattern as AudioSocketReader._listen.
+        # Eliminates the bind-then-chmod TOCTOU window where the
+        # socket file briefly exists with permissive mode.
+        old_umask = os.umask(0o177)
+        try:
+            s.bind(str(self._socket_path))
+        finally:
+            os.umask(old_umask)
         os.chmod(self._socket_path, 0o600)
         # Backlog of 4 is plenty: there's at most one bridge per
         # CoreAudio output, and the menubar typically toggles them one at
@@ -553,6 +589,26 @@ class LocalFifoBroadcaster:
             except OSError:
                 # Listener was closed by stop(); exit cleanly.
                 return
+            # Cap concurrent clients. There's exactly one bridge per
+            # active local CoreAudio output, so MAX_BROADCASTER_CLIENTS
+            # is well above any plausible legitimate count. This guard
+            # prevents a buggy/runaway local process from exhausting fds
+            # before we hit the per-process limit.
+            with self._clients_lock:
+                current_count = len(self._clients)
+            if current_count >= MAX_BROADCASTER_CLIENTS:
+                logger.warning(
+                    "local_fifo_client_rejected_cap",
+                    extra={
+                        "clients": current_count,
+                        "cap": MAX_BROADCASTER_CLIENTS,
+                    },
+                )
+                try:
+                    client_sock.close()
+                except OSError:
+                    pass
+                continue
             try:
                 # Smallish send buffer so a slow client surfaces as EAGAIN
                 # quickly rather than building a multi-second backlog.
@@ -647,7 +703,11 @@ class LocalFifoBroadcaster:
             logger.exception("local_fifo_broadcast_failed")
         # Update the lag scalar even on the synchronous path so the
         # diagnostic dict is meaningful when delay is toggled at runtime.
-        self._actual_delivery_lag_ms = (time.monotonic() - now) * 1000.0
+        # Hold `_delay_cond` so concurrent `diagnostics()` readers see
+        # a consistent value (matches HIGH-3 review finding).
+        lag = (time.monotonic() - now) * 1000.0
+        with self._delay_cond:
+            self._actual_delivery_lag_ms = lag
 
     def _run_broadcaster(self) -> None:
         """Idle thread placeholder.
@@ -721,18 +781,25 @@ class LocalFifoBroadcaster:
                         self._delay_cond.wait(timeout=sleep_for)
                     continue
             # Releasable items are dispatched outside the cond lock so
-            # a slow `_broadcast` send doesn't block `feed()`.
+            # a slow `_broadcast` send doesn't block `feed()`. We also
+            # check `stop_event` between items so a large `ready` batch
+            # (e.g. after a multi-second GIL stall) cannot keep the pump
+            # thread inside this loop past `stop()`'s 2 s join budget.
             for due, enq, packet in ready:
+                if self._stop_event.is_set():
+                    break
                 try:
                     self._broadcast(packet)
                 except Exception:  # noqa: BLE001
                     logger.exception("local_fifo_broadcast_failed")
                 # Lag = how long the packet actually spent in flight,
                 # from feed() to here. Should be very close to the
-                # configured delay_ms in steady state.
-                self._actual_delivery_lag_ms = (
-                    time.monotonic() - enq
-                ) * 1000.0
+                # configured delay_ms in steady state. Take the
+                # cond lock for the write so concurrent `diagnostics()`
+                # readers see a consistent value (matches HIGH-3 fix).
+                lag = (time.monotonic() - enq) * 1000.0
+                with self._delay_cond:
+                    self._actual_delivery_lag_ms = lag
 
     def _broadcast(self, packet: bytes) -> None:
         """Send one OwnTone packet to every connected client.
