@@ -79,6 +79,26 @@ public actor Router {
     private var aggregateStreamDiagnostic: AggregateDevice.StreamDiagnostic?
     private var routing: [String: DeviceRouting] = [:]
     private var measuredAirplayLatencyMs: Int = 1800
+    /// Per-session set of subdevice UIDs we've already logged the
+    /// "hardware volume rejected" warning for. Each UID logs ONCE,
+    /// then goes silent — many DP / HDMI displays expose no writable
+    /// VolumeScalar on any element, so without this gate the log
+    /// would emit on every single replan (every slider drag) and
+    /// drown out every other diagnostic. The diagnostic report can
+    /// inspect `aggregateHwVolumeRejectionCounts` to surface the
+    /// total rejection count per UID without spamming stderr.
+    private var loggedHwVolumeRejectionUIDs: Set<String> = []
+    /// Total number of rejected hardware-volume writes per UID this
+    /// session. Incremented on every rejection regardless of whether
+    /// we logged. Surfaced through `diagnosticSCKReport()` so a
+    /// support ticket can show "we tried 47 times, never accepted".
+    private var aggregateHwVolumeRejectionCounts: [String: Int] = [:]
+    /// Per-session set of subdevice UIDs whose hardware volume is
+    /// known unsupported (a write attempt returned false at least
+    /// once). Future replans skip the call into CoreAudio entirely
+    /// and go straight to the software-gain fallback. Cleared on
+    /// teardown so re-plug or device hot-swap gets a fresh probe.
+    private var aggregateHwVolumeUnsupportedUIDs: Set<String> = []
     private var ipc: IpcClient?
     private var audioWriter: AudioSocketWriter?
     /// Whole-home AirPlay mode bridges, keyed by SyncCast device ID.
@@ -293,7 +313,16 @@ public actor Router {
         for (id, b) in localBridges {
             bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) err:\(b.lastError.isEmpty ? "none" : b.lastError)"
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)"
+        // Per-subdevice hardware-volume rejection counters. Surfaced
+        // here because the stderr log emits ONCE per UID per session;
+        // a support ticket needs to see total rejection counts for
+        // any device routed through software-gain fallback (typical:
+        // DP / HDMI displays).
+        var hwVolInfo = ""
+        for (uid, count) in aggregateHwVolumeRejectionCounts {
+            hwVolInfo += " hwVolRejected[\(uid.prefix(6))]=\(count)"
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)\(hwVolInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
@@ -650,6 +679,14 @@ public actor Router {
         aggregateCoveredUIDs = []
         aggregateUIDByDeviceID.removeAll()
         aggregateStreamDiagnostic = nil
+        // Per-session caches that only make sense for the now-defunct
+        // aggregate. A re-plug of a device gets a fresh probe; the
+        // count of past rejections doesn't survive teardown either,
+        // so the diagnostic report reflects only the current session's
+        // active aggregate.
+        loggedHwVolumeRejectionUIDs.removeAll()
+        aggregateHwVolumeRejectionCounts.removeAll()
+        aggregateHwVolumeUnsupportedUIDs.removeAll()
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {
@@ -753,26 +790,100 @@ public actor Router {
 
         // In aggregate mode, also apply per-device HARDWARE volume on
         // the underlying physical DACs. The single AUHAL atop the
-        // aggregate cannot do this — it sees one stream and applies
-        // gain uniformly to every subdevice. Hardware volume bypasses
-        // the AUHAL entirely.
-        if let agg = aggregateDevice {
+        // aggregate cannot natively do this — it sees one stream and
+        // applies gain uniformly to every subdevice. Hardware volume
+        // bypasses the AUHAL entirely … but only on devices whose
+        // CoreAudio driver actually exposes
+        // `kAudioDevicePropertyVolumeScalar` as writable.
+        //
+        // DP / HDMI display speakers (the user's PG27UCDM is the
+        // canonical example) DO NOT — there's no hardware path to
+        // control their output level, the user must use the OSD.
+        // For those, we fall back to per-channel-pair software gain
+        // applied at the AUHAL render layer: the splat already writes
+        // the source stereo into every output pair, so attenuating
+        // just the display's pair (e.g. channels 2..3 with master at
+        // channels 0..1) gives the user a working slider without
+        // touching the master's volume. This is digital attenuation,
+        // so very low values lose effective bit depth — that's the
+        // documented quality trade-off the user implicitly accepts
+        // by using a monitor speaker.
+        if let agg = aggregateDevice,
+           let aggOut = localOutputs[agg.aggregateUID] {
             for (devID, uid) in aggregateUIDByDeviceID {
                 let r = routing[devID] ?? DeviceRouting(deviceID: devID)
                 let target = r.muted ? Float(0) : r.volume
-                let ok = agg.setSubdeviceVolume(uid: uid, volume: target)
-                if !ok {
-                    // We log to stderr but don't surface in lastError —
-                    // hardware volume is best-effort. Some devices
-                    // (HDMI, certain pro audio interfaces) refuse all
-                    // software writes; the user just gets uniform
-                    // levels in that case, which is the pre-fix
-                    // behavior, not a regression.
-                    FileHandle.standardError.write(Data(
-                        "[Router] hardware volume rejected for \(uid.prefix(20)) (target=\(target))\n".utf8
-                    ))
-                }
+                applyAggregateSubdeviceVolume(
+                    aggregate: agg,
+                    aggregateOutput: aggOut,
+                    deviceID: devID,
+                    uid: uid,
+                    target: target
+                )
             }
         }
+    }
+
+    /// Apply the user's slider value to one subdevice of the active
+    /// aggregate. Tries hardware volume first; on rejection (or on a
+    /// device that's known unsupported from a prior probe) routes
+    /// through the per-channel-pair software gain on the aggregate's
+    /// AUHAL.
+    ///
+    /// The "known unsupported" cache short-circuits the slow CoreAudio
+    /// probe loop on every replan — without it, every slider drag
+    /// would re-walk 32 elements for the display before falling back,
+    /// which is a several-ms-per-frame UI hitch.
+    private func applyAggregateSubdeviceVolume(
+        aggregate: AggregateDevice,
+        aggregateOutput: LocalOutput,
+        deviceID: String,
+        uid: String,
+        target: Float
+    ) {
+        // Fast-path: we already know this device's hardware volume
+        // is unsupported. Skip the CoreAudio call entirely.
+        let knownUnsupported =
+            aggregateHwVolumeUnsupportedUIDs.contains(uid) ||
+            AggregateDevice.isHardwareVolumeKnownUnsupported(uid: uid)
+        let hwOk: Bool
+        if knownUnsupported {
+            hwOk = false
+        } else {
+            hwOk = aggregate.setSubdeviceVolume(uid: uid, volume: target)
+        }
+        if hwOk {
+            // Hardware accepted. If we previously installed a
+            // software-gain fallback for this pair (e.g. the device
+            // was unsupported and is now back, after re-plug), reset
+            // the pair to 1.0 so we don't double-attenuate.
+            if let pair = aggregate.subdeviceChannelOffset(uid: uid)
+                .map({ $0 / max(1, aggregateOutput.channelCount) }) {
+                aggregateOutput.setSoftwareGain(pair: pair, gain: 1.0)
+            }
+            return
+        }
+        // Hardware rejected. Increment the diagnostic counter on every
+        // rejection; emit the stderr line ONCE per UID per session.
+        aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
+        aggregateHwVolumeUnsupportedUIDs.insert(uid)
+        if !loggedHwVolumeRejectionUIDs.contains(uid) {
+            loggedHwVolumeRejectionUIDs.insert(uid)
+            FileHandle.standardError.write(Data(
+                ("[Router] hardware volume unsupported for \(uid.prefix(20)) — falling back to software gain (this device's level must be controlled via its OSD or via SyncCast's per-device slider; further rejections silenced)\n").utf8
+            ))
+        }
+        // Route the slider value into the AUHAL's per-pair gain. The
+        // channel-pair index is the subdevice's first output channel
+        // divided by the source channel count (typically 2). If the
+        // aggregate's stream layout doesn't match our model (e.g. one
+        // wide stream where we expected per-subdevice pairs), the
+        // setSoftwareGain call no-ops on out-of-range pair indices.
+        guard let firstChannel = aggregate.subdeviceChannelOffset(uid: uid) else {
+            return
+        }
+        let pair = firstChannel / max(1, aggregateOutput.channelCount)
+        aggregateOutput.setSoftwareGain(pair: pair, gain: target)
+        _ = deviceID  // intentionally unused — kept in signature for future per-device diagnostics
     }
 }
