@@ -12,6 +12,12 @@ public final class AirPlayDiscovery: @unchecked Sendable {
     private var continuation: AsyncStream<DiscoveryEvent>.Continuation?
     private var seen: [String: Device] = [:]
     private let idMap = StableIDMap()
+    /// Serial queue used to confine all access to `seen` and
+    /// `continuation`. NWBrowser's `browseResultsChangedHandler` can fire
+    /// concurrently from libdispatch — without this serialization we got
+    /// EXC_BAD_ACCESS in Dictionary.makeIterator() when two threads
+    /// touched `seen` at once.
+    private let queue = DispatchQueue(label: "io.syncast.discovery.airplay")
 
     public init() {}
 
@@ -31,17 +37,22 @@ public final class AirPlayDiscovery: @unchecked Sendable {
         )
         let browser = NWBrowser(for: descriptor, using: params)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
-            self?.handleResults(results)
+            // Hop onto our serial queue so the Dictionary mutations
+            // inside handleResults are never racy against another
+            // invocation from libdispatch.
+            self?.queue.async { self?.handleResults(results) }
         }
         browser.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed(let err):
-                self?.continuation?.yield(.error("airplay browse: \(err)"))
+                self?.queue.async { self?.continuation?.yield(.error("airplay browse: \(err)")) }
             default:
                 break
             }
         }
-        browser.start(queue: .global(qos: .utility))
+        // Pin the browser's own callback queue to ours so even Apple's
+        // own internal dispatch path is serial relative to us.
+        browser.start(queue: queue)
         self.browser = browser
     }
 

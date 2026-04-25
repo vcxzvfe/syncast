@@ -181,22 +181,6 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
             && asbd.mBitsPerChannel == 32
             && frameCount > 0 {
             if writeFastPath(sb: sb, frames: frameCount, nonInterleaved: isNonInterleaved) {
-                // Sample peak amplitude of the just-written ring frames so
-                // we can tell whether SCK is delivering silence (0.0) or
-                // real audio. Reads back from the ring.
-                let writePos = ringBuffer.writePosition
-                let sampleCount = min(frameCount, 256)
-                let scratch = UnsafeMutablePointer<Float>.allocate(capacity: sampleCount)
-                defer { scratch.deallocate() }
-                let ptrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: 1)
-                ptrs.initialize(to: scratch)
-                defer { ptrs.deallocate() }
-                _ = ringBuffer.read(at: writePos - Int64(sampleCount),
-                                    frames: sampleCount, into: ptrs)
-                var peak: Float = 0
-                for i in 0..<sampleCount { peak = max(peak, abs(scratch[i])) }
-                debugLastPeak = peak
-                if peak > debugMaxPeak { debugMaxPeak = peak }
                 debugBuffersWritten &+= 1
                 tickCount &+= 1
                 return
@@ -368,6 +352,15 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
                 }
                 chPtrs[c] = UnsafePointer(m.assumingMemoryBound(to: Float.self))
             }
+            // Sample peak from channel 0 BEFORE writing to ring — avoids
+            // a separate read-back path. Reads at most 256 samples,
+            // bounded by available frames.
+            let sampleN = min(frames, 256)
+            var pk: Float = 0
+            let p = chPtrs[0]
+            for i in 0..<sampleN { pk = max(pk, abs(p[i])) }
+            debugLastPeak = pk
+            if pk > debugMaxPeak { debugMaxPeak = pk }
             ringBuffer.write(channels: chPtrs, frames: frames)
         } else {
             guard let m = buffers[0].mData else {
