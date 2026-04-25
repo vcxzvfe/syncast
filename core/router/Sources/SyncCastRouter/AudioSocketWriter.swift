@@ -19,13 +19,29 @@ public final class AudioSocketWriter: @unchecked Sendable {
     private var fd: Int32 = -1
     private var task: Task<Void, Never>?
     private let lock = NSLock()
-    /// Diagnostic — packets actually sent through the socket.
+    /// Diagnostic — packets actually sent through the socket (full-frame
+    /// only). A short send (sent < bytesPerPacket) is counted in
+    /// `partialSends` and NOT in `packetsSent`, so this counter accurately
+    /// reflects the rate of well-formed s16le packets the receiver sees.
     public private(set) var packetsSent: UInt64 = 0
     public private(set) var bytesSent: UInt64 = 0
     public private(set) var lastSendError: String = ""
     /// Diagnostic — packets that found the ring under-filled and emitted
     /// silence to keep wall-clock pacing. Indicator of capture stalls.
     public private(set) var underrunPackets: UInt64 = 0
+    /// Diagnostic — Darwin.send() returned 0 < n < bytesPerPacket. With
+    /// SOCK_STREAM that mis-frames the s16le wire format, so we treat it
+    /// as an error rather than as a successful packet.
+    public private(set) var partialSends: UInt64 = 0
+    /// Sentinel for true idempotent start. Just checking
+    /// `task != nil && !task.isCancelled` is racy: stop() cancels the
+    /// task but the detached body keeps executing until it observes
+    /// cancellation, and a stop+start cycle in that window used to spawn
+    /// a SECOND writer that paced its own 100 pkts/s. Two writers ⇒ the
+    /// observed 2.2× over-rate that overflowed the kernel pipe buffer.
+    /// We set this flag true on entry to runLoop and clear on exit;
+    /// start() refuses to spawn while it's true.
+    private var writerActive: Bool = false
 
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
@@ -33,18 +49,21 @@ public final class AudioSocketWriter: @unchecked Sendable {
     }
 
     public func start() throws {
-        // Idempotent: if we already have a running writer task with an
-        // open fd, do nothing. Calling start() twice (from successive
-        // pushAirplayState invocations) used to stomp the previous fd
-        // and kill the original task — which manifested as "AudioSocket
-        // sent 68 packets then stopped forever".
-        let existingFd = lock.withLock { fd }
-        if existingFd >= 0, let t = task, !t.isCancelled {
-            return
-        }
+        // Idempotent: refuse to spawn a second writer while the previous
+        // one is still alive. The `writerActive` flag is the source of
+        // truth — `task != nil && !task.isCancelled` is racy because the
+        // detached body continues running between cancel() and the next
+        // await checkpoint. Two concurrent writers each pacing at 100/s
+        // showed up downstream as 200+/s on the wire, overflowing the
+        // 8 KB kernel pipe and corrupting s16le framing.
+        let active = lock.withLock { writerActive }
+        if active { return }
         try connect()
+        lock.withLock { writerActive = true }
         task = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runLoop()
+            guard let self else { return }
+            self.lock.withLock { self.writerActive = false }
         }
     }
 
@@ -53,6 +72,7 @@ public final class AudioSocketWriter: @unchecked Sendable {
         task = nil
         lock.lock(); defer { lock.unlock() }
         if fd >= 0 { Darwin.close(fd); fd = -1 }
+        writerActive = false
     }
 
     private func connect() throws {
@@ -111,19 +131,27 @@ public final class AudioSocketWriter: @unchecked Sendable {
         )
 
         var nextRead: Int64 = -1
-        let startNs = DispatchTime.now().uptimeNanoseconds
+        var startNs = DispatchTime.now().uptimeNanoseconds
         var packetsConsumed: UInt64 = 0
 
         while !Task.isCancelled {
             // 1. Wall-clock pacing. Sleep until our scheduled wake-up for
-            //    THIS packet. If we're already late (loop got behind),
-            //    we proceed without sleeping. The next iteration's sleep
-            //    will catch back up.
+            //    THIS packet. If we're already late by ≤ 2 packets, we
+            //    proceed without sleeping — the next iteration's sleep
+            //    catches back up. If we're late by MORE than 2 packets
+            //    (likely woke up after a system sleep, debugger pause, or
+            //    long GC stall) we re-anchor `startNs` so we don't try to
+            //    "catch up" by emitting a 100-packet burst that would
+            //    instantly overflow the 8 KB kernel pipe and corrupt
+            //    s16le framing. The invariant we restore is:
+            //        packetsConsumed * packetIntervalNs ≈ now - startNs
             let targetNs = startNs &+ packetsConsumed &* packetIntervalNs
             let nowNs = DispatchTime.now().uptimeNanoseconds
             if nowNs < targetNs {
                 try? await Task.sleep(nanoseconds: targetNs &- nowNs)
                 if Task.isCancelled { return }
+            } else if nowNs > targetNs &+ (packetIntervalNs &* 2) {
+                startNs = nowNs &- packetsConsumed &* packetIntervalNs
             }
 
             // 2. Pull one packet's worth of frames from the ring. If the
@@ -166,8 +194,19 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 if e == EINTR { continue }
                 break
             }
-            packetsSent &+= 1
-            bytesSent &+= UInt64(sent)
+            // packetsSent reflects only well-framed packets the receiver
+            // can decode. A short send mis-aligns the s16le stream, so we
+            // count it separately and DON'T advance packetsSent — that
+            // way the diagnostic rate (pkts/s) only ticks when real audio
+            // crosses the wire. packetsConsumed advances regardless so
+            // the wall-clock pacer stays anchored to elapsed real time.
+            if sent == bytesPerPacket {
+                packetsSent &+= 1
+                bytesSent &+= UInt64(sent)
+            } else {
+                partialSends &+= 1
+                lastSendError = "short send n=\(sent)"
+            }
             packetsConsumed &+= 1
         }
     }
