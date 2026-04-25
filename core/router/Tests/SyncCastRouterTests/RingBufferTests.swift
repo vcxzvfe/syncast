@@ -1,60 +1,58 @@
 import XCTest
 @testable import SyncCastRouter
 
+private func writeRing(_ rb: RingBuffer, _ buffers: [[Float]]) {
+    let frames = buffers[0].count
+    let ptrs = UnsafeMutablePointer<UnsafePointer<Float>>.allocate(capacity: buffers.count)
+    defer { ptrs.deallocate() }
+    var holders: [UnsafeBufferPointer<Float>] = []
+    for b in buffers {
+        let bp = b.withUnsafeBufferPointer { $0 }
+        holders.append(bp)
+    }
+    for (i, bp) in holders.enumerated() { ptrs[i] = bp.baseAddress! }
+    rb.write(channels: ptrs, frames: frames)
+}
+
+private func readRing(_ rb: RingBuffer, at: Int64, frames: Int, channels: Int) -> ([[Float]], Int) {
+    let outPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channels)
+    defer { outPtrs.deallocate() }
+    var arrays = (0..<channels).map { _ in [Float](repeating: -1, count: frames) }
+    for ch in 0..<channels {
+        arrays[ch].withUnsafeMutableBufferPointer { outPtrs[ch] = $0.baseAddress! }
+    }
+    let filled = rb.read(at: at, frames: frames, into: outPtrs)
+    return (arrays, filled)
+}
+
 final class RingBufferTests: XCTestCase {
     func testWriteThenReadRoundTrip() {
         let rb = RingBuffer(channelCount: 2, capacityFrames: 1024)
         let frames = 256
-        var ch0 = [Float](repeating: 0, count: frames)
-        var ch1 = [Float](repeating: 0, count: frames)
-        for i in 0..<frames {
-            ch0[i] = Float(i)
-            ch1[i] = Float(-i)
-        }
-        ch0.withUnsafeBufferPointer { p0 in
-            ch1.withUnsafeBufferPointer { p1 in
-                rb.write(channels: [p0.baseAddress!, p1.baseAddress!], frames: frames)
-            }
-        }
-        var out0 = [Float](repeating: -999, count: frames)
-        var out1 = [Float](repeating: -999, count: frames)
-        let filled = out0.withUnsafeMutableBufferPointer { o0 in
-            out1.withUnsafeMutableBufferPointer { o1 in
-                rb.read(at: 0, frames: frames, into: [o0.baseAddress!, o1.baseAddress!])
-            }
-        }
+        let ch0 = (0..<frames).map { Float($0) }
+        let ch1 = (0..<frames).map { Float(-$0) }
+        writeRing(rb, [ch0, ch1])
+        let (out, filled) = readRing(rb, at: 0, frames: frames, channels: 2)
         XCTAssertEqual(filled, frames)
-        XCTAssertEqual(out0, ch0)
-        XCTAssertEqual(out1, ch1)
+        XCTAssertEqual(out[0], ch0)
+        XCTAssertEqual(out[1], ch1)
     }
 
     func testReadBeforeWriteCursorIsZero() {
         let rb = RingBuffer(channelCount: 1, capacityFrames: 256)
-        let buf = [Float](repeating: 1.0, count: 64)
-        buf.withUnsafeBufferPointer {
-            rb.write(channels: [$0.baseAddress!], frames: 64)
-        }
-        // Read before window: should be zero-filled.
-        var out = [Float](repeating: -1, count: 32)
-        let filled = out.withUnsafeMutableBufferPointer { o in
-            rb.read(at: -100, frames: 32, into: [o.baseAddress!])
-        }
+        writeRing(rb, [[Float](repeating: 1.0, count: 64)])
+        let (out, filled) = readRing(rb, at: -100, frames: 32, channels: 1)
         XCTAssertEqual(filled, 0)
-        XCTAssertTrue(out.allSatisfy { $0 == 0 })
+        XCTAssertTrue(out[0].allSatisfy { $0 == 0 })
     }
 
     func testWrappingPreservesData() {
         let cap = 64
         let rb = RingBuffer(channelCount: 1, capacityFrames: cap)
-        let one = [Float](repeating: 1.0, count: cap)
-        let two = [Float](repeating: 2.0, count: cap)
-        one.withUnsafeBufferPointer { rb.write(channels: [$0.baseAddress!], frames: cap) }
-        two.withUnsafeBufferPointer { rb.write(channels: [$0.baseAddress!], frames: cap) }
-        var out = [Float](repeating: -1, count: cap)
-        let filled = out.withUnsafeMutableBufferPointer { o in
-            rb.read(at: Int64(cap), frames: cap, into: [o.baseAddress!])
-        }
+        writeRing(rb, [[Float](repeating: 1.0, count: cap)])
+        writeRing(rb, [[Float](repeating: 2.0, count: cap)])
+        let (out, filled) = readRing(rb, at: Int64(cap), frames: cap, channels: 1)
         XCTAssertEqual(filled, cap)
-        XCTAssertTrue(out.allSatisfy { $0 == 2.0 })
+        XCTAssertTrue(out[0].allSatisfy { $0 == 2.0 })
     }
 }

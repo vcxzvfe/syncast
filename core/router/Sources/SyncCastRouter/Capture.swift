@@ -24,6 +24,11 @@ public final class Capture {
     private var deviceID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
     private var running = false
+    /// Pre-allocated channel pointer slot. Filled inside the IOProc by
+    /// pointer assignment (no allocation). Sized once at init to
+    /// `channelCount`.
+    private let channelPtrs: UnsafeMutablePointer<UnsafePointer<Float>?>
+    private let channelPtrsCount: Int
 
     public init(
         sampleRate: Double = 48_000,
@@ -36,7 +41,12 @@ public final class Capture {
             channelCount: channelCount,
             capacityFrames: ringCapacityFrames
         )
+        let ptrs = UnsafeMutablePointer<UnsafePointer<Float>?>.allocate(capacity: channelCount)
+        ptrs.initialize(repeating: nil, count: channelCount)
+        self.channelPtrs = ptrs
+        self.channelPtrsCount = channelCount
     }
+
 
     public func start(uid: String) throws {
         let id = try Self.deviceID(forUID: uid)
@@ -45,29 +55,37 @@ public final class Capture {
         var procID: AudioDeviceIOProcID?
         let ringRef = ringBuffer
         let chanCount = channelCount
+        let chPtrs = channelPtrs   // pre-allocated; no closure allocation
         let status = AudioDeviceCreateIOProcIDWithBlock(
             &procID,
             id,
             DispatchQueue.global(qos: .userInteractive),
             { _, inInputData, _, _, _ in
-                // inInputData is non-nil for input-direction IOProcs. We must
-                // copy frames out before this callback returns.
+                // inInputData is non-nil for input-direction IOProcs. We
+                // must copy frames out before this callback returns. No
+                // Swift runtime allocations inside this body — `chPtrs` is
+                // pre-allocated; we only do pointer assignments.
                 let inputList = UnsafeMutableAudioBufferListPointer(
                     UnsafeMutablePointer(mutating: inInputData)
                 )
                 guard inputList.count >= chanCount else { return }
                 let frames = Int(inputList[0].mDataByteSize) / MemoryLayout<Float>.size
                 if frames == 0 { return }
-                var planar: [UnsafePointer<Float>] = []
-                planar.reserveCapacity(chanCount)
+                var ok = true
                 for ch in 0..<chanCount {
-                    let buf = inputList[ch]
-                    if let raw = buf.mData {
-                        planar.append(raw.assumingMemoryBound(to: Float.self))
+                    if let raw = inputList[ch].mData {
+                        let mut = raw.assumingMemoryBound(to: Float.self)
+                        chPtrs[ch] = UnsafePointer(mut)
+                    } else {
+                        ok = false
+                        break
                     }
                 }
-                if planar.count == chanCount {
-                    ringRef.write(channels: planar, frames: frames)
+                if ok {
+                    chPtrs.withMemoryRebound(to: UnsafePointer<Float>.self,
+                                             capacity: chanCount) { rebound in
+                        ringRef.write(channels: rebound, frames: frames)
+                    }
                 }
             }
         )
@@ -92,6 +110,8 @@ public final class Capture {
 
     deinit {
         stop()
+        channelPtrs.deinitialize(count: channelPtrsCount)
+        channelPtrs.deallocate()
     }
 
     // MARK: - Helpers
@@ -106,7 +126,7 @@ public final class Capture {
         var resolved: AudioObjectID = 0
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
         let status = withUnsafePointer(to: &cfUid) { uidPtr -> OSStatus in
-            var pSize = UInt32(MemoryLayout<CFString>.size)
+            let pSize = UInt32(MemoryLayout<CFString>.size)
             return AudioObjectGetPropertyData(
                 AudioObjectID(kAudioObjectSystemObject),
                 &address,

@@ -75,14 +75,13 @@ public actor IpcClient {
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         var line = Data(); line.append(data); line.append(0x0a)
+        // Send the bytes BEFORE installing the continuation. If the write
+        // fails we throw without leaving a dangling pending entry, and the
+        // continuation only suspends on the response — it never owns the
+        // blocking write.
+        try writeAll(line)
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any, Error>) in
             self.pending[id] = cont
-            do {
-                try writeAll(line)
-            } catch {
-                self.pending.removeValue(forKey: id)
-                cont.resume(throwing: error)
-            }
         }
     }
 

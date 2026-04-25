@@ -12,9 +12,15 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "SyncCastAtomic",
+            path: "Sources/SyncCastAtomic",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "SyncCastRouter",
             dependencies: [
                 .product(name: "SyncCastDiscovery", package: "discovery"),
+                "SyncCastAtomic",
             ],
             path: "Sources/SyncCastRouter"
         ),
