@@ -1199,4 +1199,74 @@ public actor Router {
         let result = try? await ipc.call("local_fifo.diagnostics", params: [:])
         return result as? [String: Any]
     }
+
+    // MARK: - Passive continuous calibration
+    //
+    // Owns one PassiveCalibrator: a continuous mic AUHAL + a 30-s loop
+    // that GCC-PHATs the SCK ring against the live mic capture. Each
+    // Sample above `minConfidenceForUpdate` (default 0.5) is forwarded
+    // to `local_fifo.set_delay_ms`. UI polls `lastPassiveSample` for
+    // diagnostics; it never touches `PassiveCalibrator` directly.
+    public private(set) var passiveCalibrator: PassiveCalibrator?
+    public private(set) var lastPassiveSample: PassiveCalibrator.Sample?
+    /// Bumped on every Sample callback (above threshold). Useful for
+    /// diagnosing "engine alive vs. not converging".
+    public private(set) var passiveSampleCount: Int = 0
+
+    /// Begin passive calibration. Idempotent. `microphoneDeviceID = nil`
+    /// uses the system default input. Throws on mic-permission denial
+    /// or no-input-device.
+    public func startPassiveCalibration(
+        microphoneDeviceID: AudioDeviceID? = nil
+    ) async throws {
+        if passiveCalibrator != nil { return }
+        let calibrator = PassiveCalibrator(
+            ringBuffer: sckCapture.ringBuffer,
+            microphoneDeviceID: microphoneDeviceID,
+            onSampleAvailable: { [weak self] sample in
+                guard let self else { return }
+                Task { await self.handlePassiveSample(sample) }
+            }
+        )
+        do {
+            try await calibrator.start()
+        } catch {
+            lastError = "passive calibration start failed: \(error)"
+            throw error
+        }
+        passiveCalibrator = calibrator
+    }
+
+    /// Stop passive calibration. Idempotent.
+    public func stopPassiveCalibration() {
+        passiveCalibrator?.stop()
+        passiveCalibrator = nil
+    }
+
+    /// Cache + forward to the broadcaster. Clamp matches sidecar's own
+    /// [0, 10 000] range so a stray negative-lag peak doesn't trigger
+    /// spurious clamp warnings sidecar-side.
+    private func handlePassiveSample(_ sample: PassiveCalibrator.Sample) async {
+        passiveSampleCount &+= 1
+        lastPassiveSample = sample
+        let clamped = max(0, min(10_000, sample.suggestedDelayMs))
+        do {
+            _ = try await setLocalFifoDelayMs(clamped)
+        } catch {
+            lastError = "passive set_delay_ms failed: \(error)"
+        }
+    }
+
+    /// Mutate tunables from outside the actor. No-op if calibrator
+    /// hasn't been started. Each parameter is independently optional.
+    public func updatePassiveTunables(
+        correlationWindowSeconds: Double? = nil,
+        measurementIntervalSeconds: Double? = nil,
+        minConfidenceForUpdate: Double? = nil
+    ) {
+        guard let c = passiveCalibrator else { return }
+        if let v = correlationWindowSeconds { c.correlationWindowSeconds = v }
+        if let v = measurementIntervalSeconds { c.measurementIntervalSeconds = v }
+        if let v = minConfidenceForUpdate { c.minConfidenceForUpdate = v }
+    }
 }
