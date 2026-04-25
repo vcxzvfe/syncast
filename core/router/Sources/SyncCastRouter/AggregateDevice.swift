@@ -64,6 +64,22 @@ public final class AggregateDevice {
     public let deviceID: AudioObjectID
     public let masterUID: String
     public let subDeviceUIDs: [String]
+    /// The channel count AUHAL must declare on its input scope to match
+    /// what the aggregate's output stream actually exposes.
+    ///
+    /// Why this is dynamic: with stacked=0 and 2-ch subdevices, the
+    /// expected layout is one stream of 2 channels (kernel fans the
+    /// stereo to every subdevice). In practice, with two 2-ch subdevices
+    /// (e.g. MBP built-in + display speakers), the aggregate often
+    /// exposes 4 channels in one stream (kernel concatenated subdevices'
+    /// channels regardless of stacked=0 — observed on Sonoma+). If AUHAL
+    /// is configured for 2-ch, only the first pair receives audio; the
+    /// second physical speaker is silent.
+    ///
+    /// The fix: query the actual stream channel count post-create and
+    /// configure AUHAL to match. The render callback writes the source
+    /// stereo into EVERY channel pair (splat) so all subdevices play.
+    public let outputChannelCount: Int
 
     /// Build a new private aggregate. Throws if the kernel rejects the
     /// composition (most often: a UID that isn't a real, currently-online
@@ -140,6 +156,91 @@ public final class AggregateDevice {
         // engages the SRC immediately and the wobble is gone. Loopback
         // does this via its "Output Clock" feature.
         Self.setNominalSampleRate(newID, rate: 48_000)
+
+        // === Channel-count fix (Strategy 2 / stereo-mode silent-second-
+        // device bug) ===
+        //
+        // First try approach (A): coerce every output stream to 2-ch by
+        // setting `kAudioStreamPropertyVirtualFormat`. If the kernel
+        // accepts, AUHAL writes 2 channels and the aggregate fans them
+        // out to every subdevice (the documented stacked=0 contract).
+        //
+        // If the kernel rejects (most often on stacked aggregate streams
+        // — they're considered immutable by the AggregateClock plug-in),
+        // we fall back to approach (B): re-read the actual channel count
+        // and accept it. AUHAL on top will then be configured for the
+        // wider count and render() splats stereo into every channel pair.
+        Self.tryNarrowOutputStreamsToStereo(newID)
+        let (_, _, total) = Self.readStreamChannels(newID)
+        // Floor at 2 — even if the read failed, AUHAL must be at least
+        // a stereo pair. A device that exposes 0 output channels post-
+        // create is broken in a way we can't paper over here.
+        self.outputChannelCount = max(2, total)
+    }
+
+    /// Approach (A) for the channel-count bug: try to set every output
+    /// stream's virtual format to 2-ch Float32 non-interleaved. If the
+    /// kernel accepts, AUHAL on top will be a clean 2-ch surface and the
+    /// kernel handles the fan-out per the stacked=0 contract.
+    ///
+    /// Best-effort — failure is silently tolerated, and the caller falls
+    /// back to (B) by reading the resulting channel count.
+    private static func tryNarrowOutputStreamsToStereo(_ aggregateID: AudioObjectID) {
+        var streamsAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            aggregateID, &streamsAddr, 0, nil, &size
+        ) == noErr, size > 0 else { return }
+        let count = Int(size) / MemoryLayout<AudioStreamID>.size
+        var streams = Array(repeating: AudioStreamID(0), count: count)
+        guard AudioObjectGetPropertyData(
+            aggregateID, &streamsAddr, 0, nil, &size, &streams
+        ) == noErr else { return }
+
+        // Read sample rate from the aggregate — we want to keep whatever
+        // we already negotiated above.
+        var rateAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var sampleRate: Float64 = 48_000
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        _ = AudioObjectGetPropertyData(
+            aggregateID, &rateAddr, 0, nil, &rateSize, &sampleRate
+        )
+
+        var virtualAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioStreamPropertyVirtualFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var format = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat
+                | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        let formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        for s in streams {
+            // Best-effort. Most aggregate stream objects reject this
+            // because their stream layout is derived from their
+            // subdevices and the kernel considers it immutable.
+            _ = AudioObjectSetPropertyData(
+                s, &virtualAddr, 0, nil, formatSize, &format
+            )
+        }
     }
 
     private static func setNominalSampleRate(_ id: AudioObjectID, rate: Float64) {
