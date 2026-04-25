@@ -196,12 +196,41 @@ to the inbound one in §"Audio data" above):
 
 ```json
 {"method":"event.device_state","params":{
-  "device_id":"...","state":"connected|streaming|degraded|disconnected",
+  "device_id":"...","state":"<state>",
   "rtt_ms":3.2,"buffer_ms":1820,"last_error":null
 }}
 ```
 
-Emitted at most once per second per device.
+`state` is one of:
+
+| state | Emitted when | UI sync-dot colour |
+|---|---|---|
+| `added` | Device first registered via `device.add` | – |
+| `streaming` | `stream.start` accepted; PCM is flowing | – |
+| `connecting` | Sidecar is calling OwnTone REST `set_output_enabled` (or waiting for OwnTone's mDNS scan to discover the receiver). Emitted at the start of every reconcile attempt for an enabled device. | yellow |
+| `connected` | OwnTone REST confirmed `selected=True` for this device's output (verified via post-call `/api/outputs` poll). Audio is wired up. | green |
+| `failed` | REST returned non-200, or post-call verification observed `selected=False`, or OwnTone never discovered the receiver within the 30 s deferred-reconcile budget. `last_error` carries a short reason string. | red |
+| `disconnected` | User toggled the device off (sidecar issued `set_output_enabled false`). | grey |
+
+Notes:
+
+- `connecting`/`connected`/`failed`/`disconnected` describe the wiring
+  state between sidecar and OwnTone REST. `added`/`streaming` describe
+  the audio-data lifecycle. The two are independent (e.g. a device can
+  be `streaming` but not `connected` for a brief window during the
+  start-stream race that the sidecar's deferred reconcile resolves).
+- The Swift router caches the most recent state per device and surfaces
+  it to the UI via `Router.connectionState(deviceID:)` and
+  `Router.connectionStatesSnapshot()`. The menubar polls the snapshot
+  once per second.
+- `last_error` is only populated for `failed`; it's a free-form short
+  string suitable for inline display ("OwnTone never discovered
+  receiver", "REST error: ...", etc.). The UI shows it under the
+  device row when the dot is red.
+
+Emitted at most once per second per device for the legacy informational
+states; emitted ON EVERY transition for the wiring states (so the UI
+sees timely yellow→green/red transitions).
 
 ### `event.measured_latency`
 
