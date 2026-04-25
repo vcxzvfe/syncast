@@ -588,6 +588,133 @@ public final class AggregateDevice {
         return result
     }
 
+    // MARK: - Per-device hardware volume
+    //
+    // Why this exists
+    // ---------------
+    // In aggregate mode there's a SINGLE AUHAL on top of the kernel-
+    // level fan-out, so the existing `LocalOutput.setRouting(gain:)`
+    // applies one global software gain to the entire stream — every
+    // physical speaker hears the same level. The user's per-device
+    // volume sliders (e.g. "MBP at 80% + display at 50%") cannot be
+    // honored that way.
+    //
+    // Fix: write hardware volume directly on each underlying physical
+    // device via `kAudioDevicePropertyVolumeScalar`. The aggregate
+    // doesn't intercept this — the volume lives on the DAC and stays
+    // applied even after the aggregate is torn down. (That's also why
+    // we restore the previous level on stop, see `restoreSubdeviceVolume`
+    // — TODO P3 if we want to be polite to other apps.)
+    //
+    // CoreAudio volume element semantics:
+    //   - Element 0 ("master") — sometimes settable, sometimes a
+    //     read-only mirror of the per-channel max. Headphone DACs
+    //     and most aggregates expose it, USB class-compliant devices
+    //     usually don't.
+    //   - Element 1..N — per-channel. Always per-element on devices
+    //     that don't accept master writes. We set every output channel
+    //     to the same scalar so the user's slider behaves as a balanced
+    //     gain.
+
+    /// Apply a 0..1 scalar volume to the physical device backing
+    /// the subdevice with UID `uid`. Returns whether ANY write
+    /// succeeded — partial-success (some channels accepted, others
+    /// rejected) is reported as success.
+    ///
+    /// Best-effort: a device that refuses every write (some HDMI
+    /// outputs, some pro audio interfaces with hardware-only volume
+    /// knobs) returns false. Caller can fall back to the AUHAL
+    /// software gain in that case, which means losing per-device
+    /// granularity but preserving overall mute/duck behavior.
+    @discardableResult
+    public func setSubdeviceVolume(uid: String, volume: Float) -> Bool {
+        let clamped = max(0.0, min(1.0, volume))
+        // Resolve the underlying physical device. The aggregate's owned
+        // subdevice objects are NOT the right target for hardware
+        // volume (they're aggregate-internal facades). The actual DAC
+        // hardware lives behind the UID's translated AudioObjectID.
+        guard subDeviceUIDs.contains(uid) else { return false }
+        let physicalID: AudioObjectID
+        do {
+            physicalID = try Self.deviceIDForUID(uid)
+        } catch {
+            return false
+        }
+        return Self.applyHardwareVolume(physicalID: physicalID, volume: clamped)
+    }
+
+    /// Static so it can be unit-tested in isolation. Tries master
+    /// element first; falls back to per-channel iteration. Returns
+    /// true if any write succeeded.
+    static func applyHardwareVolume(
+        physicalID: AudioObjectID,
+        volume: Float
+    ) -> Bool {
+        // Step 1: try element 0 (master) if it's both present AND
+        // settable. A device that has it as a read-only mirror will
+        // claim has=true, settable=false; we must check both.
+        if isVolumeWritable(physicalID, element: 0) {
+            if writeVolume(physicalID, element: 0, volume: volume) {
+                return true
+            }
+        }
+        // Step 2: iterate per-channel elements. We don't know the
+        // exact channel count without reading kAudioDevicePropertyStreams,
+        // but kAudioDevicePropertyVolumeScalar tolerates a missing
+        // element (returns kAudioHardwareUnknownPropertyError); we
+        // simply skip those. Capping at 32 covers every realistic
+        // multichannel speaker setup and avoids an unbounded loop on
+        // pathological devices.
+        var anyWrite = false
+        for elem in 1...32 {
+            if writeVolume(physicalID, element: AudioObjectPropertyElement(elem), volume: volume) {
+                anyWrite = true
+            }
+        }
+        return anyWrite
+    }
+
+    /// True iff `kAudioDevicePropertyVolumeScalar` exists on the given
+    /// element AND is settable. Both checks are needed — a read-only
+    /// master mirror passes HasProperty but fails IsSettable.
+    private static func isVolumeWritable(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var settable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(id, &addr, &settable) == noErr else {
+            return false
+        }
+        return settable.boolValue
+    }
+
+    /// Write a scalar 0..1 volume to a specific (id, element) pair.
+    /// Returns true on noErr, false otherwise. We do NOT first check
+    /// IsSettable here because per-channel writes that succeed on
+    /// element N are common even when element 0 reports unsettable.
+    private static func writeVolume(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement,
+        volume: Float
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var value = volume
+        let size = UInt32(MemoryLayout<Float>.size)
+        let status = AudioObjectSetPropertyData(id, &addr, 0, nil, size, &value)
+        return status == noErr
+    }
+
     // MARK: - Master selection helper
 
     /// Picks the best master subdevice from a candidate set.

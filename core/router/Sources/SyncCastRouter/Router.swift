@@ -45,6 +45,11 @@ public actor Router {
     /// audio out to. Used to decide if a routing change requires destroy +
     /// recreate (different set) or is a no-op (same set).
     private var aggregateCoveredUIDs: Set<String> = []
+    /// Maps SyncCast device ID → coreAudio UID for every device the
+    /// active aggregate covers. Used by replan() to apply per-device
+    /// hardware volume — routing is keyed by SyncCast ID, but the
+    /// hardware-volume API needs the underlying device's UID.
+    private var aggregateUIDByDeviceID: [String: String] = [:]
     /// Cached stream-format diagnostic from the most recent aggregate
     /// build. Surfaced by `diagnosticSCKReport()` so field logs show the
     /// actual channel layout of the kernel-level fan-out — invaluable
@@ -421,6 +426,11 @@ public actor Router {
             }
             aggregateDevice = agg
             aggregateCoveredUIDs = candidateUIDs
+            // Build the SyncCast-id → UID map needed by replan() to
+            // apply per-device hardware volume.
+            var idToUID: [String: String] = [:]
+            for e in enabled { idToUID[e.deviceID] = e.uid }
+            aggregateUIDByDeviceID = idToUID
             // Key the AUHAL by the aggregate UID so diagnostic dumps and
             // setRouting iteration can find it without confusing it with
             // a per-device entry.
@@ -444,6 +454,7 @@ public actor Router {
             aggregateDevice = nil
         }
         aggregateCoveredUIDs = []
+        aggregateUIDByDeviceID.removeAll()
         aggregateStreamDiagnostic = nil
     }
 
@@ -544,6 +555,30 @@ public actor Router {
                 gain: r.volume,
                 muted: r.muted
             )
+        }
+
+        // In aggregate mode, also apply per-device HARDWARE volume on
+        // the underlying physical DACs. The single AUHAL atop the
+        // aggregate cannot do this — it sees one stream and applies
+        // gain uniformly to every subdevice. Hardware volume bypasses
+        // the AUHAL entirely.
+        if let agg = aggregateDevice {
+            for (devID, uid) in aggregateUIDByDeviceID {
+                let r = routing[devID] ?? DeviceRouting(deviceID: devID)
+                let target = r.muted ? Float(0) : r.volume
+                let ok = agg.setSubdeviceVolume(uid: uid, volume: target)
+                if !ok {
+                    // We log to stderr but don't surface in lastError —
+                    // hardware volume is best-effort. Some devices
+                    // (HDMI, certain pro audio interfaces) refuse all
+                    // software writes; the user just gets uniform
+                    // levels in that case, which is the pre-fix
+                    // behavior, not a regression.
+                    FileHandle.standardError.write(Data(
+                        "[Router] hardware volume rejected for \(uid.prefix(20)) (target=\(target))\n".utf8
+                    ))
+                }
+            }
         }
     }
 }
