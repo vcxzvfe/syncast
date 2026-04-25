@@ -62,7 +62,7 @@ final class AppModel {
     }
 
     enum StreamingState: String, Sendable {
-        case idle, starting, running, error
+        case idle, starting, running, stopping, error
     }
 
     var statusIconName: String {
@@ -70,6 +70,7 @@ final class AppModel {
         case .idle:     return "speaker.wave.2"
         case .starting: return "speaker.wave.2.bubble"
         case .running:  return "speaker.wave.3.fill"
+        case .stopping: return "speaker.wave.2.bubble"
         case .error:    return "speaker.slash"
         }
     }
@@ -91,6 +92,18 @@ final class AppModel {
     /// generating 30+ reconcile passes in 2 seconds (observed in
     /// launch.log before this guard was added).
     private var reconcileTimer: Task<Void, Never>?
+
+    /// Single-flight guard for setMode. Even with the streamingState =
+    /// .stopping race fix in setMode, a rapid double-click of the
+    /// segmented mode picker (e.g. wholeHome → stereo → wholeHome over
+    /// ~150 ms) can queue THREE Tasks in sequence: each one observes a
+    /// transient .idle state between transitions and spawns its own
+    /// router.stop / reconcile pair, leading to overlapping engine
+    /// teardowns. This flag rate-limits mode transitions to one at a
+    /// time — extra clicks during a transition are dropped, and the
+    /// user-visible behavior is "your last click is honored after the
+    /// current transition finishes". Security Review C2.
+    private var modeTransitioning: Bool = false
 
     init() {
         self.discovery = DiscoveryService()
@@ -344,6 +357,13 @@ final class AppModel {
                     await router.setRouting(r)
                     if r.enabled { await router.enable(deviceID: id) }
                 }
+                // Tell the router which mode it's in BEFORE start. The
+                // sidecar uses this to decide whether to spin up the
+                // local-fifo broadcaster, and the router uses it to skip
+                // the local-aggregate path in whole-home mode (audio
+                // there flows through OwnTone, not direct AUHAL).
+                await router.setMode(mode == .wholeHome ? .wholeHome : .stereo)
+
                 // Push AirPlay state BEFORE SCK start. AirPlay activation
                 // (OwnTone spawn) is independent of SCK and must not be
                 // gated by it. If SCK is slow / failing / waiting on a
@@ -351,6 +371,18 @@ final class AppModel {
                 await pushAirplayState()
                 try await router.start(devices: snapshot)
                 SyncCastLog.log("reconcile: router.start OK")
+
+                // In whole-home mode, after the router has SCK capture +
+                // OwnTone running, open one LocalAirPlayBridge per
+                // user-enabled local CoreAudio device. These connect to
+                // the sidecar's broadcast socket and render OwnTone's
+                // player-clock-driven PCM through AUHAL on each device,
+                // putting them on the SAME PTP timeline as the AirPlay
+                // receivers.
+                if mode == .wholeHome {
+                    await router.startWholeHome(devices: snapshot)
+                }
+
                 // After 1.5s, log the IOProc tick count to confirm CoreAudio
                 // is actually pumping data. If still 0 → TCC denied mic.
                 Task { [weak self] in
@@ -393,7 +425,19 @@ final class AppModel {
             for (_, r) in routing {
                 await router.setRouting(r)
             }
-            await router.syncLocalOutputs(devices: devices)
+            // Mode-specific reconciliation:
+            //   - .stereo: syncLocalOutputs opens/closes per-device AUHAL
+            //     and the private aggregate as needed (existing path).
+            //   - .wholeHome: skip local AUHAL reconciliation; instead
+            //     update the bridge set against the new enabled-device
+            //     list. AirPlay receivers are handled by pushAirplayState
+            //     below (same path as before).
+            switch mode {
+            case .stereo:
+                await router.syncLocalOutputs(devices: devices)
+            case .wholeHome:
+                await router.startWholeHome(devices: devices)
+            }
             await pushAirplayState()
         default:
             SyncCastLog.log("reconcile: no-op (state=\(streamingState.rawValue) shouldRun=\(shouldRun))")
@@ -440,6 +484,17 @@ final class AppModel {
     /// switch back.
     func setMode(_ newMode: Mode) {
         guard newMode != mode else { return }
+        // Single-flight: if a previous setMode is still running its async
+        // stop+reconcile, drop this call. Without this, three quick
+        // clicks (whole-home → stereo → whole-home over ~150 ms) can
+        // each spawn their own Task — and the .stopping → .idle window
+        // mid-transition lets the second click see streamingState != .stopping
+        // and spawn an overlapping teardown that races with the first.
+        // Security Review C2.
+        if modeTransitioning {
+            SyncCastLog.log("setMode: dropping \(newMode.rawValue) — transition in flight")
+            return
+        }
         SyncCastLog.log("setMode: \(mode.rawValue) → \(newMode.rawValue)")
         mode = newMode
         // Disable any device that the new mode can't drive.
@@ -450,7 +505,39 @@ final class AppModel {
                 routing[dev.id] = r
             }
         }
-        reconcileEngine()
+        // Force a full pipeline restart by stopping the engine, then
+        // reconciling. The two modes have different audio paths
+        // (stereo: local Aggregate AUHAL; wholeHome: SCK→OwnTone→
+        // bridges + AirPlay) and switching live without a full stop
+        // would leave us in an inconsistent state — e.g. an aggregate
+        // still open while OwnTone is also driving the same physical
+        // devices via bridges, which would double-play. The brief
+        // (~200 ms) silence during transition is well below the
+        // user-perceptible UI feedback threshold.
+        //
+        // Race avoidance: set streamingState = .stopping BEFORE we
+        // launch the async stop Task. While the stop is in flight,
+        // any concurrent toggle/setVolume that fires reconcileEngine
+        // hits the (.stopping, _) → default arm in reconcileEngineAsync
+        // and is a no-op, instead of the (.idle, true) arm which
+        // would otherwise double-start the router (Code Review H1).
+        if streamingState == .running || streamingState == .starting {
+            streamingState = .stopping
+            modeTransitioning = true
+            Task { [weak self] in
+                guard let self else { return }
+                await self.router.stop()
+                await MainActor.run {
+                    self.streamingState = .idle
+                    self.modeTransitioning = false
+                    self.reconcileEngine()
+                }
+            }
+        } else {
+            // No engine to stop — the new mode just needs reconciliation.
+            // No async work, so no need to flip the transition flag here.
+            reconcileEngine()
+        }
     }
 
     func toggleDevice(_ id: String) {

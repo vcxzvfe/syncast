@@ -68,6 +68,7 @@ struct MainPopover: View {
         case .idle:     return "Idle · \(model.enabledDeviceCount) selected"
         case .starting: return "Starting…"
         case .running:  return "Streaming · \(model.enabledDeviceCount) devices"
+        case .stopping: return "Stopping…"
         case .error:    return model.lastError ?? "Error"
         }
     }
