@@ -27,6 +27,10 @@
          audio devices as microphones for TCC purposes. -->
     <key>NSMicrophoneUsageDescription</key>
     <string>SyncCast captures audio from BlackHole (a virtual audio driver) so it can re-emit the same stream to your local speakers and AirPlay 2 receivers in sync.</string>
+    <!-- Required since macOS Sequoia for any app that browses mDNS / Bonjour
+         services. Without this key the OS denies the browse silently. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SyncCast browses the local network for AirPlay 2 receivers (HomePod, Xiaomi Sound, other Macs) so you can include them in synchronized playback.</string>
     <!-- Bonjour service types we actively browse for -->
     <key>NSBonjourServices</key>
     <array>

@@ -1,13 +1,44 @@
 import SwiftUI
 import AppKit
+import Foundation
 import SyncCastDiscovery
 import SyncCastRouter
+
+/// File-based logger reachable from `open`-launched apps where stderr is
+/// detached and NSLog is silently dropped by the system log subsystem.
+/// Always writes to ~/Library/Logs/SyncCast/launch.log.
+public enum SyncCastLog {
+    private static let path: URL = {
+        let dir = FileManager.default
+            .urls(for: .libraryDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Logs/SyncCast", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("launch.log")
+    }()
+    private static let lock = NSLock()
+
+    public static func log(_ msg: String) {
+        let line = "\(Date()) \(msg)\n"
+        fputs(line, stderr)
+        lock.lock(); defer { lock.unlock() }
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: path.path),
+           let h = try? FileHandle(forWritingTo: path) {
+            try? h.seekToEnd()
+            try? h.write(contentsOf: data)
+            try? h.close()
+        } else {
+            try? data.write(to: path)
+        }
+    }
+}
 
 @main
 struct SyncCastApp: App {
     @State private var model = AppModel()
 
     init() {
+        SyncCastLog.log("=== SyncCast process starting (pid \(getpid())) ===")
         // Hide from Dock — menubar-only app.
         NSApp?.setActivationPolicy(.accessory)
     }
