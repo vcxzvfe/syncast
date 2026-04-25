@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode / Swift
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.swp
+.swiftpm/
+Packages/
+.build/
+xcuserdata/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project
+/dist/
+/artifacts/
+/.env
+/.env.local
+*.log
+/sidecar/.venv/
+/sidecar/dist/
+
+# IDE
+.idea/
+.vscode/
+*.iml
