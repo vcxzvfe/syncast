@@ -500,11 +500,28 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         self.unit = unit
         unitInstalled = true   // Suppresses the AudioUnit-rollback defer.
         refConInstalled = true // Suppresses the refCon-rollback defer.
-        // Read cursor lags the writer by ~50 ms so the very first
+        // Read cursor lags the writer by ~100 ms so the very first
         // renders see real data even before the broadcaster's first
-        // packet has gone through SCK conversion. 2200 frames @ 44.1k.
-        stateLock.withLock { self.readCursor = max(0, ring.writePosition - 2_200) }
+        // packet has gone through SCK conversion. 4800 frames @ 48 kHz
+        // matches LocalOutput.openAudioUnit's identical safety margin.
+        stateLock.withLock {
+            self.readCursor = max(0, ring.writePosition - Self.baselineBackoffFrames)
+        }
     }
+
+    /// 100 ms safety margin between the writer's `writePosition` and the
+    /// render callback's `readCursor`. Without this, the bridge ran with
+    /// only `frames` (≈ 10 ms) of slack — fine while the AUHAL output
+    /// was being CoreAudio-resampled at 44.1 kHz (the resampler dampens
+    /// rate skew), but at 48 kHz native the AUHAL's device clock and
+    /// AudioSocketWriter's wall-clock pacer drift independently. With a
+    /// near-zero margin, cursor periodically lands at exactly `writePos`
+    /// and `RingBuffer.read` returns 0 valid frames (zero-fills the
+    /// whole AUHAL buffer) — observable as `peak: 0.0000` while pkts
+    /// and ticks both advance. 100 ms is the same baseline LocalOutput
+    /// uses; the ring is sized 16384 frames ≈ 341 ms so this still
+    /// leaves >2x headroom against further drift.
+    private static let baselineBackoffFrames: Int64 = 4_800
 
     /// AUHAL render callback. Real-time thread: NO allocations, NO
     /// async, NO Swift runtime calls beyond the unfair-lock acquire.
@@ -512,24 +529,37 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         guard let ioData = ioData else { return noErr }
         let bufList = UnsafeMutableAudioBufferListPointer(ioData)
         if bufList.count < channelCount { return noErr }
+        if frames <= 0 { return noErr }
 
         // Snapshot the cursor under the lock; advance it after we've
         // copied frames out (so a concurrent stop() observing the
         // cursor sees a consistent value).
         let cursor = stateLock.withLock { self.readCursor }
         let writePos = ring.writePosition
-        // Resync if we've never run (cursor=0), if the writer has
-        // overrun us by more than the ring (lost data), or if the
-        // cursor somehow leapt ahead of the writer (shouldn't happen,
-        // but defend).
+        // Default target: trail the writer by `baselineBackoffFrames`
+        // (~100 ms) PLUS one render block. That gives every read full
+        // coverage even when the device clock and the writer's wall-
+        // clock pacer drift; without the baseline margin, cursor would
+        // tend to settle exactly at `writePos` and every read would
+        // return 0 valid frames (silent peak).
+        let target: Int64 = max(
+            0, writePos - Self.baselineBackoffFrames - Int64(frames)
+        )
+        // Resync conditions:
+        //   * first call (cursor=0)
+        //   * cursor fell so far behind the writer that it's outside
+        //     the ring (lost data — sustained stall)
+        //   * cursor leapt ahead of the writer (shouldn't happen, but
+        //     defend against it)
+        //   * cursor drifted more than 250 ms from `target` in either
+        //     direction — safety net for clock divergence over time.
         let lowerValid = max(0, writePos - Int64(ring.capacityFrames) + Int64(frames))
+        let driftLimitFrames: Int64 = Int64(inboundSampleRate) / 4   // 250 ms
         let needsResync =
             cursor == 0 ||
             cursor < lowerValid ||
-            cursor > writePos
-        // Default to "trail the writer by one render block" so a fresh
-        // resync gives us the freshest data without underrunning.
-        let target: Int64 = max(0, writePos - Int64(frames))
+            cursor > writePos ||
+            abs(cursor - target) > driftLimitFrames
         let startFrame: Int64 = needsResync ? target : cursor
 
         // Channel-pointer wiring with the pre-allocated outPtrs slot.
