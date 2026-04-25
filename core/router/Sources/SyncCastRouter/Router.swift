@@ -125,15 +125,29 @@ public actor Router {
 
     public func stop() async {
         state = .stopping
+        // 1. Stop the audio writer's send loop, but DO NOT nil it. The
+        //    instance holds the ring + socket-path; .start() can reconnect
+        //    cleanly on the next reconcile. Nilling this and `ipc` below
+        //    is what made "toggle Xiaomi off then back on → silent
+        //    forever" — subsequent setActiveAirplayDevices saw `ipc==nil`
+        //    and silently returned without re-arming the AirPlay stream.
         audioWriter?.stop()
-        audioWriter = nil
+        // 2. Tell the sidecar to stop its current stream session, but
+        //    KEEP the IPC connection open. The sidecar's `_on_client`
+        //    finally was previously hardened to NOT shutdown OwnTone on
+        //    disconnect, so this socket stays valid; closing it here
+        //    forces a reconnect-from-scratch path that doesn't exist
+        //    (attachSidecar is bootstrap-only).
         if let ipc = ipc {
             _ = try? await ipc.call("stream.stop", params: [:])
-            await ipc.close()
         }
-        ipc = nil
+        // 3. Tear down the AUHAL outputs. Each LocalOutput.stop() does
+        //    AudioOutputUnitStop/Uninitialize/Dispose synchronously.
         for (_, out) in localOutputs { out.stop() }
         localOutputs.removeAll()
+        // 4. Stop the SCK capture stream. SCKCapture.stop() launches an
+        //    unstructured Task to await the SCStream.stopCapture; that
+        //    task finishes asynchronously but won't be re-entered here.
         sckCapture.stop()
         state = .idle
     }

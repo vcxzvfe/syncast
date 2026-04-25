@@ -42,6 +42,15 @@ public final class LocalOutput {
     public private(set) var lastRenderPeak: Float = 0
     /// Phase counter for SYNCAST_TONE diagnostic mode.
     private var toneSampleIndex: UInt64 = 0
+    /// Opaque pointer from `Unmanaged.passRetained(self).toOpaque()` that
+    /// we hand to the AUHAL via `inputProcRefCon`. We hold a +1 retain on
+    /// `self` for as long as the AUHAL is alive, then `.release()` it in
+    /// `stop()` after Dispose. This closes the use-after-free window:
+    /// before this fix, `passUnretained` meant the render callback could
+    /// fire with `self` already deallocated (e.g. when the user toggles
+    /// a device off and the dictionary releases the `LocalOutput` while
+    /// AUHAL's last in-flight render is still running on the RT thread).
+    private var refConOpaque: UnsafeMutableRawPointer?
 
     /// Per-process registry of each open LocalOutput's hardware output
     /// latency in frames (deviceLatency + safetyOffset + streamLatency).
@@ -193,13 +202,21 @@ public final class LocalOutput {
         )
         guard status == noErr else { throw LocalOutputError.configurationFailed(status) }
 
-        // Render callback.
+        // Render callback. We `passRetained(self)` so the AUHAL holds a
+        // strong reference for its entire lifetime. The matching
+        // `.release()` lives in `stop()` after the unit is disposed.
+        // Without this, `localOutputs.removeValue(forKey:)` could deallocate
+        // `self` while a render block was still in flight on the RT thread,
+        // and the next ABL access would land on freed memory — exactly the
+        // crash class the user hit when toggling Xiaomi off.
+        let opaque = Unmanaged.passRetained(self).toOpaque()
+        self.refConOpaque = opaque
         var callback = AURenderCallbackStruct(
             inputProc: { (inRefCon, _, _, _, inNumberFrames, ioData) -> OSStatus in
                 let owner = Unmanaged<LocalOutput>.fromOpaque(inRefCon).takeUnretainedValue()
                 return owner.render(frames: Int(inNumberFrames), ioData: ioData)
             },
-            inputProcRefCon: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            inputProcRefCon: opaque
         )
         status = AudioUnitSetProperty(
             unit,
@@ -234,12 +251,22 @@ public final class LocalOutput {
 
     public func stop() {
         guard let unit = unit else { return }
+        // Order matters. Stop first (blocks until the current render
+        // callback has returned), then uninitialize, then dispose. After
+        // Dispose, the AUHAL no longer holds our refCon, so it's safe to
+        // release the +1 retain we put on `self` in start().
         AudioOutputUnitStop(unit)
         AudioUnitUninitialize(unit)
         AudioComponentInstanceDispose(unit)
         self.unit = nil
         initialized = false
-        Self.latencyLock.withLock {
+        if let opaque = refConOpaque {
+            // Mark consumed BEFORE releasing so any (impossible but
+            // defensive) re-entry sees a nil opaque and skips the release.
+            refConOpaque = nil
+            Unmanaged<LocalOutput>.fromOpaque(opaque).release()
+        }
+        _ = Self.latencyLock.withLock {
             Self.deviceLatencyFramesByDevID.removeValue(forKey: deviceUID)
         }
     }
