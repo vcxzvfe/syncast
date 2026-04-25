@@ -59,6 +59,7 @@ class ControlServer:
             "mode.set": self._on_mode_set,
             "local_fifo.path": self._on_local_fifo_path,
             "local_fifo.diagnostics": self._on_local_fifo_diagnostics,
+            "local_fifo.set_delay_ms": self._on_local_fifo_set_delay_ms,
         }
 
     async def run(self) -> None:
@@ -267,3 +268,20 @@ class ControlServer:
         / log dumps). Returns zero-valued payload when broadcaster is off.
         """
         return self._devices.broadcaster_diagnostics()
+
+    async def _on_local_fifo_set_delay_ms(
+        self, params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Tweak the broadcast-side delay (whole-home mode wall-clock
+        alignment) at runtime. Used by the menubar's Sync Settings
+        panel and by automated drift-correction tooling.
+
+        Negative values clamp to 0. The applied value is returned so
+        the caller can re-render the UI from the canonical state.
+        """
+        raw = params.get("delay_ms")
+        if not isinstance(raw, (int, float)):
+            raise jsonrpc.RpcError(
+                jsonrpc.INVALID_PARAMS, "delay_ms must be a number",
+            )
+        return self._devices.set_local_fifo_delay_ms(int(raw))

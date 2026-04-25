@@ -43,7 +43,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import jsonrpc, log
-from .audio_socket import AudioSocketReader, LocalFifoBroadcaster
+from .audio_socket import (
+    DEFAULT_LOCAL_FIFO_DELAY_MS,
+    AudioSocketReader,
+    LocalFifoBroadcaster,
+)
 
 logger = log.get("sidecar.devices")
 
@@ -84,6 +88,7 @@ class DeviceManager:
         owntone_binary: Path | None = None,
         owntone_config_template: Path | None = None,
         state_dir: Path | None = None,
+        local_fifo_delay_ms: int = DEFAULT_LOCAL_FIFO_DELAY_MS,
     ) -> None:
         self._notify = notify
         self._devices: dict[str, Device] = {}
@@ -104,6 +109,12 @@ class DeviceManager:
         # changes per OwnTone process.
         self._fifo_output_id: str | None = None
         self._local_fifo_socket_path: Path = default_local_fifo_socket_path()
+        # Broadcast-side delay applied to bridge fan-out so local
+        # CoreAudio playback aligns wall-clock with AirPlay receivers
+        # (which play ~1.8 s behind capture). Forwarded to every
+        # newly-constructed LocalFifoBroadcaster, and re-applied via
+        # `set_local_fifo_delay_ms` if the menubar tweaks it at runtime.
+        self._local_fifo_delay_ms = max(0, int(local_fifo_delay_ms))
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
         self._state_dir = state_dir
@@ -442,11 +453,40 @@ class DeviceManager:
                 "clients_connected": 0,
                 "fifo_open_failures": 0,
                 "per_client": [],
+                "delay_ms": self._local_fifo_delay_ms,
+                "pending_packets": 0,
+                "chunks_dropped_due_to_overflow": 0,
+                "actual_delivery_lag_ms": 0.0,
             }
         diag = self._broadcaster.diagnostics()
         diag["running"] = True
         diag["mode"] = self._mode
         return diag
+
+    def set_local_fifo_delay_ms(self, delay_ms: int) -> dict[str, Any]:
+        """Adjust the broadcast-side delay at runtime.
+
+        Stores the value on the device manager so future broadcaster
+        constructions (e.g. mode toggle out and back to whole_home)
+        pick it up automatically, AND, if a broadcaster is currently
+        running, applies it live via ``LocalFifoBroadcaster.set_delay_ms``.
+
+        Negative values clamp to 0. Returns the actually-applied value
+        plus the running broadcaster's report so the caller can verify
+        the in-flight queue depth after a delay change.
+        """
+        applied = max(0, int(delay_ms))
+        self._local_fifo_delay_ms = applied
+        if self._broadcaster is not None:
+            try:
+                applied = self._broadcaster.set_delay_ms(applied)
+            except Exception:  # noqa: BLE001
+                logger.exception("local_fifo_set_delay_failed")
+        logger.info(
+            "local_fifo_delay_set",
+            extra={"delay_ms": applied, "running": self._broadcaster is not None},
+        )
+        return {"delay_ms": applied}
 
     async def flush(self) -> dict[str, Any]:
         if self._owntone is None:
@@ -519,6 +559,7 @@ class DeviceManager:
         broadcaster = LocalFifoBroadcaster(
             socket_path=self._local_fifo_socket_path,
             fifo_path=self._owntone.output_fifo_path,
+            delay_ms=self._local_fifo_delay_ms,
         )
         broadcaster.start()
         # CRITICAL: wait until the broadcaster thread has finished the

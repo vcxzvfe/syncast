@@ -28,6 +28,7 @@ Two responsibilities live in this module:
 
 from __future__ import annotations
 
+import collections
 import errno
 import os
 import socket
@@ -56,6 +57,25 @@ LOCAL_FIFO_CHUNK_BYTES = 352 * 2 * 2  # 1408
 # multi-second backlog the receiver would still try to play); larger
 # buffers tolerate occasional render-thread hiccups but mask real problems.
 LOCAL_FIFO_CLIENT_SNDBUF = 16 * 1024
+
+# Default broadcast-side delay for whole-home mode. AirPlay receivers
+# play ~1800 ms behind capture (PTP-anchored playout); local CoreAudio
+# bridges play ~50 ms behind. We hold each PCM packet inside the
+# broadcaster for `default_delay_ms - bridge_latency` so both paths emit
+# the SAME audio at the SAME wall-clock instant. Tuned empirically.
+DEFAULT_LOCAL_FIFO_DELAY_MS = 1750
+
+# Overflow tolerance: if the delay queue accumulates more than
+# `delay + this margin` worth of pending audio, drop the OLDEST packets.
+# At 100 pkt/s input this should never trip; it's purely a safety valve
+# against a stuck pump thread (e.g. clock skew, GIL starvation under
+# extreme load) creating unbounded memory growth.
+LOCAL_FIFO_OVERFLOW_MARGIN_S = 0.5
+
+# Pump-thread wait cap. We sleep until the next item is due, but never
+# longer than this — keeps `stop_event` responsiveness sub-100ms even
+# when the queue is empty or the next due-time is far in the future.
+LOCAL_FIFO_PUMP_WAIT_CAP_S = 0.1
 
 
 class AudioSocketReader:
@@ -215,45 +235,68 @@ class _BroadcastClient:
 
 
 class LocalFifoBroadcaster:
-    """Fans OwnTone's output fifo bytes out to N Swift ``LocalAirPlayBridge``
-    clients in lockstep with the AirPlay receivers.
+    """Fans Swift PCM packets out to N ``LocalAirPlayBridge`` clients in
+    lockstep with the AirPlay receivers.
 
     Lifecycle:
 
       * ``start()``  — open the listener Unix socket at ``socket_path``,
-        open OwnTone's output fifo at ``fifo_path`` for read, spawn TWO
-        threads:
+        spawn three threads:
 
           - ``listener``: blocking ``accept(2)`` loop; appends new
             ``_BroadcastClient`` instances to the registry.
-          - ``broadcaster``: blocking ``read(2)`` from the OwnTone fifo,
-            then non-blocking ``send(2)`` to every registered client
-            with per-client backlog tracking.
+          - ``broadcaster``: legacy placeholder thread (post-tee
+            architecture; see ``_run_broadcaster`` for the long story).
+          - ``delay-pump``: pops items from the delay queue when
+            their wall-clock due-time arrives and calls
+            ``_broadcast(packet)``. Always spawned so a runtime
+            ``set_delay_ms(N)`` from a 0 baseline works without
+            having to start a thread mid-flight; idle when the
+            queue is empty (cheap condition wait).
 
-      * ``stop()``  — closes the listener, closes the fifo fd (causing
-        the broadcaster's read to return 0), joins both threads, then
+      * ``stop()``  — closes the listener, closes the fifo fd, drains
+        the delay queue, joins all threads (within 2 s), then
         forcefully closes every still-connected client socket.
-
-    The fifo is opened ``O_RDONLY`` *without* ``O_NONBLOCK``: OwnTone
-    creates it as the writer and we want the read to BLOCK when no audio
-    is queued, both because (a) busy-spinning a fifo read that never
-    yields wedges a CPU at 100% and (b) we want the broadcast to flow at
-    OwnTone's player-clock pace, not faster. The trade-off: ``stop()``
-    has to close the fd to wake the read, which is what we do.
 
     Client-side broadcasting is non-blocking. We set ``SO_SNDBUF`` low
     on each client socket (``LOCAL_FIFO_CLIENT_SNDBUF``) so a slow
     Swift bridge surfaces as ``EAGAIN`` instead of a kernel-level
     multi-megabyte backlog the receiver would still try to render.
+
+    Delay line (whole-home wall-clock alignment):
+
+      Local-bridge playback (Swift ``LocalAirPlayBridge`` → AUHAL)
+      sits ~50 ms behind capture, while AirPlay receivers play ~1800 ms
+      behind (PTP-anchored playout). Without compensation, bridges are
+      ~1.7 s AHEAD of receivers — clearly audible echo across the room.
+      We hold each packet inside the broadcaster for ``delay_ms`` (default
+      1750 ms) before fanning out to bridges, so the same audio reaches
+      both paths at the same wall-clock instant.
+
+      The delay queue is bounded: if pending audio exceeds
+      ``delay + LOCAL_FIFO_OVERFLOW_MARGIN_S`` (= 2.25 s by default) we
+      drop the OLDEST packets and bump
+      ``chunks_dropped_due_to_overflow``. That should never happen at
+      steady state (input is 100 pkt/s, queue drains at the same rate);
+      it's a safety valve against a stuck pump thread or clock skew.
+
+      ``delay_ms == 0`` is the cheap path: ``feed()`` calls
+      ``_broadcast`` synchronously and the pump thread doesn't run.
     """
 
-    def __init__(self, socket_path: Path, fifo_path: Path) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        fifo_path: Path,
+        delay_ms: int = DEFAULT_LOCAL_FIFO_DELAY_MS,
+    ) -> None:
         self._socket_path = socket_path
         self._fifo_path = fifo_path
         self._listen_sock: socket.socket | None = None
         self._fifo_fd: int | None = None
         self._listener_thread: threading.Thread | None = None
         self._broadcast_thread: threading.Thread | None = None
+        self._delay_pump_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         # Set by the broadcaster thread once the OwnTone fifo open
         # succeeds (or fails). `start()` does NOT wait on this — see
@@ -267,10 +310,29 @@ class LocalFifoBroadcaster:
         # by a slow send().
         self._clients: list[_BroadcastClient] = []
         self._clients_lock = threading.Lock()
+        # Delay-line state. Items are tuples of
+        # (due_monotonic_s, enqueued_monotonic_s, packet_bytes). The
+        # condition variable is signaled by `feed()` when a new item
+        # arrives or by `stop()` when shutdown begins. Mutations to
+        # `_delay_queue` and `_delay_seconds` happen under the
+        # condition's underlying lock.
+        self._delay_seconds = max(0.0, delay_ms / 1000.0)
+        self._delay_cond = threading.Condition()
+        self._delay_queue: collections.deque[tuple[float, float, bytes]] = (
+            collections.deque()
+        )
         # Diagnostics — read from the IPC layer for `state.report` etc.
         self.bytes_broadcast: int = 0
         self.chunks_broadcast: int = 0
         self.fifo_open_failures: int = 0
+        # Counter for packets dropped by the bounded-queue safety valve
+        # when pending audio exceeds `delay + overflow margin`.
+        self.chunks_dropped_due_to_overflow: int = 0
+        # Sliding scalar: time-from-feed-to-_broadcast for the most
+        # recently delivered packet, in milliseconds. Lets the user (or
+        # an automated check) verify that the delay is actually being
+        # applied to within tens of milliseconds of `delay_ms`.
+        self._actual_delivery_lag_ms: float = 0.0
 
     # ---------- diagnostics ----------
 
@@ -279,18 +341,58 @@ class LocalFifoBroadcaster:
         with self._clients_lock:
             return len(self._clients)
 
+    @property
+    def delay_ms(self) -> int:
+        """Currently configured broadcast delay in milliseconds."""
+        return int(round(self._delay_seconds * 1000.0))
+
+    def set_delay_ms(self, delay_ms: int) -> int:
+        """Update the broadcast delay at runtime.
+
+        Negative values clamp to 0 (the synchronous cheap path).
+        Returns the actually-applied value (after clamping).
+
+        Switching to 0 *while* packets are queued causes those packets
+        to drain naturally at their original due-times — we don't
+        retroactively flush them, since flushing 1.7 s of audio at
+        once would punch a transient through whatever bridge clients
+        have. Switching FROM 0 to a positive value applies to all
+        future ``feed()`` calls; in-flight packets (none, since the 0
+        path is synchronous) are not affected.
+
+        Thread-safe: takes the condition's underlying lock so the pump
+        thread sees a consistent value on its next iteration. Wakes
+        the pump so it re-evaluates its sleep budget against the new
+        delay.
+        """
+        applied = max(0, int(delay_ms))
+        with self._delay_cond:
+            self._delay_seconds = applied / 1000.0
+            self._delay_cond.notify_all()
+        return applied
+
     def diagnostics(self) -> dict[str, object]:
         with self._clients_lock:
             per_client = [
                 {"addr": str(c.addr), "chunks_dropped": c.chunks_dropped}
                 for c in self._clients
             ]
+        with self._delay_cond:
+            pending_packets = len(self._delay_queue)
+            delay_ms = int(round(self._delay_seconds * 1000.0))
+            actual_lag_ms = self._actual_delivery_lag_ms
         return {
             "bytes_broadcast": self.bytes_broadcast,
             "chunks_broadcast": self.chunks_broadcast,
             "clients_connected": len(per_client),
             "fifo_open_failures": self.fifo_open_failures,
             "per_client": per_client,
+            "delay_ms": delay_ms,
+            "pending_packets": pending_packets,
+            "chunks_dropped_due_to_overflow": (
+                self.chunks_dropped_due_to_overflow
+            ),
+            "actual_delivery_lag_ms": actual_lag_ms,
         }
 
     # ---------- lifecycle ----------
@@ -323,11 +425,31 @@ class LocalFifoBroadcaster:
             name="syncast-localfifo-broadcast",
             daemon=True,
         )
+        # The delay-pump thread runs unconditionally — it cheaply waits
+        # on the condition variable when the queue is empty (whether
+        # because delay==0 or just because nothing has been fed yet).
+        # Spawning it always keeps `set_delay_ms()` race-free (no need
+        # to start a thread mid-flight if delay is bumped from 0 to >0).
+        self._delay_pump_thread = threading.Thread(
+            target=self._run_delay_pump,
+            name="syncast-localfifo-delay-pump",
+            daemon=True,
+        )
         self._listener_thread.start()
         self._broadcast_thread.start()
+        self._delay_pump_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
+        # Wake the pump so it sees stop_event flipped and exits its
+        # condition wait promptly. We also drain the queue here under
+        # the same lock to avoid leaking 1+ seconds of pending audio
+        # bytes; if we left them, GC would still free them when the
+        # broadcaster is dropped, but explicit draining keeps the leak
+        # bounded even if a caller stashes a reference.
+        with self._delay_cond:
+            self._delay_queue.clear()
+            self._delay_cond.notify_all()
         listen = self._listen_sock
         self._listen_sock = None
         if listen is not None:
@@ -344,11 +466,16 @@ class LocalFifoBroadcaster:
                 os.close(fd)
             except OSError:
                 pass
-        for t in (self._listener_thread, self._broadcast_thread):
+        for t in (
+            self._listener_thread,
+            self._broadcast_thread,
+            self._delay_pump_thread,
+        ):
             if t is not None:
                 t.join(timeout=2.0)
         self._listener_thread = None
         self._broadcast_thread = None
+        self._delay_pump_thread = None
         # Forcefully drop any clients still connected.
         with self._clients_lock:
             for c in self._clients:
@@ -448,7 +575,8 @@ class LocalFifoBroadcaster:
             )
 
     def feed(self, packet: bytes) -> None:
-        """Push one PCM chunk to every connected bridge client.
+        """Push one PCM chunk into the delay queue (or directly to
+        bridge clients if ``delay_ms == 0``).
 
         Called by `AudioSocketReader` immediately after writing the
         chunk to OwnTone's input fifo (the AirPlay-bound copy). This
@@ -457,16 +585,69 @@ class LocalFifoBroadcaster:
         (which had unfixable multi-reader semantics — see fifo.c
         patch in build/owntone-server/src/outputs/fifo.c).
 
-        Thread-safe: `_broadcast` does its own locking. Any chunk
+        Delay path (``delay_seconds > 0``):
+          enqueue (due_time, enqueued_time, packet) and signal the
+          pump. The pump pops items whose due-time has arrived and
+          calls ``_broadcast(packet)``. Wall-clock alignment with
+          AirPlay receivers (which play ~1.8 s behind capture) is
+          maintained by holding the packet for ``delay_ms`` here.
+
+        Synchronous path (``delay_seconds == 0``):
+          ``_broadcast`` is called directly on the caller's thread
+          for zero-overhead pass-through.
+
+        Thread-safe: ``_broadcast`` does its own locking. Any chunk
         size is acceptable — bridge clients accumulate to their own
         packet boundary on the receive side.
         """
         if self._stop_event.is_set():
             return
+        # Snapshot delay under the cond lock so we react to a recent
+        # `set_delay_ms(0)` without a race window where one packet
+        # leaks past the pump.
+        now = time.monotonic()
+        with self._delay_cond:
+            delay = self._delay_seconds
+            if delay <= 0.0:
+                # Cheap path: no queueing, dispatch synchronously.
+                # Fall through to the synchronous _broadcast call
+                # outside the lock so a slow client send can't block
+                # an unrelated thread that's holding the cond.
+                pass
+            else:
+                due = now + delay
+                # Bound the queue. Steady-state we expect ~100 packets
+                # at a delay of 1750 ms (input is 100 pkt/s); the cap
+                # is `delay + LOCAL_FIFO_OVERFLOW_MARGIN_S` worth of
+                # packets, computed from input rate. We measure pending
+                # audio in WALL-CLOCK seconds (oldest due-time vs newest
+                # due-time) rather than packet count: that's both more
+                # accurate (handles variable packet sizes) and self-
+                # adapting to the configured delay.
+                if self._delay_queue:
+                    oldest_due = self._delay_queue[0][0]
+                    pending_seconds = due - oldest_due
+                    cap_seconds = delay + LOCAL_FIFO_OVERFLOW_MARGIN_S
+                    while (
+                        self._delay_queue
+                        and pending_seconds > cap_seconds
+                    ):
+                        self._delay_queue.popleft()
+                        self.chunks_dropped_due_to_overflow += 1
+                        if self._delay_queue:
+                            oldest_due = self._delay_queue[0][0]
+                            pending_seconds = due - oldest_due
+                self._delay_queue.append((due, now, packet))
+                self._delay_cond.notify()
+                return
+        # Synchronous path (delay <= 0): release-on-fall-through above.
         try:
             self._broadcast(packet)
         except Exception:  # noqa: BLE001
             logger.exception("local_fifo_broadcast_failed")
+        # Update the lag scalar even on the synchronous path so the
+        # diagnostic dict is meaningful when delay is toggled at runtime.
+        self._actual_delivery_lag_ms = (time.monotonic() - now) * 1000.0
 
     def _run_broadcaster(self) -> None:
         """Idle thread placeholder.
@@ -485,6 +666,73 @@ class LocalFifoBroadcaster:
         self._fifo_ready.set()
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=1.0)
+
+    def _run_delay_pump(self) -> None:
+        """Drain the delay queue, releasing packets to ``_broadcast``
+        when their wall-clock due-time arrives.
+
+        Wait policy:
+          * Empty queue → wait on the condition with a 100 ms cap so
+            ``stop_event`` flips are noticed promptly.
+          * Non-empty queue → wait until the next due-time, capped at
+            100 ms. ``feed()`` notifies the condition when a new
+            (potentially-earlier) item arrives, so an empty-→full
+            transition doesn't sit on the cap.
+
+        We do NOT busy-wait. We do NOT call ``time.sleep`` in a tight
+        loop. Every wait happens via ``threading.Condition.wait`` on a
+        bounded timeout, so the thread parks the kernel scheduler and
+        only re-runs when it should.
+
+        Drift handling: if the system clock jumps or the GIL stalls
+        for several seconds, we may emerge from a wait with multiple
+        items past due. We pop them all in one pass before sleeping
+        again, so the queue catches up rather than holding stale audio.
+        """
+        while True:
+            with self._delay_cond:
+                if self._stop_event.is_set():
+                    return
+                now = time.monotonic()
+                # Drain every item whose due-time has arrived.
+                ready: list[tuple[float, float, bytes]] = []
+                while self._delay_queue and self._delay_queue[0][0] <= now:
+                    ready.append(self._delay_queue.popleft())
+                # Determine the next wake budget. If the queue is
+                # empty we wait the cap (so we still notice stop_event
+                # within ~100 ms even with no traffic). If the queue
+                # has a future item, sleep until that item is due,
+                # again capped.
+                if not ready:
+                    if self._delay_queue:
+                        sleep_for = max(
+                            0.0,
+                            min(
+                                LOCAL_FIFO_PUMP_WAIT_CAP_S,
+                                self._delay_queue[0][0] - now,
+                            ),
+                        )
+                    else:
+                        sleep_for = LOCAL_FIFO_PUMP_WAIT_CAP_S
+                    # Wait for either: stop_event flip, feed() notify
+                    # or the time-until-due to elapse. Returning early
+                    # from a notify is fine — we re-loop and check.
+                    if sleep_for > 0:
+                        self._delay_cond.wait(timeout=sleep_for)
+                    continue
+            # Releasable items are dispatched outside the cond lock so
+            # a slow `_broadcast` send doesn't block `feed()`.
+            for due, enq, packet in ready:
+                try:
+                    self._broadcast(packet)
+                except Exception:  # noqa: BLE001
+                    logger.exception("local_fifo_broadcast_failed")
+                # Lag = how long the packet actually spent in flight,
+                # from feed() to here. Should be very close to the
+                # configured delay_ms in steady state.
+                self._actual_delivery_lag_ms = (
+                    time.monotonic() - enq
+                ) * 1000.0
 
     def _broadcast(self, packet: bytes) -> None:
         """Send one OwnTone packet to every connected client.
