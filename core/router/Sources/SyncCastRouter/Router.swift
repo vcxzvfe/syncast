@@ -1209,6 +1209,11 @@ public actor Router {
     // diagnostics; it never touches `PassiveCalibrator` directly.
     public private(set) var passiveCalibrator: PassiveCalibrator?
     public private(set) var lastPassiveSample: PassiveCalibrator.Sample?
+    /// External subscriber, set by `startPassiveCalibration(...,onSampleAvailable:)`.
+    /// Invoked synchronously inside the actor in `handlePassiveSample`
+    /// (off the calibrator's own thread) so the UI sees samples promptly,
+    /// independent of the sidecar push latency.
+    private var externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)?
     /// Bumped on every Sample callback (above threshold). Useful for
     /// diagnosing "engine alive vs. not converging".
     public private(set) var passiveSampleCount: Int = 0
@@ -1217,9 +1222,12 @@ public actor Router {
     /// uses the system default input. Throws on mic-permission denial
     /// or no-input-device.
     public func startPassiveCalibration(
-        microphoneDeviceID: AudioDeviceID? = nil
+        microphoneDeviceID: AudioDeviceID? = nil,
+        intervalSeconds: Int? = nil,
+        onSampleAvailable: (@Sendable (PassiveCalibrator.Sample) -> Void)? = nil
     ) async throws {
         if passiveCalibrator != nil { return }
+        externalPassiveSampleCallback = onSampleAvailable
         let calibrator = PassiveCalibrator(
             ringBuffer: sckCapture.ringBuffer,
             microphoneDeviceID: microphoneDeviceID,
@@ -1228,10 +1236,17 @@ public actor Router {
                 Task { await self.handlePassiveSample(sample) }
             }
         )
+        // Apply user-configured interval BEFORE start so the first
+        // measurement window matches the user's preference rather than
+        // the calibrator's internal default.
+        if let interval = intervalSeconds {
+            calibrator.measurementIntervalSeconds = Double(interval)
+        }
         do {
             try await calibrator.start()
         } catch {
             lastError = "passive calibration start failed: \(error)"
+            externalPassiveSampleCallback = nil
             throw error
         }
         passiveCalibrator = calibrator
@@ -1241,6 +1256,7 @@ public actor Router {
     public func stopPassiveCalibration() {
         passiveCalibrator?.stop()
         passiveCalibrator = nil
+        externalPassiveSampleCallback = nil
     }
 
     /// Cache + forward to the broadcaster. Clamp matches sidecar's own
@@ -1249,6 +1265,10 @@ public actor Router {
     private func handlePassiveSample(_ sample: PassiveCalibrator.Sample) async {
         passiveSampleCount &+= 1
         lastPassiveSample = sample
+        // Forward to UI subscriber (AppModel) BEFORE the sidecar push.
+        // The UI just displays the measurement; it shouldn't block on
+        // the JSON-RPC round-trip if the sidecar happens to be slow.
+        externalPassiveSampleCallback?(sample)
         let clamped = max(0, min(10_000, sample.suggestedDelayMs))
         do {
             _ = try await setLocalFifoDelayMs(clamped)

@@ -158,7 +158,7 @@ final class AppModel {
             restartBackgroundCalibrationIfActive()
         }
     }
-    var lastCalibrationSample: BackgroundCalibrationSample? = nil
+    var lastCalibrationSample: PassiveCalibrator.Sample? = nil
     /// True iff the engine is running (toggle on + bad preconditions → false).
     var backgroundCalibrationActive: Bool = false
     /// Toggle on but mic permission denied/restricted.
@@ -989,11 +989,20 @@ final class AppModel {
             SyncCastLog.log("bgCalib: starting interval=\(interval)s mic=\(micID.map(String.init) ?? "default")")
             Task { [weak self] in
                 guard let self else { return }
-                await self.router.startPassiveCalibration(
-                    intervalSeconds: interval, micID: micID
-                ) { sample in
-                    Task { @MainActor [weak self] in
-                        self?.handleBackgroundCalibrationSample(sample)
+                do {
+                    try await self.router.startPassiveCalibration(
+                        microphoneDeviceID: micID,
+                        intervalSeconds: interval,
+                        onSampleAvailable: { sample in
+                            Task { @MainActor [weak self] in
+                                self?.handleBackgroundCalibrationSample(sample)
+                            }
+                        }
+                    )
+                } catch {
+                    SyncCastLog.log("bgCalib: start failed: \(error)")
+                    await MainActor.run {
+                        self.backgroundCalibrationActive = false
                     }
                 }
             }
@@ -1024,7 +1033,7 @@ final class AppModel {
         stopBackgroundCalibration(thenReconcile: true)
     }
 
-    private func handleBackgroundCalibrationSample(_ sample: BackgroundCalibrationSample) {
+    private func handleBackgroundCalibrationSample(_ sample: PassiveCalibrator.Sample) {
         lastCalibrationSample = sample
         SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDelayMs)ms suggested=\(sample.suggestedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
         setAirplayDelay(sample.suggestedDelayMs)
