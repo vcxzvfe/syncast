@@ -45,6 +45,18 @@ public actor Router {
     /// audio out to. Used to decide if a routing change requires destroy +
     /// recreate (different set) or is a no-op (same set).
     private var aggregateCoveredUIDs: Set<String> = []
+    /// Maps SyncCast device ID → coreAudio UID for every device the
+    /// active aggregate covers. Used by replan() to apply per-device
+    /// hardware volume — routing is keyed by SyncCast ID, but the
+    /// hardware-volume API needs the underlying device's UID.
+    private var aggregateUIDByDeviceID: [String: String] = [:]
+    /// Cached stream-format diagnostic from the most recent aggregate
+    /// build. Surfaced by `diagnosticSCKReport()` so field logs show the
+    /// actual channel layout of the kernel-level fan-out — invaluable
+    /// for diagnosing the "only one speaker plays" symptom (which is
+    /// almost always a channel-count mismatch between AUHAL stream
+    /// format and the aggregate's exposed stream layout).
+    private var aggregateStreamDiagnostic: AggregateDevice.StreamDiagnostic?
     private var routing: [String: DeviceRouting] = [:]
     private var measuredAirplayLatencyMs: Int = 1800
     private var ipc: IpcClient?
@@ -225,7 +237,18 @@ public actor Router {
         } else {
             driverInfo = " driver=idle"
         }
-        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(renderInfo)\(awInfo)"
+        // Aggregate stream-format diagnostic: surfaces the actual channel
+        // layout so field logs make the "only one speaker plays" bug
+        // unambiguous. Format:
+        //   streamChannelCount=streams=1 ch=[2] total=2 master=2  (good)
+        //   streamChannelCount=streams=1 ch=[4] total=4 master=2  (bug)
+        let streamInfo: String
+        if let diag = aggregateStreamDiagnostic {
+            streamInfo = " streamChannelCount=\(diag.summary)"
+        } else {
+            streamInfo = ""
+        }
+        return "seen=\(s.debugBuffersSeen) written=\(s.debugBuffersWritten) ticks=\(s.tickCount) peak=\(String(format: "%.4f", s.debugLastPeak))/\(String(format: "%.4f", s.debugMaxPeak)) readback=\(String(format: "%.4f", s.debugReadbackPeak))@\(s.debugReadbackPos) last=\(s.debugLastReason)\(driverInfo)\(streamInfo)\(renderInfo)\(awInfo)"
     }
 
     /// Reconcile the open AUHAL set against the current routing snapshot.
@@ -364,11 +387,32 @@ public actor Router {
             return
         }
 
+        // Diagnose the aggregate's actual output-stream layout BEFORE
+        // opening AUHAL. This reads kAudioDevicePropertyStreamConfiguration
+        // and lets us correlate AUHAL's mChannelsPerFrame=2 against the
+        // aggregate's real channel count. If they mismatch (e.g. 4 ch
+        // because the kernel exposed both subdevices' channels via one
+        // stream), only the first 2 channels get audio and the second
+        // physical speaker is silent — the user-reported bug.
+        let diag = agg.diagnoseStreamConfig()
+        // stderr — Router has no SyncCastLog dependency.
+        FileHandle.standardError.write(Data(
+            "[Router] aggregate stream diag: \(diag.summary) outputCh=\(agg.outputChannelCount)\n".utf8
+        ))
+        aggregateStreamDiagnostic = diag
+
+        // AUHAL is configured for the aggregate's REAL channel count.
+        // If approach (A) succeeded in narrowing every stream to 2-ch,
+        // outputChannelCount == 2 and render() emits a clean stereo pair.
+        // If (A) was rejected and outputChannelCount is wider (typically
+        // 2*subdeviceCount), render() splats the source stereo into
+        // every channel pair so all subdevices play.
         let out = LocalOutput(
             deviceID: agg.deviceID, deviceUID: agg.aggregateUID,
             ring: sckCapture.ringBuffer,
             sampleRate: sckCapture.sampleRate,
-            channelCount: sckCapture.channelCount
+            channelCount: sckCapture.channelCount,
+            outputChannelCount: agg.outputChannelCount
         )
         do {
             try out.start()
@@ -382,6 +426,11 @@ public actor Router {
             }
             aggregateDevice = agg
             aggregateCoveredUIDs = candidateUIDs
+            // Build the SyncCast-id → UID map needed by replan() to
+            // apply per-device hardware volume.
+            var idToUID: [String: String] = [:]
+            for e in enabled { idToUID[e.deviceID] = e.uid }
+            aggregateUIDByDeviceID = idToUID
             // Key the AUHAL by the aggregate UID so diagnostic dumps and
             // setRouting iteration can find it without confusing it with
             // a per-device entry.
@@ -405,6 +454,8 @@ public actor Router {
             aggregateDevice = nil
         }
         aggregateCoveredUIDs = []
+        aggregateUIDByDeviceID.removeAll()
+        aggregateStreamDiagnostic = nil
     }
 
     public func updateAirplayLatency(_ measuredMs: Int) {
@@ -504,6 +555,30 @@ public actor Router {
                 gain: r.volume,
                 muted: r.muted
             )
+        }
+
+        // In aggregate mode, also apply per-device HARDWARE volume on
+        // the underlying physical DACs. The single AUHAL atop the
+        // aggregate cannot do this — it sees one stream and applies
+        // gain uniformly to every subdevice. Hardware volume bypasses
+        // the AUHAL entirely.
+        if let agg = aggregateDevice {
+            for (devID, uid) in aggregateUIDByDeviceID {
+                let r = routing[devID] ?? DeviceRouting(deviceID: devID)
+                let target = r.muted ? Float(0) : r.volume
+                let ok = agg.setSubdeviceVolume(uid: uid, volume: target)
+                if !ok {
+                    // We log to stderr but don't surface in lastError —
+                    // hardware volume is best-effort. Some devices
+                    // (HDMI, certain pro audio interfaces) refuse all
+                    // software writes; the user just gets uniform
+                    // levels in that case, which is the pre-fix
+                    // behavior, not a regression.
+                    FileHandle.standardError.write(Data(
+                        "[Router] hardware volume rejected for \(uid.prefix(20)) (target=\(target))\n".utf8
+                    ))
+                }
+            }
         }
     }
 }

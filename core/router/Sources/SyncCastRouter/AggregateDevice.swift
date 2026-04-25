@@ -64,6 +64,22 @@ public final class AggregateDevice {
     public let deviceID: AudioObjectID
     public let masterUID: String
     public let subDeviceUIDs: [String]
+    /// The channel count AUHAL must declare on its input scope to match
+    /// what the aggregate's output stream actually exposes.
+    ///
+    /// Why this is dynamic: with stacked=0 and 2-ch subdevices, the
+    /// expected layout is one stream of 2 channels (kernel fans the
+    /// stereo to every subdevice). In practice, with two 2-ch subdevices
+    /// (e.g. MBP built-in + display speakers), the aggregate often
+    /// exposes 4 channels in one stream (kernel concatenated subdevices'
+    /// channels regardless of stacked=0 — observed on Sonoma+). If AUHAL
+    /// is configured for 2-ch, only the first pair receives audio; the
+    /// second physical speaker is silent.
+    ///
+    /// The fix: query the actual stream channel count post-create and
+    /// configure AUHAL to match. The render callback writes the source
+    /// stereo into EVERY channel pair (splat) so all subdevices play.
+    public let outputChannelCount: Int
 
     /// Build a new private aggregate. Throws if the kernel rejects the
     /// composition (most often: a UID that isn't a real, currently-online
@@ -140,6 +156,91 @@ public final class AggregateDevice {
         // engages the SRC immediately and the wobble is gone. Loopback
         // does this via its "Output Clock" feature.
         Self.setNominalSampleRate(newID, rate: 48_000)
+
+        // === Channel-count fix (Strategy 2 / stereo-mode silent-second-
+        // device bug) ===
+        //
+        // First try approach (A): coerce every output stream to 2-ch by
+        // setting `kAudioStreamPropertyVirtualFormat`. If the kernel
+        // accepts, AUHAL writes 2 channels and the aggregate fans them
+        // out to every subdevice (the documented stacked=0 contract).
+        //
+        // If the kernel rejects (most often on stacked aggregate streams
+        // — they're considered immutable by the AggregateClock plug-in),
+        // we fall back to approach (B): re-read the actual channel count
+        // and accept it. AUHAL on top will then be configured for the
+        // wider count and render() splats stereo into every channel pair.
+        Self.tryNarrowOutputStreamsToStereo(newID)
+        let (_, _, total) = Self.readStreamChannels(newID)
+        // Floor at 2 — even if the read failed, AUHAL must be at least
+        // a stereo pair. A device that exposes 0 output channels post-
+        // create is broken in a way we can't paper over here.
+        self.outputChannelCount = max(2, total)
+    }
+
+    /// Approach (A) for the channel-count bug: try to set every output
+    /// stream's virtual format to 2-ch Float32 non-interleaved. If the
+    /// kernel accepts, AUHAL on top will be a clean 2-ch surface and the
+    /// kernel handles the fan-out per the stacked=0 contract.
+    ///
+    /// Best-effort — failure is silently tolerated, and the caller falls
+    /// back to (B) by reading the resulting channel count.
+    private static func tryNarrowOutputStreamsToStereo(_ aggregateID: AudioObjectID) {
+        var streamsAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            aggregateID, &streamsAddr, 0, nil, &size
+        ) == noErr, size > 0 else { return }
+        let count = Int(size) / MemoryLayout<AudioStreamID>.size
+        var streams = Array(repeating: AudioStreamID(0), count: count)
+        guard AudioObjectGetPropertyData(
+            aggregateID, &streamsAddr, 0, nil, &size, &streams
+        ) == noErr else { return }
+
+        // Read sample rate from the aggregate — we want to keep whatever
+        // we already negotiated above.
+        var rateAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var sampleRate: Float64 = 48_000
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        _ = AudioObjectGetPropertyData(
+            aggregateID, &rateAddr, 0, nil, &rateSize, &sampleRate
+        )
+
+        var virtualAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioStreamPropertyVirtualFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var format = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat
+                | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        let formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        for s in streams {
+            // Best-effort. Most aggregate stream objects reject this
+            // because their stream layout is derived from their
+            // subdevices and the kernel considers it immutable.
+            _ = AudioObjectSetPropertyData(
+                s, &virtualAddr, 0, nil, formatSize, &format
+            )
+        }
     }
 
     private static func setNominalSampleRate(_ id: AudioObjectID, rate: Float64) {
@@ -200,11 +301,135 @@ public final class AggregateDevice {
         return result
     }
 
+    // MARK: - Stream-format diagnostic
+    //
+    // Why this exists
+    // ---------------
+    // Reported bug (Strategy 2 / stereo mode): when 2+ local outputs are
+    // enabled, only ONE physical speaker emits sound — the second is
+    // silent. AUHAL renders fire (renderTickCount climbs, peak > 0), the
+    // aggregate is built (driver=aggregate(2)), drift is on … but only
+    // one DAC produces audio.
+    //
+    // The hypothesis: AUHAL is configured for 2-ch (mChannelsPerFrame=2),
+    // but the aggregate's stream may expose 2*N channels — one stereo pair
+    // per subdevice. AUHAL writes the first pair only, leaving the rest
+    // silent. The kernel docs state that stacked=0 should make every
+    // subdevice receive the SAME frames (a true fan-out), but on some
+    // OS / driver combinations the aggregate's STREAM still surfaces the
+    // sum of subdevice channels.
+    //
+    // To prove or refute the hypothesis we need to read back
+    // `kAudioDevicePropertyStreamConfiguration` AFTER create. That gives
+    // us an AudioBufferList describing every output stream's actual
+    // channel count. We log the result. If totalChannels > 2 with two
+    // 2-ch subdevices, the hypothesis is correct and we need a fix
+    // (set virtual format to 2-ch, or widen AUHAL to match).
+    public struct StreamDiagnostic: Sendable {
+        public let streamCount: Int
+        public let channelsPerStream: [Int]
+        public let totalChannels: Int
+        public let masterSubdeviceChannels: Int
+        public var summary: String {
+            let perStream = channelsPerStream.map(String.init).joined(separator: ",")
+            return "streams=\(streamCount) ch=[\(perStream)] total=\(totalChannels) master=\(masterSubdeviceChannels)"
+        }
+    }
+
+    /// Reads back the aggregate's actual output-stream layout. Call
+    /// IMMEDIATELY after construction, before opening an AUHAL on top.
+    /// Used to diagnose the "only one device plays" bug when 2+ outputs
+    /// are stacked into a single aggregate.
+    public func diagnoseStreamConfig() -> StreamDiagnostic {
+        let (streams, perStream, total) = Self.readStreamChannels(deviceID)
+        // Walk owned subdevices to find the master and read its channel
+        // count. Use scope=Output because that's what AUHAL pulls from.
+        var masterCh: Int = 0
+        for subID in Self.aggregateOwnedSubDeviceIDs(aggregateID: deviceID) {
+            guard let uid = Self.readSubDeviceUID(subID), uid == masterUID else {
+                continue
+            }
+            // The subdevice object inherits AudioDevice; its channel
+            // count is whatever the underlying physical device exposes.
+            // Read on scope=Output — AUHAL pulls outputs.
+            masterCh = Self.readStreamChannelTotal(subID, scope: kAudioDevicePropertyScopeOutput)
+            break
+        }
+        return StreamDiagnostic(
+            streamCount: streams,
+            channelsPerStream: perStream,
+            totalChannels: total,
+            masterSubdeviceChannels: masterCh
+        )
+    }
+
+    /// Reads `kAudioDevicePropertyStreamConfiguration` on `id`,
+    /// scope=Output, returns (streamCount, perStreamChannels, total).
+    /// Internal so XCTest can exercise it on any AudioObjectID-shaped value.
+    static func readStreamChannels(_ id: AudioObjectID) -> (Int, [Int], Int) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr,
+              size > 0 else {
+            return (0, [], 0)
+        }
+        // AudioBufferList is variable-length; allocate a raw buffer and
+        // bind to AudioBufferList head, then iterate.
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { raw.deallocate() }
+        let listPtr = raw.assumingMemoryBound(to: AudioBufferList.self)
+        let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, listPtr)
+        guard status == noErr else { return (0, [], 0) }
+        let bufList = UnsafeMutableAudioBufferListPointer(listPtr)
+        var perStream: [Int] = []
+        var total = 0
+        for i in 0..<bufList.count {
+            let ch = Int(bufList[i].mNumberChannels)
+            perStream.append(ch)
+            total += ch
+        }
+        return (bufList.count, perStream, total)
+    }
+
+    /// Convenience: total channel count on a given scope.
+    private static func readStreamChannelTotal(
+        _ id: AudioObjectID,
+        scope: AudioObjectPropertyScope
+    ) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr,
+              size > 0 else { return 0 }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { raw.deallocate() }
+        let listPtr = raw.assumingMemoryBound(to: AudioBufferList.self)
+        let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, listPtr)
+        guard status == noErr else { return 0 }
+        let bufList = UnsafeMutableAudioBufferListPointer(listPtr)
+        var total = 0
+        for i in 0..<bufList.count { total += Int(bufList[i].mNumberChannels) }
+        return total
+    }
+
     /// Returns the AudioObjectIDs of every kAudioSubDeviceClassID object
     /// owned by `aggregateID`. These are the in-aggregate subdevice
     /// instances (NOT the underlying physical devices), and they're the
     /// only correct target for sub-device drift / latency property reads.
-    private static func aggregateOwnedSubDeviceIDs(
+    static func aggregateOwnedSubDeviceIDs(
         aggregateID: AudioObjectID
     ) -> [AudioObjectID] {
         var addr = AudioObjectPropertyAddress(
@@ -361,6 +586,133 @@ public final class AggregateDevice {
         }
         guard status == noErr, let result = cfUid as String? else { return nil }
         return result
+    }
+
+    // MARK: - Per-device hardware volume
+    //
+    // Why this exists
+    // ---------------
+    // In aggregate mode there's a SINGLE AUHAL on top of the kernel-
+    // level fan-out, so the existing `LocalOutput.setRouting(gain:)`
+    // applies one global software gain to the entire stream — every
+    // physical speaker hears the same level. The user's per-device
+    // volume sliders (e.g. "MBP at 80% + display at 50%") cannot be
+    // honored that way.
+    //
+    // Fix: write hardware volume directly on each underlying physical
+    // device via `kAudioDevicePropertyVolumeScalar`. The aggregate
+    // doesn't intercept this — the volume lives on the DAC and stays
+    // applied even after the aggregate is torn down. (That's also why
+    // we restore the previous level on stop, see `restoreSubdeviceVolume`
+    // — TODO P3 if we want to be polite to other apps.)
+    //
+    // CoreAudio volume element semantics:
+    //   - Element 0 ("master") — sometimes settable, sometimes a
+    //     read-only mirror of the per-channel max. Headphone DACs
+    //     and most aggregates expose it, USB class-compliant devices
+    //     usually don't.
+    //   - Element 1..N — per-channel. Always per-element on devices
+    //     that don't accept master writes. We set every output channel
+    //     to the same scalar so the user's slider behaves as a balanced
+    //     gain.
+
+    /// Apply a 0..1 scalar volume to the physical device backing
+    /// the subdevice with UID `uid`. Returns whether ANY write
+    /// succeeded — partial-success (some channels accepted, others
+    /// rejected) is reported as success.
+    ///
+    /// Best-effort: a device that refuses every write (some HDMI
+    /// outputs, some pro audio interfaces with hardware-only volume
+    /// knobs) returns false. Caller can fall back to the AUHAL
+    /// software gain in that case, which means losing per-device
+    /// granularity but preserving overall mute/duck behavior.
+    @discardableResult
+    public func setSubdeviceVolume(uid: String, volume: Float) -> Bool {
+        let clamped = max(0.0, min(1.0, volume))
+        // Resolve the underlying physical device. The aggregate's owned
+        // subdevice objects are NOT the right target for hardware
+        // volume (they're aggregate-internal facades). The actual DAC
+        // hardware lives behind the UID's translated AudioObjectID.
+        guard subDeviceUIDs.contains(uid) else { return false }
+        let physicalID: AudioObjectID
+        do {
+            physicalID = try Self.deviceIDForUID(uid)
+        } catch {
+            return false
+        }
+        return Self.applyHardwareVolume(physicalID: physicalID, volume: clamped)
+    }
+
+    /// Static so it can be unit-tested in isolation. Tries master
+    /// element first; falls back to per-channel iteration. Returns
+    /// true if any write succeeded.
+    static func applyHardwareVolume(
+        physicalID: AudioObjectID,
+        volume: Float
+    ) -> Bool {
+        // Step 1: try element 0 (master) if it's both present AND
+        // settable. A device that has it as a read-only mirror will
+        // claim has=true, settable=false; we must check both.
+        if isVolumeWritable(physicalID, element: 0) {
+            if writeVolume(physicalID, element: 0, volume: volume) {
+                return true
+            }
+        }
+        // Step 2: iterate per-channel elements. We don't know the
+        // exact channel count without reading kAudioDevicePropertyStreams,
+        // but kAudioDevicePropertyVolumeScalar tolerates a missing
+        // element (returns kAudioHardwareUnknownPropertyError); we
+        // simply skip those. Capping at 32 covers every realistic
+        // multichannel speaker setup and avoids an unbounded loop on
+        // pathological devices.
+        var anyWrite = false
+        for elem in 1...32 {
+            if writeVolume(physicalID, element: AudioObjectPropertyElement(elem), volume: volume) {
+                anyWrite = true
+            }
+        }
+        return anyWrite
+    }
+
+    /// True iff `kAudioDevicePropertyVolumeScalar` exists on the given
+    /// element AND is settable. Both checks are needed — a read-only
+    /// master mirror passes HasProperty but fails IsSettable.
+    private static func isVolumeWritable(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var settable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(id, &addr, &settable) == noErr else {
+            return false
+        }
+        return settable.boolValue
+    }
+
+    /// Write a scalar 0..1 volume to a specific (id, element) pair.
+    /// Returns true on noErr, false otherwise. We do NOT first check
+    /// IsSettable here because per-channel writes that succeed on
+    /// element N are common even when element 0 reports unsettable.
+    private static func writeVolume(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement,
+        volume: Float
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var value = volume
+        let size = UInt32(MemoryLayout<Float>.size)
+        let status = AudioObjectSetPropertyData(id, &addr, 0, nil, size, &value)
+        return status == noErr
     }
 
     // MARK: - Master selection helper
