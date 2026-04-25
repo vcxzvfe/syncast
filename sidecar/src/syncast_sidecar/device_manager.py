@@ -14,11 +14,28 @@ Architecture (per ADR-006):
   • The audio data path runs in parallel: `AudioSocketReader` accepts
     PCM packets from the Swift router on a SOCK_SEQPACKET socket and
     forwards them straight into OwnTone's FIFO pipe.
+
+Whole-home AirPlay mode (Strategy 1):
+
+  • A second data plane exists alongside the inbound `AudioSocketReader`:
+    `LocalFifoBroadcaster` reads OwnTone's OUTPUT fifo (configured via
+    the `fifo {}` section in owntone.conf) and fans player-clock-driven
+    PCM out to N Swift `LocalAirPlayBridge` clients. This lets local
+    CoreAudio outputs stay in lockstep with AirPlay receivers, since
+    every output rides OwnTone's single player clock.
+  • Modes:
+      - "stereo"     — broadcast listener is OFF. OwnTone may or may not
+                       be running; the legacy `stream.start` path still
+                       works for AirPlay-only output as before.
+      - "whole_home" — broadcast listener is ON. OwnTone is required to
+                       be running, since Swift bridges depend on it
+                       producing PCM into the output fifo.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -26,9 +43,22 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import jsonrpc, log
-from .audio_socket import AudioSocketReader
+from .audio_socket import AudioSocketReader, LocalFifoBroadcaster
 
 logger = log.get("sidecar.devices")
+
+
+def default_local_fifo_socket_path() -> Path:
+    """Canonical broadcast-socket path for whole-home AirPlay mode.
+
+    Uses ``/tmp/syncast-$UID.localfifo.sock`` so multiple concurrent
+    macOS user sessions on the same machine each get their own listener.
+    The router resolves the path via the ``local_fifo.path`` IPC method
+    rather than hardcoding it; this function is the single source of
+    truth.
+    """
+    uid = os.geteuid()
+    return Path(f"/tmp/syncast-{uid}.localfifo.sock")
 
 
 NotifyFn = Callable[[str, dict[str, Any]], None]
@@ -63,6 +93,12 @@ class DeviceManager:
         self._lock: asyncio.Lock | None = None
         self._owntone: Any = None      # OwnToneBackend, lazily started
         self._audio_reader: AudioSocketReader | None = None
+        # Whole-home mode plumbing. The broadcaster is created on
+        # transition into whole_home mode and torn down on transition
+        # out. `_mode` is the latched state — single source of truth.
+        self._mode: str = "stereo"
+        self._broadcaster: LocalFifoBroadcaster | None = None
+        self._local_fifo_socket_path: Path = default_local_fifo_socket_path()
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
         self._state_dir = state_dir
@@ -76,12 +112,22 @@ class DeviceManager:
         async with self._get_lock():
             await self._stop_streaming_unlocked()
             self._devices.clear()
+            # Tear the broadcaster down BEFORE OwnTone — otherwise the
+            # broadcaster's read on the (now unreffed) fifo would have
+            # to wait for the OS to send EOF, adding ~seconds to shutdown.
+            if self._broadcaster is not None:
+                try:
+                    self._broadcaster.stop()
+                except Exception:  # noqa: BLE001
+                    logger.exception("broadcaster_stop_failed")
+                self._broadcaster = None
             if self._owntone is not None:
                 try:
                     await self._owntone.stop()
                 except Exception:  # noqa: BLE001
                     logger.exception("owntone_stop_failed")
                 self._owntone = None
+            self._mode = "stereo"
 
     # ---------- discovery ----------
 
@@ -199,6 +245,75 @@ class DeviceManager:
             await self._stop_streaming_unlocked()
         return {"stopped": True}
 
+    # ---------- whole-home mode ----------
+
+    async def set_mode(self, mode: str) -> dict[str, Any]:
+        """Switch between "stereo" and "whole_home" data planes.
+
+        Idempotent: re-entering the same mode is a no-op (returns
+        ``applied=False``). Otherwise:
+
+          * ``stereo``      — stop the broadcast listener if running.
+                              OwnTone is left ALIVE if it's already up
+                              (other code paths may want it for legacy
+                              AirPlay-only streaming) but we don't bring
+                              it up just for this. We DO clear streaming
+                              state so a future ``stream.start`` is clean.
+          * ``whole_home``  — ensure OwnTone is running (so the output
+                              fifo has a writer), then start the
+                              broadcaster. Future Swift bridges will
+                              connect to the listener path returned by
+                              ``local_fifo.path``.
+        """
+        if mode not in ("stereo", "whole_home"):
+            raise jsonrpc.RpcError(
+                jsonrpc.INVALID_PARAMS,
+                f"unknown mode: {mode!r} (expected 'stereo' or 'whole_home')",
+            )
+        async with self._get_lock():
+            if mode == self._mode:
+                return {"applied": False, "mode": self._mode}
+            if mode == "whole_home":
+                await self._ensure_owntone()
+                self._ensure_broadcaster()
+            else:  # stereo
+                if self._broadcaster is not None:
+                    try:
+                        self._broadcaster.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("broadcaster_stop_failed")
+                    self._broadcaster = None
+            self._mode = mode
+        return {"applied": True, "mode": self._mode}
+
+    def get_local_fifo_path(self) -> dict[str, Any]:
+        """Return the broadcast-socket path Swift bridges connect to.
+
+        Synchronous (no lock): the path is computed once at construction
+        and never changes for the life of the sidecar.
+        """
+        return {"socket_path": str(self._local_fifo_socket_path)}
+
+    def broadcaster_diagnostics(self) -> dict[str, Any]:
+        """Expose the broadcaster's running counters. Used by the
+        diagnostic UI / log dumps; the menubar may surface this for the
+        user. Safe to call at any time — returns zeros if no broadcaster
+        is currently running."""
+        if self._broadcaster is None:
+            return {
+                "running": False,
+                "mode": self._mode,
+                "bytes_broadcast": 0,
+                "chunks_broadcast": 0,
+                "clients_connected": 0,
+                "fifo_open_failures": 0,
+                "per_client": [],
+            }
+        diag = self._broadcaster.diagnostics()
+        diag["running"] = True
+        diag["mode"] = self._mode
+        return diag
+
     async def flush(self) -> dict[str, Any]:
         if self._owntone is None:
             return {"flushed": True}
@@ -244,6 +359,39 @@ class DeviceManager:
                 jsonrpc.INTERNAL_ERROR, f"owntone start failed: {e}",
             ) from e
         self._owntone = backend
+
+    def _ensure_broadcaster(self) -> None:
+        """Spin up the LocalFifoBroadcaster if not already running.
+
+        Called only from inside `set_mode("whole_home")` while holding
+        the lock; OwnTone is guaranteed to be alive at this point because
+        `_ensure_owntone()` ran first. The broadcaster opens OwnTone's
+        output fifo for read, so OwnTone has to be up first or the open
+        will spin in the broadcaster's retry loop until timeout.
+        """
+        if self._broadcaster is not None:
+            return
+        if self._owntone is None:
+            # Defensive — set_mode already calls _ensure_owntone before
+            # us. If we get here, something is very wrong; surface it
+            # rather than silently producing a half-wired data plane.
+            raise jsonrpc.RpcError(
+                jsonrpc.INTERNAL_ERROR,
+                "cannot start broadcaster without owntone",
+            )
+        broadcaster = LocalFifoBroadcaster(
+            socket_path=self._local_fifo_socket_path,
+            fifo_path=self._owntone.output_fifo_path,
+        )
+        broadcaster.start()
+        self._broadcaster = broadcaster
+        logger.info(
+            "broadcaster_started",
+            extra={
+                "socket": str(self._local_fifo_socket_path),
+                "fifo": str(self._owntone.output_fifo_path),
+            },
+        )
 
     async def _ensure_audio_reader(self, audio_socket: Path) -> None:
         if self._audio_reader is not None:
