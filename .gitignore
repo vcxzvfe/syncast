@@ -31,12 +31,16 @@ venv/
 
 # Project
 /dist/
+/build/
 /artifacts/
 /.env
 /.env.local
 *.log
 /sidecar/.venv/
 /sidecar/dist/
+/sidecar/dist-pyinstaller/
+/sidecar/build/
+/sidecar/syncast-sidecar.spec
 
 # IDE
 .idea/
