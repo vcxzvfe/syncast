@@ -179,6 +179,16 @@ class DeviceManager:
                 existing.host = host
                 existing.port = port
                 existing.name = name
+                # Diagnostic: prove that re-add is hitting the upsert
+                # branch with the expected name. The Xiaomi-stuck-off
+                # bug only surfaces when `_reconcile_outputs` runs with
+                # the device present in self._devices — explicit logging
+                # here removes any doubt about whether device.add is
+                # arriving at all.
+                logger.info(
+                    "device_add_idempotent",
+                    extra={"device_id": device_id, "name": name},
+                )
                 return {"connected": True, "reported_latency_ms": 1800}
             dev = Device(
                 id=device_id,
@@ -189,6 +199,15 @@ class DeviceManager:
                 state="added",
             )
             self._devices[device_id] = dev
+            # Diagnostic: first-time registration, the canonical signal
+            # that the menubar successfully reached the sidecar with a
+            # device. Used by the Xiaomi-stuck-off triage.
+            logger.info(
+                "device_add_new",
+                extra={"device_id": device_id, "name": name,
+                       "host": host, "port": port,
+                       "device_count": len(self._devices)},
+            )
             self._notify("event.device_state", {
                 "device_id": device_id, "state": "added", "buffer_ms": 1800,
             })
@@ -226,6 +245,18 @@ class DeviceManager:
         self, params: dict[str, Any], audio_socket: Path,
     ) -> dict[str, Any]:
         device_ids = list(params.get("device_ids", []))
+        # Diagnostic: log every stream.start call with the precise
+        # device_ids list. This is the single most important breadcrumb
+        # for diagnosing the Xiaomi-never-selected bug — if start_stream
+        # never logs, the menubar isn't sending it; if it logs with an
+        # empty or wrong list, the menubar's pushAirplayState is wrong;
+        # if it logs with Xiaomi present then the bug is downstream in
+        # _reconcile_outputs.
+        logger.info(
+            "start_stream_entry",
+            extra={"device_ids": device_ids,
+                   "known_device_count": len(self._devices)},
+        )
         if not device_ids:
             raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "device_ids empty")
         async with self._get_lock():
@@ -484,24 +515,80 @@ class DeviceManager:
 
         OwnTone's REST `/api/outputs` returns a list of receivers it has
         discovered; we match by host+name and enable/disable accordingly.
+
+        Diagnostic logging: the Xiaomi-never-selected bug surfaces here.
+        We log:
+          - the OwnTone outputs as the sidecar sees them (name + id)
+          - per-device match lookup (name → match? + result of REST call)
+        Without this, the bug is invisible from the outside: OwnTone's
+        REST /api/outputs simply shows `selected=False`, leaving us no
+        signal as to whether `_reconcile_outputs` even ran, ran but
+        couldn't find a match, or ran but the REST PUT silently failed.
         """
         if self._owntone is None:
+            logger.warning("reconcile_outputs_no_owntone")
             return
         outputs = self._owntone.list_outputs()
         # Index OwnTone outputs by (name, host) tolerantly.
         by_name = {str(o.get("name", "")).lower(): o for o in outputs}
         enabled_set = set(enabled_ids)
+        # Diagnostic: dump the universe of inputs to the matching loop in
+        # one log line. Field reports can compare device.name against
+        # `by_name_keys` to spot locale/case/whitespace divergence.
+        logger.info(
+            "reconcile_outputs_begin",
+            extra={
+                "device_count": len(self._devices),
+                "enabled_ids": list(enabled_set),
+                "by_name_keys": list(by_name.keys()),
+                "owntone_output_count": len(outputs),
+            },
+        )
         for dev_id, dev in self._devices.items():
             match = by_name.get(dev.name.lower())
             if match is None:
+                # Diagnostic: this is the most likely failure mode for
+                # Xiaomi-never-selected. Logging WHICH device missed
+                # against WHICH set of OwnTone names removes guessing.
+                logger.warning(
+                    "reconcile_outputs_no_match",
+                    extra={
+                        "device_id": dev_id,
+                        "device_name": dev.name,
+                        "device_name_lower": dev.name.lower(),
+                        "available_names": list(by_name.keys()),
+                    },
+                )
                 continue
             dev.owntone_output_id = str(match.get("id"))
+            should_enable = dev_id in enabled_set
             try:
-                self._owntone.set_output_enabled(dev.owntone_output_id, dev_id in enabled_set)
-                if dev_id in enabled_set:
+                self._owntone.set_output_enabled(dev.owntone_output_id, should_enable)
+                if should_enable:
                     self._owntone.set_output_volume(dev.owntone_output_id, dev.volume)
-            except Exception:  # noqa: BLE001
-                logger.exception("owntone_reconcile_failed", extra={"id": dev_id})
+                # Diagnostic: success path. Field logs can prove that
+                # the REST call WAS issued for the intended id, so any
+                # discrepancy with /api/outputs?selected=False is
+                # OwnTone-internal (e.g. it rejected the receiver).
+                logger.info(
+                    "reconcile_outputs_set",
+                    extra={
+                        "device_id": dev_id,
+                        "device_name": dev.name,
+                        "owntone_output_id": dev.owntone_output_id,
+                        "enable": should_enable,
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception(
+                    "owntone_reconcile_failed",
+                    extra={
+                        "device_id": dev_id,
+                        "device_name": dev.name,
+                        "owntone_output_id": dev.owntone_output_id,
+                        "error_kind": type(e).__name__,
+                    },
+                )
 
     async def _stop_streaming_unlocked(self) -> None:
         if not self._streaming:
