@@ -1,5 +1,6 @@
 import Foundation
 import CoreAudio
+import os.lock
 
 /// A private CoreAudio Aggregate Device that fans out audio to multiple
 /// physical output devices in lockstep. Drift correction is enabled on every
@@ -643,6 +644,17 @@ public final class AggregateDevice {
         return Self.applyHardwareVolume(physicalID: physicalID, volume: clamped)
     }
 
+    /// Per-physical-device cache of writable volume elements, populated
+    /// lazily on the first `applyHardwareVolume` call for a given
+    /// device. HDMI / DisplayPort outputs charge >5 ms on each missing
+    /// element's `AudioObjectSetPropertyData` call, so a naive 1..32 loop
+    /// on every slider drag wedges the UI for >100 ms per frame. With the
+    /// cache, slider drags hit a 1-2 element loop every time after the
+    /// first probe.
+    private static let writableElementsLock = OSAllocatedUnfairLock()
+    private static var writableElementsCache:
+        [AudioObjectID: [AudioObjectPropertyElement]] = [:]
+
     /// Static so it can be unit-tested in isolation. Tries master
     /// element first; falls back to per-channel iteration. Returns
     /// true if any write succeeded.
@@ -650,24 +662,56 @@ public final class AggregateDevice {
         physicalID: AudioObjectID,
         volume: Float
     ) -> Bool {
-        // Step 1: try element 0 (master) if it's both present AND
-        // settable. A device that has it as a read-only mirror will
-        // claim has=true, settable=false; we must check both.
+        // Step 0: cache lookup. If we've already probed this device,
+        // skip straight to writing the known-writable elements.
+        let cached: [AudioObjectPropertyElement]? = writableElementsLock
+            .withLock { writableElementsCache[physicalID] }
+        if let elements = cached {
+            return writeToCachedElements(physicalID, elements: elements, volume: volume)
+        }
+        // Step 1: probe writable elements. Element 0 first, then 1..32
+        // with an early bail-out after 4 consecutive misses (most DACs
+        // expose at most 2 channels, and the per-element probe on HDMI/
+        // DP outputs is the slow path that motivated this cache).
+        var writable: [AudioObjectPropertyElement] = []
         if isVolumeWritable(physicalID, element: 0) {
+            writable.append(0)
+        }
+        var consecutiveMisses = 0
+        for elem in 1...32 {
+            let element = AudioObjectPropertyElement(elem)
+            if isVolumeWritable(physicalID, element: element) {
+                writable.append(element)
+                consecutiveMisses = 0
+            } else {
+                consecutiveMisses += 1
+                if consecutiveMisses >= 4 { break }
+            }
+        }
+        let frozen = writable
+        writableElementsLock.withLock {
+            writableElementsCache[physicalID] = frozen
+        }
+        return writeToCachedElements(physicalID, elements: frozen, volume: volume)
+    }
+
+    /// Write `volume` to every element in `elements`. Tries master
+    /// element 0 first if present; if its write is accepted the device
+    /// is mirroring per-channel state from element 0 and we can skip
+    /// the rest. Returns true if any write succeeded.
+    private static func writeToCachedElements(
+        _ physicalID: AudioObjectID,
+        elements: [AudioObjectPropertyElement],
+        volume: Float
+    ) -> Bool {
+        var anyWrite = false
+        if elements.contains(0) {
             if writeVolume(physicalID, element: 0, volume: volume) {
                 return true
             }
         }
-        // Step 2: iterate per-channel elements. We don't know the
-        // exact channel count without reading kAudioDevicePropertyStreams,
-        // but kAudioDevicePropertyVolumeScalar tolerates a missing
-        // element (returns kAudioHardwareUnknownPropertyError); we
-        // simply skip those. Capping at 32 covers every realistic
-        // multichannel speaker setup and avoids an unbounded loop on
-        // pathological devices.
-        var anyWrite = false
-        for elem in 1...32 {
-            if writeVolume(physicalID, element: AudioObjectPropertyElement(elem), volume: volume) {
+        for element in elements where element != 0 {
+            if writeVolume(physicalID, element: element, volume: volume) {
                 anyWrite = true
             }
         }
