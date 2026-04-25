@@ -77,6 +77,14 @@ class OwnToneBackend:
                 "owntone binary not found in PATH; run scripts/bootstrap.sh"
             )
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        # CRITICAL: an OwnTone left over from a previous session (e.g. the
+        # menubar was force-killed without running its shutdown handler,
+        # or install-app.sh missed it) holds an exclusive SQLite lock on
+        # `songs.db`. Spawning a second OwnTone against the same db then
+        # fails with "DB init error: database is locked" and exits within
+        # a few seconds. Defend against that by killing any prior OwnTone
+        # bound to OUR config path before we spawn ours.
+        self._kill_stale_owntone()
         self._ensure_fifo()
         self._write_config()
         cmd = [self.binary, "-c", str(self.config_path), "-f"]
@@ -92,6 +100,40 @@ class OwnToneBackend:
         # otherwise we block. OwnTone opens its pipe input lazily on first
         # play; we open O_NONBLOCK and accept short writes initially.
         self._open_fifo_nonblocking()
+
+    def _kill_stale_owntone(self) -> None:
+        """Find and SIGKILL any other owntone process that has our config
+        path on its command line. Best-effort: any pgrep/pkill failure is
+        swallowed (e.g. on systems without procps the BusyBox fallback
+        differs)."""
+        target = str(self.config_path)
+        try:
+            res = subprocess.run(  # noqa: S603,S607
+                ["pgrep", "-f", target],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        my_pid = os.getpid()
+        for line in res.stdout.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid == my_pid:
+                continue
+            logger.warning("killing_stale_owntone", extra={"pid": pid})
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                logger.warning("could_not_kill_pid", extra={"pid": pid})
+        # Brief pause so the killed process releases its sqlite lock
+        # before we spawn our own.
+        time.sleep(0.2)
 
     async def stop(self) -> None:
         if self._fifo_fd is not None:

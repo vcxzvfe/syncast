@@ -109,14 +109,22 @@ struct MainPopover: View {
             } else {
                 if !model.localDevices.isEmpty {
                     sectionHeader("Local")
+                    // Pass `deviceID: String` instead of the `Device` value
+                    // so `DeviceRow` looks the device up via `model.devices`
+                    // every render. If we captured `Device` directly, a
+                    // .updated discovery event could leave the row's
+                    // closures bound to a stale Device (or worse, a row
+                    // recycled by SwiftUI under another id). User-visible
+                    // symptom of that bug: tapping one row toggled a
+                    // different device.
                     ForEach(model.localDevices) { dev in
-                        DeviceRow(device: dev)
+                        DeviceRow(deviceID: dev.id)
                     }
                 }
                 if !model.airPlayDevices.isEmpty {
                     sectionHeader("AirPlay")
                     ForEach(model.airPlayDevices) { dev in
-                        DeviceRow(device: dev)
+                        DeviceRow(deviceID: dev.id)
                     }
                 }
             }
@@ -156,16 +164,36 @@ struct MainPopover: View {
 }
 
 private struct DeviceRow: View {
-    let device: Device
+    /// Stable SyncCast id of the device this row represents. Looked up via
+    /// `model.devices` on each render; never captured by value. Without this
+    /// indirection, SwiftUI view recycling can bind a row's tap closure to
+    /// a stale `Device` value, causing taps to toggle the wrong device.
+    let deviceID: String
+
     @Environment(AppModel.self) private var model
 
+    private var device: Device? {
+        model.devices.first { $0.id == deviceID }
+    }
+
     private var routing: DeviceRouting {
-        model.routing[device.id] ?? DeviceRouting(deviceID: device.id)
+        model.routing[deviceID] ?? DeviceRouting(deviceID: deviceID)
     }
 
     var body: some View {
+        // If discovery has dropped the device while the menu is open, render
+        // nothing for that row rather than holding a stale reference.
+        if let device = device {
+            rowBody(for: device)
+        } else {
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func rowBody(for device: Device) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: iconName)
+            Image(systemName: iconName(for: device))
                 .font(.system(size: 14))
                 .foregroundStyle(routing.enabled ? AnyShapeStyle(.tint) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
                 .frame(width: 22)
@@ -175,7 +203,7 @@ private struct DeviceRow: View {
                     Text(device.name)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
-                    transportBadge
+                    transportBadge(for: device)
                     Spacer(minLength: 0)
                     syncDot
                 }
@@ -185,11 +213,17 @@ private struct DeviceRow: View {
                               ? "speaker.slash.fill" : "speaker.wave.1.fill")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
-                            .onTapGesture { model.toggleMute(device.id) }
+                            // All tap closures use `deviceID` (the let-bound
+                            // String), not `device.id` (the just-looked-up
+                            // Device's id). They're the same value in normal
+                            // operation, but using `deviceID` removes any
+                            // chance of binding to a transiently-different
+                            // Device returned by `model.devices.first`.
+                            .onTapGesture { model.toggleMute(deviceID) }
                         VolumeSlider(
                             value: Binding(
                                 get: { Double(routing.volume) },
-                                set: { model.setVolume(Float($0), for: device.id) }
+                                set: { model.setVolume(Float($0), for: deviceID) }
                             )
                         )
                     }
@@ -199,18 +233,14 @@ private struct DeviceRow: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(routing.enabled ? Color.accentColor.opacity(0.06) : Color.clear)
-        // Make the WHOLE row a tap target — clicking anywhere on the row
-        // (icon, name, badge, sync dot, blank space) toggles the device.
-        // Previously the tap target was only on the inner VStack and many
-        // pixels (icon column, trailing space) didn't react to clicks.
         .contentShape(Rectangle())
-        .onTapGesture { model.toggleDevice(device.id) }
+        .onTapGesture { model.toggleDevice(deviceID) }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text("\(device.name), \(routing.enabled ? "enabled" : "disabled")"))
         .accessibilityHint(Text("Double-tap to \(routing.enabled ? "disable" : "enable")"))
     }
 
-    private var iconName: String {
+    private func iconName(for device: Device) -> String {
         switch device.transport {
         case .coreAudio:
             if device.name.localizedCaseInsensitiveContains("display") { return "tv" }
@@ -221,7 +251,7 @@ private struct DeviceRow: View {
         }
     }
 
-    private var transportBadge: some View {
+    private func transportBadge(for device: Device) -> some View {
         Text(device.transport == .airplay2 ? "AirPlay" : "Local")
             .font(.system(size: 9, weight: .semibold))
             .padding(.horizontal, 5).padding(.vertical, 1)

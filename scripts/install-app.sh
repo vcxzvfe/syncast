@@ -22,6 +22,16 @@ log "Stopping any running instance"
 pkill -9 -f /Applications/SyncCast.app 2>/dev/null || true
 pkill -9 -f /Users/.*/syncast/dist/SyncCast.app 2>/dev/null || true
 pkill -9 -f syncast-sidecar 2>/dev/null || true
+# CRITICAL: OwnTone holds the SyncCast SQLite database with an exclusive
+# lock. If we leave the previous OwnTone child running while replacing
+# the bundle, the next sidecar's `_ensure_owntone` spawns a fresh
+# OwnTone that fails to init with "DB init error: database is locked",
+# which then health-checks itself dead and respawns in a loop. Kill any
+# OwnTone bound to the SyncCast app paths AND any orphan owntone in
+# the current user's process list.
+pkill -9 -f /Applications/SyncCast.app/.*owntone 2>/dev/null || true
+pkill -9 -f syncast/.*owntone 2>/dev/null || true
+pkill -9 -f /owntone/owntone 2>/dev/null || true
 sleep 1
 
 log "Replacing $DST"

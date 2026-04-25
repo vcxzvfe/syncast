@@ -160,6 +160,29 @@ final class AppModel {
             switch event {
             case .appeared(let dev):
                 SyncCastLog.log("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))".replacingOccurrences(of: "[SyncCast] ", with: ""))
+                // If a logical device with the same coreAudioUID / host+name
+                // already exists under a DIFFERENT id (e.g. discovery layer
+                // minted a fresh UUID after a rename or socket flap), migrate
+                // its routing entry rather than orphan it. Without this, the
+                // routing dict keeps an entry under the OLD id while the row
+                // taps drive the NEW id, and the user perceives "click does
+                // nothing" because the AUHAL state is keyed off the orphan.
+                if let existingIdx = devices.firstIndex(where: { sameLogicalDevice($0, dev) }) {
+                    let oldID = devices[existingIdx].id
+                    if oldID != dev.id {
+                        SyncCastLog.log("device id migration: \(dev.name) \(oldID.prefix(8)) → \(dev.id.prefix(8))")
+                        devices[existingIdx] = dev
+                        if var oldR = routing.removeValue(forKey: oldID) {
+                            oldR.deviceID = dev.id
+                            routing[dev.id] = oldR
+                        } else if routing[dev.id] == nil {
+                            routing[dev.id] = DeviceRouting(deviceID: dev.id, enabled: false)
+                        }
+                        devices.sort { $0.name < $1.name }
+                        detectBlackHole(in: dev)
+                        return
+                    }
+                }
                 if !devices.contains(where: { $0.id == dev.id }) {
                     devices.append(dev)
                     devices.sort { $0.name < $1.name }
@@ -171,6 +194,16 @@ final class AppModel {
             case .updated(let dev):
                 if let idx = devices.firstIndex(where: { $0.id == dev.id }) {
                     devices[idx] = dev
+                } else if let idx = devices.firstIndex(where: { sameLogicalDevice($0, dev) }) {
+                    // Same physical device, new SyncCast id. Migrate the
+                    // routing slot so user toggles don't drop on the floor.
+                    let oldID = devices[idx].id
+                    SyncCastLog.log("device id migration on update: \(dev.name) \(oldID.prefix(8)) → \(dev.id.prefix(8))")
+                    devices[idx] = dev
+                    if var oldR = routing.removeValue(forKey: oldID) {
+                        oldR.deviceID = dev.id
+                        routing[dev.id] = oldR
+                    }
                 }
                 detectBlackHole(in: dev)
             case .disappeared(let id):
@@ -182,6 +215,29 @@ final class AppModel {
         }
     }
 
+    /// Two `Device` values describe the same physical/logical device when
+    /// their stable transport identity matches: coreAudioUID for local,
+    /// host+name for AirPlay. Used by `applyEvent` to detect when discovery
+    /// minted a new SyncCast id for a device we've already seen, so we can
+    /// migrate the routing entry instead of stranding it under the old id.
+    private func sameLogicalDevice(_ a: Device, _ b: Device) -> Bool {
+        guard a.transport == b.transport else { return false }
+        switch a.transport {
+        case .coreAudio:
+            if let ua = a.coreAudioUID, let ub = b.coreAudioUID {
+                return ua == ub
+            }
+            return false
+        case .airplay2:
+            // Bonjour service name is unique per receiver; combined with host
+            // it's effectively the receiver's stable identity for our needs.
+            // We deliberately do NOT match on id/UUID here — this function
+            // exists precisely to bridge the case where the SyncCast id
+            // differs.
+            return a.name == b.name && (a.host ?? "") == (b.host ?? "")
+        }
+    }
+
     // BlackHole detection removed — SCK doesn't need it.
     private func detectBlackHole(in dev: Device) { /* no-op, retained for call-site compat */ }
 
@@ -190,15 +246,33 @@ final class AppModel {
     /// one enabled output, stop it otherwise.
     private func reconcileEngine() {
         // Coalesce rapid-fire callers (toggleDevice / setVolume / toggleMute /
-        // permission watcher). 80 ms is below the user-perceptible threshold
-        // for UI feedback but enough to absorb a flurry of taps. Each new
-        // call cancels the pending timer — only the last wins.
+        // permission watcher). 30 ms is short enough that single-tap toggles
+        // feel instant but still absorbs the 4-5 redundant calls that one
+        // tap can fan out to (Observable invalidations, slider drag bursts).
+        // We deliberately keep this short to avoid the user-reported
+        // "click did nothing" symptom, which an 80 ms window made worse.
         reconcileTimer?.cancel()
         reconcileTimer = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 80_000_000)
+            try? await Task.sleep(nanoseconds: 30_000_000)
             if Task.isCancelled { return }
             await self?.reconcileEngineAsync()
         }
+    }
+
+    /// Compact one-line dump of the current `routing` dict, with every
+    /// device's name + enabled flag. Used in toggleDevice logs so we can
+    /// diagnose UI ↔ model desync (user reports "tapped X but Y toggled").
+    /// If the log line shows the right id was toggled but the user saw
+    /// the wrong row react, the bug is in the SwiftUI layer, not the
+    /// model. If the wrong id was toggled, the bug is in MainPopover's
+    /// row→id binding.
+    private func routingSummary() -> String {
+        routing.map { (id, r) -> String in
+            let name = devices.first(where: { $0.id == id })?.name ?? "?"
+            return "\(name)=\(r.enabled ? "ON" : "off")"
+        }
+        .sorted()
+        .joined(separator: ", ")
     }
 
     private func reconcileEngineAsync() async {
@@ -261,11 +335,20 @@ final class AppModel {
             await router.stop()
             streamingState = .idle
         case (.running, true):
+            // ORDER MATTERS. Router holds its own copy of `routing`
+            // (Router.routing) which `syncLocalOutputs` reads to decide
+            // which AUHALs to open/close. If we call syncLocalOutputs
+            // BEFORE pushing the latest routing snapshot, it sees stale
+            // enabled-flags and leaves a just-disabled output's AUHAL
+            // running — symptom the user reports as "I turned MBP off
+            // but it kept playing while only Xiaomi should have been on".
+            // Push routing first, THEN reconcile the AUHAL set, THEN
+            // push AirPlay state.
             SyncCastLog.log("reconcile: pushing routing updates + syncing local outputs")
-            await router.syncLocalOutputs(devices: devices)
             for (_, r) in routing {
                 await router.setRouting(r)
             }
+            await router.syncLocalOutputs(devices: devices)
             await pushAirplayState()
         default:
             SyncCastLog.log("reconcile: no-op (state=\(streamingState.rawValue) shouldRun=\(shouldRun))")
@@ -311,10 +394,14 @@ final class AppModel {
 
     func toggleDevice(_ id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
+        let oldEnabled = r.enabled
         r.enabled.toggle()
         routing[id] = r
         let name = devices.first(where: { $0.id == id })?.name ?? id
-        SyncCastLog.log("toggleDevice: \(name) → enabled=\(r.enabled)")
+        // Emit BOTH the toggled id and the post-toggle full routing so
+        // we can prove or disprove the user-reported "click X but Y
+        // toggled" symptom from the log alone (no Console.app needed).
+        SyncCastLog.log("toggleDevice: \(name) [id=\(id.prefix(8))] \(oldEnabled ? "ON" : "off") → \(r.enabled ? "ON" : "off"). routing: { \(routingSummary()) }")
         reconcileEngine()
     }
 
