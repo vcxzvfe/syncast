@@ -180,6 +180,30 @@ final class AppModel {
         }
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
 
+        // SYNCAST_INITIAL_MODE=wholehome|stereo flips the engine into the
+        // requested mode at bootstrap, BEFORE SYNCAST_AUTO_TEST starts
+        // toggling devices. Used for whole-home end-to-end verification —
+        // dev only. Default is whatever `mode` is initialized to.
+        if let modeEnv = ProcessInfo.processInfo.environment["SYNCAST_INITIAL_MODE"] {
+            let normalized = modeEnv.lowercased()
+            let target: Mode? = {
+                if normalized == "wholehome" || normalized == "whole_home" { return .wholeHome }
+                if normalized == "stereo" { return .stereo }
+                return nil
+            }()
+            if let target = target, target != mode {
+                SyncCastLog.log("INITIAL_MODE env: \(mode.rawValue) → \(target.rawValue)")
+                // We're inside bootstrap which itself runs in a Task. Schedule
+                // setMode shortly after so all the discovery + sidecar
+                // attach is in place; otherwise mode.set IPC could race
+                // attachSidecar.
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    await MainActor.run { self?.setMode(target) }
+                }
+            }
+        }
+
         // SYNCAST_AUTO_TEST=mbp triggers an automated toggle of the MBP
         // built-in speaker 4 seconds after bootstrap. Used for shell-driven
         // end-to-end audio verification — strictly dev only.
