@@ -164,11 +164,23 @@ public actor Router {
         state = .starting
         do {
             try await sckCapture.start()
-            // Single entry point for opening local outputs. Picks individual
-            // AUHALs vs synchronized aggregate based on the enabled-output
-            // count (see reconcileLocalDriver). Used by both initial start
-            // and live retag via syncLocalOutputs.
-            reconcileLocalDriver(devices: devices)
+            // Mode-gated local driver setup. In stereo mode the SCK ring
+            // feeds AUHALs on enabled physical devices directly (low-latency
+            // path). In whole_home mode local audio flows via the bridge
+            // chain: SCK → audioWriter → sidecar → OwnTone → fifo
+            // broadcaster → LocalAirPlayBridge → AUHAL. The two paths MUST
+            // NOT both render to the same physical device — that produces
+            // double-audio at different latencies (garbled). Bridges are
+            // brought up by `startWholeHome(devices:)`, which the AppModel
+            // calls right after `start` resolves.
+            if mode == .stereo {
+                reconcileLocalDriver(devices: devices)
+            } else {
+                // Whole_home: ensure no stale aggregate AUHAL is left over
+                // from a previous mode. tearDownLocalDriver is idempotent
+                // (no-op if localOutputs is already empty + aggregate is nil).
+                tearDownLocalDriver()
+            }
             replan()
             state = .running
         } catch {
@@ -324,10 +336,14 @@ public actor Router {
     // only after the user has chosen which devices participate.
 
     /// Tell the sidecar to switch data planes, and synchronize our
-    /// local state with the result. In stereo→whole_home, this is a
-    /// prerequisite for `startWholeHome`. In whole_home→stereo, this
-    /// also tears down any active bridges so the next stereo start has
-    /// a clean slate.
+    /// local state with the result. The two paths are mutually
+    /// exclusive — in stereo mode only the SCK→AUHAL aggregate runs;
+    /// in whole_home mode only LocalAirPlayBridge instances run.
+    /// Allowing both to render to the same physical device produces
+    /// double-audio at different latencies (garbled). To make the
+    /// invariant impossible to violate, this function fully tears down
+    /// whichever path belongs to the OPPOSITE mode before the new mode
+    /// can come up via `start(devices:)` / `startWholeHome(devices:)`.
     public func setMode(_ newMode: Mode) async {
         guard let ipc else {
             lastError = "ipc not attached, cannot set mode"
@@ -339,15 +355,25 @@ public actor Router {
             lastError = "mode.set(\(newMode.rawValue)): \(error)"
             return
         }
-        // Mode change accepted by sidecar. Local cleanup:
-        if newMode == .stereo {
-            // Drop every bridge — they're useless without the sidecar
-            // broadcaster on the other end. Local outputs (LocalOutput
-            // /aggregate) are NOT touched here; if the user restarts
-            // stereo streaming via `start(devices:)` they'll be opened
-            // by reconcileLocalDriver.
+        // Mode change accepted by sidecar. Local cleanup — drop the
+        // OPPOSITE mode's audio path so the two never render to the
+        // same physical device simultaneously.
+        switch newMode {
+        case .stereo:
+            // Going to stereo: kill every bridge. They're useless
+            // without the sidecar broadcaster on the other end, and
+            // leaving them running while the SCK→aggregate path is
+            // about to come up would double-play.
             for (_, b) in localBridges { b.stop() }
             localBridges.removeAll()
+        case .wholeHome:
+            // Going to whole_home: tear down the SCK→aggregate path.
+            // Otherwise reconcileEngineAsync's running-true→wholeHome
+            // arm could leave the aggregate AUHAL rendering at the
+            // same time the bridges spin up (Symptom 2 in the field
+            // report — `driver=wholeHome(2)` AND `render[agg:…]`
+            // ticking concurrently).
+            tearDownLocalDriver()
         }
         // Stash the new mode AFTER the IPC succeeds so a failed call
         // doesn't lie about our state.
