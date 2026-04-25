@@ -123,9 +123,64 @@ struct MainPopover: View {
                     .lineLimit(2)
                     .onTapGesture { model.dismissCalibrationStatus() }
             }
+
+            // Continuous (background) calibration: toggle, optional
+            // stepper, status caption.
+            HStack(spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { model.backgroundCalibrationEnabled },
+                    set: { newValue in
+                        model.backgroundCalibrationEnabled = newValue
+                        if newValue {
+                            Task { await model.ensureMicPermissionForBackgroundCalibration() }
+                        }
+                    }
+                )) {
+                    Text("Continuous").font(.system(size: 10))
+                }
+                .toggleStyle(.switch).controlSize(.mini)
+                .accessibilityIdentifier("continuousCalibrationToggle")
+                if model.backgroundCalibrationEnabled {
+                    Stepper(value: Binding(
+                        get: { model.backgroundCalibrationIntervalS },
+                        set: { model.backgroundCalibrationIntervalS = $0 }
+                    ), in: AppModel.bgIntervalRange, step: 10) {
+                        Text("\(model.backgroundCalibrationIntervalS)s")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 32, alignment: .trailing)
+                    }
+                    .controlSize(.mini)
+                    .accessibilityIdentifier("continuousCalibrationStepper")
+                }
+                Spacer()
+            }
+            if model.backgroundCalibrationEnabled,
+               let status = continuousStatusText {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundStyle(model.backgroundCalibrationMicDenied ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                    .lineLimit(2)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+    }
+
+    /// One of: mic-denied / inactive / waiting / active-with-sample.
+    private var continuousStatusText: String? {
+        if model.backgroundCalibrationMicDenied {
+            return "Microphone access denied — open System Settings"
+        }
+        if !model.backgroundCalibrationActive {
+            return "Inactive — enable AirPlay first"
+        }
+        guard let sample = model.lastCalibrationSample else {
+            return "Active — waiting for sample"
+        }
+        let age = max(0, Int(Date().timeIntervalSince(sample.timestamp)))
+        let pct = Int((sample.confidence * 100).rounded())
+        return "Active — last sample \(sample.measuredDelayMs) ms drift (\(pct)% confidence) \(age)s ago"
     }
 
     private var autoCalibrateLabel: String {
