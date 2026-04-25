@@ -107,6 +107,12 @@ class DeviceManager:
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
         self._state_dir = state_dir
+        # Background asyncio.Task that retries OwnTone-output discovery
+        # for any device that wasn't found in time during start_stream.
+        # See `_schedule_deferred_reconcile` for lifetime details.
+        # Stored as Optional and lazily created — keeps __init__ free
+        # of asyncio primitives that must live inside the running loop.
+        self._deferred_reconcile_task: asyncio.Task[None] | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -185,9 +191,14 @@ class DeviceManager:
                 # the device present in self._devices — explicit logging
                 # here removes any doubt about whether device.add is
                 # arriving at all.
+                #
+                # NOTE: stdlib `logging.LogRecord` reserves `name` for
+                # the logger's name; passing it via `extra=` raises
+                # KeyError. We use `device_name` for the same reason
+                # everywhere this module logs a device's display name.
                 logger.info(
                     "device_add_idempotent",
-                    extra={"device_id": device_id, "name": name},
+                    extra={"device_id": device_id, "device_name": name},
                 )
                 return {"connected": True, "reported_latency_ms": 1800}
             dev = Device(
@@ -202,9 +213,14 @@ class DeviceManager:
             # Diagnostic: first-time registration, the canonical signal
             # that the menubar successfully reached the sidecar with a
             # device. Used by the Xiaomi-stuck-off triage.
+            #
+            # NOTE: stdlib `logging.LogRecord` reserves `name` for the
+            # logger's name; passing `name=` via `extra=` raises
+            # KeyError("Attempt to overwrite 'name' in LogRecord"). Use
+            # `device_name` consistently throughout.
             logger.info(
                 "device_add_new",
-                extra={"device_id": device_id, "name": name,
+                extra={"device_id": device_id, "device_name": name,
                        "host": host, "port": port,
                        "device_count": len(self._devices)},
             )
@@ -266,7 +282,7 @@ class DeviceManager:
                     jsonrpc.DEVICE_NOT_FOUND, f"unknown: {missing}",
                 )
             await self._ensure_owntone()
-            self._reconcile_outputs(device_ids)
+            await self._reconcile_outputs(device_ids)
             await self._ensure_audio_reader(audio_socket)
             self._owntone.play_pipe()  # idempotent: tells OwnTone to start consuming the FIFO
             for d in device_ids:
@@ -510,28 +526,80 @@ class DeviceManager:
         reader.start()
         self._audio_reader = reader
 
-    def _reconcile_outputs(self, enabled_ids: list[str]) -> None:
+    async def _reconcile_outputs(self, enabled_ids: list[str]) -> None:
         """Tell OwnTone which of its known outputs to send to.
 
         OwnTone's REST `/api/outputs` returns a list of receivers it has
         discovered; we match by host+name and enable/disable accordingly.
 
-        Diagnostic logging: the Xiaomi-never-selected bug surfaces here.
-        We log:
-          - the OwnTone outputs as the sidecar sees them (name + id)
-          - per-device match lookup (name → match? + result of REST call)
-        Without this, the bug is invisible from the outside: OwnTone's
-        REST /api/outputs simply shows `selected=False`, leaving us no
-        signal as to whether `_reconcile_outputs` even ran, ran but
-        couldn't find a match, or ran but the REST PUT silently failed.
+        Critical timing note (root cause of "Xiaomi never selected=True"):
+          OwnTone discovers AirPlay receivers via its own mDNS scanner.
+          That scan typically takes 1-3 seconds AFTER OwnTone starts to
+          populate. start_stream is called ~milliseconds after we spawn
+          OwnTone in whole-home mode, so the first list_outputs() call
+          legitimately returns ONLY the always-present devices (LAN
+          peers OwnTone learned at boot from cached state) and the local
+          fifo. Devices like Xiaomi Sound that are slower to advertise
+          via mDNS get missed entirely, and `_reconcile_outputs` would
+          previously fall through with no match and never retry.
+          User-visible: the menubar shows "Xiaomi enabled" but OwnTone
+          REST `/api/outputs` shows `selected=False` forever.
+
+        Fix: poll list_outputs() with a short backoff (up to ~3s total)
+        until every enabled target has appeared, OR the budget is spent.
+        For any target that STILL hasn't appeared, schedule a background
+        polling task that keeps retrying for the lifetime of the stream
+        (slow speakers can take 10+ seconds in the wild, especially on
+        congested networks). The background task self-terminates when
+        the device is unenabled, the stream stops, or it succeeds.
+
+        Connection-state events: emits `connecting` before each REST call,
+        `connected` on verified success (post-call REST poll confirms
+        selected=True), `failed` on REST error or unverified state.
+        Consumed by the Swift Router → AppModel → MainPopover for the
+        per-device sync dot. See `proto/ipc-schema.md`.
+
+        Diagnostic logging: every step is logged. Field reports tell us
+        which step failed without re-running with extra flags.
         """
         if self._owntone is None:
             logger.warning("reconcile_outputs_no_owntone")
             return
-        outputs = self._owntone.list_outputs()
-        # Index OwnTone outputs by (name, host) tolerantly.
-        by_name = {str(o.get("name", "")).lower(): o for o in outputs}
         enabled_set = set(enabled_ids)
+
+        # Phase 1: try to build the name → output mapping with a brief
+        # retry budget. Most of the time the very first call succeeds
+        # because OwnTone has cached its peer list from a prior session.
+        # The retry loop is for cold-start AirPlay receivers that take
+        # 1-3 seconds to advertise.
+        outputs = self._owntone.list_outputs()
+        by_name = self._index_outputs_by_name(outputs)
+        unmatched_targets = [
+            d for d in enabled_set
+            if self._devices[d].name.lower() not in by_name
+        ]
+        # Backoff schedule: 250ms, 500ms, 1s, 1.25s — total budget ~3s.
+        # Bounded so a slow device doesn't block the start_stream RPC
+        # forever; remaining wait happens in the background reconcile.
+        retry_delays = [0.25, 0.5, 1.0, 1.25]
+        for delay in retry_delays:
+            if not unmatched_targets:
+                break
+            await asyncio.sleep(delay)
+            outputs = self._owntone.list_outputs()
+            by_name = self._index_outputs_by_name(outputs)
+            unmatched_targets = [
+                d for d in enabled_set
+                if self._devices[d].name.lower() not in by_name
+            ]
+            logger.info(
+                "reconcile_outputs_retry",
+                extra={
+                    "delay": delay,
+                    "still_unmatched": len(unmatched_targets),
+                    "by_name_keys": list(by_name.keys()),
+                },
+            )
         # Diagnostic: dump the universe of inputs to the matching loop in
         # one log line. Field reports can compare device.name against
         # `by_name_keys` to spot locale/case/whitespace divergence.
@@ -544,6 +612,7 @@ class DeviceManager:
                 "owntone_output_count": len(outputs),
             },
         )
+
         for dev_id, dev in self._devices.items():
             match = by_name.get(dev.name.lower())
             if match is None:
@@ -559,40 +628,256 @@ class DeviceManager:
                         "available_names": list(by_name.keys()),
                     },
                 )
+                # If this was a target the user wants enabled, emit
+                # `connecting` (we're still trying via the deferred
+                # reconcile task). The deferred task will flip this to
+                # connected or failed based on what actually happens.
+                if dev_id in enabled_set:
+                    self._notify_conn_state(
+                        dev_id, "connecting",
+                        reason="awaiting OwnTone mDNS discovery",
+                    )
                 continue
             dev.owntone_output_id = str(match.get("id"))
             should_enable = dev_id in enabled_set
-            try:
-                self._owntone.set_output_enabled(dev.owntone_output_id, should_enable)
-                if should_enable:
-                    self._owntone.set_output_volume(dev.owntone_output_id, dev.volume)
-                # Diagnostic: success path. Field logs can prove that
-                # the REST call WAS issued for the intended id, so any
-                # discrepancy with /api/outputs?selected=False is
-                # OwnTone-internal (e.g. it rejected the receiver).
-                logger.info(
-                    "reconcile_outputs_set",
-                    extra={
-                        "device_id": dev_id,
-                        "device_name": dev.name,
-                        "owntone_output_id": dev.owntone_output_id,
-                        "enable": should_enable,
-                    },
+            await self._apply_output_state(
+                dev_id=dev_id,
+                dev=dev,
+                output=match,
+                should_enable=should_enable,
+            )
+
+        # Phase 2: spin up the deferred reconcile. It re-polls the list
+        # for any enabled device that didn't get matched in phase 1.
+        # Idempotent — replaces any previous task.
+        if unmatched_targets:
+            self._schedule_deferred_reconcile(set(unmatched_targets))
+
+    def _index_outputs_by_name(
+        self, outputs: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Build a case-insensitive name → output dict.
+
+        Extracted from `_reconcile_outputs` so retry loops and the
+        deferred-reconcile task share the same matching semantics.
+        """
+        return {str(o.get("name", "")).lower(): o for o in outputs}
+
+    async def _apply_output_state(
+        self,
+        dev_id: str,
+        dev: Device,
+        output: dict[str, Any],
+        should_enable: bool,
+    ) -> None:
+        """Issue the REST PUT to enable/disable a single output and emit
+        the corresponding connection-state event.
+
+        Verification: after a successful `set_output_enabled(true)` we
+        re-fetch /api/outputs once after a short wait and confirm
+        `selected=True` flipped. OwnTone is known to reject silently
+        (HTTP 200 returned but the receiver ultimately stayed off — e.g.
+        password-required, network unreachable, AirPlay rejection). The
+        post-call verification turns that silent failure into a `failed`
+        connection event the UI can surface.
+
+        State events:
+          - `connecting` before the REST call (so the UI can show a
+            yellow dot during the round-trip).
+          - `connected` on verified success.
+          - `failed` on REST error OR unverified state after wait.
+          - For disable calls (`should_enable=False`) we emit
+            `disconnected` because the user opted out.
+        """
+        output_id = str(output.get("id", ""))
+        try:
+            if should_enable:
+                self._notify_conn_state(dev_id, "connecting")
+            self._owntone.set_output_enabled(output_id, should_enable)
+            if should_enable:
+                self._owntone.set_output_volume(output_id, dev.volume)
+            logger.info(
+                "reconcile_outputs_set",
+                extra={
+                    "device_id": dev_id,
+                    "device_name": dev.name,
+                    "owntone_output_id": output_id,
+                    "enable": should_enable,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "owntone_reconcile_failed",
+                extra={
+                    "device_id": dev_id,
+                    "device_name": dev.name,
+                    "owntone_output_id": output_id,
+                    "error_kind": type(e).__name__,
+                },
+            )
+            if should_enable:
+                self._notify_conn_state(
+                    dev_id, "failed", reason=f"REST error: {e}",
                 )
-            except Exception as e:  # noqa: BLE001
-                logger.exception(
-                    "owntone_reconcile_failed",
-                    extra={
-                        "device_id": dev_id,
-                        "device_name": dev.name,
-                        "owntone_output_id": dev.owntone_output_id,
-                        "error_kind": type(e).__name__,
-                    },
+            return
+        if not should_enable:
+            self._notify_conn_state(dev_id, "disconnected")
+            return
+        # Verify the output actually flipped to selected=True. OwnTone
+        # answers PUT /api/outputs/{id} synchronously even before the
+        # receiver has acked the AirPlay setup; an unreachable / rejecting
+        # receiver only surfaces in the next list_outputs() call.
+        await asyncio.sleep(0.5)
+        try:
+            outputs = self._owntone.list_outputs()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "reconcile_outputs_verify_list_failed",
+                extra={"device_id": dev_id, "error_kind": type(e).__name__},
+            )
+            self._notify_conn_state(
+                dev_id, "failed", reason=f"verify list failed: {e}",
+            )
+            return
+        for o in outputs:
+            if str(o.get("id", "")) == output_id:
+                if o.get("selected"):
+                    self._notify_conn_state(dev_id, "connected")
+                else:
+                    self._notify_conn_state(
+                        dev_id, "failed",
+                        reason="OwnTone rejected: selected stayed False",
+                    )
+                return
+        # Output disappeared from the list (rare — receiver dropped off
+        # network in the half-second since the PUT). Treat as failure.
+        self._notify_conn_state(
+            dev_id, "failed", reason="output disappeared after enable",
+        )
+
+    def _notify_conn_state(
+        self, device_id: str, state: str, reason: str | None = None,
+    ) -> None:
+        """Helper that emits the per-device connection-state notification.
+
+        Wraps `event.device_state` with the same payload shape as the
+        existing emitter but with a richer `state` enum. The old
+        `added | streaming | connected` values are preserved; the new
+        ones (`connecting`, `failed`, `disconnected`) describe the
+        OwnTone-side wiring rather than the audio-data state.
+        See `proto/ipc-schema.md` for the full enum.
+        """
+        params: dict[str, Any] = {"device_id": device_id, "state": state}
+        if reason is not None:
+            params["last_error"] = reason
+        self._notify("event.device_state", params)
+
+    def _schedule_deferred_reconcile(self, target_ids: set[str]) -> None:
+        """Spin up a background task that retries reconciliation for
+        devices that haven't appeared in OwnTone's outputs list yet.
+
+        Why background: holding the device-manager lock while waiting
+        10s for mDNS would freeze every other RPC (set_volume, mode.set,
+        stop_stream). The deferred task acquires the lock for short
+        windows only — a quick list_outputs() + maybe one set_output
+        call per pass.
+
+        Lifecycle: cancelled by `_stop_streaming_unlocked` when the
+        stream stops. Self-terminates when every target has either
+        succeeded or been disabled by the user.
+        """
+        # Cancel any prior task. start_stream calls _reconcile_outputs
+        # whenever the user toggles a device, so multiple stacked tasks
+        # would all fight for the lock and re-emit duplicate events.
+        prior = getattr(self, "_deferred_reconcile_task", None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+        task = asyncio.create_task(
+            self._deferred_reconcile_loop(set(target_ids)),
+        )
+        self._deferred_reconcile_task = task
+
+    async def _deferred_reconcile_loop(self, targets: set[str]) -> None:
+        """Loop body for the background reconcile.
+
+        Polls OwnTone's outputs every ~1.5s for up to 30 seconds. When a
+        target's output finally appears, takes the device-manager lock
+        briefly, applies the enable, and removes the target from the
+        watch set. Stops once the watch set is empty.
+        """
+        deadline = time.monotonic() + 30.0
+        try:
+            while targets and time.monotonic() < deadline:
+                await asyncio.sleep(1.5)
+                if self._owntone is None:
+                    logger.info("deferred_reconcile_owntone_gone")
+                    return
+                # Short critical section: list + maybe enable. We
+                # release between iterations so the main loop's
+                # toggles aren't blocked.
+                async with self._get_lock():
+                    if not self._streaming:
+                        logger.info("deferred_reconcile_stream_stopped")
+                        return
+                    outputs = self._owntone.list_outputs()
+                    by_name = self._index_outputs_by_name(outputs)
+                    matched: set[str] = set()
+                    for dev_id in list(targets):
+                        # User may have toggled the device off while
+                        # we were waiting; skip it.
+                        dev = self._devices.get(dev_id)
+                        if dev is None:
+                            matched.add(dev_id)
+                            continue
+                        match = by_name.get(dev.name.lower())
+                        if match is None:
+                            continue
+                        dev.owntone_output_id = str(match.get("id"))
+                        logger.info(
+                            "deferred_reconcile_match",
+                            extra={
+                                "device_id": dev_id,
+                                "device_name": dev.name,
+                                "owntone_output_id": dev.owntone_output_id,
+                            },
+                        )
+                        await self._apply_output_state(
+                            dev_id=dev_id,
+                            dev=dev,
+                            output=match,
+                            should_enable=True,
+                        )
+                        matched.add(dev_id)
+                    targets -= matched
+            if targets:
+                # Timed out. Surface failure to the UI for any
+                # still-unmatched device.
+                logger.warning(
+                    "deferred_reconcile_timeout",
+                    extra={"remaining": list(targets)},
                 )
+                for dev_id in targets:
+                    self._notify_conn_state(
+                        dev_id, "failed",
+                        reason="OwnTone never discovered receiver",
+                    )
+        except asyncio.CancelledError:
+            # Expected on shutdown / re-schedule.
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("deferred_reconcile_crashed")
 
     async def _stop_streaming_unlocked(self) -> None:
         if not self._streaming:
             return
+        # Cancel the deferred-reconcile task BEFORE we tear down audio
+        # state. If it ran during teardown, it could re-enable an
+        # output on an OwnTone that's about to die, leaving stale
+        # selected=True flags in REST and confusing the next session.
+        prior = getattr(self, "_deferred_reconcile_task", None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+        self._deferred_reconcile_task = None
         if self._audio_reader is not None:
             self._audio_reader.stop()
             self._audio_reader = None
