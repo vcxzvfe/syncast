@@ -909,41 +909,6 @@ private struct HybridSparkline: View {
     }
 }
 
-// MARK: - HybridDriftTracker UI placeholder
-//
-// TODO(integrator): when the parallel agent's HybridDriftTracker + AppModel
-// fields land, DELETE the `enum HybridDriftTracker` and the `extension AppModel`
-// below. Required AppModel fields (must match these exact names):
-//   var hybridTrackingEnabled: Bool                     // read/write, persisted
-//   var lastTrackerSample: HybridDriftTracker.Sample?
-//   var hybridTrackerHistory: [HybridDriftTracker.Sample]   // last 60 (~15 s @ 4 Hz)
-extension AppModel {
-    var hybridTrackingEnabled: Bool {
-        get { false }
-        set { _ = newValue }      // inert until real stored property exists
-    }
-    var lastTrackerSample: HybridDriftTracker.Sample? { nil }
-    var hybridTrackerHistory: [HybridDriftTracker.Sample] { [] }
-}
-
-enum HybridDriftTracker {
-    struct Sample: Sendable {
-        let timestamp: Date
-        let kalmanOffsetMs: Double
-        let kalmanDriftPpm: Double
-        let measuredOffsetMs: Double?
-        let confidence: Double
-        let source: Source
-        let appliedCorrectionMs: Double
-        let resultingDelayMs: Double
-        let state: State
-    }
-    enum Source: Sendable, Equatable { case passive, active, none }
-    enum State: Sendable, Equatable {
-        case coldStart
-        case warming(progress: Double)      // 0…1
-        case locked
-        case drifting(quietSeconds: Double)
-        case lost(reason: String)
-    }
-}
+// (Placeholder enum HybridDriftTracker + extension AppModel removed:
+//  the real type now ships in SyncCastRouter and the real AppModel
+//  fields are in place.)
