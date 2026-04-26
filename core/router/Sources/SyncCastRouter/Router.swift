@@ -559,14 +559,41 @@ public actor Router {
                     perDeviceOffsetMs: delta.perDeviceOffsetMs
                 )
             },
-            freqRunner: { [weak self] snap in
+            freqRunner: { [weak self] snap, frequencies, toneAmplitude in
                 guard let self else {
                     throw CalibrationFailure.engineFailed("router gone")
                 }
-                return try await self.runFrequencyResponseTest(
-                    devices: snap.devices,
-                    microphoneDeviceID: snap.microphoneDeviceID
-                )
+                // **v7**: forward optional sweep params from the
+                // diagnostic socket. Both nil ⇒ default sweep (the
+                // pre-v7 behavior). Either non-nil overrides only
+                // that parameter — `runFrequencyResponseTest` already
+                // accepts these as defaulted parameters, so the
+                // pattern below avoids duplicating its signature.
+                if let frequencies, let toneAmplitude {
+                    return try await self.runFrequencyResponseTest(
+                        devices: snap.devices,
+                        microphoneDeviceID: snap.microphoneDeviceID,
+                        frequencies: frequencies,
+                        toneAmplitude: Float(toneAmplitude)
+                    )
+                } else if let frequencies {
+                    return try await self.runFrequencyResponseTest(
+                        devices: snap.devices,
+                        microphoneDeviceID: snap.microphoneDeviceID,
+                        frequencies: frequencies
+                    )
+                } else if let toneAmplitude {
+                    return try await self.runFrequencyResponseTest(
+                        devices: snap.devices,
+                        microphoneDeviceID: snap.microphoneDeviceID,
+                        toneAmplitude: Float(toneAmplitude)
+                    )
+                } else {
+                    return try await self.runFrequencyResponseTest(
+                        devices: snap.devices,
+                        microphoneDeviceID: snap.microphoneDeviceID
+                    )
+                }
             }
         )
         do {

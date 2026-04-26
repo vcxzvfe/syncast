@@ -23,8 +23,15 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
     /// Runner for the `freqresponse` sweep. Returns the same struct
     /// `runFrequencyResponseTest` produces; the server serializes it to
     /// JSON via `Codable` for the wire format.
-    public typealias FreqRunner = @Sendable (Snapshot) async throws
-        -> FrequencyResponseResult
+    /// **v7**: optional `frequencies` and `toneAmplitude` are forwarded
+    /// from the JSON-RPC `params` payload — both nil means "use the
+    /// router default sweep" (the previous behavior). Either non-nil
+    /// overrides only that one parameter.
+    public typealias FreqRunner = @Sendable (
+        _ snapshot: Snapshot,
+        _ frequencies: [Double]?,
+        _ toneAmplitude: Double?
+    ) async throws -> FrequencyResponseResult
 
     public let socketPath: URL
     private let provider: Provider
@@ -129,16 +136,19 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         guard let method = obj["method"] as? String else {
             sendError(client: client, id: rid, code: -32600, message: "missing method"); return
         }
+        let params = obj["params"] as? [String: Any]
         switch method {
         case "calibrate":    handleCalibrate(client: client, id: rid)
-        case "freqresponse": handleFreqResponse(client: client, id: rid)
+        case "freqresponse": handleFreqResponse(client: client, id: rid, params: params)
         case "ping":         sendResult(client: client, id: rid, result: ["ok": true])
         default:             sendError(client: client, id: rid, code: -32601,
                                        message: "method not found: \(method)")
         }
     }
 
-    private func handleFreqResponse(client: Int32, id: Any) {
+    private func handleFreqResponse(
+        client: Int32, id: Any, params: [String: Any]?
+    ) {
         guard let runner = freqRunner else {
             sendError(client: client, id: id, code: -32601,
                       message: "freqresponse runner not configured"); return
@@ -151,6 +161,18 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
             sendError(client: client, id: id, code: -32002,
                       message: "calibration already in progress"); return
         }
+        // Extract optional frequencies / toneAmplitude from the JSON-RPC
+        // `params` payload. JSON's number type lands in Foundation as
+        // either `NSNumber` (most common) or `Double`; the cast chain
+        // handles both. Invalid types (e.g. strings) silently fall back
+        // to nil — the runner uses its defaults in that case.
+        let frequenciesParam: [Double]? = (params?["frequencies"] as? [Any])
+            .flatMap { arr -> [Double]? in
+                let doubles = arr.compactMap { ($0 as? NSNumber)?.doubleValue }
+                return doubles.count == arr.count ? doubles : nil
+            }
+        let amplitudeParam: Double? = (params?["toneAmplitude"] as? NSNumber)?
+            .doubleValue
         final class Box: @unchecked Sendable {
             var success: [String: Any]?
             var error: (Int, String)?
@@ -163,7 +185,9 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
                 box.error = (-32001, "router not in whole-home + running state"); return
             }
             do {
-                let result = try await runner(snap)
+                let result = try await runner(
+                    snap, frequenciesParam, amplitudeParam
+                )
                 // Encode through Codable → JSONSerialization round-trip so
                 // the existing `writeFrame` (Foundation JSON) can handle it.
                 let data = try JSONEncoder().encode(result)
