@@ -4,6 +4,18 @@ import AudioToolbox
 import Accelerate
 import os.lock
 
+/// **DEPRECATED** — replaced by `ContinuousActiveCalibrator` (driven
+/// by `ActiveCalibrator` instead of GCC-PHAT). The passive engine
+/// cannot distinguish per-device latencies on a single mic capture
+/// (single-peak detection on shared music produces ±100 ms run-to-run
+/// variance plus bad absolute values), which made continuous
+/// correction worse than no correction. Kept around as a legacy
+/// fallback for the router-side methods that still reference the
+/// type; new continuous-calibration entry points use
+/// `Router.startContinuousActiveCalibration`.
+///
+/// Original docstring follows.
+///
 /// Passive continuous-calibration engine. Cross-correlates the source
 /// PCM (mono mix from the SCK ring) against a live mic capture; the
 /// GCC-PHAT peak gives the wall-clock playback delay (room re-radiation
@@ -20,6 +32,7 @@ import os.lock
 /// Threads: AUHAL render callback writes mic into a lock-free ring; a
 /// background `Task` runs the periodic correlation off the audio
 /// thread. `start()` / `stop()` are idempotent.
+@available(*, deprecated, message: "Use ContinuousActiveCalibrator (Router.startContinuousActiveCalibration). Passive GCC-PHAT cannot distinguish per-device latencies and produces unreliable measurements.")
 public final class PassiveCalibrator: @unchecked Sendable {
 
     /// Per-class trace gate. `false` ⇒ skip string construction entirely.
