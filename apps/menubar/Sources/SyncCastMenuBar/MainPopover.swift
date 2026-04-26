@@ -140,6 +140,14 @@ struct MainPopover: View {
                 Toggle(isOn: Binding(
                     get: { model.backgroundCalibrationEnabled },
                     set: { newValue in
+                        // Mutual exclusion: enabling Continuous turns off
+                        // Hybrid Tracking. They drive the same delay-line
+                        // and would fight each other.
+                        if newValue && model.hybridTrackingEnabled {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                model.hybridTrackingEnabled = false
+                            }
+                        }
                         model.backgroundCalibrationEnabled = newValue
                         if newValue {
                             Task { await model.ensureMicPermissionForBackgroundCalibration() }
@@ -150,6 +158,7 @@ struct MainPopover: View {
                 }
                 .toggleStyle(.switch).controlSize(.mini)
                 .accessibilityIdentifier("continuousCalibrationToggle")
+                .help("Continuous Calibration runs full Auto-calibrate every N minutes. Hybrid Tracking continuously corrects drift in real-time. Choose one.")
                 if model.backgroundCalibrationEnabled {
                     Stepper(value: Binding(
                         get: { model.backgroundCalibrationIntervalS },
@@ -176,9 +185,162 @@ struct MainPopover: View {
                 liveStatusBlock
                     .accessibilityIdentifier("continuousCalibrationLiveStatus")
             }
+
+            // Hybrid Tracking row: continuous closed-loop tracker that
+            // corrects AirPlay drift in real-time via passive cross-
+            // correlation (95%) with occasional inaudible 18 kHz probes
+            // (~5%). Mutually exclusive with the Continuous toggle.
+            hybridTrackingRow
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+    }
+
+    // MARK: - Hybrid Tracking UI
+    //
+    // Toggle + (?) help icon. When ON, expands an inline panel with
+    // tracker state, offset/drift/confidence, last correction, and a
+    // 60×24 sparkline of kalmanOffsetMs (~15 s @ 4 Hz). Mutually
+    // exclusive with the Continuous toggle above.
+    @ViewBuilder
+    private var hybridTrackingRow: some View {
+        HStack(spacing: 8) {
+            Toggle(isOn: Binding(
+                get: { model.hybridTrackingEnabled },
+                set: { newValue in
+                    if newValue && model.backgroundCalibrationEnabled {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            model.backgroundCalibrationEnabled = false
+                        }
+                    }
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.hybridTrackingEnabled = newValue
+                    }
+                }
+            )) {
+                Text("Hybrid Tracking (real-time)").font(.system(size: 10))
+            }
+            .toggleStyle(.switch).controlSize(.mini)
+            .accessibilityIdentifier("hybridTrackingToggle")
+            .help("Continuously corrects AirPlay drift in real-time. Mutually exclusive with Continuous Calibration.")
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .help("""
+                Continuously listens via mic and corrects AirPlay drift in real-time.
+                Uses passive cross-correlation 95% of the time (silent).
+                Occasionally injects an inaudible 18 kHz probe (~5% of the time).
+                Settles to ±30 ms within 60 s, then maintains it indefinitely.
+                CPU: <2%, requires whole-home mode + mic permission.
+                """)
+                .accessibilityIdentifier("hybridTrackingHelp")
+            Spacer()
+        }
+        if model.hybridTrackingEnabled {
+            hybridTrackingStatusBlock
+                .accessibilityIdentifier("hybridTrackingStatus")
+        }
+    }
+
+    /// Inline status panel under the toggle. Three text rows + sparkline,
+    /// or "Initializing…" until the first sample arrives.
+    @ViewBuilder
+    private var hybridTrackingStatusBlock: some View {
+        if let s = model.lastTrackerSample {
+            VStack(alignment: .leading, spacing: 3) {
+                // Row 1: state + source + probes
+                HStack(spacing: 6) {
+                    Text("State:")
+                    Text(stateLabel(s.state)).foregroundStyle(stateColor(s.state))
+                    Text("Source: \(sourceLabel(s))")
+                    Text("· Probes: \(probeCount(in: model.hybridTrackerHistory))")
+                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
+                }
+                // Row 2: offset / drift / confidence
+                HStack(spacing: 6) {
+                    Text("Offset: \(Int(s.kalmanOffsetMs.rounded())) ms")
+                    Text("(drift \(String(format: "%+.1f", s.kalmanDriftPpm)) ppm)")
+                        .foregroundStyle(.tertiary)
+                    Text("Conf: \(String(format: "%.1f", s.confidence))")
+                        .foregroundStyle(s.confidence >= 4
+                            ? AnyShapeStyle(HierarchicalShapeStyle.secondary)
+                            : AnyShapeStyle(Color.orange))
+                    Spacer(minLength: 0)
+                }
+                // Row 3: last correction + applied delay
+                HStack(spacing: 6) {
+                    Text("Last correction: \(correctionLabel(s.appliedCorrectionMs))")
+                    Text("· Applied delay: \(Int(s.resultingDelayMs.rounded())) ms")
+                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
+                }
+                HybridSparkline(samples: model.hybridTrackerHistory)
+                    .frame(width: 60, height: 24)
+                    .accessibilityIdentifier("hybridTrackingSparkline")
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+        } else {
+            Text("Initializing tracker…")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+        }
+    }
+
+    /// "+3 ms" / "-3 ms" / "0 ms" — sign-prefixed correction string.
+    private func correctionLabel(_ corr: Double) -> String {
+        let v = Int(corr.rounded())
+        if v == 0 { return "0 ms" }
+        return v > 0 ? "+\(v) ms" : "\(v) ms"
+    }
+
+    /// Display string for each tracker state: cold/warm/lock/drift/lost.
+    private func stateLabel(_ state: HybridDriftTracker.State) -> String {
+        switch state {
+        case .coldStart:                  return "🔵 Cold start…"
+        case .warming(let p):             return "🟡 Warming \(Int((p * 100).rounded()))%"
+        case .locked:                     return "🟢 Locked"
+        case .drifting(let quietSeconds): return "🟠 Drifting (quiet \(Int(quietSeconds.rounded()))s)"
+        case .lost(let reason):           return "🔴 Lost: \(reason)"
+        }
+    }
+
+    private func stateColor(_ state: HybridDriftTracker.State) -> Color {
+        switch state {
+        case .coldStart: return .blue
+        case .warming:   return .yellow
+        case .locked:    return .green
+        case .drifting:  return .orange
+        case .lost:      return .red
+        }
+    }
+
+    /// "Passive (4Hz)" / "🔉 Probe" (sticky for ~2 s after an active
+    /// sample, then reverts) / "—" for `.none`.
+    private func sourceLabel(_ s: HybridDriftTracker.Sample) -> String {
+        let probeFresh = model.hybridTrackerHistory.suffix(8).contains {
+            if case .active = $0.source,
+               s.timestamp.timeIntervalSince($0.timestamp) <= 2.0 { return true }
+            return false
+        }
+        if probeFresh { return "🔉 Probe" }
+        switch s.source {
+        case .passive: return "Passive (4Hz)"
+        case .active:  return "🔉 Probe"
+        case .none:    return "—"
+        }
+    }
+
+    /// Count of `.active` samples in the visible history. Integrator
+    /// may swap for an engine-side counter if probe count must persist
+    /// across restarts.
+    private func probeCount(in history: [HybridDriftTracker.Sample]) -> Int {
+        history.reduce(0) { acc, s in
+            if case .active = s.source { return acc + 1 } else { return acc }
+        }
     }
 
     // MARK: - Live continuous-calibration status block
@@ -711,3 +873,77 @@ private struct VolumeSlider: View {
 
 // (Per-device-τ shim removed: ContinuousActiveCalibrator.Sample now
 // natively exposes perDeviceTauMs, so no extension fallback is needed.)
+
+// 60×24 sparkline of kalmanOffsetMs over ~15 s @ 4 Hz. Y-axis
+// auto-scales to value range + 10 ms padding; x is even spacing.
+private struct HybridSparkline: View {
+    let samples: [HybridDriftTracker.Sample]
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.secondary.opacity(0.08))
+                if samples.count >= 2 {
+                    sparkPath(size: geo.size)
+                        .stroke(Color.accentColor, lineWidth: 1)
+                }
+            }
+        }
+        .accessibilityLabel(Text("Drift tracker sparkline"))
+    }
+
+    private func sparkPath(size: CGSize) -> Path {
+        let values = samples.map(\.kalmanOffsetMs)
+        guard let lo = values.min(), let hi = values.max() else { return Path() }
+        let yMin = lo - 10, yMax = hi + 10
+        let yRange = max(1.0, yMax - yMin)
+        let dx = size.width / CGFloat(max(1, values.count - 1))
+        return Path { p in
+            for (i, v) in values.enumerated() {
+                let x = CGFloat(i) * dx
+                let y = size.height - CGFloat((v - yMin) / yRange) * size.height
+                i == 0 ? p.move(to: .init(x: x, y: y)) : p.addLine(to: .init(x: x, y: y))
+            }
+        }
+    }
+}
+
+// MARK: - HybridDriftTracker UI placeholder
+//
+// TODO(integrator): when the parallel agent's HybridDriftTracker + AppModel
+// fields land, DELETE the `enum HybridDriftTracker` and the `extension AppModel`
+// below. Required AppModel fields (must match these exact names):
+//   var hybridTrackingEnabled: Bool                     // read/write, persisted
+//   var lastTrackerSample: HybridDriftTracker.Sample?
+//   var hybridTrackerHistory: [HybridDriftTracker.Sample]   // last 60 (~15 s @ 4 Hz)
+extension AppModel {
+    var hybridTrackingEnabled: Bool {
+        get { false }
+        set { _ = newValue }      // inert until real stored property exists
+    }
+    var lastTrackerSample: HybridDriftTracker.Sample? { nil }
+    var hybridTrackerHistory: [HybridDriftTracker.Sample] { [] }
+}
+
+enum HybridDriftTracker {
+    struct Sample: Sendable {
+        let timestamp: Date
+        let kalmanOffsetMs: Double
+        let kalmanDriftPpm: Double
+        let measuredOffsetMs: Double?
+        let confidence: Double
+        let source: Source
+        let appliedCorrectionMs: Double
+        let resultingDelayMs: Double
+        let state: State
+    }
+    enum Source: Sendable, Equatable { case passive, active, none }
+    enum State: Sendable, Equatable {
+        case coldStart
+        case warming(progress: Double)      // 0…1
+        case locked
+        case drifting(quietSeconds: Double)
+        case lost(reason: String)
+    }
+}
