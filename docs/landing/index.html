@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="SyncCast — open-source macOS menubar app that captures system audio with ScreenCaptureKit and routes it in sync to local speakers and AirPlay 2 receivers.">
+<title>SyncCast — One audio source. Every speaker in the house.</title>
+<style>
+  /* ---------- reset + base ---------- */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+    background: #0b0d10;
+    color: #e6e8eb;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: inherit; text-decoration: none; }
+  img, svg { display: block; max-width: 100%; }
+
+  /* ---------- ambient gradient backdrop ---------- */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: -20% -20% auto auto;
+    width: 60vw;
+    height: 60vw;
+    background: radial-gradient(closest-side, rgba(94, 92, 230, 0.35), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed;
+    inset: auto auto -20% -20%;
+    width: 50vw;
+    height: 50vw;
+    background: radial-gradient(closest-side, rgba(10, 132, 255, 0.25), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ---------- layout ---------- */
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+
+  /* ---------- nav ---------- */
+  nav.top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 0;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: -0.01em; }
+  .brand .mark {
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, #5E5CE6 0%, #BF5AF2 100%);
+    display: grid; place-items: center;
+    box-shadow: 0 4px 14px rgba(94, 92, 230, 0.45);
+  }
+  .brand .mark svg { width: 16px; height: 16px; color: #fff; }
+  nav.top a.gh {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 14px;
+    font-size: 14px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.04);
+    transition: background 0.18s ease, border-color 0.18s ease;
+  }
+  nav.top a.gh:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.25); }
+  nav.top a.gh svg { width: 16px; height: 16px; }
+
+  /* ---------- hero ---------- */
+  header.hero { padding: 80px 0 100px; text-align: center; }
+  header.hero h1 {
+    font-size: clamp(38px, 6.4vw, 72px);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    background: linear-gradient(180deg, #ffffff 0%, #b9bcc4 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 24px;
+  }
+  header.hero h1 .accent {
+    background: linear-gradient(135deg, #5E5CE6 0%, #BF5AF2 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  header.hero p.lede {
+    font-size: clamp(16px, 1.8vw, 20px);
+    color: #a4a8b0;
+    max-width: 640px;
+    margin: 0 auto 40px;
+  }
+  .cta-row { display: inline-flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  a.btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 14px 22px;
+    font-size: 15px;
+    font-weight: 600;
+    border-radius: 10px;
+    transition: transform 0.12s ease, box-shadow 0.18s ease, background 0.18s ease;
+  }
+  a.btn.primary {
+    background: linear-gradient(135deg, #5E5CE6 0%, #BF5AF2 100%);
+    color: #fff;
+    box-shadow: 0 8px 24px rgba(94, 92, 230, 0.35);
+  }
+  a.btn.primary:hover { transform: translateY(-1px); box-shadow: 0 12px 28px rgba(94, 92, 230, 0.45); }
+  a.btn.secondary {
+    background: rgba(255,255,255,0.06);
+    color: #e6e8eb;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  a.btn.secondary:hover { background: rgba(255,255,255,0.1); }
+  a.btn svg { width: 16px; height: 16px; }
+  .pill {
+    display: inline-block;
+    margin-bottom: 22px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #b9bcc4;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 999px;
+    background: rgba(255,255,255,0.03);
+  }
+  .pill .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #30d158; margin-right: 8px; vertical-align: middle; }
+
+  /* ---------- section ---------- */
+  section { padding: 80px 0; }
+  section h2 {
+    font-size: clamp(28px, 3.4vw, 40px);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 16px;
+    text-align: center;
+  }
+  section p.tagline { text-align: center; color: #a4a8b0; max-width: 560px; margin: 0 auto 56px; font-size: 16px; }
+
+  /* ---------- feature grid ---------- */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+  }
+  .feature {
+    padding: 28px 24px;
+    border-radius: 14px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.015) 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    transition: border-color 0.2s ease, transform 0.2s ease;
+  }
+  .feature:hover { border-color: rgba(94, 92, 230, 0.4); transform: translateY(-2px); }
+  .feature .icon {
+    width: 38px; height: 38px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, rgba(94, 92, 230, 0.25), rgba(191, 90, 242, 0.18));
+    display: grid; place-items: center;
+    margin-bottom: 16px;
+    color: #b29dff;
+  }
+  .feature .icon svg { width: 20px; height: 20px; }
+  .feature h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; letter-spacing: -0.01em; }
+  .feature p { font-size: 14px; color: #a4a8b0; }
+
+  /* ---------- architecture diagram ---------- */
+  .diagram {
+    background: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.01) 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 40px 24px;
+    overflow-x: auto;
+  }
+  .diagram svg { margin: 0 auto; max-width: 100%; height: auto; }
+
+  /* ---------- install / code block ---------- */
+  pre.code {
+    background: #0a0c10;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    padding: 22px 24px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.7;
+    color: #d8dbe0;
+    max-width: 760px;
+    margin: 0 auto;
+  }
+  pre.code .c { color: #6c7682; }
+  pre.code .p { color: #5e9bff; }
+  pre.code .s { color: #a8c98e; }
+
+  /* ---------- footer ---------- */
+  footer {
+    border-top: 1px solid rgba(255,255,255,0.08);
+    padding: 32px 0 48px;
+    margin-top: 40px;
+    text-align: center;
+    color: #6c7682;
+    font-size: 13px;
+  }
+  footer a { color: #a4a8b0; }
+  footer a:hover { color: #fff; }
+
+  /* ---------- mobile ---------- */
+  @media (max-width: 600px) {
+    header.hero { padding: 56px 0 72px; }
+    section { padding: 56px 0; }
+    nav.top a.gh span { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav class="top" aria-label="Primary">
+    <a class="brand" href="#" aria-label="SyncCast home">
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12h2l3-7 4 14 3-9 2 5h4"/>
+        </svg>
+      </span>
+      <span>SyncCast</span>
+    </a>
+    <a class="gh" href="https://github.com/vcxzvfe/syncast" target="_blank" rel="noopener" aria-label="View SyncCast on GitHub">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.6v-2c-3.2.7-3.8-1.5-3.8-1.5-.5-1.3-1.3-1.6-1.3-1.6-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.2-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.5-1.5 7.8-5.8 7.8-10.9C23.5 5.7 18.3.5 12 .5z"/>
+      </svg>
+      <span>GitHub</span>
+    </a>
+  </nav>
+
+  <header class="hero">
+    <span class="pill"><span class="dot"></span>Open source · macOS</span>
+    <h1>One audio source.<br><span class="accent">Every speaker</span> in the house.</h1>
+    <p class="lede">SyncCast captures macOS system audio via ScreenCaptureKit and fans it out to local speakers and AirPlay 2 receivers — in sync, with no driver, no root, no fuss.</p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/vcxzvfe/syncast" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.6v-2c-3.2.7-3.8-1.5-3.8-1.5-.5-1.3-1.3-1.6-1.3-1.6-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.2-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.5-1.5 7.8-5.8 7.8-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+        Get on GitHub
+      </a>
+      <a class="btn secondary" href="#install">View install</a>
+    </div>
+  </header>
+</div>
+
+<main>
+
+  <section id="features" class="wrap">
+    <h2>Built for the way you actually listen</h2>
+    <p class="tagline">macOS gives you two half-solutions. SyncCast unifies them in one menubar.</p>
+
+    <div class="features">
+      <article class="feature">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 18 0"/><path d="M6 12a6 6 0 0 1 12 0"/><circle cx="12" cy="12" r="2"/></svg>
+        </div>
+        <h3>Whole-home AirPlay sync</h3>
+        <p>Send the same stream to every AirPlay 2 receiver in your home — HomePods, Apple TVs, third-party speakers — locked to PTP for tight cross-room timing.</p>
+      </article>
+
+      <article class="feature">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 9v6"/><path d="M15 9v6"/></svg>
+        </div>
+        <h3>Stereo local mix</h3>
+        <p>Keep video sync intact for low-latency local playback. A separate Stereo mode routes the built-in speakers and any USB or HDMI outputs through one aggregate device.</p>
+      </article>
+
+      <article class="feature">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8"/><path d="M12 18v4"/><path d="M7 9l3 3-3 3"/><path d="M14 15h3"/></svg>
+        </div>
+        <h3>ScreenCaptureKit native</h3>
+        <p>Apple's first-class capture API — no virtual driver to install, no kernel extension, no kext signing. SyncCast runs entirely in user-space.</p>
+      </article>
+
+      <article class="feature">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/><path d="M14 4l-4 16"/></svg>
+        </div>
+        <h3>Open source, hackable</h3>
+        <p>MIT-licensed Swift + Python. Pluggable transport layer for AirPlay 2 today and other protocols tomorrow. Read the code, file an issue, send a PR.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="architecture" class="wrap">
+    <h2>How it works</h2>
+    <p class="tagline">Capture once. Route many. Mode switching is mutually exclusive — Whole-home or Stereo, never both.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 880 360" role="img" aria-labelledby="diagTitle diagDesc" xmlns="http://www.w3.org/2000/svg">
+        <title id="diagTitle">SyncCast architecture</title>
+        <desc id="diagDesc">macOS system audio captured by ScreenCaptureKit, routed through SyncCast to either local CoreAudio outputs or AirPlay 2 receivers.</desc>
+        <defs>
+          <linearGradient id="gradPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#5E5CE6"/>
+            <stop offset="100%" stop-color="#BF5AF2"/>
+          </linearGradient>
+          <linearGradient id="gradBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#0A84FF"/>
+            <stop offset="100%" stop-color="#5E5CE6"/>
+          </linearGradient>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#7d8590"/>
+          </marker>
+        </defs>
+
+        <!-- Source: Mac system audio -->
+        <g>
+          <rect x="40" y="140" width="180" height="80" rx="12" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.18)"/>
+          <text x="130" y="170" text-anchor="middle" fill="#e6e8eb" font-family="-apple-system, system-ui, sans-serif" font-size="14" font-weight="600">macOS audio</text>
+          <text x="130" y="192" text-anchor="middle" fill="#a4a8b0" font-family="-apple-system, system-ui, sans-serif" font-size="12">ScreenCaptureKit</text>
+        </g>
+
+        <!-- arrow source -> router -->
+        <line x1="220" y1="180" x2="338" y2="180" stroke="#7d8590" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+        <!-- Router box -->
+        <g>
+          <rect x="340" y="120" width="200" height="120" rx="14" fill="url(#gradPurple)" opacity="0.95"/>
+          <text x="440" y="160" text-anchor="middle" fill="#fff" font-family="-apple-system, system-ui, sans-serif" font-size="16" font-weight="700">SyncCast</text>
+          <text x="440" y="184" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-family="-apple-system, system-ui, sans-serif" font-size="12">Router · Mode switch</text>
+          <text x="440" y="206" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-family="-apple-system, system-ui, sans-serif" font-size="11">Whole-home  |  Stereo</text>
+        </g>
+
+        <!-- arrows out -->
+        <line x1="540" y1="160" x2="660" y2="80" stroke="#7d8590" stroke-width="1.6" marker-end="url(#arrow)"/>
+        <line x1="540" y1="200" x2="660" y2="280" stroke="#7d8590" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+        <!-- Local outputs -->
+        <g>
+          <rect x="660" y="40" width="180" height="90" rx="12" fill="rgba(10,132,255,0.12)" stroke="rgba(10,132,255,0.45)"/>
+          <text x="750" y="72" text-anchor="middle" fill="#e6e8eb" font-family="-apple-system, system-ui, sans-serif" font-size="14" font-weight="600">Local speakers</text>
+          <text x="750" y="94" text-anchor="middle" fill="#a4a8b0" font-family="-apple-system, system-ui, sans-serif" font-size="12">CoreAudio aggregate</text>
+          <text x="750" y="113" text-anchor="middle" fill="#6c7682" font-family="-apple-system, system-ui, sans-serif" font-size="11">built-in · USB · HDMI</text>
+        </g>
+
+        <!-- AirPlay -->
+        <g>
+          <rect x="660" y="240" width="180" height="90" rx="12" fill="rgba(191,90,242,0.12)" stroke="rgba(191,90,242,0.45)"/>
+          <text x="750" y="272" text-anchor="middle" fill="#e6e8eb" font-family="-apple-system, system-ui, sans-serif" font-size="14" font-weight="600">AirPlay 2 devices</text>
+          <text x="750" y="294" text-anchor="middle" fill="#a4a8b0" font-family="-apple-system, system-ui, sans-serif" font-size="12">RTSP / PTP</text>
+          <text x="750" y="313" text-anchor="middle" fill="#6c7682" font-family="-apple-system, system-ui, sans-serif" font-size="11">HomePod · Apple TV · 3P</text>
+        </g>
+
+        <!-- Mode tags -->
+        <text x="600" y="115" text-anchor="middle" fill="#7d8590" font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">Stereo mode</text>
+        <text x="600" y="265" text-anchor="middle" fill="#7d8590" font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">Whole-home mode</text>
+      </svg>
+    </div>
+  </section>
+
+  <section id="install" class="wrap">
+    <h2>Install in three commands</h2>
+    <p class="tagline">Clone, build, install. No package manager wrappers, no installers — just the source you can read.</p>
+
+<pre class="code"><span class="c"># 1. Clone the repo</span>
+git clone https://github.com/vcxzvfe/syncast.git
+<span class="p">cd</span> syncast
+
+<span class="c"># 2. Build the Swift menubar app + Python AirPlay sidecar</span>
+./scripts/bootstrap.sh
+./scripts/package-app.sh
+
+<span class="c"># 3. Install to /Applications</span>
+bash scripts/install-app.sh
+
+<span class="c"># Launch</span>
+<span class="p">open</span> /Applications/SyncCast.app</pre>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>SyncCast is open source under the <a href="https://github.com/vcxzvfe/syncast/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>.</p>
+    <p style="margin-top: 6px;">&copy; 2026 SyncCast contributors · <a href="https://github.com/vcxzvfe/syncast" target="_blank" rel="noopener">github.com/vcxzvfe/syncast</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
