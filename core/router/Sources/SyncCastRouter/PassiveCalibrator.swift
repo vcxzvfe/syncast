@@ -22,6 +22,20 @@ import os.lock
 /// thread. `start()` / `stop()` are idempotent.
 public final class PassiveCalibrator: @unchecked Sendable {
 
+    /// Per-class trace gate. `false` ⇒ skip string construction entirely.
+    public static var verboseTracing: Bool = true
+    /// `iter=…` counter on every cycle log. Reset to 0 on `start()`.
+    private var iterationCount: UInt64 = 0
+    /// Last-seen mic write position. Delta = frames pushed by the AU
+    /// render callback since the previous cycle — zero ⇒ AU dead
+    /// (hypothesis #3) even though `AudioOutputUnitStart` returned ok.
+    private var lastMicWritePos: Int64 = 0
+    @inline(__always)
+    private static func trace(_ msg: @autoclosure () -> String) {
+        guard verboseTracing else { return }
+        CalibTrace.log(msg())
+    }
+
     public struct Sample: Sendable {
         public let measuredDelayMs: Int
         /// 0..1, peak prominence: (peak − runner-up) / peak.
@@ -111,11 +125,31 @@ public final class PassiveCalibrator: @unchecked Sendable {
         )
         let context = PassiveMicCaptureContext(ring: micRing)
         let opaque = Unmanaged.passUnretained(context).toOpaque()
-        let unit = try Self.openInputUnit(
-            deviceID: try resolveInputDeviceID(),
-            inputCallbackContext: opaque
-        )
+        let resolvedDevice: AudioDeviceID
+        do {
+            resolvedDevice = try resolveInputDeviceID()
+            Self.trace("[PassiveCalibrator] start: mic device id=\(resolvedDevice) caller_provided=\(microphoneDeviceID.map(String.init) ?? "nil") interval=\(measurementIntervalSeconds)s window=\(correlationWindowSeconds)s minConf=\(minConfidenceForUpdate) maxLag=\(maxExpectedDelaySeconds)s")
+        } catch {
+            Self.trace("[PassiveCalibrator] start: FAILED to resolve input device: \(error) — hypothesis #6 (TCC) or no default mic")
+            throw error
+        }
+        let unit: AudioUnit
+        do {
+            unit = try Self.openInputUnit(
+                deviceID: resolvedDevice,
+                inputCallbackContext: opaque
+            )
+            Self.trace("[PassiveCalibrator] start: AudioUnit opened+started OK on dev=\(resolvedDevice)")
+        } catch {
+            // Permission-denied / start-failed surfaces here. Logging the
+            // exact error shape disambiguates hypothesis #6 (TCC) from
+            // hypothesis #3 (AU started but render callback never fires).
+            Self.trace("[PassiveCalibrator] start: AudioUnit FAILED: \(error)")
+            throw error
+        }
         context.unit = unit
+        iterationCount = 0
+        lastMicWritePos = 0
         stateLock.withLockUnchecked {
             _liveUnit = unit
             _captureContext = context
@@ -143,6 +177,7 @@ public final class PassiveCalibrator: @unchecked Sendable {
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
+            Self.trace("[PassiveCalibrator] stop: AudioUnit torn down (last iter=\(iterationCount))")
         }
     }
 
@@ -150,6 +185,7 @@ public final class PassiveCalibrator: @unchecked Sendable {
         // Wait one interval — gives the mic ring time to fill and
         // OwnTone time to settle after a mode switch.
         let firstWaitNs = UInt64(measurementIntervalSeconds * 1_000_000_000)
+        Self.trace("[PassiveCalibrator] loop: armed; first sleep=\(measurementIntervalSeconds)s before first cycle")
         do { try await Task.sleep(nanoseconds: firstWaitNs) } catch { return }
 
         while !Task.isCancelled {
@@ -162,11 +198,20 @@ public final class PassiveCalibrator: @unchecked Sendable {
             let context: PassiveMicCaptureContext? =
                 stateLock.withLockUnchecked { _captureContext }
             guard let context else { return }
-            if let sample = computeOnce(
+            iterationCount &+= 1
+            let outcome = computeOnce(
                 micContext: context, windowSeconds: window,
                 maxLagSeconds: maxLag
-            ), sample.confidence >= minConf {
+            )
+            if let sample = outcome.sample, sample.confidence >= minConf {
+                Self.trace("[PassiveCalibrator] iter=\(iterationCount) \(outcome.summary) -> SAMPLE_EMITTED measuredDelay=\(sample.measuredDelayMs)ms suggested=\(sample.suggestedDelayMs)ms")
                 onSampleAvailable(sample)
+            } else if let sample = outcome.sample {
+                Self.trace("[PassiveCalibrator] iter=\(iterationCount) \(outcome.summary) -> SKIP (confidence \(String(format: "%.2f", sample.confidence)) < min \(String(format: "%.2f", minConf)))")
+            } else {
+                // Skipped before producing a Sample: gate / not-enough-frames
+                // / FFT failure. `outcome.summary` carries the reason.
+                Self.trace("[PassiveCalibrator] iter=\(iterationCount) \(outcome.summary) -> SKIP")
             }
             // Sleep in 500 ms chunks so cancellation lands quickly.
             var remaining = UInt64(interval * 1_000_000_000)
@@ -177,6 +222,15 @@ public final class PassiveCalibrator: @unchecked Sendable {
                 remaining &-= slice
             }
         }
+    }
+
+    /// Wrapper for `computeOnce` that pairs the (optional) Sample with a
+    /// human-readable trace string. `sample == nil` ⇒ early-skip path
+    /// (gates / not-enough-frames / FFT failure); the loop logger pulls
+    /// `summary` out either way.
+    private struct CycleOutcome {
+        let sample: Sample?
+        let summary: String
     }
 
     /// One correlation cycle. Returns nil on insufficient signal or
@@ -190,7 +244,7 @@ public final class PassiveCalibrator: @unchecked Sendable {
         micContext: PassiveMicCaptureContext,
         windowSeconds: Double,
         maxLagSeconds: Double
-    ) -> Sample? {
+    ) -> CycleOutcome {
         let sr = Self.sampleRate
         let windowFrames = Int(windowSeconds * sr)
         let maxLagFrames = Int(maxLagSeconds * sr)
@@ -198,7 +252,15 @@ public final class PassiveCalibrator: @unchecked Sendable {
 
         let micRing = micContext.ring
         let micWritePos = micRing.writePosition
-        guard micWritePos >= Int64(windowFrames) else { return nil }
+        // Frames pushed by the AU render callback since the last cycle.
+        // Zero across multiple consecutive iterations ⇒ AU render dead
+        // (hypothesis #3) even though `AudioOutputUnitStart` returned ok.
+        let framesSinceLast = micWritePos - lastMicWritePos
+        lastMicWritePos = micWritePos
+        guard micWritePos >= Int64(windowFrames) else {
+            return CycleOutcome(sample: nil,
+                summary: "mic_writepos=\(micWritePos) need=\(windowFrames) mic_frames=\(framesSinceLast) gate=NO_MIC_FRAMES")
+        }
         let micBuf = UnsafeMutablePointer<Float>.allocate(capacity: windowFrames)
         defer { micBuf.deallocate() }
         micBuf.initialize(repeating: 0, count: windowFrames)
@@ -209,11 +271,17 @@ public final class PassiveCalibrator: @unchecked Sendable {
                 frames: windowFrames, into: p
             )
         }
-        guard micFilled == windowFrames else { return nil }
+        guard micFilled == windowFrames else {
+            return CycleOutcome(sample: nil,
+                summary: "mic_filled=\(micFilled)/\(windowFrames) gate=MIC_RING_UNDERREAD")
+        }
         let mic = Array(UnsafeBufferPointer(start: micBuf, count: windowFrames))
 
         let sourceTargetStart = sourceRing.writePosition - Int64(sourceFrames)
-        guard sourceTargetStart >= 0 else { return nil }
+        guard sourceTargetStart >= 0 else {
+            return CycleOutcome(sample: nil,
+                summary: "source_writepos=\(sourceRing.writePosition) need=\(sourceFrames) gate=SOURCE_RING_NOT_READY")
+        }
         let chCount = sourceRing.channelCount
         let chPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>
             .allocate(capacity: chCount)
@@ -238,32 +306,55 @@ public final class PassiveCalibrator: @unchecked Sendable {
         // Energy gate at ~−60 dBFS RMS — below this, correlation
         // produces meaningless peaks (silence or noise on either side).
         let silenceThreshold: Float = 0.001
-        if Self.rms(mic) < silenceThreshold { return nil }
-        if Self.rms(source) < silenceThreshold { return nil }
+        let micRms = Self.rms(mic)
+        let sourceRms = Self.rms(source)
+        let micDb = Self.dbfs(micRms)
+        let srcDb = Self.dbfs(sourceRms)
+        if micRms < silenceThreshold {
+            return CycleOutcome(sample: nil,
+                summary: "mic_rms=\(micDb)dB source_rms=\(srcDb)dB mic_frames=\(framesSinceLast) gate=FAIL_MIC_BELOW_-60dBFS")
+        }
+        if sourceRms < silenceThreshold {
+            return CycleOutcome(sample: nil,
+                summary: "mic_rms=\(micDb)dB source_rms=\(srcDb)dB mic_frames=\(framesSinceLast) gate=FAIL_SOURCE_BELOW_-60dBFS")
+        }
 
         let n = Self.nextPowerOfTwo(sourceFrames + windowFrames)
         guard let corr = Self.gccPhat(
             source: source, sourceLength: sourceFrames,
             mic: mic, micLength: windowFrames, fftSize: n
-        ) else { return nil }
+        ) else {
+            return CycleOutcome(sample: nil,
+                summary: "mic_rms=\(micDb)dB source_rms=\(srcDb)dB gate=PASS fft_size=\(n) gate=FAIL_GCCPHAT")
+        }
 
         let validEnd = sourceFrames - windowFrames + 1
-        guard validEnd > 1 else { return nil }
+        guard validEnd > 1 else {
+            return CycleOutcome(sample: nil,
+                summary: "mic_rms=\(micDb)dB source_rms=\(srcDb)dB gate=PASS validEnd=\(validEnd) gate=FAIL_NO_VALID_LAG_RANGE")
+        }
         let (peakIndex, peakValue, runnerUp) = Self.peakAndRunnerUp(
             in: corr, begin: 0, end: validEnd
         )
-        guard peakValue > 0 else { return nil }
+        guard peakValue > 0 else {
+            return CycleOutcome(sample: nil,
+                summary: "mic_rms=\(micDb)dB source_rms=\(srcDb)dB gate=PASS peak_idx=\(peakIndex) peak_mag=0 gate=FAIL_ZERO_PEAK")
+        }
 
         let lagSamples = peakIndex - maxLagFrames
         let measuredDelayMs = Int((Double(lagSamples) / sr) * 1000.0)
         let confidence = max(0.0, min(1.0,
             Double((peakValue - runnerUp) / peakValue)
         ))
-        return Sample(
-            measuredDelayMs: measuredDelayMs,
-            confidence: confidence,
-            suggestedDelayMs: max(0, measuredDelayMs),
-            timestamp: Date()
+        let summary = "mic_rms=\(micDb)dB source_rms=\(srcDb)dB mic_frames=\(framesSinceLast) gate=PASS peak_idx=\(peakIndex) peak_mag=\(String(format: "%.4f", peakValue)) runnerUp=\(String(format: "%.4f", runnerUp)) confidence=\(String(format: "%.2f", confidence))"
+        return CycleOutcome(
+            sample: Sample(
+                measuredDelayMs: measuredDelayMs,
+                confidence: confidence,
+                suggestedDelayMs: max(0, measuredDelayMs),
+                timestamp: Date()
+            ),
+            summary: summary
         )
     }
 
@@ -376,6 +467,13 @@ public final class PassiveCalibrator: @unchecked Sendable {
             vDSP_measqv(ptr.baseAddress!, 1, &ms, vDSP_Length(ptr.count))
         }
         return sqrt(ms)
+    }
+
+    /// Convert a linear-amplitude RMS to a 1-decimal dBFS string. Returns
+    /// `-inf` for zero. Used only for log formatting.
+    private static func dbfs(_ rms: Float) -> String {
+        if rms <= 0 { return "-inf" }
+        return String(format: "%.1f", 20.0 * Foundation.log10(Double(rms)))
     }
 
     /// Locate the global maximum and the next-highest peak from outside
@@ -541,3 +639,5 @@ private final class PassiveMicCaptureContext {
         return noErr
     }
 }
+
+
