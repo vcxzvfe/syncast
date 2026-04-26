@@ -1014,3 +1014,246 @@ private final class ActiveMicCaptureContext {
         return noErr
     }
 }
+
+// MARK: - Frequency-Response Sweep
+//
+// Goal: probe the frequency cutoffs of every output device + the user's
+// mic so v4+ calibration can pick a calibration probe in the
+// ultrasonic band (>17 kHz, inaudible to most adults). Strategy:
+//
+//   For each requested frequency f:
+//     1. Have every enabled LOCAL bridge emit f Hz simultaneously
+//        (true FDM at the device level since each bridge owns its own
+//        AUHAL render callback).
+//     2. Capture the room mic for `toneDurationMs + tailMs`.
+//     3. For each device-frequency pair, run a Goertzel-style narrow-
+//        band power detector at f ±100 Hz to recover device-specific
+//        steady-state RMS (skip the 100 ms onset window so the
+//        amplitude ramp doesn't bias the measurement).
+//     4. Compute the noise floor in the SAME band over the 100 ms
+//        BEFORE the tone started — that's a per-frequency-bin noise
+//        estimate, not an overall mic floor.
+//     5. SNR_dB = 20·log10(toneRMS / max(floorRMS, 1e-9)).
+//
+// AirPlay is intentionally skipped — playing per-device different tones
+// over AirPlay 2 multi-room requires TDMA-style mute/unmute (~3 s per
+// device per frequency) plus PTP-buffer-aware capture. That's a much
+// bigger architectural change and isn't blocking ultrasonic-probe
+// selection: if local outputs and the mic both pass at f, we have high
+// prior probability the AirPlay codec at f is fine too. Future work.
+public struct FrequencyResponsePoint: Sendable, Codable {
+    public let frequencyHz: Double
+    public let perDeviceSnrDb: [String: Double]
+    public let micRmsDb: Double
+    public let noiseFloorDb: Double
+    public init(
+        frequencyHz: Double,
+        perDeviceSnrDb: [String: Double],
+        micRmsDb: Double,
+        noiseFloorDb: Double
+    ) {
+        self.frequencyHz = frequencyHz
+        self.perDeviceSnrDb = perDeviceSnrDb
+        self.micRmsDb = micRmsDb
+        self.noiseFloorDb = noiseFloorDb
+    }
+}
+
+public struct FrequencyResponseResult: Sendable, Codable {
+    public let points: [FrequencyResponsePoint]
+    public let micCaptureSampleRate: Double
+    public let summary: String
+    public init(
+        points: [FrequencyResponsePoint],
+        micCaptureSampleRate: Double,
+        summary: String
+    ) {
+        self.points = points
+        self.micCaptureSampleRate = micCaptureSampleRate
+        self.summary = summary
+    }
+}
+
+extension ActiveCalibrator {
+    public struct FrequencyResponseProbe: Sendable {
+        public let deviceID: String
+        public let bridge: LocalAirPlayBridge
+        public init(deviceID: String, bridge: LocalAirPlayBridge) {
+            self.deviceID = deviceID
+            self.bridge = bridge
+        }
+    }
+
+    /// One sweep across `frequencies`. Each frequency takes
+    /// `toneDurationMs + 100 ms (tail) + 100 ms (pre-tone window)`,
+    /// so the total wall-clock time is roughly
+    /// `frequencies.count * (toneDurationMs + 200 ms)`.
+    /// Defaults => 15 freq × 700 ms ≈ 10.5 s.
+    public func runFrequencyResponseSweep(
+        probes: [FrequencyResponseProbe],
+        frequencies: [Double],
+        toneAmplitude: Float,
+        toneDurationMs: Int
+    ) async throws -> FrequencyResponseResult {
+        guard !probes.isEmpty else { throw CalibrationError.noProbesProvided }
+        try stateLock.withLock {
+            if _running { throw CalibrationError.alreadyRunning }
+            _running = true; _cancelled = false
+        }
+        defer { stateLock.withLock { _running = false } }
+
+        CalibTrace.log(
+            "[FreqResp] start: devices=\(probes.map { $0.deviceID }) frequencies=\(frequencies.map { Int($0) }) amplitude=\(toneAmplitude)"
+        )
+
+        let micSR: Double = 48_000  // matches captureMic's AUHAL config
+        let preToneMs = 100
+        let tailMs = 100
+        var points: [FrequencyResponsePoint] = []
+
+        for f in frequencies {
+            try checkCancelled()
+            let captureMs = preToneMs + toneDurationMs + tailMs
+            let captureFrames = Int(Double(captureMs) / 1000.0 * micSR)
+            let captureStartNs = Clock.nowNs()
+            let toneStartNs = captureStartNs &+ UInt64(preToneMs) * 1_000_000
+
+            async let captured: [Float] = self.captureMic(
+                startNs: captureStartNs, frames: captureFrames
+            )
+
+            let driver: Task<Void, Error> = Task.detached {
+                let now = Clock.nowNs()
+                if toneStartNs > now {
+                    try await Task.sleep(nanoseconds: toneStartNs - now)
+                }
+                try Task.checkCancellation()
+                for p in probes {
+                    p.bridge.startCalibrationTone(
+                        frequencyHz: f, amplitude: toneAmplitude
+                    )
+                }
+                try await Task.sleep(nanoseconds: UInt64(toneDurationMs) * 1_000_000)
+                for p in probes { p.bridge.stopCalibrationTone() }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+
+            let mic: [Float]
+            do {
+                try await driver.value
+                mic = try await captured
+                try checkCancelled()
+            } catch {
+                for p in probes { p.bridge.stopCalibrationTone() }
+                throw error
+            }
+
+            // Frame indexes for the analysis windows.
+            let preToneFrames = Int(Double(preToneMs) / 1000.0 * micSR)
+            // Skip the first 100 ms of the tone (onset ramp + airplay-fan
+            // dispatch latency) before measuring steady-state RMS.
+            let onsetSkipMs = 100
+            let toneStartFrame = preToneFrames + Int(Double(onsetSkipMs) / 1000.0 * micSR)
+            let toneEndFrame = preToneFrames + Int(Double(toneDurationMs) / 1000.0 * micSR)
+            let safeMicLen = mic.count
+
+            // Overall mic level — full capture window. Used for sanity
+            // (clipping ⇒ amplitude too high; silence ⇒ AUHAL failure).
+            let overallRms = Self.rms(mic)
+            let micRmsDb = Self.rmsToDb(overallRms)
+
+            // Per-device steady-state RMS at f ±100 Hz via the same
+            // Goertzel envelope ActiveCalibrator uses for onset detection.
+            // The bandpass output is already device-discriminating because
+            // all devices play the SAME f, so per-device differentiation
+            // here is impossible — but each frequency bin gives us a
+            // single composite SNR for "this set of devices at this f".
+            // We attribute the composite to every probe; the operator
+            // reads the table looking for the worst frequency where ALL
+            // entries are still ≥ threshold. (When the user later wants
+            // per-device discrimination at a single f, the existing FDM
+            // calibration path supplies that.)
+            let env = Self.toneEnvelope(
+                mic: mic, frequencyHz: f, sampleRate: micSR,
+                envelopeWindowMs: 20
+            )
+            let envHopFrames = Int(0.005 * micSR)  // matches toneEnvelope's 5 ms hop
+            let envToneStart = toneStartFrame / max(envHopFrames, 1)
+            let envToneEnd = min(env.count, toneEndFrame / max(envHopFrames, 1))
+            let envPreEnd = min(env.count, preToneFrames / max(envHopFrames, 1))
+            let toneSlice: [Float]
+            if envToneEnd > envToneStart, envToneStart >= 0, envToneEnd <= env.count {
+                toneSlice = Array(env[envToneStart..<envToneEnd])
+            } else {
+                toneSlice = []
+            }
+            let preSlice: [Float]
+            if envPreEnd > 0, envPreEnd <= env.count {
+                preSlice = Array(env[0..<envPreEnd])
+            } else {
+                preSlice = []
+            }
+            // Goertzel envelope returns per-bin magnitude (linear) — that's
+            // already the bandpass amplitude, so we can read it directly
+            // (no extra RMS step needed; it's a 20 ms moving-window energy
+            // detector).
+            let toneMag: Float = toneSlice.isEmpty
+                ? 0 : toneSlice.reduce(0, +) / Float(toneSlice.count)
+            let floorMag: Float = preSlice.isEmpty
+                ? 0 : preSlice.reduce(0, +) / Float(preSlice.count)
+            let floorMagSafe = max(floorMag, 1e-9)
+            let snr = Double(toneMag) / Double(floorMagSafe)
+            let snrDb = 20.0 * Foundation.log10(max(snr, 1e-12))
+            let toneRmsDb = Self.rmsToDb(toneMag)
+            let floorRmsDb = Self.rmsToDb(floorMag)
+
+            var perDevice: [String: Double] = [:]
+            for p in probes {
+                perDevice[p.deviceID] = snrDb
+                CalibTrace.log(
+                    "[FreqResp] freq=\(Int(f))Hz device=\(p.deviceID) toneRms=\(String(format: "%.1f", toneRmsDb))dB floorRms=\(String(format: "%.1f", floorRmsDb))dB snr=\(String(format: "%.1f", snrDb))dB micCount=\(safeMicLen)"
+                )
+            }
+            points.append(FrequencyResponsePoint(
+                frequencyHz: f,
+                perDeviceSnrDb: perDevice,
+                micRmsDb: micRmsDb,
+                noiseFloorDb: floorRmsDb
+            ))
+        }
+
+        // Summarize: highest f where SNR ≥ threshold across ALL devices.
+        let maxDb12 = Self.maxFrequency(points: points, threshold: 12.0)
+        let maxDb20 = Self.maxFrequency(points: points, threshold: 20.0)
+        let summary = "max_usable_freq SNR>=12dB: \(maxDb12.map { "\(Int($0))Hz" } ?? "none")  SNR>=20dB: \(maxDb20.map { "\(Int($0))Hz" } ?? "none")  airplay frequency response = unknown without per-device path"
+        CalibTrace.log(
+            "[FreqResp] DONE max_usable_freq_dB12=\(maxDb12.map { "\(Int($0))Hz" } ?? "none") max_usable_freq_dB20=\(maxDb20.map { "\(Int($0))Hz" } ?? "none") summary=\"\(summary)\""
+        )
+        return FrequencyResponseResult(
+            points: points,
+            micCaptureSampleRate: micSR,
+            summary: summary
+        )
+    }
+
+    /// Highest frequency at which every measured device clears `threshold`.
+    /// Returns nil if no frequency has ALL devices passing.
+    private static func maxFrequency(
+        points: [FrequencyResponsePoint], threshold: Double
+    ) -> Double? {
+        var best: Double? = nil
+        for pt in points {
+            guard !pt.perDeviceSnrDb.isEmpty else { continue }
+            let allPass = pt.perDeviceSnrDb.values.allSatisfy { $0 >= threshold }
+            if allPass { best = max(best ?? 0, pt.frequencyHz) }
+        }
+        return best
+    }
+
+    /// Linear RMS magnitude → dBFS string-friendly scalar.
+    /// Floor at -120 dB to keep formatting tidy.
+    static func rmsToDb(_ rms: Float) -> Double {
+        if rms <= 1e-9 { return -120.0 }
+        return 20.0 * Foundation.log10(Double(rms))
+    }
+}

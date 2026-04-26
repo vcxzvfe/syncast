@@ -20,17 +20,31 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
     public typealias Provider = @Sendable () async -> Snapshot?
     public typealias Runner = @Sendable (Snapshot) async throws
         -> (deltaMs: Int, confidence: Double, perDeviceOffsetMs: [String: Int])
+    /// Runner for the `freqresponse` sweep. Returns the same struct
+    /// `runFrequencyResponseTest` produces; the server serializes it to
+    /// JSON via `Codable` for the wire format.
+    public typealias FreqRunner = @Sendable (Snapshot) async throws
+        -> FrequencyResponseResult
 
     public let socketPath: URL
     private let provider: Provider
     private let runner: Runner
+    private let freqRunner: FreqRunner?
     private var listenFd: Int32 = -1
     private var acceptThread: Thread?
     private let lock = NSLock()
     private var inProgress: Bool = false
 
-    public init(socketPath: URL, provider: @escaping Provider, runner: @escaping Runner) {
-        self.socketPath = socketPath; self.provider = provider; self.runner = runner
+    public init(
+        socketPath: URL,
+        provider: @escaping Provider,
+        runner: @escaping Runner,
+        freqRunner: FreqRunner? = nil
+    ) {
+        self.socketPath = socketPath
+        self.provider = provider
+        self.runner = runner
+        self.freqRunner = freqRunner
     }
 
     public func start() throws {
@@ -116,10 +130,60 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
             sendError(client: client, id: rid, code: -32600, message: "missing method"); return
         }
         switch method {
-        case "calibrate": handleCalibrate(client: client, id: rid)
-        case "ping":      sendResult(client: client, id: rid, result: ["ok": true])
-        default:          sendError(client: client, id: rid, code: -32601,
-                                    message: "method not found: \(method)")
+        case "calibrate":    handleCalibrate(client: client, id: rid)
+        case "freqresponse": handleFreqResponse(client: client, id: rid)
+        case "ping":         sendResult(client: client, id: rid, result: ["ok": true])
+        default:             sendError(client: client, id: rid, code: -32601,
+                                       message: "method not found: \(method)")
+        }
+    }
+
+    private func handleFreqResponse(client: Int32, id: Any) {
+        guard let runner = freqRunner else {
+            sendError(client: client, id: id, code: -32601,
+                      message: "freqresponse runner not configured"); return
+        }
+        let claimed: Bool = lock.calibLock {
+            if inProgress { return false }
+            inProgress = true; return true
+        }
+        if !claimed {
+            sendError(client: client, id: id, code: -32002,
+                      message: "calibration already in progress"); return
+        }
+        final class Box: @unchecked Sendable {
+            var success: [String: Any]?
+            var error: (Int, String)?
+        }
+        let box = Box()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached { [provider] in
+            defer { sem.signal() }
+            guard let snap = await provider() else {
+                box.error = (-32001, "router not in whole-home + running state"); return
+            }
+            do {
+                let result = try await runner(snap)
+                // Encode through Codable → JSONSerialization round-trip so
+                // the existing `writeFrame` (Foundation JSON) can handle it.
+                let data = try JSONEncoder().encode(result)
+                if let obj = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any]
+                {
+                    box.success = obj
+                } else {
+                    box.error = (-32000, "freqresponse: result not a JSON object")
+                }
+            } catch { box.error = (-32000, "\(error)") }
+        }
+        sem.wait()
+        lock.calibLock { inProgress = false }
+        if let err = box.error {
+            sendError(client: client, id: id, code: err.0, message: err.1)
+        } else if let ok = box.success {
+            sendResult(client: client, id: id, result: ok)
+        } else {
+            sendError(client: client, id: id, code: -32000, message: "no result")
         }
     }
 
