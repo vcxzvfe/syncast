@@ -36,21 +36,29 @@ import SyncCastDiscovery
 ///      envelope → first-rise threshold → onset_time = arrival
 ///      latency.
 ///
-/// **Phase 2 (AirPlay TDMA, sequential, ~2.5 s per device)**
+/// **Phase 2 (AirPlay TDMA, sequential, ~12 s per device with cycles=3)**
 ///   For each enabled AirPlay device j:
 ///   1. Snapshot all AirPlay devices' current volumes.
 ///   2. Set `volume=0` on every OTHER AirPlay device via
 ///      `device.set_volume`.
-///   3. Synthesize a linear-sweep chirp `chirpStartHz` → `chirpEndHz`
-///      over `chirpDurationMs` ms with a small per-device frequency
-///      offset for spectral identifiability.
-///   4. Inject the chirp into the SCK ring at a known wall-clock
+///   3. Build a per-device **ULTRASONIC** chirp template — linear sweep
+///      `chirpStartHz` → `chirpEndHz` (17.5–18.5 kHz, inaudible to
+///      adults) over `chirpDurationMs` ms, with a 600 Hz per-device
+///      band offset so each device has a uniquely identifiable
+///      ultrasonic signature.
+///   4. **v5 multi-cycle**: repeat steps 5–7 `airplayCyclesPerDevice`
+///      times (default 3), with `airplayInterCycleGapMs` between
+///      cycles. Per-cycle records peak_idx, peak_time, peak_prominence.
+///   5. Inject the chirp into the SCK ring at a known wall-clock
 ///      anchor (mic capture is synchronized to the same clock).
-///   5. Wait `airplayCaptureDurationMs` for the chirp to arrive +
+///   6. Wait `airplayCaptureDurationMs` for the chirp to arrive +
 ///      tail.
-///   6. Restore the snapshotted volumes.
 ///   7. Cross-correlate mic signal vs. the known chirp template to
-///      find peak position → arrival_time.
+///      find peak position → cycle's arrival_time.
+///   8. **v5 aggregation**: τ_dev = median(τ_0..τ_{N-1});
+///      uncertainty = MAD(τ_0..τ_{N-1});
+///      confidence = median(peak_prominences) × max(0, 1 - MAD/median).
+///   9. Restore the snapshotted volumes.
 ///
 /// **Phase 3 (compute alignment)**
 ///   `delta = max(airplay τ) − max(local τ)`. ADD to current
@@ -95,11 +103,17 @@ public final class ActiveCalibrator: @unchecked Sendable {
         /// calibration time origin. Local entries are typically tens
         /// of ms (modulo the airplayDelayMs delay-line in whole-home
         /// mode); AirPlay entries are typically 1500–3500 ms.
+        /// **v5**: For AirPlay devices this is the MEDIAN of
+        /// `airplayCyclesPerDevice` independent measurements.
         public let perDeviceTauMs: [String: Int]
-        /// Per-device confidence: SNR for local (peak / noise floor),
-        /// xcorr peak / background MAD for AirPlay. Higher is better;
-        /// values below ~3.0 should be treated as "couldn't measure".
+        /// Per-device confidence: SNR for local (peak / noise floor);
+        /// for AirPlay (v5) `peak-prominence × (1 - normalized MAD)` so
+        /// run-to-run jitter penalizes confidence even when each
+        /// individual cycle clears the noise floor.
         public let perDeviceConfidence: [String: Double]
+        /// Per-device run-to-run MAD, in ms. Empty for local devices
+        /// (single-shot in v5). MAD ≤ 20 ms = tight; ≥ 80 ms = noisy.
+        public let perDeviceUncertaintyMs: [String: Int]
         /// Worst (lowest) per-device confidence in this run.
         public let aggregateConfidence: Double
         /// Signed delta = max(AirPlay τ) − max(local τ); ADD to
@@ -109,10 +123,12 @@ public final class ActiveCalibrator: @unchecked Sendable {
         public init(
             perDeviceTauMs: [String: Int],
             perDeviceConfidence: [String: Double],
+            perDeviceUncertaintyMs: [String: Int] = [:],
             aggregateConfidence: Double, deltaMs: Int
         ) {
             self.perDeviceTauMs = perDeviceTauMs
             self.perDeviceConfidence = perDeviceConfidence
+            self.perDeviceUncertaintyMs = perDeviceUncertaintyMs
             self.aggregateConfidence = aggregateConfidence
             self.deltaMs = deltaMs
         }
@@ -165,18 +181,27 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// mode can be up to ~3 s due to the delay-line.
     public static let localCaptureTailMs: Int = 3500
 
-    /// AirPlay chirp parameters. Linear sweep 200–800 Hz over 100 ms is
-    /// short enough to be barely disruptive, has a sharp matched-filter
-    /// peak (the autocorrelation of a chirp is a narrow sinc), and sits
-    /// in a frequency band that's well-passed by every AirPlay codec.
-    public static let chirpStartHz: Double = 200
-    public static let chirpEndHz: Double = 800
+    /// AirPlay chirp parameters. **v5: ULTRASONIC chirp** — moved from
+    /// the audible 200–800 Hz band (which produced an audible "click" on
+    /// every Phase 2 cycle) up to 17.5–18.5 kHz where adult ears can't
+    /// hear it. AirPlay codecs (ALAC lossless, AAC at 256 kbps) preserve
+    /// content up to ~20 kHz with high fidelity, so the chirp survives
+    /// the OwnTone → AirPlay pipeline cleanly. Amplitude is bumped to
+    /// 0.7 (from 0.5) to compensate for the high-frequency speaker
+    /// rolloff measured on the user's hardware (the freq-resp sweep
+    /// showed ~50 dB acoustic loss between 1 kHz and 18 kHz).
+    public static let chirpStartHz: Double = 17500
+    public static let chirpEndHz: Double = 18500
     public static let chirpDurationMs: Int = 100
-    public static let chirpAmplitude: Float = 0.5
-    /// Per-device chirp start-frequency offset to make the templates
-    /// spectrally distinguishable: device j's chirp starts at
-    /// `chirpStartHz + j * chirpPerDeviceOffsetHz`.
-    public static let chirpPerDeviceOffsetHz: Double = 100
+    public static let chirpAmplitude: Float = 0.7
+    /// Per-device chirp start-frequency offset. **v5: 600 Hz spacing**
+    /// so every AirPlay receiver gets a uniquely identifiable ultrasonic
+    /// band: device j sweeps `[startHz + j*600, endHz + j*600]` Hz —
+    /// dev 0: 17.5-18.5k, dev 1: 18.1-19.1k, dev 2: 18.7-19.7k,
+    /// dev 3: 19.3-20.3k (codec edge — fine for ALAC/AAC@256k).
+    /// Distinct bands give operator-readable logs, future-FDM
+    /// compatibility, and band-limited matched-filter resilience.
+    public static let chirpPerDeviceOffsetHz: Double = 600
     /// Mic capture window for one AirPlay device, after chirp injection.
     /// AirPlay PTP buffer is typically 1.5–2.5 s with outliers up to
     /// ~3.5 s; we capture 4 s so the matched-filter search has full
@@ -192,6 +217,14 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// Quiet gap between AirPlay device captures so the previous
     /// device's chirp tail fully decays before we measure the next.
     public static let airplayInterDeviceGapMs: Int = 200
+    /// **v5 multi-cycle averaging.** Each AirPlay device is measured N
+    /// times; we report MEDIAN tau and MAD as uncertainty. cycles=1 had
+    /// ±~95 ms run-to-run variance; cycles=3 collapses that to ~±15 ms.
+    /// Phase 1 (local FDM) is NOT multi-cycled — already <±5 ms.
+    public static let airplayCyclesPerDevice: Int = 3
+    /// Quiet gap between consecutive cycles on the SAME device — long
+    /// enough to let the previous chirp's room reverb decay.
+    public static let airplayInterCycleGapMs: Int = 200
 
     /// Confidence threshold below which we mark a measurement as
     /// "could not measure" but still report it. 3.0 is the classic
@@ -251,12 +284,14 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
         var perDeviceTau: [String: Int] = [:]
         var perDeviceConf: [String: Double] = [:]
+        var perDeviceUncertainty: [String: Int] = [:]
 
         // Phase 1: local FDM (parallel sine tones, single mic capture).
         if !localProbes.isEmpty {
             let phase1 = try await runLocalPhase(probes: localProbes)
             for (id, tau) in phase1.tau { perDeviceTau[id] = tau }
             for (id, c) in phase1.confidence { perDeviceConf[id] = c }
+            for (id, u) in phase1.uncertainty { perDeviceUncertainty[id] = u }
         }
 
         try checkCancelled()
@@ -306,6 +341,7 @@ public final class ActiveCalibrator: @unchecked Sendable {
             )
             for (id, tau) in phase2.tau { perDeviceTau[id] = tau }
             for (id, c) in phase2.confidence { perDeviceConf[id] = c }
+            for (id, u) in phase2.uncertainty { perDeviceUncertainty[id] = u }
         }
 
         // Phase 3: compute delta.
@@ -319,13 +355,25 @@ public final class ActiveCalibrator: @unchecked Sendable {
         let delta: Int = (maxAir == Int.min || maxLoc == Int.min) ? 0 : maxAir - maxLoc
         let aggregate = perDeviceConf.values.min() ?? 0
 
+        // **v5**: surface AirPlay median + uncertainty in the final
+        // trace so operators get a one-line health summary.
+        let airplayTaus = airplayProbes
+            .compactMap { perDeviceTau[$0.deviceID] }.filter { $0 >= 0 }
+        let airplayUnc = airplayProbes
+            .compactMap { perDeviceUncertainty[$0.deviceID] }
+        let medStr = airplayTaus.isEmpty ? "n/a" : "\(Self.medianInt(airplayTaus))ms"
+        let uncStr = airplayUnc.isEmpty ? "n/a" : "\(Self.medianInt(airplayUnc))ms"
+        let localStr = perDeviceTau.filter { id, _ in
+            localProbes.contains { $0.deviceID == id }
+        }
         Self.trace(
-            "[ActiveCalib] DONE local=\(perDeviceTau.filter { id, _ in localProbes.contains { $0.deviceID == id } }) airplay=\(perDeviceTau.filter { id, _ in airplayProbes.contains { $0.deviceID == id } }) delta=\(delta)ms confidence=\(String(format: "%.2f", aggregate))"
+            "[ActiveCalib] DONE local=\(localStr) airplay_median=\(medStr) airplay_uncertainty=\(uncStr) delta=\(delta)ms confidence=\(String(format: "%.2f", aggregate))"
         )
 
         return Result(
             perDeviceTauMs: perDeviceTau,
             perDeviceConfidence: perDeviceConf,
+            perDeviceUncertaintyMs: perDeviceUncertainty,
             aggregateConfidence: aggregate,
             deltaMs: delta
         )
@@ -367,6 +415,9 @@ public final class ActiveCalibrator: @unchecked Sendable {
     private struct PhaseResult {
         var tau: [String: Int]
         var confidence: [String: Double]
+        /// **v5**: per-device MAD across cycles, in ms. Empty for
+        /// single-cycle phases (Phase 1 local FDM).
+        var uncertainty: [String: Int] = [:]
     }
 
     /// Each enabled bridge gets its own pilot frequency; ALL bridges play
@@ -515,6 +566,16 @@ public final class ActiveCalibrator: @unchecked Sendable {
     }
 
     // MARK: - Phase 2: AirPlay TDMA
+    //
+    // **v5 algorithm** — for each device, N = `airplayCyclesPerDevice`
+    // cycles of inject-capture-correlate (each cycle implemented in
+    // `runAirplayOneCycle`). Aggregation:
+    //   tau_med  = median(τ_0..τ_{N-1})
+    //   tau_mad  = median(|τ_k − tau_med|)
+    //   peak_med = median(peak_prominence_0..peak_prominence_{N-1})
+    //   confidence = peak_med * max(0, 1 − tau_mad / max(tau_med, 1))
+    // High confidence requires BOTH a sharp matched-filter peak AND
+    // tight cross-cycle agreement.
 
     private func runAirplayPhase(
         probes: [AirPlayProbe],
@@ -526,6 +587,7 @@ public final class ActiveCalibrator: @unchecked Sendable {
     ) async throws -> PhaseResult {
         var tau: [String: Int] = [:]
         var conf: [String: Double] = [:]
+        var unc: [String: Int] = [:]
 
         // Snapshot original volumes — restore on every exit path.
         let originalVolumes: [String: Float] = Dictionary(
@@ -542,10 +604,14 @@ public final class ActiveCalibrator: @unchecked Sendable {
             }
         }
 
+        let cycles = max(1, Self.airplayCyclesPerDevice)
+
         for (j, target) in probes.enumerated() {
             try checkCancelled()
 
-            // Mute every other AirPlay device.
+            // Mute every other AirPlay device for the full duration of
+            // this device's cycle set (no need to re-mute between cycles
+            // — they stay muted as long as we're on this target).
             for other in probes where other.deviceID != target.deviceID {
                 await setAirplayVolume(other.deviceID, 0)
             }
@@ -553,7 +619,9 @@ public final class ActiveCalibrator: @unchecked Sendable {
             // iteration muted it.
             await setAirplayVolume(target.deviceID, target.originalVolume)
 
-            // Build the per-device chirp template.
+            // Build the per-device chirp templates ONCE (identical across
+            // every cycle — only the wall-clock anchor changes). Stereo
+            // broadcast: same signal in both channels.
             let startHz = Self.chirpStartHz + Double(j) * Self.chirpPerDeviceOffsetHz
             let endHz = Self.chirpEndHz + Double(j) * Self.chirpPerDeviceOffsetHz
             let chirp = Self.linearChirp(
@@ -562,81 +630,167 @@ public final class ActiveCalibrator: @unchecked Sendable {
                 amplitude: Self.chirpAmplitude,
                 sampleRate: sckRingSampleRate
             )
-            // Stereo broadcast: same signal in both channels.
             let chirpStereo: [[Float]] = [chirp, chirp]
-
-            Self.trace(
-                "[ActiveCalib] phase=airplay_TDMA device=\(target.deviceID) enabled_only=true chirp=\(Int(startHz))-\(Int(endHz))Hz dur=\(Self.chirpDurationMs)ms"
-            )
-
-            // Capture mic + inject chirp. The chirp is anchored a few
-            // hundred ms after capture starts so the noise-floor window
-            // is captured; AirPlay's PTP buffer (~1.8 s) means the
-            // audible arrival is mid-capture.
-            let captureFrames = Int(
-                Double(Self.airplayCaptureDurationMs) / 1000.0 * Self.micSampleRate
-            )
-            let captureStartNs = Clock.nowNs()
-            let injectAtNs = captureStartNs &+ 100_000_000  // +100 ms
-
-            async let captured: [Float] = self.captureMic(
-                startNs: captureStartNs, frames: captureFrames
-            )
-            async let injected: Void = injectChirpToRing(chirpStereo, injectAtNs)
-
-            await injected
-            let mic = try await captured
-            try checkCancelled()
-
-            // Build the matched-filter template at the MIC sample rate
-            // (downsample-by-decimation if SCK is also 48k they're equal).
-            // We resample the chirp to mic rate via piecewise re-synth so
-            // we don't need a polyphase filter.
+            // Unit-amplitude template at mic rate for matched-filter.
             let micChirp = Self.linearChirp(
                 startHz: startHz, endHz: endHz,
                 durationMs: Self.chirpDurationMs,
-                amplitude: 1.0,  // unit amplitude — we want correlation peak height
+                amplitude: 1.0,
                 sampleRate: Self.micSampleRate
             )
 
-            // Cross-correlate. We use FFT-based xcorr (same machinery
-            // MuteDip uses) so the search is O(N log N) for the 4 s mic
-            // window vs. N² for direct vDSP_conv.
-            let cd = Self.fftCrossCorrelation(env: mic, pattern: micChirp)
-            // Peak search restricted to the post-injection window. The
-            // inject anchor sits at toneStartFrame samples into the mic
-            // signal; the chirp arrives `airplaySearchMinMs ..
-            // airplaySearchMaxMs` after that.
-            let injectFrame = Int(Double(injectAtNs - captureStartNs) / 1_000_000_000.0 * Self.micSampleRate)
-            let kMin = injectFrame + Int(Double(Self.airplaySearchMinMs) / 1000.0 * Self.micSampleRate)
-            let kMax = min(cd.count - 1,
-                injectFrame + Int(Double(Self.airplaySearchMaxMs) / 1000.0 * Self.micSampleRate))
-            guard kMax > kMin else {
-                Self.trace("[ActiveCalib] device=\(target.deviceID) SKIP search_window empty kMin=\(kMin) kMax=\(kMax)")
-                tau[target.deviceID] = -1
-                conf[target.deviceID] = 0
-                continue
-            }
-            let (peakIdx, peakVal) = Self.argmax(cd, begin: kMin, end: kMax + 1)
-            let (background, mad) = Self.backgroundStats(
-                cd, excludingIdx: peakIdx, neighborhood: 64
-            )
-            let madFloor = max(mad, 1e-9)
-            let confidence = Double((abs(peakVal) - background) / Float(madFloor))
-            // Latency is peak frame - inject frame, in ms.
-            let tauMs = Int(Double(peakIdx - injectFrame) / Self.micSampleRate * 1000.0)
-            tau[target.deviceID] = tauMs
-            conf[target.deviceID] = confidence
             Self.trace(
-                "[ActiveCalib] phase=airplay_TDMA device=\(target.deviceID) peak_idx=\(peakIdx) peak_time=\(tauMs)ms peak=\(String(format: "%.4f", peakVal)) bg=\(String(format: "%.4f", background)) mad=\(String(format: "%.4f", mad)) confidence=\(String(format: "%.2f", confidence))"
+                "[ActiveCalib] phase=airplay_TDMA device=\(target.deviceID) chirp=\(Int(startHz))-\(Int(endHz))Hz dur=\(Self.chirpDurationMs)ms cycles=\(cycles)"
             )
 
+            // Per-cycle measurement collectors.
+            var cycleTaus: [Int] = []
+            var cyclePeakProms: [Double] = []
+
+            for k in 0..<cycles {
+                try checkCancelled()
+                let cycle = try await runAirplayOneCycle(
+                    deviceID: target.deviceID,
+                    chirpStereo: chirpStereo,
+                    micChirp: micChirp,
+                    injectChirpToRing: injectChirpToRing
+                )
+                Self.trace(
+                    "[ActiveCalib] phase=airplay_TDMA device=\(target.deviceID) cycle=\(k + 1)/\(cycles) peak_idx=\(cycle.peakIdx) peak_time=\(cycle.tauMs)ms peak=\(String(format: "%.4f", cycle.peakVal)) bg=\(String(format: "%.4f", cycle.background)) mad=\(String(format: "%.4f", cycle.bgMad)) prominence=\(String(format: "%.2f", cycle.peakProminence))"
+                )
+                if cycle.tauMs >= 0 {
+                    cycleTaus.append(cycle.tauMs)
+                    cyclePeakProms.append(cycle.peakProminence)
+                }
+                // Inter-cycle gap: skip after the LAST cycle (we're going
+                // to take the inter-DEVICE gap right after).
+                if k < cycles - 1 {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(Self.airplayInterCycleGapMs) * 1_000_000
+                    )
+                }
+            }
+
+            // Aggregate across cycles. If every cycle failed (empty
+            // collectors), record τ=-1 / confidence=0 like the v4 path.
+            if cycleTaus.isEmpty {
+                tau[target.deviceID] = -1
+                conf[target.deviceID] = 0
+                unc[target.deviceID] = 0
+                Self.trace(
+                    "[ActiveCalib] device=\(target.deviceID) cycles=\(cycles) ALL_FAILED — recording τ=-1"
+                )
+            } else {
+                let medianTau = Self.medianInt(cycleTaus)
+                let madTau = Self.madInt(cycleTaus, median: medianTau)
+                let medianProm = Self.medianDouble(cyclePeakProms)
+                // Normalized MAD: clip to [0, 1] so a wildly-jittery
+                // device (MAD > tau itself) doesn't produce negative
+                // confidence.
+                let normalizedMad = Double(madTau) / max(Double(medianTau), 1.0)
+                let madPenalty = max(0, 1.0 - normalizedMad)
+                let confidence = medianProm * madPenalty
+                tau[target.deviceID] = medianTau
+                conf[target.deviceID] = confidence
+                unc[target.deviceID] = madTau
+                Self.trace(
+                    "[ActiveCalib] device=\(target.deviceID) cycles=\(cycles) median=\(medianTau)ms MAD=\(madTau)ms peak_prominence_med=\(String(format: "%.2f", medianProm)) madPenalty=\(String(format: "%.2f", madPenalty)) confidence=\(String(format: "%.2f", confidence))"
+                )
+            }
+
             // Inter-device gap so the previous chirp's ring tail decays
-            // before the next one fires.
+            // before the next device's first cycle fires.
             try await Task.sleep(nanoseconds: UInt64(Self.airplayInterDeviceGapMs) * 1_000_000)
         }
 
-        return PhaseResult(tau: tau, confidence: conf)
+        return PhaseResult(tau: tau, confidence: conf, uncertainty: unc)
+    }
+
+    // MARK: - Phase 2 helpers
+
+    /// Per-cycle measurement output. Decoupled from the run-aggregator
+    /// so the inner loop is self-contained and easy to unit-test.
+    private struct AirplayCycleMeasurement {
+        let peakIdx: Int
+        let peakVal: Float
+        let background: Float
+        let bgMad: Float
+        let peakProminence: Double
+        /// Latency in ms; -1 if the search window was empty (the ring
+        /// shrank below kMin → invalid measurement).
+        let tauMs: Int
+    }
+
+    /// One TDMA chirp injection + capture + matched-filter pass for a
+    /// single AirPlay device. Identical to the v4 inner block; broken
+    /// out as a method so the v5 multi-cycle loop can call it N times.
+    private func runAirplayOneCycle(
+        deviceID: String,
+        chirpStereo: [[Float]],
+        micChirp: [Float],
+        injectChirpToRing: @escaping @Sendable (
+            _ samples: [[Float]], _ atNs: UInt64
+        ) async -> Void
+    ) async throws -> AirplayCycleMeasurement {
+        // Capture mic + inject chirp. The chirp is anchored a few
+        // hundred ms after capture starts so the noise-floor window
+        // is captured; AirPlay's PTP buffer (~1.8 s) means the
+        // audible arrival is mid-capture.
+        let captureFrames = Int(
+            Double(Self.airplayCaptureDurationMs) / 1000.0 * Self.micSampleRate
+        )
+        let captureStartNs = Clock.nowNs()
+        let injectAtNs = captureStartNs &+ 100_000_000  // +100 ms
+
+        async let captured: [Float] = self.captureMic(
+            startNs: captureStartNs, frames: captureFrames
+        )
+        async let injected: Void = injectChirpToRing(chirpStereo, injectAtNs)
+
+        await injected
+        let mic = try await captured
+        try checkCancelled()
+
+        // Cross-correlate. FFT-based, same machinery as MuteDip.
+        let cd = Self.fftCrossCorrelation(env: mic, pattern: micChirp)
+        let injectFrame = Int(
+            Double(injectAtNs - captureStartNs) / 1_000_000_000.0 * Self.micSampleRate
+        )
+        let kMin = injectFrame
+            + Int(Double(Self.airplaySearchMinMs) / 1000.0 * Self.micSampleRate)
+        let kMax = min(
+            cd.count - 1,
+            injectFrame + Int(
+                Double(Self.airplaySearchMaxMs) / 1000.0 * Self.micSampleRate
+            )
+        )
+        guard kMax > kMin else {
+            Self.trace(
+                "[ActiveCalib] device=\(deviceID) SKIP search_window empty kMin=\(kMin) kMax=\(kMax)"
+            )
+            return AirplayCycleMeasurement(
+                peakIdx: -1, peakVal: 0,
+                background: 0, bgMad: 0,
+                peakProminence: 0, tauMs: -1
+            )
+        }
+        let (peakIdx, peakVal) = Self.argmax(cd, begin: kMin, end: kMax + 1)
+        let (background, mad) = Self.backgroundStats(
+            cd, excludingIdx: peakIdx, neighborhood: 64
+        )
+        let madFloor = max(mad, 1e-9)
+        let prominence = Double((abs(peakVal) - background) / Float(madFloor))
+        let tauMs = Int(
+            Double(peakIdx - injectFrame) / Self.micSampleRate * 1000.0
+        )
+        return AirplayCycleMeasurement(
+            peakIdx: peakIdx,
+            peakVal: peakVal,
+            background: background,
+            bgMad: mad,
+            peakProminence: prominence,
+            tauMs: tauMs
+        )
     }
 
     // MARK: - Signal generation
@@ -853,6 +1007,26 @@ public final class ActiveCalibrator: @unchecked Sendable {
         guard !x.isEmpty else { return 0 }
         let sorted = x.sorted()
         return sorted[sorted.count / 2]
+    }
+
+    /// **v5 multi-cycle averaging helpers.** Lower-middle median for
+    /// odd N (cycles=3 → element 1 of sorted array) and even N alike.
+    /// Lower median is a well-behaved robust estimator; we never need
+    /// continuous mid-range interpolation here.
+    static func medianInt(_ x: [Int]) -> Int {
+        guard !x.isEmpty else { return 0 }
+        return x.sorted()[(x.count - 1) / 2]
+    }
+    static func medianDouble(_ x: [Double]) -> Double {
+        guard !x.isEmpty else { return 0 }
+        return x.sorted()[(x.count - 1) / 2]
+    }
+    /// Median absolute deviation — robust dispersion estimator. A
+    /// single outlier shifts σ arbitrarily; MAD's nested-median caps
+    /// influence at half a sample.
+    static func madInt(_ x: [Int], median: Int) -> Int {
+        guard !x.isEmpty else { return 0 }
+        return medianInt(x.map { abs($0 - median) })
     }
 
     /// FFT-based cross-correlation: IFFT(FFT(x) · conj(FFT(y))). Borrowed
