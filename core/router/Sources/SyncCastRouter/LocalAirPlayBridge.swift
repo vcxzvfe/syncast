@@ -145,6 +145,46 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// device. Clamped to [0, 1] in `setVolume`.
     private var _volumeGain: Float = 1.0
 
+    // MARK: - Calibration tone override (v4 ActiveCalibrator)
+    //
+    // When `_calibToneActive` is true, the render callback ignores the
+    // ring and synthesizes a fixed-frequency sine wave per AUHAL block.
+    // Used by `ActiveCalibrator` Phase 1 (local FDM) so each enabled
+    // bridge plays a unique pilot tone (e.g. 1 kHz on bridge_0, 2 kHz on
+    // bridge_1, …) the room mic can identify by bandpass-filtering.
+    //
+    // Why a separate override path rather than mixing the tone INTO the
+    // ring stream: mixing would require buffering both at sample-accurate
+    // alignment with whatever OwnTone's player thread is producing right
+    // now, which is exactly the cross-clock domain we're trying to
+    // *measure*. Replacing the output for ~1.5 s side-steps the issue:
+    // the tone IS the audio for that window, the user hears a brief
+    // pilot, and we get the cleanest possible stimulus for onset
+    // detection.
+    //
+    // Threading:
+    //   * `startCalibrationTone(frequency:)` / `stopCalibrationTone()`
+    //     are called from the actor; they take `stateLock` to publish
+    //     the new state atomically.
+    //   * The render callback reads the snapshot under the same lock
+    //     once per AUHAL block (already does this for `_volumeGain`).
+    //   * Phase accumulator is owned by the render callback; the
+    //     start/stop calls reset it when toggling so the first sample
+    //     after activation is at phase=0 (clean attack edge).
+    private var _calibToneActive: Bool = false
+    private var _calibToneFreqHz: Double = 1000.0
+    private var _calibToneAmp: Float = 0.05
+    /// Phase accumulator (radians); only mutated from the render thread,
+    /// so we don't bother with the lock for it. Reset under the lock
+    /// when start/stop transitions fire.
+    private var _calibTonePhase: Double = 0.0
+    /// One-shot ramp counter used to fade the tone in/out across a few
+    /// ms so the AUHAL block doesn't pop. Counts in render samples,
+    /// decremented each render block. Sign carries direction:
+    /// `> 0` ⇒ fade-in, `< 0` ⇒ fade-out, `== 0` ⇒ steady (or off).
+    private var _calibToneRampSamples: Int = 0
+    private static let calibToneRampMs: Double = 5.0
+
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
@@ -207,6 +247,44 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     public func setVolume(_ v: Float) {
         let clamped = max(0, min(1, v))
         stateLock.withLock { _volumeGain = clamped }
+    }
+
+    // MARK: - Calibration tone override (v4 ActiveCalibrator)
+
+    /// Begin emitting a sine pilot tone at `frequencyHz` (amplitude
+    /// `amplitude`, default 0.05 ≈ −26 dBFS) on every render block.
+    /// Replaces the ring read for the duration; the user hears the tone
+    /// instead of music. Call `stopCalibrationTone()` to restore normal
+    /// playback. `amplitude` is clamped to [0, 1].
+    ///
+    /// The render callback fades in over ~5 ms to avoid a click on
+    /// activation. Resets `_calibTonePhase` to zero for a clean rising
+    /// edge — this is what the mic-side onset detector keys off of.
+    public func startCalibrationTone(
+        frequencyHz: Double, amplitude: Float = 0.05
+    ) {
+        let amp = max(0, min(1, amplitude))
+        let rampSamples = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
+        stateLock.withLock {
+            _calibToneActive = true
+            _calibToneFreqHz = frequencyHz
+            _calibToneAmp = amp
+            _calibTonePhase = 0
+            _calibToneRampSamples = rampSamples  // > 0 ⇒ fade-in
+        }
+    }
+
+    /// Stop the calibration tone and resume reading from the ring on
+    /// the next render block. Triggers a ~5 ms fade-out so the
+    /// transition back to live audio doesn't pop.
+    public func stopCalibrationTone() {
+        let rampSamples = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
+        stateLock.withLock {
+            // We mark the tone as still "active" but with a negative
+            // ramp count, so the render path knows to fade OUT and then
+            // flip `_calibToneActive=false` when the ramp completes.
+            _calibToneRampSamples = -rampSamples
+        }
     }
 
     // MARK: - Lifecycle
@@ -564,13 +642,119 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         if bufList.count < channelCount { return noErr }
         if frames <= 0 { return noErr }
 
-        // Snapshot the cursor + volume gain under the lock; advance the
-        // cursor after we've copied frames out (so a concurrent stop()
-        // observing the cursor sees a consistent value). One lock
-        // acquisition per render block.
-        let snapshot = stateLock.withLock {
-            (cursor: self.readCursor, gain: self._volumeGain)
+        // Snapshot the cursor + volume gain + calibration-tone state
+        // under the lock; advance the cursor after we've copied frames
+        // out (so a concurrent stop() observing the cursor sees a
+        // consistent value). One lock acquisition per render block.
+        struct RenderSnapshot {
+            var cursor: Int64
+            var gain: Float
+            var toneActive: Bool
+            var toneFreqHz: Double
+            var toneAmp: Float
+            var toneRampSamples: Int
         }
+        var toneEndedThisBlock = false
+        let snapshot: RenderSnapshot = stateLock.withLock {
+            RenderSnapshot(
+                cursor: self.readCursor,
+                gain: self._volumeGain,
+                toneActive: self._calibToneActive,
+                toneFreqHz: self._calibToneFreqHz,
+                toneAmp: self._calibToneAmp,
+                toneRampSamples: self._calibToneRampSamples
+            )
+        }
+
+        // Fast-path the calibration tone override: skip the ring entirely
+        // and synthesize a fixed-frequency sine into every output channel.
+        // This replaces the user's audio for the duration of Phase 1
+        // (local FDM) — the user hears the pilot tone(s) for ~1.5 s.
+        if snapshot.toneActive {
+            for ch in 0..<channelCount {
+                if let raw = bufList[ch].mData {
+                    outPtrs[ch] = raw.assumingMemoryBound(to: Float.self)
+                } else {
+                    return noErr
+                }
+            }
+            let omega = 2.0 * Double.pi * snapshot.toneFreqHz / inboundSampleRate
+            var phase = _calibTonePhase
+            let baseAmp = snapshot.toneAmp
+            // Ramp envelope: fade-in (positive remaining) → 1.0 multiplier,
+            // fade-out (negative remaining) → 1.0 → 0 then disable. The
+            // ramp counter counts in samples; we tick it down per sample.
+            var rampRemaining = snapshot.toneRampSamples
+            let rampTotal = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
+            for i in 0..<frames {
+                // Compute envelope multiplier in [0, 1].
+                var envelope: Float = 1.0
+                if rampRemaining > 0 {
+                    // Fade-in: envelope rises linearly 0 → 1.
+                    let progressed = max(0, rampTotal - rampRemaining)
+                    envelope = Float(progressed) / Float(max(1, rampTotal))
+                    rampRemaining -= 1
+                } else if rampRemaining < 0 {
+                    // Fade-out: envelope falls linearly 1 → 0.
+                    let absRem = -rampRemaining
+                    envelope = Float(absRem) / Float(max(1, rampTotal))
+                    rampRemaining += 1
+                    if rampRemaining == 0 {
+                        // Last fade-out sample: signal end of tone.
+                        toneEndedThisBlock = true
+                    }
+                }
+                let s = baseAmp * envelope * Float(sin(phase))
+                phase += omega
+                if phase > 2.0 * Double.pi {
+                    phase -= 2.0 * Double.pi
+                }
+                for ch in 0..<channelCount {
+                    outPtrs[ch][i] = s
+                }
+            }
+            // Persist phase for the next block; persist updated ramp
+            // remainder; if the fade-out completed, flip the active
+            // flag. We snapshot the locals into immutable lets so the
+            // closure passed into `withLock` captures only Sendable
+            // values (Swift 6 strict concurrency).
+            _calibTonePhase = phase
+            let endedSnapshot = toneEndedThisBlock
+            let phaseSnapshot = phase
+            let rampSnapshot = rampRemaining
+            stateLock.withLock {
+                self._calibTonePhase = phaseSnapshot
+                self._calibToneRampSamples = rampSnapshot
+                if endedSnapshot {
+                    self._calibToneActive = false
+                    self._calibToneRampSamples = 0
+                }
+            }
+            // Apply per-bridge software gain on top of the tone (keeps
+            // user's volume slider effective during calibration). Skip
+            // multiply when gain is 1.0 (the common case for active
+            // calibration — we don't want the user's volume to muffle
+            // the pilot tone, but we still respect it if set).
+            if snapshot.gain != 1.0 {
+                var g = snapshot.gain
+                let frameCount = vDSP_Length(frames)
+                for ch in 0..<channelCount {
+                    let p = outPtrs[ch]
+                    vDSP_vsmul(p, 1, &g, p, 1, frameCount)
+                }
+            }
+            renderTickCount &+= 1
+            var pk: Float = 0
+            let nProbe = min(frames, 128)
+            let p0 = outPtrs[0]
+            for i in 0..<nProbe { pk = max(pk, abs(p0[i])) }
+            lastRenderPeak = pk
+            // Don't advance readCursor — when tone deactivates, render()
+            // will resync against the writer's current position via the
+            // `cursor == 0` resync check below.
+            return noErr
+        }
+
         let cursor = snapshot.cursor
         let writePos = ring.writePosition
         // Default target: trail the writer by `baselineBackoffFrames`
