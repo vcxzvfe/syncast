@@ -42,10 +42,12 @@ import SyncCastDiscovery
 ///   2. Set `volume=0` on every OTHER AirPlay device via
 ///      `device.set_volume`.
 ///   3. Build a per-device **ULTRASONIC** chirp template — linear sweep
-///      `chirpStartHz` → `chirpEndHz` (17.5–18.5 kHz, inaudible to
-///      adults) over `chirpDurationMs` ms, with a 600 Hz per-device
-///      band offset so each device has a uniquely identifiable
-///      ultrasonic signature.
+///      `chirpStartHz` → `chirpEndHz` (18.5–19.0 kHz, inaudible to
+///      adults; bumped from 17.5–18.5 kHz after a Xiaomi receiver was
+///      reported emitting audible intermodulation at the lower band)
+///      over `chirpDurationMs` ms, with a 300 Hz per-device band
+///      offset so each device has a uniquely identifiable ultrasonic
+///      signature.
 ///   4. **v5 multi-cycle**: repeat steps 5–7 `airplayCyclesPerDevice`
 ///      times (default 3), with `airplayInterCycleGapMs` between
 ///      cycles. Per-cycle records peak_idx, peak_time, peak_prominence.
@@ -152,22 +154,15 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     // MARK: - Configuration
 
-    /// Ultrasonic frequencies for local bridges, ordered by INAUDIBILITY
-    /// to a typical adult listener. Index 0 (18 kHz) is used when there
-    /// is only one local device (single-bridge calibration); we want
-    /// THAT case to be the most imperceptible. Frequencies selected from
-    /// a real frequency-response sweep on the user's hardware (MBP +
-    /// Logitech mic, 2026-04-26):
-    ///   18 kHz: SNR 33.5 dB ⭐⭐ (inaudible to >95% of adults) — DEFAULT
-    ///   19 kHz: SNR 32.2 dB ⭐⭐ (inaudible)
-    ///   18.5 kHz: SNR ~33 dB ⭐⭐ (inaudible — interpolated)
-    ///   16 kHz: SNR 39.5 dB ⭐ (audible to ~30% of young adults; fallback)
-    ///   17 kHz: SNR 14.8 dB ❌ (mic/room notch — AVOID; not in list)
-    ///   20 kHz+: mic anti-alias edge
-    /// Bandpass guard ±100 Hz; minimum 500 Hz spacing means zero
-    /// cross-talk between concurrent bridges. With 4 entries we support
-    /// up to 4 simultaneous local devices.
-    public static let localFrequencies: [Double] = [18000, 19000, 18500, 16000]
+    /// Ultrasonic frequencies for local bridges, ordered by INAUDIBILITY.
+    /// All entries above 18 kHz now (16 kHz fallback dropped — audible
+    /// to ~30% of young adults, and field reports show 18+ kHz reliably
+    /// reaches the mic). Freq sweep on user's hardware: 18/18.5/19 kHz
+    /// all SNR ≥ 32 dB; 19.5 kHz interpolated at ~28 dB, still well
+    /// above the 12 dB working threshold. 17 kHz has a mic/room notch
+    /// (14.8 dB) and is AVOIDED. Bandpass guard ±100 Hz; 500 Hz
+    /// minimum spacing → zero cross-talk between concurrent bridges.
+    public static let localFrequencies: [Double] = [19000, 19500, 18500, 18000]
     /// Bumped from 0.05 to 0.15 because high-frequency speaker rolloff
     /// attenuates ultrasonic content significantly at the SPEAKER
     /// (the freq-resp sweep showed 18 kHz tone produced only -68 dBFS at
@@ -181,27 +176,30 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// mode can be up to ~3 s due to the delay-line.
     public static let localCaptureTailMs: Int = 3500
 
-    /// AirPlay chirp parameters. **v5: ULTRASONIC chirp** — moved from
-    /// the audible 200–800 Hz band (which produced an audible "click" on
-    /// every Phase 2 cycle) up to 17.5–18.5 kHz where adult ears can't
-    /// hear it. AirPlay codecs (ALAC lossless, AAC at 256 kbps) preserve
-    /// content up to ~20 kHz with high fidelity, so the chirp survives
-    /// the OwnTone → AirPlay pipeline cleanly. Amplitude is bumped to
-    /// 0.7 (from 0.5) to compensate for the high-frequency speaker
-    /// rolloff measured on the user's hardware (the freq-resp sweep
-    /// showed ~50 dB acoustic loss between 1 kHz and 18 kHz).
-    public static let chirpStartHz: Double = 17500
-    public static let chirpEndHz: Double = 18500
+    /// AirPlay chirp parameters. **v6: HIGHER ULTRASONIC band** —
+    /// 17.5–18.5 kHz at amp 0.7 caused a Xiaomi receiver to emit
+    /// audible intermodulation (cheap-speaker non-linear distortion
+    /// folds harmonics into the audible band). Mitigations: raise
+    /// band to 18.5–19.0 kHz where speaker HF rolloff steepens, AND
+    /// drop amplitude to 0.4 for more headroom. Trades ~5 dB SPL but
+    /// matched-filter still sits ~25 dB above noise floor at 19 kHz.
+    /// AirPlay codecs (ALAC, AAC@256k) preserve content to ~20 kHz.
+    public static let chirpStartHz: Double = 18500
+    public static let chirpEndHz: Double = 19000
     public static let chirpDurationMs: Int = 100
-    public static let chirpAmplitude: Float = 0.7
-    /// Per-device chirp start-frequency offset. **v5: 600 Hz spacing**
-    /// so every AirPlay receiver gets a uniquely identifiable ultrasonic
-    /// band: device j sweeps `[startHz + j*600, endHz + j*600]` Hz —
-    /// dev 0: 17.5-18.5k, dev 1: 18.1-19.1k, dev 2: 18.7-19.7k,
-    /// dev 3: 19.3-20.3k (codec edge — fine for ALAC/AAC@256k).
-    /// Distinct bands give operator-readable logs, future-FDM
-    /// compatibility, and band-limited matched-filter resilience.
-    public static let chirpPerDeviceOffsetHz: Double = 600
+    public static let chirpAmplitude: Float = 0.4
+    /// Per-device chirp start-frequency offset. **v6: 300 Hz spacing**
+    /// (down from 600 Hz) — chirp bandwidth is now only 500 Hz, so
+    /// 600 Hz spacing would push dev 3 past the mic's 20 kHz edge.
+    /// With 300 Hz: dev 0=18.5-19.0k, dev 1=18.8-19.3k, dev 2=19.1-
+    /// 19.6k, dev 3=19.4-19.9k. Bands overlap 200 Hz but each chirp's
+    /// unique start-frequency / sweep slope is preserved, so cross-
+    /// correlation peaks remain device-specific (sensitive to full
+    /// time-frequency signature, not just band). Dev 3 at 19.4-19.9k
+    /// sits near the mic's 20 kHz anti-alias edge — freq sweep gave
+    /// ~16 dB SNR there, still above the 12 dB working threshold but
+    /// tight; if 4-device deployments fail, drop to 3-device.
+    public static let chirpPerDeviceOffsetHz: Double = 300
     /// Mic capture window for one AirPlay device, after chirp injection.
     /// AirPlay PTP buffer is typically 1.5–2.5 s with outliers up to
     /// ~3.5 s; we capture 4 s so the matched-filter search has full
