@@ -246,6 +246,41 @@ public final class ActiveCalibrator: @unchecked Sendable {
         try checkCancelled()
 
         // Phase 2: AirPlay TDMA (sequential per device).
+        //
+        // CRITICAL: silence the LOCAL bridges before Phase 2. The chirp
+        // we inject into the SCK ringBuffer fans out to BOTH the AirPlay
+        // path (~2700 ms after injection due to PTP buffer) AND the
+        // broadcaster→bridge path (~50–2500 ms after injection). Without
+        // silencing the bridges, the mic hears the chirp from the
+        // CLOSER local speaker first, and the cross-correlation
+        // sometimes locks onto that early peak instead of the AirPlay
+        // peak — observed empirically across consecutive runs:
+        //   Run 1: airplay τ=2684 ms (correct)
+        //   Run 2: airplay τ=2762 ms (correct)
+        //   Run 3: airplay τ= 473 ms (WRONG — locked on local echo)
+        // Setting bridge volume to 0 keeps the chirp flowing through
+        // the audio pipeline (so OwnTone's queue stays primed and the
+        // AirPlay session doesn't auto-stop) but silences the local
+        // re-radiation. Restored after Phase 2 from the snapshot.
+        var savedBridgeVolumes: [(LocalAirPlayBridge, Float)] = []
+        if !airplayProbes.isEmpty && !localProbes.isEmpty {
+            for p in localProbes {
+                let v = p.bridge.currentVolume
+                savedBridgeVolumes.append((p.bridge, v))
+                p.bridge.setVolume(0)
+            }
+            CalibTrace.log(
+                "[ActiveCalib] phase=airplay_TDMA silenced \(savedBridgeVolumes.count) local bridges"
+            )
+        }
+
+        defer {
+            // Restore on every exit path (success, throw, cancel).
+            for (bridge, v) in savedBridgeVolumes {
+                bridge.setVolume(v)
+            }
+        }
+
         if !airplayProbes.isEmpty {
             let phase2 = try await runAirplayPhase(
                 probes: airplayProbes,

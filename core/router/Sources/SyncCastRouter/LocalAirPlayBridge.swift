@@ -249,6 +249,13 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         stateLock.withLock { _volumeGain = clamped }
     }
 
+    /// Read the current software-gain value. Useful for snapshot/restore
+    /// workflows like the Phase-2 calibration flow that temporarily
+    /// silences the bridge while running an AirPlay-only test.
+    public var currentVolume: Float {
+        stateLock.withLock { _volumeGain }
+    }
+
     // MARK: - Calibration tone override (v4 ActiveCalibrator)
 
     /// Begin emitting a sine pilot tone at `frequencyHz` (amplitude
