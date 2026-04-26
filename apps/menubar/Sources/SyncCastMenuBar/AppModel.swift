@@ -700,6 +700,12 @@ final class AppModel {
                 await router.syncLocalOutputs(devices: devices)
             case .wholeHome:
                 await router.startWholeHome(devices: devices)
+                // Re-install calibration diagnostic socket. The Router's
+                // installer is idempotent (returns early if a server is
+                // already bound), so this is safe on every reconcile and
+                // also self-healing if some prior transition tore the
+                // socket down without an immediate reinstall.
+                await installCalibrationDiagnosticSocket()
             }
             await pushAirplayState()
         default:
