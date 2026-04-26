@@ -75,7 +75,12 @@ final class AppModel {
     /// NOT the live `AudioDeviceID` (a UInt32 that changes on replug).
     /// `selectedMicID` itself is the LIVE id, resolved at refresh time.
     var selectedMicID: AudioDeviceID? {
-        didSet { persistSelectedMic() }
+        didSet {
+            persistSelectedMic()
+            // Hybrid tracker captures mic id at start; restart so the
+            // live engine actually listens through the new pick.
+            restartHybridTrackerIfActive()
+        }
     }
 
     /// Effective mic id used by the calibration runner: either
@@ -154,7 +159,13 @@ final class AppModel {
     var backgroundCalibrationEnabled: Bool = AppModel.loadPersistedBgEnabled() {
         didSet {
             UserDefaults.standard.set(backgroundCalibrationEnabled, forKey: AppModel.bgEnabledKey)
+            // Mutex with hybrid tracker — both drive the same delay-line
+            // cache; whichever the user just enabled wins.
+            if backgroundCalibrationEnabled && hybridTrackingEnabled {
+                hybridTrackingEnabled = false
+            }
             reconcileBackgroundCalibration()
+            reconcileHybridTracker()
         }
     }
     /// Sample interval (seconds, clamped to `bgIntervalRange`). Live
@@ -223,6 +234,33 @@ final class AppModel {
         // Persisted values from the old 10…300 range are clamped into
         // the new 60…3600 floor/ceiling on first load.
         return min(max(raw, bgIntervalRange.lowerBound), bgIntervalRange.upperBound)
+    }
+
+    // MARK: - Hybrid drift tracker (closed-loop, ~4 Hz)
+    // Sister engine to `backgroundCalibrationEnabled`; mutually exclusive
+    // because both write the same delay-line cache. Mutex is enforced in
+    // the didSet observers below.
+    var hybridTrackingEnabled: Bool = AppModel.loadPersistedHybridEnabled() {
+        didSet {
+            UserDefaults.standard.set(hybridTrackingEnabled, forKey: AppModel.hybridEnabledKey)
+            if hybridTrackingEnabled && backgroundCalibrationEnabled {
+                backgroundCalibrationEnabled = false
+            }
+            reconcileHybridTracker()
+            reconcileBackgroundCalibration()
+        }
+    }
+    /// Most recent Sample from the hybrid loop, rendered by MainPopover.
+    var lastTrackerSample: HybridDriftTracker.Sample? = nil
+    /// 60 × ~250 ms = 15 s sliding window of recent samples.
+    var hybridTrackerHistory: [HybridDriftTracker.Sample] = []
+    static let hybridTrackerHistoryCapacity: Int = 60
+    /// True iff the engine is running (preconditions hold).
+    var hybridTrackerActive: Bool = false
+
+    static let hybridEnabledKey = "syncast.hybridTrackingEnabled"
+    private static func loadPersistedHybridEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: hybridEnabledKey)
     }
 
 
@@ -706,11 +744,13 @@ final class AppModel {
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
                 reconcileBackgroundCalibration()
+                reconcileHybridTracker()
             } catch {
                 SyncCastLog.log("reconcile: router.start FAILED: \(error)")
                 lastError = "engine: \(error.localizedDescription)"
                 streamingState = .error
                 reconcileBackgroundCalibration()
+                reconcileHybridTracker()
             }
         case (.running, false):
             SyncCastLog.log("reconcile: stopping (no enabled outputs)")
@@ -718,6 +758,7 @@ final class AppModel {
             await router.stop()
             streamingState = .idle
             reconcileBackgroundCalibration()
+            reconcileHybridTracker()
         case (.running, true):
             // ORDER MATTERS. Router holds its own copy of `routing`
             // (Router.routing) which `syncLocalOutputs` reads to decide
@@ -845,6 +886,7 @@ final class AppModel {
                     self.modeTransitioning = false
                     self.reconcileEngine()
                     self.reconcileBackgroundCalibration()
+                    self.reconcileHybridTracker()
                 }
             }
         } else {
@@ -852,6 +894,7 @@ final class AppModel {
             // No async work, so no need to flip the transition flag here.
             reconcileEngine()
             reconcileBackgroundCalibration()
+            reconcileHybridTracker()
         }
     }
 
@@ -1020,6 +1063,11 @@ final class AppModel {
             continuousPausedForManual = false
             reconcileBackgroundCalibration()
         }
+        // A successful full Auto-calibrate populates the AirPlay τ cache
+        // in the Router, which is a precondition for the hybrid tracker.
+        // Reconcile now so a user with `hybridTrackingEnabled = true`
+        // sees the tracker auto-start as soon as the cache is ready.
+        reconcileHybridTracker()
     }
 
     /// Clear a non-idle status. Bound to the popover's "Dismiss" button
@@ -1203,6 +1251,98 @@ final class AppModel {
             reconcileBackgroundCalibration()
         @unknown default:
             return
+        }
+    }
+
+    // MARK: - Hybrid drift tracker lifecycle
+
+    /// Drive the hybrid tracker on or off. Idempotent. ACTIVE iff
+    /// wholeHome + running + enabled + mic-OK + cached AirPlay τ prior.
+    /// Mutex with `backgroundCalibrationEnabled` is enforced at the
+    /// toggle setter; here we only check positive preconditions.
+    func reconcileHybridTracker() {
+        Task { [weak self] in
+            guard let self else { return }
+            let cacheReady = await self.router.hasFullCalibrationCache
+            await MainActor.run { self.applyHybridReconcile(cacheReady: cacheReady) }
+        }
+    }
+
+    private func applyHybridReconcile(cacheReady: Bool) {
+        let shouldRun = mode == .wholeHome && streamingState == .running
+            && hybridTrackingEnabled && hasMicrophonePermission && cacheReady
+        switch (hybridTrackerActive, shouldRun) {
+        case (false, true):
+            hybridTrackerActive = true
+            let micID = effectiveMicID
+            SyncCastLog.log("hybridTracker: starting mic=\(micID.map(String.init) ?? "default")")
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.router.startHybridTracker(
+                        microphoneDeviceID: micID,
+                        onSample: { sample in
+                            Task { @MainActor [weak self] in
+                                self?.handleHybridTrackerSample(sample)
+                            }
+                        }
+                    )
+                } catch {
+                    SyncCastLog.log("hybridTracker: start failed: \(error)")
+                    await MainActor.run { self.hybridTrackerActive = false }
+                }
+            }
+        case (true, false):
+            SyncCastLog.log("hybridTracker: stopping")
+            stopHybridTrackerEngine()
+        default: break
+        }
+    }
+
+    /// Stop the engine without flipping the toggle (preserve user pref).
+    private func stopHybridTrackerEngine() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.router.stopHybridTracker()
+            await MainActor.run {
+                self.hybridTrackerActive = false
+                self.lastTrackerSample = nil
+                self.hybridTrackerHistory = []
+            }
+        }
+    }
+
+    /// Stop + reconcile so the next start picks up the new value
+    /// (currently used for mic-selection changes).
+    fileprivate func restartHybridTrackerIfActive() {
+        guard hybridTrackerActive else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.router.stopHybridTracker()
+            await MainActor.run {
+                self.hybridTrackerActive = false
+                self.lastTrackerSample = nil
+                self.hybridTrackerHistory = []
+                self.reconcileHybridTracker()
+            }
+        }
+    }
+
+    /// Receive a Sample. Router has already applied the delay-line
+    /// correction; mirror `resultingDelayMs` into the slider field +
+    /// persist, and append to the history ring.
+    private func handleHybridTrackerSample(_ sample: HybridDriftTracker.Sample) {
+        lastTrackerSample = sample
+        var next = hybridTrackerHistory
+        next.append(sample)
+        if next.count > AppModel.hybridTrackerHistoryCapacity {
+            next.removeFirst(next.count - AppModel.hybridTrackerHistoryCapacity)
+        }
+        hybridTrackerHistory = next
+        let appliedInt = Int(sample.resultingDelayMs.rounded())
+        if airplayDelayMs != appliedInt {
+            airplayDelayMs = appliedInt
+            UserDefaults.standard.set(appliedInt, forKey: AppModel.airplayDelayMsKey)
         }
     }
 

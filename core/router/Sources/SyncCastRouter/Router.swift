@@ -1520,6 +1520,9 @@ public actor Router {
     /// `initialDelayMs` callback so each cycle's delta is computed
     /// against the freshest value rather than the original seed.
     private var continuousActiveCurrentDelayMs: Int = 1750
+    /// Mutex with `continuousActiveCalibrator` (AppModel enforces). Shares
+    /// the delay-line cache via apply/snapshot helpers below.
+    private var hybridTracker: HybridDriftTracker?
     public typealias ContinuousActiveDeviceProvider =
         @Sendable () async -> [Device]
 
@@ -1791,14 +1794,47 @@ public actor Router {
         }
     }
 
-    // MARK: - Round-10 Hybrid drift tracker
-    // Closed-loop drift tracker driven by `HybridDriftTracker`. Shares
-    // the cached delay snapshot with `continuousActiveCalibrator` via
-    // `applyContinuousActiveDelay`, so the two engines stay in sync if
-    // a UI accidentally enables both.
+    // MARK: - Hybrid drift tracker (Round 10)
+    // Sister actor to `ContinuousActiveCalibrator` — shares the
+    // delay-line cache + IPC path. AppModel enforces mutual exclusion.
+    // (`hybridTracker` field declared above, near `continuousActive*`.)
 
-    private var hybridTracker: HybridDriftTracker?
     private var lastEmittedHybridSample: HybridDriftTracker.Sample?
+
+    /// True iff the most recent successful full calibration cached at
+    /// least one AirPlay τ value. AppModel gates hybrid tracking on this
+    /// because the tracker uses cached τ as its prior.
+    public var hasFullCalibrationCache: Bool {
+        !lastFullCalibrationAirplayTau.isEmpty
+    }
+
+    /// Inject a stereo chirp into the SCK ring at `atNs`. Sleeps if
+    /// future, writes immediately if past. Public so both
+    /// ActiveCalibrator (Phase 2) and HybridDriftTracker share one path.
+    public func injectChirpToRingForCalibration(
+        samples: [[Float]], atNs: UInt64
+    ) async {
+        let nowNs = Clock.nowNs()
+        if atNs > nowNs {
+            try? await Task.sleep(nanoseconds: atNs - nowNs)
+        }
+        guard samples.count >= 2,
+              !samples[0].isEmpty,
+              samples[0].count == samples[1].count
+        else { return }
+        let frames = samples[0].count
+        let ring = sckCapture.ringBuffer
+        samples[0].withUnsafeBufferPointer { ch0 in
+            samples[1].withUnsafeBufferPointer { ch1 in
+                let ptrArray: [UnsafePointer<Float>] = [
+                    ch0.baseAddress!, ch1.baseAddress!,
+                ]
+                ptrArray.withUnsafeBufferPointer { ptrs in
+                    ring.write(channels: ptrs.baseAddress!, frames: frames)
+                }
+            }
+        }
+    }
 
     /// Begin closed-loop drift tracking. Idempotent.
     public func startHybridTracker(
@@ -1807,24 +1843,6 @@ public actor Router {
         onSample: @escaping @Sendable (HybridDriftTracker.Sample) -> Void
     ) async throws {
         if hybridTracker != nil { return }
-        let ring = sckCapture.ringBuffer
-        let injectChirp: @Sendable ([[Float]], UInt64) async -> Void = { samples, atNs in
-            let nowNs = Clock.nowNs()
-            if atNs > nowNs { try? await Task.sleep(nanoseconds: atNs - nowNs) }
-            guard samples.count >= 2,
-                  !samples[0].isEmpty,
-                  samples[0].count == samples[1].count
-            else { return }
-            let frames = samples[0].count
-            samples[0].withUnsafeBufferPointer { ch0 in
-                samples[1].withUnsafeBufferPointer { ch1 in
-                    let arr: [UnsafePointer<Float>] = [ch0.baseAddress!, ch1.baseAddress!]
-                    arr.withUnsafeBufferPointer { ptrs in
-                        ring.write(channels: ptrs.baseAddress!, frames: frames)
-                    }
-                }
-            }
-        }
         // Wrap caller's onSample so we also retain the latest for the
         // diagnostic JSON-RPC `tracker.status` query.
         let wrappedOnSample: @Sendable (HybridDriftTracker.Sample) -> Void = { [weak self] sample in
@@ -1832,7 +1850,7 @@ public actor Router {
             Task { [weak self] in await self?.recordEmittedHybridSample(sample) }
         }
         let tracker = HybridDriftTracker(
-            ringBuffer: ring,
+            ringBuffer: sckCapture.ringBuffer,
             microphoneDeviceID: microphoneDeviceID,
             currentDelayMs: { [weak self] in
                 await self?.continuousActiveDelaySnapshot() ?? 1750
@@ -1840,7 +1858,11 @@ public actor Router {
             applyDelayMs: { [weak self] ms in
                 await self?.applyContinuousActiveDelay(ms)
             },
-            injectChirpToRing: injectChirp,
+            injectChirpToRing: { [weak self] samples, atNs in
+                await self?.injectChirpToRingForCalibration(
+                    samples: samples, atNs: atNs
+                ) ?? ()
+            },
             onSample: wrappedOnSample,
             configuration: configuration
         )
