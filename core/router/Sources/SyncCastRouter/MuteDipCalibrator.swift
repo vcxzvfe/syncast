@@ -117,15 +117,22 @@ public final class MuteDipCalibrator: @unchecked Sendable {
     /// expected pattern is a single rectangular pulse whose
     /// autocorrelation has no secondary lobes within this window.
     public static let localSearchMinMs: Int = 0
-    public static let localSearchMaxMs: Int = 3100
-    public static let airplaySearchMinMs: Int = 1500
-    public static let airplaySearchMaxMs: Int = 2000
+    public static let localSearchMaxMs: Int = 5000
+    /// AirPlay's PTP buffer is nominally 1.8 s but receivers vary
+    /// substantially (1.5-2.5 s typical, some up to 3.5 s). Empirically
+    /// observed peaks at ~3880 ms in the field, well outside the design
+    /// doc's [1500, 2000] window. Widen to cover the full plausible
+    /// range; the per-device cross-correlation finds THAT device's peak
+    /// regardless of where it lands within the window.
+    public static let airplaySearchMinMs: Int = 0
+    public static let airplaySearchMaxMs: Int = 5000
 
-    /// Capture-tail padding so a local mute-dip delayed by up to
-    /// `localSearchMaxMs` is still inside the recording window. Without
-    /// this, widening the search range alone is meaningless — the dip
-    /// would arrive after capture has stopped.
-    public static let searchSlackMs: Int = localSearchMaxMs
+    /// Capture-tail padding so a delayed mute-dip is still inside the
+    /// recording window. Sized to the largest search window so the peak
+    /// is always within actual captured data (avoiding FFT zero-pad
+    /// phantom peaks that produced misleading peak_outside diagnostics
+    /// in earlier debug runs).
+    public static let searchSlackMs: Int = max(localSearchMaxMs, airplaySearchMaxMs)
 
     public var cycles: Int = 1
     public var confidenceAcceptThreshold: Double = 4.0
