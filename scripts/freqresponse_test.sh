@@ -8,7 +8,9 @@
 #
 # Exit codes: 0 success, 1 socket missing, 2 RPC error, 3 parse failure.
 #
-# Sweep takes ~10 s with the default 15-frequency list. -w 60 is plenty.
+# Sweep takes ~12 s with the default 17-frequency list (500..22000 Hz,
+# explicitly including 18500/19000/19500/20000 for the ultrasonic
+# calibration band). -w 60 is plenty.
 
 set -e
 

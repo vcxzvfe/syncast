@@ -489,7 +489,8 @@ public actor Router {
         microphoneDeviceID: AudioDeviceID? = nil,
         frequencies: [Double] = [
             500, 1000, 2000, 4000, 8000, 12000, 14000,
-            15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000,
+            15000, 16000, 17000, 18000, 18500, 19000, 19500,
+            20000, 21000, 22000,
         ],
         toneAmplitude: Float = 0.1,
         toneDurationMs: Int = 500
