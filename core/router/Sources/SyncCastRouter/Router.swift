@@ -600,6 +600,11 @@ public actor Router {
                         microphoneDeviceID: snap.microphoneDeviceID
                     )
                 }
+            },
+            // Round 10: hybrid drift tracker status snapshot. nil →
+            // `result: null` reply. `[weak self]` since Router owns server.
+            trackerStatusProvider: { [weak self] in
+                await self?.lastHybridTrackerSample()
             }
         )
         do {
@@ -1793,6 +1798,7 @@ public actor Router {
     // a UI accidentally enables both.
 
     private var hybridTracker: HybridDriftTracker?
+    private var lastEmittedHybridSample: HybridDriftTracker.Sample?
 
     /// Begin closed-loop drift tracking. Idempotent.
     public func startHybridTracker(
@@ -1819,6 +1825,12 @@ public actor Router {
                 }
             }
         }
+        // Wrap caller's onSample so we also retain the latest for the
+        // diagnostic JSON-RPC `tracker.status` query.
+        let wrappedOnSample: @Sendable (HybridDriftTracker.Sample) -> Void = { [weak self] sample in
+            onSample(sample)
+            Task { [weak self] in await self?.recordEmittedHybridSample(sample) }
+        }
         let tracker = HybridDriftTracker(
             ringBuffer: ring,
             microphoneDeviceID: microphoneDeviceID,
@@ -1829,7 +1841,7 @@ public actor Router {
                 await self?.applyContinuousActiveDelay(ms)
             },
             injectChirpToRing: injectChirp,
-            onSample: onSample,
+            onSample: wrappedOnSample,
             configuration: configuration
         )
         try await tracker.start()
@@ -1840,5 +1852,50 @@ public actor Router {
     public func stopHybridTracker() async {
         await hybridTracker?.stop()
         hybridTracker = nil
+        lastEmittedHybridSample = nil
+    }
+
+    private func recordEmittedHybridSample(_ sample: HybridDriftTracker.Sample) {
+        lastEmittedHybridSample = sample
+    }
+
+    // MARK: - Hybrid drift tracker status snapshot (Round 10)
+
+    /// Snapshot of the hybrid drift tracker's most recent emitted sample,
+    /// serialised for the `tracker.status` JSON-RPC method. Returns nil
+    /// when the tracker isn't running OR has not yet emitted its first
+    /// sample. Wire contract documented in
+    /// `docs/round10_validation_protocol.md`. Field names must match
+    /// `drift_test_v2.sh`'s parser exactly.
+    public func lastHybridTrackerSample() async -> [String: Any]? {
+        guard let s = lastEmittedHybridSample else { return nil }
+        let sourceStr: String = {
+            switch s.source {
+            case .passive: return "passive"
+            case .active:  return "active"
+            case .none:    return "none"
+            }
+        }()
+        let stateStr: String = {
+            switch s.state {
+            case .coldStart:                return "coldStart"
+            case .warming(let p):           return "warming(\(String(format: "%.2f", p)))"
+            case .locked:                   return "locked"
+            case .drifting(let q):          return "drifting(\(String(format: "%.1f", q))s)"
+            case .lost(let r):              return "lost(\(r))"
+            }
+        }()
+        let measuredAny: Any = s.measuredOffsetMs.map { $0 as Any } ?? NSNull()
+        return [
+            "timestamp": ISO8601DateFormatter().string(from: s.timestamp),
+            "kalman_offset_ms": s.kalmanOffsetMs,
+            "kalman_drift_ppm": s.kalmanDriftPpm,
+            "measured_offset_ms": measuredAny,
+            "confidence": s.confidence,
+            "source": sourceStr,
+            "applied_correction_ms": s.appliedCorrectionMs,
+            "resulting_delay_ms": s.resultingDelayMs,
+            "state": stateStr,
+        ]
     }
 }

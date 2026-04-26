@@ -32,11 +32,18 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         _ frequencies: [Double]?,
         _ toneAmplitude: Double?
     ) async throws -> FrequencyResponseResult
+    /// `tracker.status` snapshot provider. Returns the latest hybrid
+    /// drift tracker sample as a JSON-ready dict (see
+    /// Router.lastHybridTrackerSample), or nil when the tracker isn't
+    /// running. Untyped so the server stays decoupled from the tracker.
+    public typealias TrackerStatusProvider =
+        @Sendable () async -> [String: Any]?
 
     public let socketPath: URL
     private let provider: Provider
     private let runner: Runner
     private let freqRunner: FreqRunner?
+    private let trackerStatusProvider: TrackerStatusProvider?
     private var listenFd: Int32 = -1
     private var acceptThread: Thread?
     private let lock = NSLock()
@@ -46,12 +53,14 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         socketPath: URL,
         provider: @escaping Provider,
         runner: @escaping Runner,
-        freqRunner: FreqRunner? = nil
+        freqRunner: FreqRunner? = nil,
+        trackerStatusProvider: TrackerStatusProvider? = nil
     ) {
         self.socketPath = socketPath
         self.provider = provider
         self.runner = runner
         self.freqRunner = freqRunner
+        self.trackerStatusProvider = trackerStatusProvider
     }
 
     public func start() throws {
@@ -138,12 +147,29 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         }
         let params = obj["params"] as? [String: Any]
         switch method {
-        case "calibrate":    handleCalibrate(client: client, id: rid)
-        case "freqresponse": handleFreqResponse(client: client, id: rid, params: params)
-        case "ping":         sendResult(client: client, id: rid, result: ["ok": true])
-        default:             sendError(client: client, id: rid, code: -32601,
-                                       message: "method not found: \(method)")
+        case "calibrate":      handleCalibrate(client: client, id: rid)
+        case "freqresponse":   handleFreqResponse(client: client, id: rid, params: params)
+        case "tracker.status": handleTrackerStatus(client: client, id: rid)
+        case "ping":           sendResult(client: client, id: rid, result: ["ok": true])
+        default:               sendError(client: client, id: rid, code: -32601,
+                                         message: "method not found: \(method)")
         }
+    }
+
+    /// `tracker.status` — lock-free read of the latest hybrid drift
+    /// tracker sample. Non-disruptive: bypasses the `inProgress` gate.
+    /// Replies `result: null` when the tracker isn't running.
+    private func handleTrackerStatus(client: Int32, id: Any) {
+        guard let provider = trackerStatusProvider else {
+            sendError(client: client, id: id, code: -32601,
+                      message: "tracker.status not configured"); return
+        }
+        final class Box: @unchecked Sendable { var sample: [String: Any]? }
+        let box = Box(); let sem = DispatchSemaphore(value: 0)
+        Task.detached { defer { sem.signal() }; box.sample = await provider() }
+        sem.wait()
+        if let s = box.sample { sendResult(client: client, id: id, result: s) }
+        else { sendNullResult(client: client, id: id) }
     }
 
     private func handleFreqResponse(
@@ -258,6 +284,13 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
 
     private func sendResult(client: Int32, id: Any, result: [String: Any]) {
         var p: [String: Any] = ["jsonrpc": "2.0", "result": result]
+        p["id"] = id is NSNull ? NSNull() : id
+        writeFrame(client: client, payload: p)
+    }
+    /// `result: null` reply variant — used by `tracker.status` when the
+    /// tracker is dormant (a no-data state, not an error).
+    private func sendNullResult(client: Int32, id: Any) {
+        var p: [String: Any] = ["jsonrpc": "2.0", "result": NSNull()]
         p["id"] = id is NSNull ? NSNull() : id
         writeFrame(client: client, payload: p)
     }
