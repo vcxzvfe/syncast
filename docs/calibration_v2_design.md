@@ -1,9 +1,38 @@
 # SyncCast Calibration v2 Design — TDMA Mute-Dip with Music-Aware Probe
 
-**Status**: Draft for review
+**Status**: SUPERSEDED — kept as historical record. See `calibration_v4_status.md` for current shipping design.
 **Author**: architect (SyncCast)
 **Date**: 2026-04-25
 **Supersedes**: calibration_v1 (sequential per-device tone)
+**Superseded by**: v3 (active-signal local FDM, AirPlay TDMA chirps) and v4 (continuous calibration on top of v3).
+
+---
+
+## Reading guide for the post-implementation reader
+
+This doc was correct in spirit but several specific design points moved
+during implementation. Inline annotations below mark each delta. The
+short version:
+
+- The "all devices receive the same PCM bytes" constraint (§2) was
+  **wrong**. Local CoreAudio bridges each own their own AUHAL render
+  callback, so the broadcaster can synthesize per-device probe waveforms
+  on the local side — pure FDM. **What we kept TDMA for is AirPlay**,
+  where the OwnTone single-stream constraint is real. v4 is a **mixed
+  FDM-local + TDMA-airplay** design (`ActiveCalibrator.swift`).
+- The probe stopped being a 0.3↔1.0 volume mute-dip and became
+  **per-device active signals**: ultrasonic 18/19/18.5/16 kHz sines for
+  local bridges (so they're inaudible to most adults), 200–800 Hz
+  linear chirps for AirPlay (because AirPlay codecs strip ultrasonics
+  and we don't care about audibility during a one-off calibration
+  burst). Confirmed empirically by the `freqresponse` sweep.
+- The 5 s budget held; total cycle is ~5 s for typical 2-local-2-airplay
+  configurations.
+- Continuous calibration (v4) wraps `ActiveCalibrator` with a control
+  loop that re-runs every N seconds and applies deltas via the
+  delay-line, instead of relying on a single one-shot at start-up.
+
+Each section below is annotated where it diverges from shipping reality.
 
 ---
 
@@ -26,9 +55,45 @@ This rules out classical signal-engineering approaches:
 
 What we **can** do per device is **gate audibility** via volume. This converts the problem from FDM to **TDMA**: in any given time slot, only one device contributes meaningful energy to the room, and we read the per-device latency by watching when its energy contribution actually appears at the mic.
 
+> **REALITY CHECK (v3+):** This is half right. The constraint
+> "all devices receive the same PCM bytes" applies only to the
+> **AirPlay 2 multi-room path** — OwnTone produces a single stream that
+> fans out to all AirPlay receivers, so per-device signals are genuinely
+> impossible there. **For local CoreAudio bridges the constraint
+> doesn't hold**: each `LocalAirPlayBridge` owns its own AUHAL render
+> callback and `startCalibrationTone(...)` injects per-device
+> waveforms directly into that callback, bypassing the shared SCK ring.
+> v3/v4 split into:
+>
+> - **Local FDM** (parallel) — each bridge gets a unique ultrasonic sine
+>   (18/19/18.5/16 kHz). Mic captures the superposition; we bandpass
+>   each band to recover that device's onset time.
+> - **AirPlay TDMA** (sequential) — for each AirPlay device, mute every
+>   other AirPlay device, inject a 200–800 Hz chirp into the SCK ring,
+>   wait ~2.7 s for the PTP buffer, cross-correlate the mic signal
+>   against the chirp template.
+>
+> Volume-based mute-dip is no longer the primary modulation; volumes
+> are still used to **silence** non-target devices during AirPlay phase
+> so their re-radiation doesn't contaminate the target's measurement.
+
 ## 3. Algorithm: Probe Generation
 
 ### 3.1 Probe Pattern
+
+> **REALITY CHECK (v3 field data):** With `T_solo = 300 ms` (ramped up
+> from the original 200 ms because confidence collapsed at the smaller
+> window), `MuteDipCalibrator` exhibited ±90 ms run-to-run variance on
+> the user's 2-airplay configuration. Music dynamics modulate the same
+> envelope band the probe lives in, the whitening step (§4.3) wasn't
+> rejecting them cleanly, and consecutive calibrations could disagree
+> by more than the perceptual ceiling. v4 (`ActiveCalibrator`) replaced
+> this entire probe path with active per-device signals (see §2 reality
+> check) and now achieves <10 ms run-to-run variance.
+> The v2 mute-dip code is still present at
+> `core/router/Sources/SyncCastRouter/MuteDipCalibrator.swift` because
+> it serves as a fallback when active calibration cannot run (no mic
+> permission yet, or single-device case where FDM degenerates).
 
 Define a TDMA cycle of N devices, each with a "solo window" of `T_solo = 200 ms` and a guard interval of `T_guard = 50 ms`. One cycle period is `T_cycle = N · (T_solo + T_guard) = 1000 ms` for N=4.
 
@@ -73,6 +138,16 @@ We run the cycle **2×** by default. Two cycles give us:
 - Detection of a transient interferer (user speech, AC unit kicking on) that corrupts one cycle but not the other.
 
 Total wall-clock: ~3.3 s + 1 cycle = **4.3 s**, still inside the budget.
+
+> **REALITY CHECK (v3+):** Multi-cycle averaging didn't survive the move
+> to active signals. Local FDM is one parallel capture (~5 s including
+> tail), AirPlay TDMA is sequential (~3 s/device), so 2-airplay-2-local
+> is one ~10 s pass. Confidence is high enough on a single pass that
+> averaging has not been re-introduced. **The continuous calibrator
+> (v4) reframes "averaging" as "more samples over time"** — every
+> cycle is a fresh point that the controller can use to detect drift,
+> rather than committing one good number at start-up and trusting it
+> forever.
 
 ## 4. Algorithm: Mic Processing
 
@@ -124,6 +199,17 @@ The search window depends on device class:
 - **AirPlay devices**: peak should land near 1.8 s. Search `k ∈ [150, 200]` (1.5–2.0 s).
 
 We do **not** search across the whole window per device — that would invite false peaks from neighboring solo windows aliased through reverb. The narrow search per device class is part of the design's robustness.
+
+> **REALITY CHECK (v3+):** Field data forced both windows to widen. The
+> narrow `[1.5, 2.0] s` AirPlay window missed real peaks at 2.7 s on
+> the user's Xiaomi receiver, and locals during whole-home mode have
+> latency `airplayDelayMs + ~30 ms` which can sit anywhere on
+> `[0, 5000] ms`. v3 widened both to `[0, 5000] ms` and accepts the
+> resulting false-peak risk because (a) active signals are spectrally
+> orthogonal so cross-talk dropped, and (b) we now silence non-target
+> bridges during AirPlay phase to kill the local-echo false-peak path.
+> See `ActiveCalibrator.airplaySearchMaxMs = 4000` and the comment
+> block in `Phase 2` of `ActiveCalibrator.run`.
 
 ## 5. Algorithm: Latency Extraction (Math)
 
@@ -255,7 +341,44 @@ The fundamental fix: v1 tried to apply textbook FDM signal engineering to an arc
 4. **Multi-mic future**: If we eventually use the iPhone mic plus the MBP mic, we get spatial diversity and can localize devices in 3D. Out of scope for v2 but the algorithm extends naturally.
 5. **Two-mic mode for cross-validation**: If the user has a second device with a mic (their phone), we could run the same algorithm on both mics simultaneously and validate that `τ_d^(mic1) − τ_d^(mic2)` matches the geometric expectation.
 
+> **REALITY CHECK (v3+):** Updated risk register:
+> 1. Volume rate-limit: not hit in practice — the volume calls during
+>    AirPlay TDMA (one per device per phase, ~4–8 calls total in 5 s)
+>    are well below OwnTone's threshold.
+> 2. Volume crossfade: OwnTone's AirPlay 2 path does NOT crossfade
+>    `device.set_volume(0)` calls — they go through immediately. We
+>    confirmed this empirically when measured peaks land cleanly at
+>    expected τ even with abrupt volume drops.
+> 3. AGC: still real. The user's Logitech BRIO mic auto-gains, which
+>    inflates noise floor between cycles. Mitigated by using
+>    confidence-relative thresholding (peak / local-MAD) rather than
+>    absolute thresholds.
+> 4. Multi-mic: still future work.
+> 5. Two-mic cross-validation: also future work.
+>
+> **New v4 risks (not anticipated in v2):**
+> 6. **Drift over time** — even a perfectly calibrated system at t=0
+>    can drift after 5+ minutes (PTP clock divergence, OwnTone buffer
+>    repolar, thermal drift in CoreAudio drivers). One-shot calibration
+>    cannot fix this. Drives the v4 continuous-calibration design.
+> 7. **MBP speaker pop** at the start of ultrasonic tone injection.
+>    Probe amplitude is 0.15 (well below clipping) but the discontinuity
+>    on AUHAL render-callback boundary is audible. Open issue.
+> 8. **Per-AirPlay-device frequency selection is impossible** by
+>    architecture (single OwnTone PCM stream). The frequency-response
+>    sweep we use to pick local probe frequencies cannot be repeated
+>    per-AirPlay-device — we get one global response curve for the
+>    OwnTone path. Mitigated by AirPlay using a different probe class
+>    (chirps, not sines) where frequency selection matters less.
+
 ## 10. Reference Implementation Pseudocode
+
+> **REALITY CHECK (v3+):** The pseudocode below describes the
+> mute-dip path (`MuteDipCalibrator.swift`), which is still in the
+> codebase as the legacy fallback. The current shipping path is
+> `ActiveCalibrator.swift` with a fundamentally different shape (FDM
+> phase + TDMA phase + delta computation, no cycle-loop). See
+> `calibration_v4_status.md` §3 for the v4 pseudocode.
 
 ```
 function calibrate(devices: [Device], cycles: Int = 2) -> [Device: Latency] {
