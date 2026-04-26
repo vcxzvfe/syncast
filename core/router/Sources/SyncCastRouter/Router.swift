@@ -398,29 +398,44 @@ public actor Router {
         pulseCount: Int = 5,
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> CalibrationDelta {
-        // v2 calibration — TDMA mute-dip per docs/calibration_v2_design.md.
-        // The previous v1 path (sequential per-device click + GCC-PHAT) is
-        // documented in the design doc §8 as fundamentally broken: the
-        // shared PCM stream architecture means GCC-PHAT against a multi-
-        // speaker mix finds ONE peak (dominated by the loudest speaker),
-        // so per-device offsets were indistinguishable. v2 modulates each
-        // device's volume on an orthogonal time pattern and cross-correlates
-        // the room mic envelope against each device's expected modulation
-        // pattern — this DOES produce a per-device latency.
+        // v4 calibration — mixed-architecture active signals.
         //
-        // The legacy `pulseCount` parameter is ignored — slot count and
-        // cycle count are determined by the design doc instead. The
-        // signature is preserved so AppModel.runAutoCalibrate can keep
-        // calling without changes.
+        // Pipeline:
+        //   * Phase 1 (local FDM, parallel ~1.5 s): each enabled local
+        //     bridge plays a unique pilot tone (1 kHz, 2 kHz, 3 kHz,
+        //     4 kHz). The mic bandpasses each frequency independently
+        //     and reports per-device onset time. TRUE FDM — measurements
+        //     are fully parallel.
+        //   * Phase 2 (AirPlay TDMA, sequential ~2.5 s/device): for each
+        //     enabled AirPlay device, mute every other AirPlay output
+        //     via `device.set_volume(0)`, inject a unique linear chirp
+        //     into the SCK ring, cross-correlate the captured mic
+        //     against the chirp template. AirPlay 2 multi-room is a
+        //     single-stream architecture so per-device differentiation
+        //     MUST be temporal; FDM in the AirPlay band is structurally
+        //     impossible.
+        //   * Phase 3: delta = max(AirPlay τ) − max(local τ); ADD to
+        //     airplayDelayMs to align local outputs with the slowest
+        //     AirPlay receiver.
+        //
+        // v3 (MuteDipCalibrator, retained as fallback) modulated the
+        // user's MUSIC volume in TDMA slots and cross-correlated the
+        // envelope. With ambient music as the carrier, run-to-run
+        // variance was ±90 ms — the chosen genre/loudness affected the
+        // per-slot envelope shape too much. v4's active signals are
+        // independent of the user's audio content.
+        //
+        // The legacy `pulseCount` parameter is ignored — Phase 1 and
+        // Phase 2 timings come from `ActiveCalibrator` defaults.
         _ = pulseCount
 
         let enabled = devices.filter { routing[$0.id]?.enabled == true }
         guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
 
-        // Snapshot the user's pre-calibration routing. Restored on EVERY
-        // exit path (success, throw, cancel) — the mute-dip cycle leaves
-        // every device at its original volume on success, but a mid-cycle
-        // throw could land us on a non-original state.
+        // Snapshot the user's pre-calibration routing so we can restore
+        // on every exit path (Phase 2 mutes other AirPlay receivers
+        // mid-cycle; a throw between mutes would otherwise leave them
+        // muted indefinitely).
         let originalRouting: [String: DeviceRouting] = Dictionary(
             uniqueKeysWithValues: enabled.compactMap { dev -> (String, DeviceRouting)? in
                 guard let r = routing[dev.id] else { return nil }
@@ -428,41 +443,70 @@ public actor Router {
             }
         )
 
-        // Capture bridge handles up-front so the volume-setter closure
-        // doesn't need to hop back into the actor on every slot transition.
-        // LocalAirPlayBridge.setVolume is thread-safe (unfair-lock backed).
+        // Build local + airplay probe lists for ActiveCalibrator. Local
+        // probes carry the bridge handle directly; AirPlay probes carry
+        // the device id + original volume so Phase 2 can mute and
+        // restore via the supplied closure.
         let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
-        // For the AirPlay closure, capture self weakly so it can call
-        // `setAirplayVolume` (actor-isolated) via an `await` Task hop.
-        let airplaySetter: MuteDipCalibrator.AsyncVolumeSetter = {
+        var localProbes: [ActiveCalibrator.LocalProbe] = []
+        var airplayProbes: [ActiveCalibrator.AirPlayProbe] = []
+        for dev in enabled {
+            switch dev.transport {
+            case .coreAudio:
+                if let bridge = bridgeSnapshot[dev.id] {
+                    localProbes.append(.init(deviceID: dev.id, bridge: bridge))
+                }
+                // Stereo-mode local outputs (no bridge) currently can't
+                // play the per-device pilot tone — they'd need an
+                // analogous override on `LocalOutput`. v4 deliberately
+                // scopes to whole-home mode (which is where calibration
+                // matters anyway — stereo mode has no AirPlay devices to
+                // align against). Stereo-mode locals are silently
+                // dropped from the probe set.
+            case .airplay2:
+                let origVol = originalRouting[dev.id]?.volume ?? 1.0
+                airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
+            }
+        }
+
+        // The chirp injection closure: write the chirp PCM into the SCK
+        // ring at the requested wall-clock anchor. We honor the anchor
+        // via a microsleep — the actor's serial executor drives this
+        // through a Task, so the anchor must be relative to the same
+        // monotonic clock the mic capture uses (Clock.nowNs).
+        let ring = sckCapture.ringBuffer
+        let injectChirpToRing: @Sendable (
+            _ samples: [[Float]], _ atNs: UInt64
+        ) async -> Void = { samples, atNs in
+            let nowNs = Clock.nowNs()
+            if atNs > nowNs {
+                try? await Task.sleep(nanoseconds: atNs - nowNs)
+            }
+            guard samples.count >= 2,
+                  !samples[0].isEmpty,
+                  samples[0].count == samples[1].count
+            else { return }
+            let frames = samples[0].count
+            samples[0].withUnsafeBufferPointer { ch0 in
+                samples[1].withUnsafeBufferPointer { ch1 in
+                    let ptrArray: [UnsafePointer<Float>] = [
+                        ch0.baseAddress!, ch1.baseAddress!,
+                    ]
+                    ptrArray.withUnsafeBufferPointer { ptrs in
+                        ring.write(channels: ptrs.baseAddress!, frames: frames)
+                    }
+                }
+            }
+        }
+
+        let airplaySetter: ActiveCalibrator.AsyncAirplayVolumeSetter = {
             [weak self] devID, vol in
             await self?.setAirplayVolume(id: devID, volume: vol)
         }
-        let localSetter: MuteDipCalibrator.VolumeSetter = { devID, vol in
-            bridgeSnapshot[devID]?.setVolume(vol)
-        }
 
-        // Build the probe set. commandLatencyMs uses class defaults — we
-        // could plumb measured AirPlay latency here in the future, but
-        // ±200 ms in the preroll budget is harmless (the mic capture is
-        // 5 s and we only need slot-0's audible transition to land inside
-        // it).
-        let probes: [MuteDipCalibrator.Probe] = enabled.map { dev in
-            let lambda = (dev.transport == .airplay2)
-                ? MuteDipCalibrator.airplayDefaultLambdaMs
-                : MuteDipCalibrator.localDefaultLambdaMs
-            let origVol = originalRouting[dev.id]?.volume ?? 1.0
-            return MuteDipCalibrator.Probe(
-                deviceID: dev.id,
-                transport: dev.transport,
-                commandLatencyMs: lambda,
-                originalVolume: origVol
-            )
-        }
+        progress?("Calibrating \(enabled.count) device\(enabled.count == 1 ? "" : "s") (active signals)…")
 
-        progress?("Calibrating \(enabled.count) device\(enabled.count == 1 ? "" : "s")…")
-
-        let calibrator = MuteDipCalibrator(microphoneDeviceID: microphoneDeviceID)
+        let calibrator = ActiveCalibrator(microphoneDeviceID: microphoneDeviceID)
 
         var didRestore = false
         func restoreOriginalRouting() async {
@@ -472,8 +516,9 @@ public actor Router {
                 routing[id] = r
             }
             replan()
-            // Re-push AirPlay volumes — the IPC sidecar may believe the
-            // last off-level (0.3) was the user's setting.
+            // Re-push AirPlay volumes — Phase 2 muted others to 0 and
+            // ActiveCalibrator's defer block restores best-effort, but
+            // sidecar-side IPC may have raced. Belt-and-braces.
             for dev in enabled where dev.transport == .airplay2 {
                 let v = originalRouting[dev.id]?.volume ?? 1.0
                 await setAirplayVolume(id: dev.id, volume: v)
@@ -483,9 +528,11 @@ public actor Router {
         do {
             try Task.checkCancellation()
             let result = try await calibrator.run(
-                probes: probes,
-                setLocalVolume: localSetter,
-                setAirplayVolume: airplaySetter
+                localProbes: localProbes,
+                airplayProbes: airplayProbes,
+                setAirplayVolume: airplaySetter,
+                injectChirpToRing: injectChirpToRing,
+                sckRingSampleRate: sckCapture.sampleRate
             )
             await restoreOriginalRouting()
             return CalibrationDelta(
