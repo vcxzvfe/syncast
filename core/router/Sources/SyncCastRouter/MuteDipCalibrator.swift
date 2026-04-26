@@ -8,13 +8,23 @@ import SyncCastDiscovery
 /// TDMA mute-dip per-device latency (calibration v2). See
 /// `docs/calibration_v2_design.md` §3–§7 for the math.
 ///
-/// Pipeline: TDMA volume modulation (200ms solo + 50ms guard per device)
-/// → 48kHz mic capture covering preroll(λ_max)+cycle+postroll → 20ms/10ms
-/// sliding RMS envelope → whitening (subtract 500ms baseline, divide by
-/// it) → 3-tap median filter → per-device FFT cross-correlation against
-/// mean-removed expected pattern m_d → argmax in class-specific window
-/// (local [0,200]ms, AirPlay [1500,2000]ms) → τ_d. Confidence =
+/// Pipeline: TDMA volume modulation (300ms solo + 50ms guard per device)
+/// → 48kHz mic capture covering preroll(λ_max)+cycle+postroll+slack →
+/// 20ms/10ms sliding RMS envelope → whitening (subtract 500ms baseline,
+/// divide by it) → 3-tap median filter → per-device FFT cross-correlation
+/// against mean-removed expected pattern m_d → argmax in class-specific
+/// window (local [0,3100]ms, AirPlay [1500,2000]ms) → τ_d. Confidence =
 /// (peak − background_median) / MAD(background); design §7 threshold 4.0.
+///
+/// Whole-home mode caveat: in whole-home mode the broadcaster routes
+/// local audio through an `airplayDelayMs` delay-line (0..3000 ms,
+/// user-tunable). That delay is NOT in `Probe.commandLatencyMs`, which
+/// only models intrinsic device latency (~30 ms local, ~1800 ms AirPlay).
+/// So local's actual command-to-mic latency is `airplayDelayMs + ~30 ms`
+/// and the local cross-correlation peak lives near τ ≈ airplayDelayMs.
+/// Hence local's search window is widened to [0, 3100] ms (max possible
+/// delay-line + slack) and capture is padded by `searchSlackMs` so the
+/// late mute-dip is still in the recording.
 ///
 /// Deviations: hard volume transitions (no 50ms half-cosine ramp — design
 /// caveat §3.2; modulation depth is what xcorr measures, bandwidth doesn't
@@ -87,7 +97,12 @@ public final class MuteDipCalibrator: @unchecked Sendable {
 
     // MARK: - Configuration (design §3, §4.5, §7)
 
-    public static let tSoloMs: Int = 200
+    /// Solo window length (ms). Bumped from 200 → 300 so AirPlay
+    /// receivers' anti-click volume ramping (typically 50–200 ms) has
+    /// time to actually reach `offLevel` before flipping back; this
+    /// deepens the dip and improves AirPlay-side cross-correlation
+    /// confidence at small cost to total calibration duration.
+    public static let tSoloMs: Int = 300
     public static let tGuardMs: Int = 50
     public static let offLevel: Float = 0.3
     public static let onLevel: Float = 1.0
@@ -95,10 +110,22 @@ public final class MuteDipCalibrator: @unchecked Sendable {
     public static let airplayDefaultLambdaMs: Int = 1800
     public static let localDefaultLambdaMs: Int = 30
 
+    /// Local search window upper bound (ms). In whole-home mode local
+    /// audio passes through the broadcaster's delay-line (≤ 3000 ms),
+    /// so the local mute-dip arrives near τ ≈ airplayDelayMs. 3100 ms
+    /// = 3000 ms hard cap + 100 ms slack. With `cycles=1` (default) the
+    /// expected pattern is a single rectangular pulse whose
+    /// autocorrelation has no secondary lobes within this window.
     public static let localSearchMinMs: Int = 0
-    public static let localSearchMaxMs: Int = 200
+    public static let localSearchMaxMs: Int = 3100
     public static let airplaySearchMinMs: Int = 1500
     public static let airplaySearchMaxMs: Int = 2000
+
+    /// Capture-tail padding so a local mute-dip delayed by up to
+    /// `localSearchMaxMs` is still inside the recording window. Without
+    /// this, widening the search range alone is meaningless — the dip
+    /// would arrive after capture has stopped.
+    public static let searchSlackMs: Int = localSearchMaxMs
 
     public var cycles: Int = 1
     public var confidenceAcceptThreshold: Double = 4.0
@@ -153,10 +180,12 @@ public final class MuteDipCalibrator: @unchecked Sendable {
             probes.map { $0.commandLatencyMs }.max() ?? 0
         )
         let prerollMs = lambdaMax
-        let totalMs = prerollMs + cycleMs * max(1, cycles) + Self.postRollMs
+        // `searchSlackMs` pads the tail so locals delayed by up to the
+        // delay-line max (whole-home mode) are still inside the capture.
+        let totalMs = prerollMs + cycleMs * max(1, cycles) + Self.postRollMs + Self.searchSlackMs
 
         Self.trace(
-            "[MuteDip] start: deviceCount=\(n) preroll=\(prerollMs)ms cycle=\(cycleMs)ms cycles=\(cycles) postroll=\(Self.postRollMs)ms total=\(totalMs)ms"
+            "[MuteDip] start: deviceCount=\(n) preroll=\(prerollMs)ms cycle=\(cycleMs)ms cycles=\(cycles) postroll=\(Self.postRollMs)ms slack=\(Self.searchSlackMs)ms total=\(totalMs)ms"
         )
 
         let captureFrames = Int(Double(totalMs + Self.captureHeadMs) / 1000.0 * Self.sampleRate)
@@ -346,13 +375,24 @@ public final class MuteDipCalibrator: @unchecked Sendable {
                 Self.trace("[MuteDip] device=\(p.deviceID) SKIP search_window=[\(kMin),\(kMax)] empty")
                 continue
             }
+            // Diagnostic: full-range argmax tells us if the in-window
+            // peak is the real one or an artifact of a too-narrow window.
+            let (fullPeakIdx, fullPeakVal) = Self.argmax(cd, begin: 0, end: cd.count)
             let (peakIdx, peakVal) = Self.argmax(cd, begin: kMin, end: kMax + 1)
+            // Outside-window max (for diagnostic — a strong peak just
+            // outside the window means the window is misplaced).
+            let (outsidePeakIdx, outsidePeakVal) = Self.argmaxOutside(
+                cd, excludeBegin: kMin, excludeEnd: kMax + 1
+            )
             let (background, mad) = Self.backgroundStats(cd, excludingIdx: peakIdx, neighborhood: 5)
             let madFloor = max(mad, 1e-9)
             let confidence = Double((abs(peakVal) - background) / Float(madFloor))
             let tauMs = peakIdx * Self.envelopeHopMs
             perDeviceTau[p.deviceID] = tauMs
             perDeviceConf[p.deviceID] = confidence
+            Self.trace(
+                "[MuteDip] device=\(p.deviceID) searchWindow=[\(kMinMs)ms..\(kMaxMs)ms] peak_idx_full=\(fullPeakIdx)(\(fullPeakIdx * Self.envelopeHopMs)ms,\(String(format: "%.4f", fullPeakVal))) peak_in_window=\(peakIdx)(\(tauMs)ms,\(String(format: "%.4f", peakVal))) peak_outside=\(outsidePeakIdx)(\(outsidePeakIdx * Self.envelopeHopMs)ms,\(String(format: "%.4f", outsidePeakVal)))"
+            )
             Self.trace(
                 "[MuteDip] device=\(p.deviceID) τ=\(tauMs)ms peak=\(String(format: "%.4f", peakVal)) background=\(String(format: "%.4f", background)) mad=\(String(format: "%.4f", mad)) confidence=\(String(format: "%.2f", confidence)) transport=\(p.transport.rawValue)"
             )
@@ -572,6 +612,21 @@ public final class MuteDipCalibrator: @unchecked Sendable {
         var idx = begin
         var val: Float = -.infinity
         for i in begin..<end {
+            let a = abs(x[i])
+            if a > val { val = a; idx = i }
+        }
+        return (idx, val)
+    }
+
+    /// argmax over `x` EXCLUDING `[excludeBegin, excludeEnd)`. Used as a
+    /// diagnostic: a strong peak outside the active search window means
+    /// the window is misplaced. Returns (-1, 0) if every index is excluded.
+    static func argmaxOutside(
+        _ x: [Float], excludeBegin: Int, excludeEnd: Int
+    ) -> (idx: Int, value: Float) {
+        var idx = -1
+        var val: Float = 0
+        for i in 0..<x.count where i < excludeBegin || i >= excludeEnd {
             let a = abs(x[i])
             if a > val { val = a; idx = i }
         }
