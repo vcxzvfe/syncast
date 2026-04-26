@@ -63,9 +63,10 @@ import SyncCastDiscovery
 ///   9. Restore the snapshotted volumes.
 ///
 /// **Phase 3 (compute alignment)**
-///   `delta = max(airplay τ) − max(local τ)`. ADD to current
-///   `airplayDelayMs` (delay-line that delays LOCAL devices to match
-///   the slowest AirPlay receiver).
+///   `delta = max(airplay τ) − max(local τ)`. ABSOLUTE TARGET value
+///   for `airplayDelayMs` (NOT a delta to add) — local τ is from the
+///   bridge's direct synthesis path which bypasses the delay-line.
+///   See `Result.deltaMs` doc.
 ///
 /// All measurements are recorded via `CalibTrace.log` with the
 /// `[ActiveCalib]` prefix, mirroring `MuteDipCalibrator`'s tracing
@@ -118,9 +119,13 @@ public final class ActiveCalibrator: @unchecked Sendable {
         public let perDeviceUncertaintyMs: [String: Int]
         /// Worst (lowest) per-device confidence in this run.
         public let aggregateConfidence: Double
-        /// Signed delta = max(AirPlay τ) − max(local τ); ADD to
-        /// airplayDelayMs to align local outputs with the slowest
-        /// AirPlay receiver.
+        /// ABSOLUTE TARGET delay-line value in ms (NOT a delta to add).
+        /// Computed as `max(AirPlay τ) − max(local τ)`. Local τ comes
+        /// from the bridge's direct calibration-tone synthesis which
+        /// bypasses the broadcaster delay-line, so this is the
+        /// delay-line setting to align outputs with the slowest AirPlay
+        /// receiver. Field name kept for ABI stability — was wrongly
+        /// interpreted as an additive delta in earlier versions.
         public let deltaMs: Int
         public init(
             perDeviceTauMs: [String: Int],
@@ -174,13 +179,14 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// Bandpass guard ±100 Hz; 500 Hz minimum spacing keeps cross-
     /// talk between concurrent bridges below -30 dB.
     public static let localFrequencies: [Double] = [18000, 18500, 16000, 17000]
-    /// Bumped from 0.05 to 0.15 because high-frequency speaker rolloff
-    /// attenuates ultrasonic content significantly at the SPEAKER
-    /// (the freq-resp sweep showed 18 kHz tone produced only -68 dBFS at
-    /// the mic vs. -17 dBFS at 1 kHz, a 50 dB acoustic-path loss). The
-    /// digital tone amplitude needs to be higher to maintain SNR at
-    /// the mic. 0.15 is still well below clipping headroom.
-    public static let localToneAmplitude: Float = 0.15
+    /// Bumped from 0.15 → 0.25. With envelope 20 ms, Phase 1 SNR at 0.15
+    /// was still only ~3-5 dB after the envelope fix (was 1.1 dB before),
+    /// too close to detection threshold for reliability. The freq-resp
+    /// sweep showed 18 kHz tone at -68 dBFS at the mic vs. -17 dBFS at
+    /// 1 kHz — a ~50 dB acoustic-path loss from speaker HF rolloff that
+    /// must be compensated digitally. 0.25 (-12 dBFS) leaves ample
+    /// clipping headroom while raising mic SNR above the working floor.
+    public static let localToneAmplitude: Float = 0.25
     public static let localToneDurationMs: Int = 1500
     /// Mic capture window is the tone duration plus tail for any
     /// extra latency — locals are typically <100 ms but in whole-home

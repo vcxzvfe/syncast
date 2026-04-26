@@ -14,10 +14,12 @@ import os.lock
 ///   * Invoke `runner` (the on-demand calibrator entry point).
 ///   * If `aggregateConfidence < confidenceFloor`: skip apply, emit
 ///     Sample, count toward consecutive-failure streak.
-///   * Else if `|deltaMs| < driftThresholdMs`: no apply, emit Sample,
-///     reset failure counter — drift is below perception threshold.
-///   * Else: `newDelay = currentDelay + deltaMs` clamped `[0, 5000]`,
+///   * Else if `|deltaMs - currentDelay| < driftThresholdMs`: no apply,
+///     emit Sample, reset failure counter — drift below perception.
+///   * Else: `newDelay = deltaMs` clamped `[0, 5000]`,
 ///     `await applyDelayMs(newDelay)`, emit Sample, reset counter.
+///     `deltaMs` is the ABSOLUTE TARGET delay-line value, not a
+///     correction — see `ActiveCalibrator.Result.deltaMs`.
 ///   * Repeat until `stop()` flips the cancel flag.
 ///
 /// On runner throw or `consecutiveFailureLimit` sequential failures,
@@ -216,10 +218,13 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
             )
             return
         }
-        if abs(delta) < threshold {
+        // `delta` is an ABSOLUTE TARGET; the drift threshold is on the
+        // *change* we'd apply, i.e. `target − current`.
+        let drift = delta - beforeDelayMs
+        if abs(drift) < threshold {
             recordSuccess()
             Self.trace(
-                "[ContActiveCalib] iter=\(iter) delta=\(delta)ms within threshold ±\(threshold)ms — no action confidence=\(String(format: "%.2f", confidence))"
+                "[ContActiveCalib] iter=\(iter) target=\(delta)ms drift=\(drift)ms within threshold ±\(threshold)ms — no action confidence=\(String(format: "%.2f", confidence))"
             )
             emitSample(
                 measuredDelta: delta, appliedDelay: beforeDelayMs,
@@ -227,12 +232,11 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
             )
             return
         }
-        let proposed = beforeDelayMs + delta
-        let clamped = min(5000, max(0, proposed))
+        let clamped = min(5000, max(0, delta))
         await applyDelayMs(clamped)
         recordSuccess()
         Self.trace(
-            "[ContActiveCalib] iter=\(iter) delta=\(delta)ms applied: \(beforeDelayMs)ms -> \(clamped)ms confidence=\(String(format: "%.2f", confidence))"
+            "[ContActiveCalib] iter=\(iter) target=\(delta)ms applied: \(beforeDelayMs)ms -> \(clamped)ms confidence=\(String(format: "%.2f", confidence))"
         )
         emitSample(
             measuredDelta: delta, appliedDelay: clamped,

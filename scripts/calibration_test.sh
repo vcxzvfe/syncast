@@ -50,6 +50,6 @@ else:
     for dev, ms in sorted(offsets.items(), key=lambda kv: kv[1]):
         print("  %-30s  %+5d ms" % (dev, ms))
 print()
-print("Recommended airplayDelayMs delta: %+d ms" % result.get("deltaMs", 0))
+print("Recommended airplayDelayMs (absolute target): %d ms" % result.get("deltaMs", 0))
 print("Confidence: %.2f" % result.get("confidence", 0.0))
 ' "$RESP"

@@ -995,12 +995,17 @@ final class AppModel {
                     }
                 }
             )
-            // Apply as a *delta* on top of the current value. The
-            // CalibrationRunner returns the signed correction needed:
-            // positive means local plays earlier than AirPlay (need
-            // more delay-line); negative means local plays after AirPlay
-            // (need less). Both are clamped by setAirplayDelay's range.
-            let next = airplayDelayMs + delta.deltaMs
+            // `deltaMs` is the ABSOLUTE TARGET delay-line value
+            // (= max(airplay τ) − max(local τ_bridge_bypass)), NOT a
+            // delta to add. SET the slider directly. The previous
+            // `+= delta` was wrong: Phase 1 measures local τ via the
+            // bridge's direct calibration-tone synthesis which bypasses
+            // the broadcaster delay-line, so re-runs would double up
+            // until clamped. See `Router.CalibrationDelta.deltaMs`.
+            let next = max(
+                AppModel.airplayDelayMsRange.lowerBound,
+                min(AppModel.airplayDelayMsRange.upperBound, delta.deltaMs)
+            )
             setAirplayDelay(next)
             calibrationStatus = .completed(
                 deltaMs: delta.deltaMs,
