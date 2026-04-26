@@ -600,11 +600,7 @@ public actor Router {
                         microphoneDeviceID: snap.microphoneDeviceID
                     )
                 }
-            },
-            // Round 11: hybrid drift tracker removed. Closure retained so
-            // CalibrationDiagnosticServer's signature stays satisfied; it
-            // always reports nil (`result: null`).
-            trackerStatusProvider: { nil }
+            }
         )
         do {
             try server.start()
