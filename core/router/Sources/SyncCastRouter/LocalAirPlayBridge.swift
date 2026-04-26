@@ -641,9 +641,29 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
     /// AUHAL render callback. Real-time thread: NO allocations, NO
     /// async, NO Swift runtime calls beyond the unfair-lock acquire.
-    /// Pipeline (FIX 1): always-path ring read → optional additive
-    /// tone overlay → software-gain ramp last so volume changes don't
-    /// click (FIX 2a) and the gain scales (music+tone) uniformly.
+    /// Pipeline (**v7 reorder**): always-path ring read → software-gain
+    /// ramp on the MUSIC ONLY → optional additive tone overlay LAST so
+    /// the calibration tone is unaffected by user volume / Phase-1
+    /// silencing.
+    ///
+    /// **Why gain BEFORE tone (rationale for v7 reorder):**
+    /// The previous order (ring → tone → gain) meant volume=0 silenced
+    /// both music AND calibration tone, defeating
+    /// `ActiveCalibrator.runLocalPhase`'s ability to silence music
+    /// while keeping the calibration probe driving the speaker.
+    /// Reordering to (ring → gain → tone) produces:
+    ///   * volume slider 1.0, tone off  → music at full level
+    ///   * volume slider 0.5, tone off  → music at half level (unchanged)
+    ///   * volume slider 0.0, tone off  → silence (unchanged)
+    ///   * volume slider 1.0, tone on   → music + tone (tone at fixed amp)
+    ///   * volume slider 0.0, tone on   → tone ONLY (Phase 1 mode)
+    /// The trade-off: the user's slider no longer attenuates the
+    /// calibration tone. This is intentional — the tone is a fixed-
+    /// amplitude calibration probe, not playback content.
+    /// Click-suppression on volume changes still works because the
+    /// gain ramp itself is unchanged; the tone is mixed in at a
+    /// constant level so its envelope (start/stop ramps) is the only
+    /// thing that controls perceived tone amplitude.
     private func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         guard let ioData = ioData else { return noErr }
         let bufList = UnsafeMutableAudioBufferListPointer(ioData)
@@ -719,7 +739,36 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         let startFrame: Int64 = needsResync ? target : cursor
         ring.read(at: startFrame, frames: frames, into: outPtrs)
 
-        // Additive overlay: mix tone on top of music (`+=`, not `=`).
+        // **v7 reorder — gain FIRST so the tone is exempt from
+        // user-volume / Phase-1 silencing attenuation.** Software
+        // gain: ramp per-sample if current != target, vDSP fast path
+        // otherwise. Ramped to suppress click on sudden 1.0 → 0
+        // transitions (pop-suppressing).
+        var newGainCurrent = snapshot.gainCurrent
+        if snapshot.gainCurrent != snapshot.gainTarget {
+            let rampTotalSamples = Int(Self.volumeRampMs / 1000.0 * inboundSampleRate)
+            let stepSamples = min(frames, max(1, rampTotalSamples))
+            let stepDelta = (snapshot.gainTarget - snapshot.gainCurrent) / Float(stepSamples)
+            var g = snapshot.gainCurrent
+            for i in 0..<frames {
+                if i < stepSamples { g += stepDelta } else { g = snapshot.gainTarget }
+                for ch in 0..<channelCount { outPtrs[ch][i] *= g }
+            }
+            newGainCurrent = (frames >= stepSamples) ? snapshot.gainTarget : g
+        } else if snapshot.gainCurrent != 1.0 {
+            var g = snapshot.gainCurrent
+            let frameCount = vDSP_Length(frames)
+            for ch in 0..<channelCount {
+                let p = outPtrs[ch]
+                vDSP_vsmul(p, 1, &g, p, 1, frameCount)
+            }
+        }
+
+        // Additive overlay: mix tone on top of (now-gain-attenuated)
+        // music with `+=`, not `=`. Tone amplitude is governed solely
+        // by `snapshot.toneAmp` and the start/stop ramp envelope —
+        // user volume is intentionally NOT applied (see render()
+        // doc comment for v7 reorder rationale).
         var phase = _calibTonePhase
         var rampRemaining = snapshot.toneRampSamples
         var toneEndedThisBlock = false
@@ -756,29 +805,6 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
                 for ch in 0..<channelCount {
                     outPtrs[ch][i] += s   // additive, not replace
                 }
-            }
-        }
-
-        // Software gain: ramp per-sample if current != target,
-        // vDSP fast path otherwise. Ramped to suppress click on
-        // sudden 1.0 → 0 transitions (pop-suppressing).
-        var newGainCurrent = snapshot.gainCurrent
-        if snapshot.gainCurrent != snapshot.gainTarget {
-            let rampTotalSamples = Int(Self.volumeRampMs / 1000.0 * inboundSampleRate)
-            let stepSamples = min(frames, max(1, rampTotalSamples))
-            let stepDelta = (snapshot.gainTarget - snapshot.gainCurrent) / Float(stepSamples)
-            var g = snapshot.gainCurrent
-            for i in 0..<frames {
-                if i < stepSamples { g += stepDelta } else { g = snapshot.gainTarget }
-                for ch in 0..<channelCount { outPtrs[ch][i] *= g }
-            }
-            newGainCurrent = (frames >= stepSamples) ? snapshot.gainTarget : g
-        } else if snapshot.gainCurrent != 1.0 {
-            var g = snapshot.gainCurrent
-            let frameCount = vDSP_Length(frames)
-            for ch in 0..<channelCount {
-                let p = outPtrs[ch]
-                vDSP_vsmul(p, 1, &g, p, 1, frameCount)
             }
         }
 

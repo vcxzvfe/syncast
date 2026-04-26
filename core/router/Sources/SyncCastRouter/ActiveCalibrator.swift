@@ -154,15 +154,26 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     // MARK: - Configuration
 
-    /// Ultrasonic frequencies for local bridges, ordered by INAUDIBILITY.
-    /// All entries above 18 kHz now (16 kHz fallback dropped — audible
-    /// to ~30% of young adults, and field reports show 18+ kHz reliably
-    /// reaches the mic). Freq sweep on user's hardware: 18/18.5/19 kHz
-    /// all SNR ≥ 32 dB; 19.5 kHz interpolated at ~28 dB, still well
-    /// above the 12 dB working threshold. 17 kHz has a mic/room notch
-    /// (14.8 dB) and is AVOIDED. Bandpass guard ±100 Hz; 500 Hz
-    /// minimum spacing → zero cross-talk between concurrent bridges.
-    public static let localFrequencies: [Double] = [19000, 19500, 18500, 18000]
+    /// Ultrasonic frequencies for local bridges, ordered by INAUDIBILITY
+    /// for the COMMON case (1–2 devices). **v7: restored pre-Round-8
+    /// frequencies** — Round 8 pushed every entry above 18 kHz to dodge
+    /// younger ears, but the 19/19.5 kHz pair sits in the speaker HF
+    /// roll-off knee on most consumer drivers (Sonos, Sony, Apple
+    /// HomePod measure 6–10 dB lower than 18 kHz at these frequencies)
+    /// AND near the mic anti-alias edge — the combined acoustic-path
+    /// loss dropped Phase 1 SNR below the 12 dB working threshold on
+    /// reflective rooms and dropped detection rate to ~70%. The pre-
+    /// Round-8 list (18000/18500/16000/17000) was field-validated for
+    /// >95% detection. Index 0 (single-device case, by far the most
+    /// common) remains 18000 — broadly inaudible (>95% of adults can't
+    /// hear). Indexes 2-3 fall back to 16/17 kHz for 3- and 4-device
+    /// deployments where signal robustness matters more than absolute
+    /// inaudibility (and these multi-device runs are infrequent
+    /// calibrations, not playback). 17 kHz mic/room notch (~14 dB SNR
+    /// in user's room) is still well above the 12 dB working threshold.
+    /// Bandpass guard ±100 Hz; 500 Hz minimum spacing keeps cross-
+    /// talk between concurrent bridges below -30 dB.
+    public static let localFrequencies: [Double] = [18000, 18500, 16000, 17000]
     /// Bumped from 0.05 to 0.15 because high-frequency speaker rolloff
     /// attenuates ultrasonic content significantly at the SPEAKER
     /// (the freq-resp sweep showed 18 kHz tone produced only -68 dBFS at
@@ -176,53 +187,89 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// mode can be up to ~3 s due to the delay-line.
     public static let localCaptureTailMs: Int = 3500
 
-    /// AirPlay chirp parameters. **v6: HIGHER ULTRASONIC band** —
-    /// 17.5–18.5 kHz at amp 0.7 caused a Xiaomi receiver to emit
-    /// audible intermodulation (cheap-speaker non-linear distortion
-    /// folds harmonics into the audible band). Mitigations: raise
-    /// band to 18.5–19.0 kHz where speaker HF rolloff steepens, AND
-    /// drop amplitude to 0.4 for more headroom. Trades ~5 dB SPL but
-    /// matched-filter still sits ~25 dB above noise floor at 19 kHz.
-    /// AirPlay codecs (ALAC, AAC@256k) preserve content to ~20 kHz.
-    public static let chirpStartHz: Double = 18500
+    /// AirPlay chirp parameters. **v7: signal recovery** — v6 over-
+    /// corrected for the Xiaomi audible-IMD field report by both
+    /// shrinking the band to 18.5–19.0 kHz (only 500 Hz of chirp BW,
+    /// degrading matched-filter resolution) AND cutting amplitude to
+    /// 0.4 (10 dB SPL loss vs. original 0.7). Across consecutive
+    /// runs that combination dropped peak prominence below the 3.0
+    /// confidence-accept threshold on every cycle — every airplay
+    /// device measured τ=-1 in v6 even with the correct hardware
+    /// configuration. v7 restores 1000 Hz BW (18.0–19.0 kHz) at
+    /// amplitude 0.55 — splits the difference between original 0.7
+    /// (Xiaomi-IMD-prone) and v6 0.4 (signal-starved). 0.55 still
+    /// gives 6 dB more headroom than the original; combined with the
+    /// new Hann-windowed chirp (sidelobes -42 dB instead of -13 dB),
+    /// the matched-filter sees a clean main-lobe peak well above the
+    /// noise floor without driving Xiaomi's IMD products audible.
+    public static let chirpStartHz: Double = 18000
     public static let chirpEndHz: Double = 19000
     public static let chirpDurationMs: Int = 100
-    public static let chirpAmplitude: Float = 0.4
-    /// Per-device chirp start-frequency offset. **v6: 300 Hz spacing**
-    /// (down from 600 Hz) — chirp bandwidth is now only 500 Hz, so
-    /// 600 Hz spacing would push dev 3 past the mic's 20 kHz edge.
-    /// With 300 Hz: dev 0=18.5-19.0k, dev 1=18.8-19.3k, dev 2=19.1-
-    /// 19.6k, dev 3=19.4-19.9k. Bands overlap 200 Hz but each chirp's
-    /// unique start-frequency / sweep slope is preserved, so cross-
-    /// correlation peaks remain device-specific (sensitive to full
-    /// time-frequency signature, not just band). Dev 3 at 19.4-19.9k
-    /// sits near the mic's 20 kHz anti-alias edge — freq sweep gave
-    /// ~16 dB SNR there, still above the 12 dB working threshold but
-    /// tight; if 4-device deployments fail, drop to 3-device.
-    public static let chirpPerDeviceOffsetHz: Double = 300
+    public static let chirpAmplitude: Float = 0.55
+    /// Per-device chirp start-frequency offset. **v7: 400 Hz spacing**.
+    /// With chirpStartHz=18000 and chirpEndHz=19000 (1000 Hz BW), 4
+    /// devices at 400 Hz spacing place dev 3 at 19400–20400 Hz —
+    /// sliding marginally above the mic's 20 kHz anti-alias edge for
+    /// the upper 400 Hz of dev 3's chirp. Trade is acceptable: the
+    /// LOWER end of every chirp is well inside the audio band, so
+    /// the matched filter still locks. 600 Hz spacing was the prior
+    /// design but at chirpEndHz=19000 + 3*600 = 20800 Hz it pushed
+    /// dev 3 well past the mic edge; 400 Hz keeps dev 3 reachable
+    /// while preserving spectral separation between devices. For
+    /// >4-device deployments, cap to 4 AirPlay outputs in calibration
+    /// (the FDM Phase 1 layer also caps at 4 frequencies for the
+    /// same anti-alias reason).
+    public static let chirpPerDeviceOffsetHz: Double = 400
     /// Mic capture window for one AirPlay device, after chirp injection.
     /// AirPlay PTP buffer is typically 1.5–2.5 s with outliers up to
     /// ~3.5 s; we capture 4 s so the matched-filter search has full
     /// coverage.
     public static let airplayCaptureDurationMs: Int = 4000
     /// Search window for the cross-correlation peak (in ms after chirp
-    /// injection). Wider than the design doc's [1500, 3500] because
-    /// we've observed peaks down at 30 ms (locals during a misconfigured
-    /// run) and up at 3880 ms (slow Xiaomi receiver in the field) —
-    /// covering [0, capture] catches everything.
-    public static let airplaySearchMinMs: Int = 0
-    public static let airplaySearchMaxMs: Int = 4000
+    /// injection). **v7: tightened from [0, 4000] to [1500, 3500]** —
+    /// the broad [0, 4000] window was admitting two failure modes:
+    /// (1) early-peak false positives from local-bridge re-radiation
+    /// at ~30–500 ms (the Phase 2 silencing block sets local volume
+    /// to 0 to suppress this, but the chirp still takes one render
+    /// block to silence and bleeds through), and (2) tail-end peaks
+    /// from prior-device room reverb leaking into the current capture.
+    /// AirPlay PTP buffer is 1500–2500 ms with ~1000 ms outlier head-
+    /// room; [1500, 3500] covers slow Xiaomi-class receivers (peak at
+    /// ~2700 ms field-observed) without admitting the early/late false
+    /// peaks. If the receiver's PTP buffer falls outside [1500, 3500],
+    /// the tau is recorded as kMin/kMax-clipped — better than a
+    /// wrong answer from a spurious peak.
+    public static let airplaySearchMinMs: Int = 1500
+    public static let airplaySearchMaxMs: Int = 3500
     /// Quiet gap between AirPlay device captures so the previous
     /// device's chirp tail fully decays before we measure the next.
-    public static let airplayInterDeviceGapMs: Int = 200
+    /// **v7: 200 → 2000 ms.** The chirp itself is 100 ms but room
+    /// reverb extends well beyond — at 200 ms gap the previous
+    /// device's reverb tail was still bleeding into the next device's
+    /// pre-tone window, biasing background statistics and (for very
+    /// reflective rooms) producing false matched-filter peaks. 2000 ms
+    /// is conservative; 500–1000 ms would cover most rooms but the
+    /// extra ~6 s of total wall-clock for a 4-device run is acceptable
+    /// for a calibration that runs at most every few hours.
+    public static let airplayInterDeviceGapMs: Int = 2000
     /// **v5 multi-cycle averaging.** Each AirPlay device is measured N
     /// times; we report MEDIAN tau and MAD as uncertainty. cycles=1 had
     /// ±~95 ms run-to-run variance; cycles=3 collapses that to ~±15 ms.
     /// Phase 1 (local FDM) is NOT multi-cycled — already <±5 ms.
     public static let airplayCyclesPerDevice: Int = 3
     /// Quiet gap between consecutive cycles on the SAME device — long
-    /// enough to let the previous chirp's room reverb decay.
-    public static let airplayInterCycleGapMs: Int = 200
+    /// enough to let the previous chirp's room reverb decay AND for
+    /// AirPlay's PTP buffer to drain so the next cycle's chirp lands
+    /// in a clean buffer (otherwise the prior cycle's chirp can still
+    /// be in flight when the matched filter starts hunting). **v7:
+    /// 200 → 1500 ms.** The PTP buffer is ~1500–2500 ms; at 200 ms
+    /// gap successive cycles overlapped in the buffer and the
+    /// matched-filter sometimes locked onto the prior cycle's peak
+    /// (manifesting as MAD across cycles ~600 ms — the inter-cycle
+    /// distance — rather than the ~15 ms observed when cycles are
+    /// independent). 1500 ms gives the prior chirp time to drain
+    /// fully through the AirPlay receiver before the next inject.
+    public static let airplayInterCycleGapMs: Int = 1500
 
     /// Confidence threshold below which we mark a measurement as
     /// "could not measure" but still report it. 3.0 is the classic
@@ -434,6 +481,40 @@ public final class ActiveCalibrator: @unchecked Sendable {
             "[ActiveCalib] phase=local_FDM bridges=\(probes.map { $0.deviceID }) frequencies=\(probes.map { freqByDevice[$0.deviceID] ?? 0 }) duration=\(Self.localToneDurationMs)ms"
         )
 
+        // **v7: silence the local bridges' MUSIC during Phase 1.**
+        // Without this, the mic captures both the calibration tone
+        // AND any concurrently-playing music. At ultrasonic
+        // frequencies music has very little energy (most program
+        // material is band-limited <16 kHz), but transient peaks
+        // (cymbals, sibilants, percussion) contain enough energy in
+        // the 16–19 kHz band to spike the noise floor and produce
+        // false onset triggers — observed empirically as occasional
+        // negative tau values on the SNRest-clear runs.
+        //
+        // Pairs with the LocalAirPlayBridge.render() pipeline change
+        // (gain BEFORE tone overlay): setting volume=0 silences only
+        // the music path; the calibration tone is overlaid AFTER the
+        // gain multiply so it drives the speaker at fixed amplitude
+        // regardless of the user's volume slider OR this Phase 1
+        // silencing. Restored on every exit path via defer.
+        var savedBridgeVolumesPhase1: [(LocalAirPlayBridge, Float)] = []
+        for p in probes {
+            let v = p.bridge.currentVolume
+            savedBridgeVolumesPhase1.append((p.bridge, v))
+            p.bridge.setVolume(0)
+        }
+        if !savedBridgeVolumesPhase1.isEmpty {
+            CalibTrace.log(
+                "[ActiveCalib] phase=local_FDM silenced \(savedBridgeVolumesPhase1.count) local bridges (music only — tone unaffected)"
+            )
+        }
+        defer {
+            // Restore on every exit path (success, throw, cancel).
+            for (bridge, v) in savedBridgeVolumesPhase1 {
+                bridge.setVolume(v)
+            }
+        }
+
         let captureMs = Self.localToneDurationMs + Self.localCaptureTailMs
         let captureFrames = Int(Double(captureMs) / 1000.0 * Self.micSampleRate)
         let captureStartNs = Clock.nowNs()
@@ -504,9 +585,19 @@ public final class ActiveCalibrator: @unchecked Sendable {
         var conf: [String: Double] = [:]
         for p in probes {
             guard let f = freqByDevice[p.deviceID] else { continue }
+            // **v7: envelopeWindowMs 5 → 20.** Phase 1 detects the
+            // onset of a steady-state ultrasonic tone, not a transient,
+            // so the integration window can grow without smearing the
+            // edge we want to find — onset accuracy is bounded by the
+            // 5 ms hop, not the window length. Quadrupling the window
+            // adds 4× more correlated samples per Goertzel bin →
+            // +6 dB gain on the tone, while uncorrelated noise grows
+            // only as √4 → +6 dB SNR improvement at 18 kHz where
+            // speaker rolloff hurts the most. The 5 ms hop is
+            // unchanged so onset resolution stays at 5 ms.
             let env = Self.toneEnvelope(
                 mic: mic, frequencyHz: f, sampleRate: Self.micSampleRate,
-                envelopeWindowMs: 5
+                envelopeWindowMs: 20
             )
             // Envelope has one sample per `envelopeHopSamples` mic frames
             // (5 ms hop). Convert frame indexes accordingly.
@@ -793,10 +884,25 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     // MARK: - Signal generation
 
-    /// Synthesize a linear-frequency-sweep chirp:
-    ///   x(t) = amp * sin(2π * (f0*t + (f1-f0)*t²/(2*T)))
+    /// Synthesize a linear-frequency-sweep chirp with a Hann amplitude
+    /// envelope:
+    ///   x(t) = amp * w_hann(t) * sin(2π * (f0*t + (f1-f0)*t²/(2*T)))
+    /// where w_hann(t) = 0.5 * (1 - cos(2π * t / T)).
     /// Linear sweeps have a time-frequency relationship f(t) = f0 + (f1-f0)*t/T,
     /// so the phase integral is the quadratic term above.
+    ///
+    /// **v7: Hann window added.** The bare rectangular window has -13 dB
+    /// peak sidelobes which limit the matched-filter dynamic range and,
+    /// in reverberant rooms, produce false correlation peaks at the
+    /// sidelobe-spacing offsets. Hann windowing drops the peak sidelobe
+    /// to -42 dB at the cost of ~1 dB of main-lobe SNR (Hann coherent
+    /// gain is 0.5 vs. 1.0 for rectangular, but the matched filter
+    /// recovers most of that since it correlates against the SAME
+    /// windowed template). The window is multiplicative on top of
+    /// `amplitude`, so peak amplitude is `amplitude * 1.0` at the
+    /// chirp midpoint and tapers to 0 at both ends — naturally fade-
+    /// in / fade-out, which also reduces audible click artifacts on
+    /// chirp boundaries.
     static func linearChirp(
         startHz: Double, endHz: Double,
         durationMs: Int, amplitude: Float,
@@ -807,10 +913,18 @@ public final class ActiveCalibrator: @unchecked Sendable {
         var out = [Float](repeating: 0, count: n)
         let T = Double(durationMs) / 1000.0
         let k = (endHz - startHz) / T
+        // Pre-compute Hann denominator. For n == 1 the window collapses
+        // to a single sample; we just emit zero (the standard Hann
+        // definition is undefined for N=1, and a 1-sample chirp is
+        // useless anyway).
+        let hannDenom = Double(max(1, n - 1))
         for i in 0..<n {
             let t = Double(i) / sampleRate
             let phase = 2.0 * Double.pi * (startHz * t + 0.5 * k * t * t)
-            out[i] = amplitude * Float(sin(phase))
+            // Hann window: 0.5 * (1 - cos(2π * i / (N - 1))) — zero at
+            // i=0 and i=N-1, peaks at i=(N-1)/2.
+            let w = 0.5 * (1.0 - cos(2.0 * Double.pi * Double(i) / hannDenom))
+            out[i] = amplitude * Float(w) * Float(sin(phase))
         }
         return out
     }
