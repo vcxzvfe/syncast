@@ -426,125 +426,23 @@ public actor Router {
         // independent of the user's audio content.
         //
         // The legacy `pulseCount` parameter is ignored — Phase 1 and
-        // Phase 2 timings come from `ActiveCalibrator` defaults.
+        // Phase 2 timings come from `ActiveCalibrator` defaults. Body
+        // delegated to `runCalibrationRaw` (also used by the continuous
+        // loop) so probe-build / routing-restore plumbing is single-
+        // sourced.
         _ = pulseCount
 
         let enabled = devices.filter { routing[$0.id]?.enabled == true }
         guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
-
-        // Snapshot the user's pre-calibration routing so we can restore
-        // on every exit path (Phase 2 mutes other AirPlay receivers
-        // mid-cycle; a throw between mutes would otherwise leave them
-        // muted indefinitely).
-        let originalRouting: [String: DeviceRouting] = Dictionary(
-            uniqueKeysWithValues: enabled.compactMap { dev -> (String, DeviceRouting)? in
-                guard let r = routing[dev.id] else { return nil }
-                return (dev.id, r)
-            }
-        )
-
-        // Build local + airplay probe lists for ActiveCalibrator. Local
-        // probes carry the bridge handle directly; AirPlay probes carry
-        // the device id + original volume so Phase 2 can mute and
-        // restore via the supplied closure.
-        let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
-        var localProbes: [ActiveCalibrator.LocalProbe] = []
-        var airplayProbes: [ActiveCalibrator.AirPlayProbe] = []
-        for dev in enabled {
-            switch dev.transport {
-            case .coreAudio:
-                if let bridge = bridgeSnapshot[dev.id] {
-                    localProbes.append(.init(deviceID: dev.id, bridge: bridge))
-                }
-                // Stereo-mode local outputs (no bridge) currently can't
-                // play the per-device pilot tone — they'd need an
-                // analogous override on `LocalOutput`. v4 deliberately
-                // scopes to whole-home mode (which is where calibration
-                // matters anyway — stereo mode has no AirPlay devices to
-                // align against). Stereo-mode locals are silently
-                // dropped from the probe set.
-            case .airplay2:
-                let origVol = originalRouting[dev.id]?.volume ?? 1.0
-                airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
-            }
-        }
-
-        // The chirp injection closure: write the chirp PCM into the SCK
-        // ring at the requested wall-clock anchor. We honor the anchor
-        // via a microsleep — the actor's serial executor drives this
-        // through a Task, so the anchor must be relative to the same
-        // monotonic clock the mic capture uses (Clock.nowNs).
-        let ring = sckCapture.ringBuffer
-        let injectChirpToRing: @Sendable (
-            _ samples: [[Float]], _ atNs: UInt64
-        ) async -> Void = { samples, atNs in
-            let nowNs = Clock.nowNs()
-            if atNs > nowNs {
-                try? await Task.sleep(nanoseconds: atNs - nowNs)
-            }
-            guard samples.count >= 2,
-                  !samples[0].isEmpty,
-                  samples[0].count == samples[1].count
-            else { return }
-            let frames = samples[0].count
-            samples[0].withUnsafeBufferPointer { ch0 in
-                samples[1].withUnsafeBufferPointer { ch1 in
-                    let ptrArray: [UnsafePointer<Float>] = [
-                        ch0.baseAddress!, ch1.baseAddress!,
-                    ]
-                    ptrArray.withUnsafeBufferPointer { ptrs in
-                        ring.write(channels: ptrs.baseAddress!, frames: frames)
-                    }
-                }
-            }
-        }
-
-        let airplaySetter: ActiveCalibrator.AsyncAirplayVolumeSetter = {
-            [weak self] devID, vol in
-            await self?.setAirplayVolume(id: devID, volume: vol)
-        }
-
         progress?("Calibrating \(enabled.count) device\(enabled.count == 1 ? "" : "s") (active signals)…")
-
-        let calibrator = ActiveCalibrator(microphoneDeviceID: microphoneDeviceID)
-
-        var didRestore = false
-        func restoreOriginalRouting() async {
-            if didRestore { return }
-            didRestore = true
-            for (id, r) in originalRouting {
-                routing[id] = r
-            }
-            replan()
-            // Re-push AirPlay volumes — Phase 2 muted others to 0 and
-            // ActiveCalibrator's defer block restores best-effort, but
-            // sidecar-side IPC may have raced. Belt-and-braces.
-            for dev in enabled where dev.transport == .airplay2 {
-                let v = originalRouting[dev.id]?.volume ?? 1.0
-                await setAirplayVolume(id: dev.id, volume: v)
-            }
-        }
-
-        do {
-            try Task.checkCancellation()
-            let result = try await calibrator.run(
-                localProbes: localProbes,
-                airplayProbes: airplayProbes,
-                setAirplayVolume: airplaySetter,
-                injectChirpToRing: injectChirpToRing,
-                sckRingSampleRate: sckCapture.sampleRate
-            )
-            await restoreOriginalRouting()
-            return CalibrationDelta(
-                deltaMs: result.deltaMs,
-                confidence: result.aggregateConfidence,
-                perDeviceOffsetMs: result.perDeviceTauMs
-            )
-        } catch {
-            await restoreOriginalRouting()
-            if error is CancellationError { throw error }
-            throw CalibrationFailure.engineFailed("\(error)")
-        }
+        let result = try await runCalibrationRaw(
+            devices: devices, microphoneDeviceID: microphoneDeviceID
+        )
+        return CalibrationDelta(
+            deltaMs: result.deltaMs,
+            confidence: result.aggregateConfidence,
+            perDeviceOffsetMs: result.perDeviceTauMs
+        )
     }
 
     // MARK: - Frequency-Response Sweep (diagnostic)
@@ -1436,27 +1334,42 @@ public actor Router {
         return result as? [String: Any]
     }
 
-    // MARK: - Passive continuous calibration
+    // MARK: - Passive continuous calibration (DEPRECATED)
     //
     // Owns one PassiveCalibrator: a continuous mic AUHAL + a 30-s loop
-    // that GCC-PHATs the SCK ring against the live mic capture. Each
-    // Sample above `minConfidenceForUpdate` (default 0.5) is forwarded
-    // to `local_fifo.set_delay_ms`. UI polls `lastPassiveSample` for
-    // diagnostics; it never touches `PassiveCalibrator` directly.
+    // that GCC-PHATs the SCK ring against the live mic capture. The
+    // engine is unreliable in practice (single-peak detection on
+    // shared music can't distinguish per-device, gives ±100 ms
+    // run-to-run variance + bad absolute values) so this entire
+    // section is preserved only for source compatibility — current
+    // continuous calibration goes through
+    // `startContinuousActiveCalibration` below. The `@available`
+    // annotation suppresses deprecation warnings on the legacy
+    // PassiveCalibrator references kept here.
+    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
     public private(set) var passiveCalibrator: PassiveCalibrator?
+    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
     public private(set) var lastPassiveSample: PassiveCalibrator.Sample?
     /// External subscriber, set by `startPassiveCalibration(...,onSampleAvailable:)`.
     /// Invoked synchronously inside the actor in `handlePassiveSample`
     /// (off the calibrator's own thread) so the UI sees samples promptly,
     /// independent of the sidecar push latency.
-    private var externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)?
+    @available(*, deprecated)
+    private var externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)? {
+        get { _externalPassiveSampleCallback }
+        set { _externalPassiveSampleCallback = newValue }
+    }
+    @available(*, deprecated)
+    private var _externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)?
     /// Bumped on every Sample callback (above threshold). Useful for
     /// diagnosing "engine alive vs. not converging".
+    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
     public private(set) var passiveSampleCount: Int = 0
 
     /// Begin passive calibration. Idempotent. `microphoneDeviceID = nil`
     /// uses the system default input. Throws on mic-permission denial
     /// or no-input-device.
+    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
     public func startPassiveCalibration(
         microphoneDeviceID: AudioDeviceID? = nil,
         intervalSeconds: Int? = nil,
@@ -1489,6 +1402,7 @@ public actor Router {
     }
 
     /// Stop passive calibration. Idempotent.
+    @available(*, deprecated, message: "Use stopContinuousActiveCalibration instead.")
     public func stopPassiveCalibration() {
         passiveCalibrator?.stop()
         passiveCalibrator = nil
@@ -1498,6 +1412,7 @@ public actor Router {
     /// Cache + forward to the broadcaster. Clamp matches sidecar's own
     /// [0, 10 000] range so a stray negative-lag peak doesn't trigger
     /// spurious clamp warnings sidecar-side.
+    @available(*, deprecated)
     private func handlePassiveSample(_ sample: PassiveCalibrator.Sample) async {
         passiveSampleCount &+= 1
         lastPassiveSample = sample
@@ -1515,6 +1430,7 @@ public actor Router {
 
     /// Mutate tunables from outside the actor. No-op if calibrator
     /// hasn't been started. Each parameter is independently optional.
+    @available(*, deprecated)
     public func updatePassiveTunables(
         correlationWindowSeconds: Double? = nil,
         measurementIntervalSeconds: Double? = nil,
@@ -1524,5 +1440,191 @@ public actor Router {
         if let v = correlationWindowSeconds { c.correlationWindowSeconds = v }
         if let v = measurementIntervalSeconds { c.measurementIntervalSeconds = v }
         if let v = minConfidenceForUpdate { c.minConfidenceForUpdate = v }
+    }
+
+    // MARK: - Continuous v4 active calibration
+    //
+    // Wraps `ActiveCalibrator` in a periodic background loop. Each
+    // cycle re-uses `runCalibrationRaw` (same plumbing as the manual
+    // one-shot button) and pushes the corrected delay through the
+    // existing `setLocalFifoDelayMs` IPC. Replaces the GCC-PHAT
+    // passive engine, which couldn't distinguish per-device taus.
+    public private(set) var continuousActiveCalibrator: ContinuousActiveCalibrator?
+    public private(set) var lastContinuousActiveSample: ContinuousActiveCalibrator.Sample?
+    /// Cached most-recent delay-line value. Read by the loop's
+    /// `initialDelayMs` callback so each cycle's delta is computed
+    /// against the freshest value rather than the original seed.
+    private var continuousActiveCurrentDelayMs: Int = 1750
+    public typealias ContinuousActiveDeviceProvider =
+        @Sendable () async -> [Device]
+
+    /// Begin continuous v4 active calibration. Idempotent. `runner`
+    /// re-enters `runCalibrationRaw` so routing / volume / restore is
+    /// single-sourced.
+    public func startContinuousActiveCalibration(
+        intervalSeconds: Int,
+        microphoneDeviceID: AudioDeviceID?,
+        initialDelayMs: Int,
+        deviceProvider: @escaping ContinuousActiveDeviceProvider,
+        onSample: @escaping @Sendable (ContinuousActiveCalibrator.Sample) -> Void
+    ) async throws {
+        if continuousActiveCalibrator != nil { return }
+        continuousActiveCurrentDelayMs = max(0, min(5000, initialDelayMs))
+        let calibrator = ContinuousActiveCalibrator(
+            runner: { [weak self] in
+                guard let self else { throw CalibrationFailure.engineFailed("router gone") }
+                let devs = await deviceProvider()
+                return try await self.runCalibrationRaw(
+                    devices: devs, microphoneDeviceID: microphoneDeviceID
+                )
+            },
+            applyDelayMs: { [weak self] ms in
+                await self?.applyContinuousActiveDelay(ms)
+            },
+            initialDelayMs: { [weak self] in
+                return await self?.continuousActiveDelaySnapshot() ?? 0
+            },
+            onSample: { [weak self] sample in
+                guard let self else { return }
+                Task { await self.recordContinuousActiveSample(sample) }
+                onSample(sample)
+            }
+        )
+        calibrator.measurementIntervalSeconds = Double(intervalSeconds)
+        do {
+            try await calibrator.start()
+        } catch {
+            lastError = "continuous active calibration start failed: \(error)"
+            throw error
+        }
+        continuousActiveCalibrator = calibrator
+    }
+
+    /// Stop the continuous loop. Idempotent.
+    public func stopContinuousActiveCalibration() {
+        continuousActiveCalibrator?.stop()
+        continuousActiveCalibrator = nil
+        lastContinuousActiveSample = nil
+    }
+
+    fileprivate func continuousActiveDelaySnapshot() -> Int {
+        return continuousActiveCurrentDelayMs
+    }
+
+    /// Cache + push to broadcaster. Failures surface in `lastError`
+    /// but don't propagate — the next cycle retries.
+    private func applyContinuousActiveDelay(_ ms: Int) async {
+        let clamped = max(0, min(10_000, ms))
+        continuousActiveCurrentDelayMs = max(0, min(5000, ms))
+        do {
+            _ = try await setLocalFifoDelayMs(clamped)
+        } catch {
+            lastError = "continuous active set_delay_ms failed: \(error)"
+        }
+    }
+
+    private func recordContinuousActiveSample(
+        _ sample: ContinuousActiveCalibrator.Sample
+    ) {
+        lastContinuousActiveSample = sample
+    }
+
+    /// Variant of `runCalibration` that returns the raw
+    /// `ActiveCalibrator.Result` instead of the squashed
+    /// `CalibrationDelta`. The continuous loop needs the full result
+    /// (per-device taus, aggregate confidence) so it can run its own
+    /// drift / confidence policies; the manual one-shot caller only
+    /// needs the squashed delta + summary so the existing API is left
+    /// alone.
+    fileprivate func runCalibrationRaw(
+        devices: [Device], microphoneDeviceID: AudioDeviceID?
+    ) async throws -> ActiveCalibrator.Result {
+        let enabled = devices.filter { routing[$0.id]?.enabled == true }
+        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
+
+        let originalRouting: [String: DeviceRouting] = Dictionary(
+            uniqueKeysWithValues: enabled.compactMap { dev -> (String, DeviceRouting)? in
+                guard let r = routing[dev.id] else { return nil }
+                return (dev.id, r)
+            }
+        )
+
+        let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
+        var localProbes: [ActiveCalibrator.LocalProbe] = []
+        var airplayProbes: [ActiveCalibrator.AirPlayProbe] = []
+        for dev in enabled {
+            switch dev.transport {
+            case .coreAudio:
+                if let bridge = bridgeSnapshot[dev.id] {
+                    localProbes.append(.init(deviceID: dev.id, bridge: bridge))
+                }
+            case .airplay2:
+                let origVol = originalRouting[dev.id]?.volume ?? 1.0
+                airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
+            }
+        }
+
+        let ring = sckCapture.ringBuffer
+        let injectChirpToRing: @Sendable (
+            _ samples: [[Float]], _ atNs: UInt64
+        ) async -> Void = { samples, atNs in
+            let nowNs = Clock.nowNs()
+            if atNs > nowNs {
+                try? await Task.sleep(nanoseconds: atNs - nowNs)
+            }
+            guard samples.count >= 2,
+                  !samples[0].isEmpty,
+                  samples[0].count == samples[1].count
+            else { return }
+            let frames = samples[0].count
+            samples[0].withUnsafeBufferPointer { ch0 in
+                samples[1].withUnsafeBufferPointer { ch1 in
+                    let ptrArray: [UnsafePointer<Float>] = [
+                        ch0.baseAddress!, ch1.baseAddress!,
+                    ]
+                    ptrArray.withUnsafeBufferPointer { ptrs in
+                        ring.write(channels: ptrs.baseAddress!, frames: frames)
+                    }
+                }
+            }
+        }
+
+        let airplaySetter: ActiveCalibrator.AsyncAirplayVolumeSetter = {
+            [weak self] devID, vol in
+            await self?.setAirplayVolume(id: devID, volume: vol)
+        }
+
+        let calibrator = ActiveCalibrator(microphoneDeviceID: microphoneDeviceID)
+
+        var didRestore = false
+        func restoreOriginalRouting() async {
+            if didRestore { return }
+            didRestore = true
+            for (id, r) in originalRouting {
+                routing[id] = r
+            }
+            replan()
+            for dev in enabled where dev.transport == .airplay2 {
+                let v = originalRouting[dev.id]?.volume ?? 1.0
+                await setAirplayVolume(id: dev.id, volume: v)
+            }
+        }
+
+        do {
+            try Task.checkCancellation()
+            let result = try await calibrator.run(
+                localProbes: localProbes,
+                airplayProbes: airplayProbes,
+                setAirplayVolume: airplaySetter,
+                injectChirpToRing: injectChirpToRing,
+                sckRingSampleRate: sckCapture.sampleRate
+            )
+            await restoreOriginalRouting()
+            return result
+        } catch {
+            await restoreOriginalRouting()
+            if error is CancellationError { throw error }
+            throw CalibrationFailure.engineFailed("\(error)")
+        }
     }
 }

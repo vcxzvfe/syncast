@@ -143,10 +143,14 @@ final class AppModel {
                    airplayDelayMsRange.upperBound)
     }
 
-    // MARK: - Background passive calibration
-    // Continuous variant of Auto-calibrate; PassiveCalibrator engine
-    // (lands in router separately) emits a Sample every N seconds and
-    // we push its suggestedDelayMs through setAirplayDelay.
+    // MARK: - Background continuous v4 active calibration
+    // Replaces the previous PassiveCalibrator-based engine, which used
+    // GCC-PHAT against shared music — that approach can't distinguish
+    // per-device latencies and produced ±100 ms run-to-run noise plus
+    // bad absolute values. The new path drives `ActiveCalibrator`
+    // (per-device unique probes, FDM for locals + TDMA mute-dip for
+    // AirPlay) on a fixed cadence and applies the corrected delay
+    // when measured drift exceeds 30 ms with sufficient confidence.
     var backgroundCalibrationEnabled: Bool = AppModel.loadPersistedBgEnabled() {
         didSet {
             UserDefaults.standard.set(backgroundCalibrationEnabled, forKey: AppModel.bgEnabledKey)
@@ -164,7 +168,9 @@ final class AppModel {
             restartBackgroundCalibrationIfActive()
         }
     }
-    var lastCalibrationSample: PassiveCalibrator.Sample? = nil
+    /// Most recent Sample emitted by the continuous loop. The popover
+    /// renders this in the "Continuous" status caption.
+    var lastCalibrationSample: ContinuousActiveCalibrator.Sample? = nil
     /// True iff the engine is running (toggle on + bad preconditions → false).
     var backgroundCalibrationActive: Bool = false
     /// Toggle on but mic permission denied/restricted.
@@ -1020,11 +1026,15 @@ final class AppModel {
         URL(fileURLWithPath: "/tmp/syncast-\(getuid()).calibration.sock")
     }
 
-    // MARK: - Background passive calibration lifecycle
+    // MARK: - Background continuous calibration lifecycle
 
     /// Drive the calibrator engine on or off. Idempotent. Wired into
     /// mode/streamingState/permission/toggle observers. ACTIVE iff:
-    /// wholeHome AND running AND enabled AND mic-OK.
+    /// wholeHome AND running AND enabled AND mic-OK. The Router runs
+    /// the v4 ContinuousActiveCalibrator loop which periodically
+    /// drives ActiveCalibrator and pushes corrected delay values
+    /// through setLocalFifoDelayMs internally; this AppModel layer
+    /// just records samples for the UI caption.
     func reconcileBackgroundCalibration() {
         // Pause for manual one-shot: stop engine, hold here.
         if continuousPausedForManual {
@@ -1048,14 +1058,26 @@ final class AppModel {
             backgroundCalibrationActive = true
             let interval = backgroundCalibrationIntervalS
             let micID = effectiveMicID
-            SyncCastLog.log("bgCalib: starting interval=\(interval)s mic=\(micID.map(String.init) ?? "default")")
+            let initialDelay = airplayDelayMs
+            SyncCastLog.log("bgCalib: starting (v4 active) interval=\(interval)s mic=\(micID.map(String.init) ?? "default") initialDelay=\(initialDelay)ms")
             Task { [weak self] in
                 guard let self else { return }
+                // Provider closure: captured weakly so a torn-down
+                // AppModel doesn't hold the loop alive. Returns the
+                // empty list on shutdown — the runner will fail with
+                // noEnabledDevices and the next cycle will retry.
+                let deviceProvider: @Sendable () async -> [Device] = {
+                    [weak self] in
+                    guard let self else { return [] }
+                    return await MainActor.run { self.devices }
+                }
                 do {
-                    try await self.router.startPassiveCalibration(
-                        microphoneDeviceID: micID,
+                    try await self.router.startContinuousActiveCalibration(
                         intervalSeconds: interval,
-                        onSampleAvailable: { sample in
+                        microphoneDeviceID: micID,
+                        initialDelayMs: initialDelay,
+                        deviceProvider: deviceProvider,
+                        onSample: { sample in
                             Task { @MainActor [weak self] in
                                 self?.handleBackgroundCalibrationSample(sample)
                             }
@@ -1081,7 +1103,7 @@ final class AppModel {
     private func stopBackgroundCalibration(thenReconcile: Bool) {
         Task { [weak self] in
             guard let self else { return }
-            await self.router.stopPassiveCalibration()
+            await self.router.stopContinuousActiveCalibration()
             await MainActor.run {
                 self.backgroundCalibrationActive = false
                 self.lastCalibrationSample = nil
@@ -1095,10 +1117,24 @@ final class AppModel {
         stopBackgroundCalibration(thenReconcile: true)
     }
 
-    private func handleBackgroundCalibrationSample(_ sample: PassiveCalibrator.Sample) {
+    /// Receive a Sample from the continuous loop. Router has already
+    /// pushed any delay-line correction through setLocalFifoDelayMs
+    /// (when |delta| ≥ 30 ms AND confidence ≥ floor); we just mirror
+    /// the applied value into airplayDelayMs so the slider reflects
+    /// reality and surface the sample for the UI caption.
+    private func handleBackgroundCalibrationSample(_ sample: ContinuousActiveCalibrator.Sample) {
         lastCalibrationSample = sample
-        SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDelayMs)ms suggested=\(sample.suggestedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
-        setAirplayDelay(sample.suggestedDelayMs)
+        SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDeltaMs)ms applied=\(sample.appliedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
+        // Mirror the loop-applied value so the slider stays in sync.
+        // We bypass `setAirplayDelay`'s debounced sidecar push — the
+        // loop already pushed via setLocalFifoDelayMs — and just
+        // update the UI-facing field + persist.
+        if airplayDelayMs != sample.appliedDelayMs {
+            airplayDelayMs = sample.appliedDelayMs
+            UserDefaults.standard.set(
+                sample.appliedDelayMs, forKey: AppModel.airplayDelayMsKey
+            )
+        }
     }
 
     /// Permission flow when the user toggles Continuous on. Mirrors

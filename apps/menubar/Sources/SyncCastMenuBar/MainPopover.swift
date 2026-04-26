@@ -189,8 +189,13 @@ struct MainPopover: View {
             return "Active — waiting for sample"
         }
         let age = max(0, Int(Date().timeIntervalSince(sample.timestamp)))
-        let pct = Int((sample.confidence * 100).rounded())
-        return "Active — last sample \(sample.measuredDelayMs) ms drift (\(pct)% confidence) \(age)s ago"
+        // ActiveCalibrator's aggregate confidence is an SNR (≥ 3 ⇒
+        // detection threshold, higher ⇒ better). Map to a 0–100%
+        // display by saturating at 20 — empirically a "very clean"
+        // measurement runs 10–30, and treating 20+ as "100% confident"
+        // keeps the popover caption readable.
+        let pct = min(100, Int((sample.confidence / 20.0 * 100).rounded()))
+        return "Active — last drift \(sample.measuredDeltaMs) ms (applied \(sample.appliedDelayMs) ms, \(pct)% confidence) \(age)s ago"
     }
 
     private var autoCalibrateLabel: String {
