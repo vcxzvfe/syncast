@@ -547,6 +547,57 @@ public actor Router {
         }
     }
 
+    // MARK: - Frequency-Response Sweep (diagnostic)
+    //
+    // Drives every enabled LOCAL bridge through a frequency sweep so the
+    // operator can pick the highest frequency that still clears a target
+    // SNR on the user's mic + speaker chain. Goal: enable v4+
+    // calibration to use ultrasonic probes (>17 kHz, inaudible to most
+    // adults) so calibration can run silently while music plays.
+    //
+    // AirPlay is intentionally NOT swept — playing different tones on
+    // different AirPlay receivers requires TDMA mute/unmute (~3 s
+    // overhead per device per frequency) and a more complex chirp-injection
+    // path. The summary string surfaces "airplay frequency response =
+    // unknown without per-device path" so the caller knows.
+    public func runFrequencyResponseTest(
+        devices: [Device],
+        microphoneDeviceID: AudioDeviceID? = nil,
+        frequencies: [Double] = [
+            500, 1000, 2000, 4000, 8000, 12000, 14000,
+            15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000,
+        ],
+        toneAmplitude: Float = 0.1,
+        toneDurationMs: Int = 500
+    ) async throws -> FrequencyResponseResult {
+        let enabled = devices.filter { routing[$0.id]?.enabled == true }
+        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
+        let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
+        var probes: [ActiveCalibrator.FrequencyResponseProbe] = []
+        for dev in enabled where dev.transport == .coreAudio {
+            if let bridge = bridgeSnapshot[dev.id] {
+                probes.append(.init(deviceID: dev.id, bridge: bridge))
+            }
+        }
+        guard !probes.isEmpty else {
+            throw CalibrationFailure.engineFailed(
+                "frequency-response sweep requires whole-home mode with at least one local bridge enabled"
+            )
+        }
+        let calibrator = ActiveCalibrator(microphoneDeviceID: microphoneDeviceID)
+        do {
+            return try await calibrator.runFrequencyResponseSweep(
+                probes: probes,
+                frequencies: frequencies,
+                toneAmplitude: toneAmplitude,
+                toneDurationMs: toneDurationMs
+            )
+        } catch {
+            if error is CancellationError { throw error }
+            throw CalibrationFailure.engineFailed("\(error)")
+        }
+    }
+
     // MARK: - Calibration diagnostic socket
     //
     // Bring up / tear down the Unix-socket listener that lets
@@ -581,6 +632,15 @@ public actor Router {
                     deltaMs: delta.deltaMs,
                     confidence: delta.confidence,
                     perDeviceOffsetMs: delta.perDeviceOffsetMs
+                )
+            },
+            freqRunner: { [weak self] snap in
+                guard let self else {
+                    throw CalibrationFailure.engineFailed("router gone")
+                }
+                return try await self.runFrequencyResponseTest(
+                    devices: snap.devices,
+                    microphoneDeviceID: snap.microphoneDeviceID
                 )
             }
         )
