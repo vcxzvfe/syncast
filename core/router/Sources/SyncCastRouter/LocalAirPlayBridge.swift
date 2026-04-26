@@ -142,35 +142,23 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// (single Float read).
     ///
     /// Default 1.0 means "no attenuation"; setting to 0 mutes the
-    /// device. Clamped to [0, 1] in `setVolume`.
-    private var _volumeGain: Float = 1.0
+    /// device. Clamped to [0, 1] in `setVolume`. `setVolume` updates
+    /// `_volumeGainTarget`; the render callback ramps `_current`
+    /// toward target across `volumeRampMs` (~10 ms) so volume changes
+    /// don't click on non-zero signal (FIX 2a).
+    private var _volumeGainCurrent: Float = 1.0
+    private var _volumeGainTarget: Float = 1.0
+    private static let volumeRampMs: Double = 10.0
 
-    // MARK: - Calibration tone override (v4 ActiveCalibrator)
+    // MARK: - Calibration tone (additive, v4 ActiveCalibrator — FIX 1)
     //
-    // When `_calibToneActive` is true, the render callback ignores the
-    // ring and synthesizes a fixed-frequency sine wave per AUHAL block.
-    // Used by `ActiveCalibrator` Phase 1 (local FDM) so each enabled
-    // bridge plays a unique pilot tone (e.g. 1 kHz on bridge_0, 2 kHz on
-    // bridge_1, …) the room mic can identify by bandpass-filtering.
-    //
-    // Why a separate override path rather than mixing the tone INTO the
-    // ring stream: mixing would require buffering both at sample-accurate
-    // alignment with whatever OwnTone's player thread is producing right
-    // now, which is exactly the cross-clock domain we're trying to
-    // *measure*. Replacing the output for ~1.5 s side-steps the issue:
-    // the tone IS the audio for that window, the user hears a brief
-    // pilot, and we get the cleanest possible stimulus for onset
-    // detection.
-    //
-    // Threading:
-    //   * `startCalibrationTone(frequency:)` / `stopCalibrationTone()`
-    //     are called from the actor; they take `stateLock` to publish
-    //     the new state atomically.
-    //   * The render callback reads the snapshot under the same lock
-    //     once per AUHAL block (already does this for `_volumeGain`).
-    //   * Phase accumulator is owned by the render callback; the
-    //     start/stop calls reset it when toggling so the first sample
-    //     after activation is at phase=0 (clean attack edge).
+    // When `_calibToneActive`, render() ADDS a fixed-frequency sine on
+    // top of music pulled from the ring — music never pauses. Mic
+    // detects the pilot via bandpass (program material is near-silent
+    // at 17–20 kHz where pilots live). Threading: start/stop publish
+    // under `stateLock`; render() snapshots once per block (same lock
+    // as gain ramp). Phase accumulator is render-thread-owned; start/
+    // stop reset it so the first post-toggle sample is at phase=0.
     private var _calibToneActive: Bool = false
     private var _calibToneFreqHz: Double = 1000.0
     private var _calibToneAmp: Float = 0.05
@@ -178,12 +166,25 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// so we don't bother with the lock for it. Reset under the lock
     /// when start/stop transitions fire.
     private var _calibTonePhase: Double = 0.0
-    /// One-shot ramp counter used to fade the tone in/out across a few
-    /// ms so the AUHAL block doesn't pop. Counts in render samples,
-    /// decremented each render block. Sign carries direction:
-    /// `> 0` ⇒ fade-in, `< 0` ⇒ fade-out, `== 0` ⇒ steady (or off).
+    /// Tone fade ramp counter (samples). Sign: `>0` fade-in, `<0`
+    /// fade-out, `0` steady. Bumped 5 → 20 ms (FIX 2b) for additive
+    /// mode where the envelope sums against music.
     private var _calibToneRampSamples: Int = 0
-    private static let calibToneRampMs: Double = 5.0
+    private static let calibToneRampMs: Double = 20.0
+
+    // MARK: - Drift-resync diagnostics (FIX 2d)
+    // render() stamps event metadata under the lock; the non-RT
+    // reader task drains via `drainDriftResyncLog` → `CalibTrace`.
+    private var _resyncSeqWritten: UInt64 = 0
+    private var _resyncSeqLogged: UInt64 = 0
+    private var _resyncFromCursor: Int64 = 0
+    private var _resyncToTarget: Int64 = 0
+    private var _resyncWritePos: Int64 = 0
+    /// Stored as `StaticString` so the render-thread store does NOT
+    /// allocate (Swift `String(describing:)` would heap-allocate).
+    /// Stringification happens in the non-RT drain function.
+    private var _resyncReason: StaticString = ""
+    public private(set) var driftResyncCount: UInt64 = 0
 
     public init(
         deviceID: AudioObjectID,
@@ -246,27 +247,23 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// bit depth).
     public func setVolume(_ v: Float) {
         let clamped = max(0, min(1, v))
-        stateLock.withLock { _volumeGain = clamped }
+        stateLock.withLock { _volumeGainTarget = clamped }
     }
 
-    /// Read the current software-gain value. Useful for snapshot/restore
-    /// workflows like the Phase-2 calibration flow that temporarily
-    /// silences the bridge while running an AirPlay-only test.
+    /// Read the current software-gain TARGET (last value passed to
+    /// `setVolume`), not the in-flight ramp value — set/get symmetry
+    /// matters for Phase-2 snapshot/restore.
     public var currentVolume: Float {
-        stateLock.withLock { _volumeGain }
+        stateLock.withLock { _volumeGainTarget }
     }
 
     // MARK: - Calibration tone override (v4 ActiveCalibrator)
 
-    /// Begin emitting a sine pilot tone at `frequencyHz` (amplitude
-    /// `amplitude`, default 0.05 ≈ −26 dBFS) on every render block.
-    /// Replaces the ring read for the duration; the user hears the tone
-    /// instead of music. Call `stopCalibrationTone()` to restore normal
-    /// playback. `amplitude` is clamped to [0, 1].
-    ///
-    /// The render callback fades in over ~5 ms to avoid a click on
-    /// activation. Resets `_calibTonePhase` to zero for a clean rising
-    /// edge — this is what the mic-side onset detector keys off of.
+    /// Mix a sine pilot tone (amplitude clamped to [0, 1], default
+    /// 0.05 ≈ −26 dBFS) ADDITIVELY on top of the music (FIX 1). 20 ms
+    /// fade-in. Phase is reset so the first sample after activation
+    /// is at phase=0 — this is what the mic-side onset detector keys
+    /// off of.
     public func startCalibrationTone(
         frequencyHz: Double, amplitude: Float = 0.05
     ) {
@@ -281,9 +278,8 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         }
     }
 
-    /// Stop the calibration tone and resume reading from the ring on
-    /// the next render block. Triggers a ~5 ms fade-out so the
-    /// transition back to live audio doesn't pop.
+    /// Stop the additive tone with a 20 ms fade-out; music continues
+    /// uninterrupted (FIX 1).
     public func stopCalibrationTone() {
         let rampSamples = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
         stateLock.withLock {
@@ -458,6 +454,8 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             chansPtr[1] = UnsafePointer(scratchFloat[1])
             ring.write(channels: chansPtr, frames: n)
             packetsReceived &+= 1
+            // Drain drift-resync events (FIX 2d, non-RT side).
+            drainDriftResyncLog()
         }
     }
 
@@ -643,29 +641,31 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
     /// AUHAL render callback. Real-time thread: NO allocations, NO
     /// async, NO Swift runtime calls beyond the unfair-lock acquire.
+    /// Pipeline (FIX 1): always-path ring read → optional additive
+    /// tone overlay → software-gain ramp last so volume changes don't
+    /// click (FIX 2a) and the gain scales (music+tone) uniformly.
     private func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         guard let ioData = ioData else { return noErr }
         let bufList = UnsafeMutableAudioBufferListPointer(ioData)
         if bufList.count < channelCount { return noErr }
         if frames <= 0 { return noErr }
 
-        // Snapshot the cursor + volume gain + calibration-tone state
-        // under the lock; advance the cursor after we've copied frames
-        // out (so a concurrent stop() observing the cursor sees a
-        // consistent value). One lock acquisition per render block.
+        // Snapshot the cursor + gain + calibration-tone state under the
+        // lock. One lock acquisition per render block.
         struct RenderSnapshot {
             var cursor: Int64
-            var gain: Float
+            var gainCurrent: Float
+            var gainTarget: Float
             var toneActive: Bool
             var toneFreqHz: Double
             var toneAmp: Float
             var toneRampSamples: Int
         }
-        var toneEndedThisBlock = false
         let snapshot: RenderSnapshot = stateLock.withLock {
             RenderSnapshot(
                 cursor: self.readCursor,
-                gain: self._volumeGain,
+                gainCurrent: self._volumeGainCurrent,
+                gainTarget: self._volumeGainTarget,
                 toneActive: self._calibToneActive,
                 toneFreqHz: self._calibToneFreqHz,
                 toneAmp: self._calibToneAmp,
@@ -673,93 +673,13 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             )
         }
 
-        // Fast-path the calibration tone override: skip the ring entirely
-        // and synthesize a fixed-frequency sine into every output channel.
-        // This replaces the user's audio for the duration of Phase 1
-        // (local FDM) — the user hears the pilot tone(s) for ~1.5 s.
-        if snapshot.toneActive {
-            for ch in 0..<channelCount {
-                if let raw = bufList[ch].mData {
-                    outPtrs[ch] = raw.assumingMemoryBound(to: Float.self)
-                } else {
-                    return noErr
-                }
+        // Channel-pointer wiring with the pre-allocated outPtrs slot.
+        for ch in 0..<channelCount {
+            if let raw = bufList[ch].mData {
+                outPtrs[ch] = raw.assumingMemoryBound(to: Float.self)
+            } else {
+                return noErr
             }
-            let omega = 2.0 * Double.pi * snapshot.toneFreqHz / inboundSampleRate
-            var phase = _calibTonePhase
-            let baseAmp = snapshot.toneAmp
-            // Ramp envelope: fade-in (positive remaining) → 1.0 multiplier,
-            // fade-out (negative remaining) → 1.0 → 0 then disable. The
-            // ramp counter counts in samples; we tick it down per sample.
-            var rampRemaining = snapshot.toneRampSamples
-            let rampTotal = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
-            for i in 0..<frames {
-                // Compute envelope multiplier in [0, 1].
-                var envelope: Float = 1.0
-                if rampRemaining > 0 {
-                    // Fade-in: envelope rises linearly 0 → 1.
-                    let progressed = max(0, rampTotal - rampRemaining)
-                    envelope = Float(progressed) / Float(max(1, rampTotal))
-                    rampRemaining -= 1
-                } else if rampRemaining < 0 {
-                    // Fade-out: envelope falls linearly 1 → 0.
-                    let absRem = -rampRemaining
-                    envelope = Float(absRem) / Float(max(1, rampTotal))
-                    rampRemaining += 1
-                    if rampRemaining == 0 {
-                        // Last fade-out sample: signal end of tone.
-                        toneEndedThisBlock = true
-                    }
-                }
-                let s = baseAmp * envelope * Float(sin(phase))
-                phase += omega
-                if phase > 2.0 * Double.pi {
-                    phase -= 2.0 * Double.pi
-                }
-                for ch in 0..<channelCount {
-                    outPtrs[ch][i] = s
-                }
-            }
-            // Persist phase for the next block; persist updated ramp
-            // remainder; if the fade-out completed, flip the active
-            // flag. We snapshot the locals into immutable lets so the
-            // closure passed into `withLock` captures only Sendable
-            // values (Swift 6 strict concurrency).
-            _calibTonePhase = phase
-            let endedSnapshot = toneEndedThisBlock
-            let phaseSnapshot = phase
-            let rampSnapshot = rampRemaining
-            stateLock.withLock {
-                self._calibTonePhase = phaseSnapshot
-                self._calibToneRampSamples = rampSnapshot
-                if endedSnapshot {
-                    self._calibToneActive = false
-                    self._calibToneRampSamples = 0
-                }
-            }
-            // Apply per-bridge software gain on top of the tone (keeps
-            // user's volume slider effective during calibration). Skip
-            // multiply when gain is 1.0 (the common case for active
-            // calibration — we don't want the user's volume to muffle
-            // the pilot tone, but we still respect it if set).
-            if snapshot.gain != 1.0 {
-                var g = snapshot.gain
-                let frameCount = vDSP_Length(frames)
-                for ch in 0..<channelCount {
-                    let p = outPtrs[ch]
-                    vDSP_vsmul(p, 1, &g, p, 1, frameCount)
-                }
-            }
-            renderTickCount &+= 1
-            var pk: Float = 0
-            let nProbe = min(frames, 128)
-            let p0 = outPtrs[0]
-            for i in 0..<nProbe { pk = max(pk, abs(p0[i])) }
-            lastRenderPeak = pk
-            // Don't advance readCursor — when tone deactivates, render()
-            // will resync against the writer's current position via the
-            // `cursor == 0` resync check below.
-            return noErr
         }
 
         let cursor = snapshot.cursor
@@ -788,33 +708,108 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             cursor < lowerValid ||
             cursor > writePos ||
             abs(cursor - target) > driftLimitFrames
-        let startFrame: Int64 = needsResync ? target : cursor
-
-        // Channel-pointer wiring with the pre-allocated outPtrs slot.
-        for ch in 0..<channelCount {
-            if let raw = bufList[ch].mData {
-                outPtrs[ch] = raw.assumingMemoryBound(to: Float.self)
-            } else {
-                return noErr
-            }
+        // Capture which branch fired (FIX 2d diagnostic, no allocs).
+        var resyncReasonLocal: StaticString = ""
+        if needsResync {
+            if cursor == 0 { resyncReasonLocal = "first" }
+            else if cursor < lowerValid { resyncReasonLocal = "underrun" }
+            else if cursor > writePos { resyncReasonLocal = "overrun" }
+            else { resyncReasonLocal = "drift" }
         }
+        let startFrame: Int64 = needsResync ? target : cursor
         ring.read(at: startFrame, frames: frames, into: outPtrs)
 
-        // Apply per-bridge software gain. Skip the multiply when gain
-        // is exactly 1.0 (the common case) so we don't burn vDSP
-        // cycles for a no-op. `vDSP_vsmul` is a real-time-safe
-        // hand-vectorized scalar-multiply that's been stable since
-        // 10.4; preferred over an inline scalar loop because AUHAL's
-        // block size (typically 256–1024 frames per channel) is well
-        // above the threshold where vDSP wins. The diagnostic peak
-        // below is read AFTER the multiply so it reflects what's
-        // actually leaving the AUHAL.
-        if snapshot.gain != 1.0 {
-            var g = snapshot.gain
+        // Additive overlay: mix tone on top of music (`+=`, not `=`).
+        var phase = _calibTonePhase
+        var rampRemaining = snapshot.toneRampSamples
+        var toneEndedThisBlock = false
+        if snapshot.toneActive {
+            let omega = 2.0 * Double.pi * snapshot.toneFreqHz / inboundSampleRate
+            let baseAmp = snapshot.toneAmp
+            let rampTotal = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
+            for i in 0..<frames {
+                var envelope: Float = 1.0
+                if rampRemaining > 0 {
+                    let progressed = max(0, rampTotal - rampRemaining)
+                    envelope = Float(progressed) / Float(max(1, rampTotal))
+                    rampRemaining -= 1
+                } else if rampRemaining < 0 {
+                    let absRem = -rampRemaining
+                    envelope = Float(absRem) / Float(max(1, rampTotal))
+                    rampRemaining += 1
+                    if rampRemaining == 0 {
+                        toneEndedThisBlock = true
+                    }
+                } else if toneEndedThisBlock {
+                    // Fade-out completed earlier this block — emit
+                    // silence for the remaining samples, not steady
+                    // tone. Without this guard, default envelope=1.0
+                    // would re-introduce a full-amplitude tone for
+                    // the tail of the block — a pop on stop.
+                    envelope = 0
+                }
+                let s = baseAmp * envelope * Float(sin(phase))
+                phase += omega
+                if phase > 2.0 * Double.pi {
+                    phase -= 2.0 * Double.pi
+                }
+                for ch in 0..<channelCount {
+                    outPtrs[ch][i] += s   // additive, not replace
+                }
+            }
+        }
+
+        // Software gain: ramp per-sample if current != target,
+        // vDSP fast path otherwise. Ramped to suppress click on
+        // sudden 1.0 → 0 transitions (pop-suppressing).
+        var newGainCurrent = snapshot.gainCurrent
+        if snapshot.gainCurrent != snapshot.gainTarget {
+            let rampTotalSamples = Int(Self.volumeRampMs / 1000.0 * inboundSampleRate)
+            let stepSamples = min(frames, max(1, rampTotalSamples))
+            let stepDelta = (snapshot.gainTarget - snapshot.gainCurrent) / Float(stepSamples)
+            var g = snapshot.gainCurrent
+            for i in 0..<frames {
+                if i < stepSamples { g += stepDelta } else { g = snapshot.gainTarget }
+                for ch in 0..<channelCount { outPtrs[ch][i] *= g }
+            }
+            newGainCurrent = (frames >= stepSamples) ? snapshot.gainTarget : g
+        } else if snapshot.gainCurrent != 1.0 {
+            var g = snapshot.gainCurrent
             let frameCount = vDSP_Length(frames)
             for ch in 0..<channelCount {
                 let p = outPtrs[ch]
                 vDSP_vsmul(p, 1, &g, p, 1, frameCount)
+            }
+        }
+
+        // Persist back under the lock. Locals → immutable lets so
+        // the withLock closure satisfies Sendable-capture rules.
+        let phaseSnapshot = phase
+        let rampSnapshot = rampRemaining
+        let toneEndedSnapshot = toneEndedThisBlock
+        let endFrame = startFrame &+ Int64(frames)
+        let gainCurrentSnapshot = newGainCurrent
+        let resyncFiredSnapshot = needsResync
+        let resyncFromSnapshot = cursor
+        let resyncToSnapshot = startFrame
+        let resyncWriteSnapshot = writePos
+        let resyncReasonSnapshot = resyncReasonLocal
+        stateLock.withLock {
+            self.readCursor = endFrame
+            self._calibTonePhase = phaseSnapshot
+            self._calibToneRampSamples = rampSnapshot
+            if toneEndedSnapshot {
+                self._calibToneActive = false
+                self._calibToneRampSamples = 0
+            }
+            self._volumeGainCurrent = gainCurrentSnapshot
+            if resyncFiredSnapshot {
+                self._resyncSeqWritten &+= 1
+                self.driftResyncCount = self._resyncSeqWritten
+                self._resyncFromCursor = resyncFromSnapshot
+                self._resyncToTarget = resyncToSnapshot
+                self._resyncWritePos = resyncWriteSnapshot
+                self._resyncReason = resyncReasonSnapshot
             }
         }
 
@@ -826,8 +821,35 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         let p0 = outPtrs[0]
         for i in 0..<n { pk = max(pk, abs(p0[i])) }
         lastRenderPeak = pk
-
-        stateLock.withLock { self.readCursor = startFrame &+ Int64(frames) }
         return noErr
+    }
+
+    // MARK: - Drift-resync log drain (non-RT)
+
+    /// Drain drift-resync events stamped by render() and emit one
+    /// `CalibTrace.log` per batch. Called from the reader task — safe
+    /// to allocate / do file I/O here.
+    private func drainDriftResyncLog() {
+        let pending: (count: UInt64, from: Int64, to: Int64, write: Int64, reason: StaticString)? = stateLock.withLock {
+            if self._resyncSeqWritten == self._resyncSeqLogged {
+                return nil
+            }
+            let count = self._resyncSeqWritten &- self._resyncSeqLogged
+            let from = self._resyncFromCursor
+            let to = self._resyncToTarget
+            let write = self._resyncWritePos
+            let reason = self._resyncReason
+            self._resyncSeqLogged = self._resyncSeqWritten
+            return (count, from, to, write, reason)
+        }
+        if let p = pending {
+            // String conversion happens here, off the RT thread.
+            CalibTrace.log(
+                "[Bridge \(deviceUID)] drift resync (\(String(describing: p.reason)))"
+                + ": cursor jumped from \(p.from) to \(p.to)"
+                + " at writePos=\(p.write)"
+                + " (events=\(p.count))"
+            )
+        }
     }
 }
