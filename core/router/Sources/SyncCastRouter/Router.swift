@@ -363,68 +363,157 @@ public actor Router {
         case engineFailed(String)
     }
 
+    /// Per-device sequential measurement. The previous "all devices at
+    /// once" approach injected one click into the live ring and let it
+    /// fan out to every enabled output simultaneously; the mic captured
+    /// one merged signal, so cross-correlation found ONE peak (dominated
+    /// by the loudest/closest speaker) and per-device offsets were
+    /// indistinguishable. To actually distinguish "Xiaomi is fast vs
+    /// PG27 is slow", we measure each device in isolation by SOLOing it:
+    /// keep every enabled device's data path live (so OwnTone never
+    /// rebuilds its session — disabling a receiver tears it down and
+    /// triggers a multi-second mDNS rediscovery), but zero the AUDIBLE
+    /// output on every device except the one being measured. AirPlay is
+    /// soloed via `device.set_volume` (sidecar → OwnTone REST PUT
+    /// /api/outputs/{id} with volume=0); local CoreAudio in whole-home
+    /// is soloed via `bridge.setVolume(0)`, reached by setting
+    /// `routing[d].muted = true` and letting `replan()` propagate.
+    /// Stereo-mode local outputs follow the same `replan()` path through
+    /// `LocalOutput.setRouting(muted:)`.
     public func runCalibration(
         devices: [Device],
         microphoneDeviceID: AudioDeviceID?,
-        pulseCount: Int = 5
+        pulseCount: Int = 5,
+        progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> CalibrationDelta {
-        // Filter to outputs the user has enabled. Unprefixed deviceIDs are
-        // hex strings like "13a454c4" so CalibrationRunner's
-        // string-prefix classifier wouldn't recognise them as airplay/local.
-        // We prefix them here at the boundary so the runner classifies
-        // correctly; the unprefixed id is preserved as the suffix for the
-        // result map, which the caller can de-prefix.
         let enabled = devices.filter { routing[$0.id]?.enabled == true }
         guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
 
-        let prefixedIDs = enabled.map { dev -> String in
-            switch dev.transport {
-            case .airplay2: return "airplay:\(dev.id)"
-            case .coreAudio: return "local:\(dev.id)"
+        // Snapshot the user's pre-calibration routing for every enabled
+        // device. Restored on EVERY exit path (success, throw, cancel)
+        // via a defer — without this, a mid-loop failure would leave the
+        // user's audio with the last solo'd device's volume profile.
+        let originalRouting: [String: DeviceRouting] = Dictionary(
+            uniqueKeysWithValues: enabled.compactMap { dev -> (String, DeviceRouting)? in
+                guard let r = routing[dev.id] else { return nil }
+                return (dev.id, r)
             }
-        }
+        )
 
         let emitter = RingBufferClickEmitter(ringBuffer: sckCapture.ringBuffer)
         let runner = CalibrationRunner(microphoneDeviceID: microphoneDeviceID)
+
+        // Per-device offsets in ms, keyed by SyncCast device id (UN-prefixed).
+        var perDeviceOffsets: [String: Int] = [:]
+        var perDeviceConfidences: [Double] = []
+
+        // Restoration is non-throwing async work over the IPC; we run it
+        // from a Task in the failure path because Swift's `defer` cannot
+        // call async functions. Successful path awaits restore inline.
+        var didRestore = false
+        func restoreOriginalRouting() async {
+            if didRestore { return }
+            didRestore = true
+            for (id, r) in originalRouting {
+                routing[id] = r
+            }
+            replan()
+            // Re-push AirPlay volumes the sidecar still believes are 0.
+            for dev in enabled where dev.transport == .airplay2 {
+                let v = originalRouting[dev.id]?.volume ?? 1.0
+                await setAirplayVolume(id: dev.id, volume: v)
+            }
+        }
+
         do {
-            let result = try await runner.run(
-                emitClicksVia: emitter,
-                deviceIDs: prefixedIDs,
-                pulseCount: pulseCount
-            )
+            for (idx, target) in enabled.enumerated() {
+                try Task.checkCancellation()
+                progress?("Calibrating \(target.name) (\(idx + 1)/\(enabled.count))…")
 
-            // Recompute the delta ourselves so we can express NEGATIVE
-            // corrections (delay-line currently too high). The runner's
-            // recommendedDelayMs is clamped to non-negative which is
-            // wrong for our use case: if local plays AFTER AirPlay,
-            // we need to REDUCE the delay-line, not zero it.
-            let airplayMax = result.perDeviceOffsetMs
-                .filter { $0.key.hasPrefix("airplay:") }.values.max()
-            let localMax = result.perDeviceOffsetMs
-                .filter { $0.key.hasPrefix("local:") }.values.max()
-            let delta: Int = {
-                switch (airplayMax, localMax) {
-                case let (a?, l?): return a - l
-                default:           return 0   // missing one side ⇒ no signal
+                // Solo: every other enabled device is muted (volume 0
+                // for AirPlay via IPC, gain 0 for local via replan), the
+                // target device keeps its current volume so the mic gets
+                // a clean signal. We deliberately keep `enabled = true`
+                // for ALL devices — flipping it to false would tear down
+                // the OwnTone output and trigger mDNS rediscovery.
+                for d in enabled {
+                    let isTarget = d.id == target.id
+                    let origR = originalRouting[d.id] ?? DeviceRouting(deviceID: d.id)
+                    let muted = !isTarget
+                    let vol = isTarget ? origR.volume : 0
+                    routing[d.id] = DeviceRouting(
+                        deviceID: d.id,
+                        enabled: true,
+                        volume: vol,
+                        muted: muted,
+                        manualDelayMs: origR.manualDelayMs
+                    )
                 }
-            }()
+                replan()  // pushes mute/volume to bridges and stereo AUHALs
+                // AirPlay volume must be pushed via IPC — replan() doesn't
+                // touch the sidecar. Setting volume=0 on the OwnTone
+                // output silences the receiver while keeping the session
+                // selected (no mDNS churn, click samples still flow).
+                for d in enabled where d.transport == .airplay2 {
+                    let v: Float = (d.id == target.id)
+                        ? (originalRouting[d.id]?.volume ?? 1.0) : 0
+                    await setAirplayVolume(id: d.id, volume: v)
+                }
 
-            // Strip the prefix from the per-device map so callers see the
-            // original device IDs.
-            var stripped: [String: Int] = [:]
-            for (k, v) in result.perDeviceOffsetMs {
-                if let colon = k.firstIndex(of: ":") {
-                    stripped[String(k[k.index(after: colon)...])] = v
-                } else {
-                    stripped[k] = v
+                // 500 ms for the OwnTone REST PUT + AirPlay receiver to
+                // apply the new volume before we emit click pulses.
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                try Task.checkCancellation()
+
+                // Run the runner against a single prefixed device ID.
+                // CalibrationRunner uses the prefix to classify
+                // airplay-vs-local for its (unused-here) recommendedDelayMs;
+                // we read the per-device offset directly.
+                let prefixedID: String = (target.transport == .airplay2)
+                    ? "airplay:\(target.id)" : "local:\(target.id)"
+                let result = try await runner.run(
+                    emitClicksVia: emitter,
+                    deviceIDs: [prefixedID],
+                    pulseCount: pulseCount
+                )
+                if let off = result.perDeviceOffsetMs[prefixedID] {
+                    perDeviceOffsets[target.id] = off
+                    perDeviceConfidences.append(result.confidence)
                 }
             }
+
+            // Restore on success path.
+            await restoreOriginalRouting()
+
+            // Compute delta = max(AirPlay) − max(local). Signed; if local
+            // is slower than AirPlay (e.g. a high software-gain bridge),
+            // the delta is negative and the caller should REDUCE the
+            // delay-line.
+            var airplayMax = Int.min
+            var localMax = Int.min
+            for dev in enabled {
+                guard let off = perDeviceOffsets[dev.id] else { continue }
+                if dev.transport == .airplay2 {
+                    if off > airplayMax { airplayMax = off }
+                } else if off > localMax { localMax = off }
+            }
+            let delta: Int
+            if airplayMax == Int.min || localMax == Int.min {
+                delta = 0   // missing one side ⇒ no useful signal
+            } else {
+                delta = airplayMax - localMax
+            }
+            let confidence = perDeviceConfidences.min() ?? 0.0
             return CalibrationDelta(
                 deltaMs: delta,
-                confidence: result.confidence,
-                perDeviceOffsetMs: stripped
+                confidence: confidence,
+                perDeviceOffsetMs: perDeviceOffsets
             )
         } catch {
+            await restoreOriginalRouting()
+            if error is CancellationError {
+                throw error
+            }
             throw CalibrationFailure.engineFailed("\(error)")
         }
     }
