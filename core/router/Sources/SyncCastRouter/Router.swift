@@ -177,6 +177,14 @@ public actor Router {
     /// idle / in stereo mode.
     private var calibrationDiagnosticServer: CalibrationDiagnosticServer?
 
+    /// Per-AirPlay-device τ (ms) captured from the most recent SUCCESSFUL
+    /// full calibration (Phase 1 + Phase 2). Continuous mode reads this
+    /// to compute drift without re-running the disruptive Phase-2 TDMA
+    /// mute-dip. Empty until the user has clicked Auto-calibrate at
+    /// least once with AirPlay devices enabled. Cleared whenever a full
+    /// run fails or the user removes all AirPlay devices.
+    private var lastFullCalibrationAirplayTau: [String: Int] = [:]
+
     /// Sockets used to talk to the Python sidecar. May be nil in unit tests
     /// or when running without AirPlay support.
     public struct SidecarSockets: Sendable {
@@ -438,6 +446,24 @@ public actor Router {
         let result = try await runCalibrationRaw(
             devices: devices, microphoneDeviceID: microphoneDeviceID
         )
+        // Cache Phase-2 AirPlay taus so the continuous loop (Phase 1
+        // only) can recompute drift without re-doing the disruptive
+        // mute-dip. Keyed by device ID; we keep ONLY ids belonging to
+        // currently-enabled AirPlay devices so a stale receiver dropped
+        // from the routing set doesn't linger forever in the cache.
+        // Failed measurements (`τ = -1`, ActiveCalibrator's sentinel)
+        // are dropped so the continuous loop doesn't anchor drift
+        // against a bogus value.
+        let enabledAirplayIDs = Set(
+            enabled.filter { $0.transport == .airplay2 }.map { $0.id }
+        )
+        var freshCache: [String: Int] = [:]
+        for id in enabledAirplayIDs {
+            if let tau = result.perDeviceTauMs[id], tau >= 0 {
+                freshCache[id] = tau
+            }
+        }
+        lastFullCalibrationAirplayTau = freshCache
         return CalibrationDelta(
             deltaMs: result.deltaMs,
             confidence: result.aggregateConfidence,
@@ -1474,7 +1500,10 @@ public actor Router {
             runner: { [weak self] in
                 guard let self else { throw CalibrationFailure.engineFailed("router gone") }
                 let devs = await deviceProvider()
-                return try await self.runCalibrationRaw(
+                // Phase-1-only — see runCalibrationLocalOnly. AirPlay τ
+                // is inherited from the most recent full calibration so
+                // continuous mode never silences AirPlay devices.
+                return try await self.runCalibrationLocalOnly(
                     devices: devs, microphoneDeviceID: microphoneDeviceID
                 )
             },
@@ -1529,6 +1558,76 @@ public actor Router {
         lastContinuousActiveSample = sample
     }
 
+    /// Phase-1-only variant for the continuous calibration loop. Drives
+    /// `ActiveCalibrator.run` with `airplayProbes: []` so Phase 2 (the
+    /// disruptive AirPlay TDMA mute-dip — ~24 s of silenced devices for
+    /// a typical 2-receiver setup) is skipped entirely. Inaudible
+    /// 18–20 kHz tones on local bridges (~1.5 s) are the only on-air
+    /// activity per cycle.
+    ///
+    /// AirPlay τ values are inherited from `lastFullCalibrationAirplayTau`
+    /// (populated by the most recent successful `runCalibration`). The
+    /// returned `Result.perDeviceTauMs` MERGES the freshly-measured
+    /// local taus with the cached AirPlay taus, and `deltaMs` is
+    /// recomputed as `max(cachedAirplay) − max(freshLocal)` so the
+    /// continuous loop's drift policy still operates against an
+    /// AirPlay-vs-local delta.
+    ///
+    /// If the user has enabled AirPlay devices but never run a full
+    /// Auto-calibrate (cache empty), throws `CalibrationFailure.engineFailed`
+    /// — the continuous loop's existing failure handling logs once and
+    /// keeps trying without disturbing the user.
+    public func runCalibrationLocalOnly(
+        devices: [Device],
+        microphoneDeviceID: AudioDeviceID?
+    ) async throws -> ActiveCalibrator.Result {
+        let enabled = devices.filter { routing[$0.id]?.enabled == true }
+        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
+        let hasAirplay = enabled.contains { $0.transport == .airplay2 }
+        if hasAirplay && lastFullCalibrationAirplayTau.isEmpty {
+            throw CalibrationFailure.engineFailed(
+                "no full calibration cached; run Auto-calibrate once before enabling continuous mode"
+            )
+        }
+        let raw = try await runCalibrationRaw(
+            devices: devices,
+            microphoneDeviceID: microphoneDeviceID,
+            skipAirplayPhase: true
+        )
+        // Merge fresh local τ with cached AirPlay τ. Only inject cached
+        // entries for AirPlay devices that are still enabled — drops
+        // stale receivers automatically.
+        let enabledAirplayIDs = Set(
+            enabled.filter { $0.transport == .airplay2 }.map { $0.id }
+        )
+        var merged = raw.perDeviceTauMs
+        for id in enabledAirplayIDs {
+            if let tau = lastFullCalibrationAirplayTau[id] { merged[id] = tau }
+        }
+        // Recompute delta = max(cached AirPlay τ) − max(fresh local τ).
+        // This is the value the continuous loop adds to the delay-line.
+        var maxAir = Int.min, maxLoc = Int.min
+        for id in enabledAirplayIDs {
+            if let t = merged[id], t > maxAir { maxAir = t }
+        }
+        for dev in enabled where dev.transport == .coreAudio {
+            if let t = raw.perDeviceTauMs[dev.id], t > maxLoc { maxLoc = t }
+        }
+        let mergedDelta: Int
+        if maxAir == Int.min || maxLoc == Int.min {
+            mergedDelta = 0
+        } else {
+            mergedDelta = maxAir - maxLoc
+        }
+        return ActiveCalibrator.Result(
+            perDeviceTauMs: merged,
+            perDeviceConfidence: raw.perDeviceConfidence,
+            perDeviceUncertaintyMs: raw.perDeviceUncertaintyMs,
+            aggregateConfidence: raw.aggregateConfidence,
+            deltaMs: mergedDelta
+        )
+    }
+
     /// Variant of `runCalibration` that returns the raw
     /// `ActiveCalibrator.Result` instead of the squashed
     /// `CalibrationDelta`. The continuous loop needs the full result
@@ -1536,8 +1635,15 @@ public actor Router {
     /// drift / confidence policies; the manual one-shot caller only
     /// needs the squashed delta + summary so the existing API is left
     /// alone.
+    ///
+    /// `skipAirplayPhase` (true → Phase-1-only) is set by the
+    /// continuous loop via `runCalibrationLocalOnly`; the manual
+    /// Auto-calibrate path leaves it false to run the full Phase 1 +
+    /// Phase 2 sequence.
     fileprivate func runCalibrationRaw(
-        devices: [Device], microphoneDeviceID: AudioDeviceID?
+        devices: [Device],
+        microphoneDeviceID: AudioDeviceID?,
+        skipAirplayPhase: Bool = false
     ) async throws -> ActiveCalibrator.Result {
         let enabled = devices.filter { routing[$0.id]?.enabled == true }
         guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
@@ -1559,9 +1665,19 @@ public actor Router {
                     localProbes.append(.init(deviceID: dev.id, bridge: bridge))
                 }
             case .airplay2:
-                let origVol = originalRouting[dev.id]?.volume ?? 1.0
-                airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
+                if !skipAirplayPhase {
+                    let origVol = originalRouting[dev.id]?.volume ?? 1.0
+                    airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
+                }
             }
+        }
+        // Phase-1-only with no local bridges enabled is a no-op; surface
+        // it as a typed failure so the continuous loop's recordFailure()
+        // path treats it as a skipped cycle.
+        if skipAirplayPhase && localProbes.isEmpty {
+            throw CalibrationFailure.engineFailed(
+                "phase-1-only calibration requires at least one enabled local bridge"
+            )
         }
 
         let ring = sckCapture.ringBuffer

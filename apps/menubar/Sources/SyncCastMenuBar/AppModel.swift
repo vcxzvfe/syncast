@@ -201,8 +201,18 @@ final class AppModel {
 
     static let bgEnabledKey = "syncast.bgCalibrationEnabled"
     static let bgIntervalKey = "syncast.bgCalibrationIntervalS"
-    static let defaultBgIntervalS: Int = 30
-    static let bgIntervalRange: ClosedRange<Int> = 10...300
+    /// 1200 s (20 min). Continuous mode now runs Phase 1 only (~1.5 s
+    /// of inaudible 18–20 kHz tones on local bridges). The disruptive
+    /// Phase-2 AirPlay TDMA mute-dip is reserved for the manual
+    /// Auto-calibrate button, so we no longer need to probe every 30 s
+    /// to keep up with drift; thermal/network drift in AirPlay shows
+    /// up only on the manual cadence anyway.
+    static let defaultBgIntervalS: Int = 1200
+    /// 60 s … 3600 s (1 min … 60 min). Floor raised from 10 s because
+    /// even the inaudible Phase-1 probe shouldn't run more than once a
+    /// minute; ceiling raised from 300 s because long-idle setups can
+    /// happily wait 1 h between drift checks.
+    static let bgIntervalRange: ClosedRange<Int> = 60...3600
 
     private static func loadPersistedBgEnabled() -> Bool {
         UserDefaults.standard.bool(forKey: bgEnabledKey)
@@ -210,6 +220,8 @@ final class AppModel {
     private static func loadPersistedBgInterval() -> Int {
         guard let raw = UserDefaults.standard.object(forKey: bgIntervalKey) as? Int
         else { return defaultBgIntervalS }
+        // Persisted values from the old 10…300 range are clamped into
+        // the new 60…3600 floor/ceiling on first load.
         return min(max(raw, bgIntervalRange.lowerBound), bgIntervalRange.upperBound)
     }
 

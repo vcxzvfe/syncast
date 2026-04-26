@@ -65,9 +65,15 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
     public typealias InitialDelayProvider = @Sendable () async -> Int
     public typealias SampleSink = @Sendable (Sample) -> Void
 
-    /// 30 s — long enough that the user isn't probed too often, short
-    /// enough to catch network/temperature drift before it's audible.
-    public var measurementIntervalSeconds: Double = 30
+    /// 1200 s (20 min). Continuous mode now runs **Phase 1 only**
+    /// (local-bridge ultrasonic FDM, ~1.5 s of inaudible 18–20 kHz
+    /// tones). The Phase-2 AirPlay TDMA mute-dip — which had to silence
+    /// every other AirPlay device + local bridge for ~24 s per cycle —
+    /// is reserved for the manual Auto-calibrate button. With only a
+    /// brief inaudible probe per cycle we can space cycles much further
+    /// apart; 20 min catches slow thermal/network drift without making
+    /// the room feel "always probing".
+    public var measurementIntervalSeconds: Double = 1200
     /// 30 ms — below human perception of inter-channel latency for
     /// music; also above `ActiveCalibrator`'s ±15 ms run-to-run noise
     /// floor. Below this we don't apply, avoiding audible "wobble"
