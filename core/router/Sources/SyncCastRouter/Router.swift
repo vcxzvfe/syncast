@@ -359,10 +359,10 @@ public actor Router {
     // Plays brief click pulses through the live whole-home audio path
     // (SCK ringBuffer → AudioSocketWriter → sidecar → both AirPlay and
     // local-bridge fan-outs) and listens via the chosen microphone to
-    // measure the relative arrival time at each output. Returns a
-    // signed *delta* (in ms) the caller should ADD to the current
-    // `airplayDelayMs` to align local bridges with the slowest AirPlay
-    // receiver.
+    // measure the relative arrival time at each output. Returns the
+    // ABSOLUTE TARGET (in ms) for `airplayDelayMs` (NOT a delta to add)
+    // — Phase 1 local τ comes from the bridge's direct synthesis path
+    // which bypasses the delay-line. See `CalibrationDelta.deltaMs`.
     //
     // Note on click injection: we write directly to `sckCapture.ringBuffer`
     // from a Task that races with SCK's own write thread. The ring's
@@ -373,7 +373,13 @@ public actor Router {
     // detection. Pausing SCK for calibration would interrupt user audio,
     // which is worse UX. Acceptable for v1.
     public struct CalibrationDelta: Sendable {
-        public let deltaMs: Int               // signed; ADD to current airplayDelayMs
+        /// ABSOLUTE TARGET delay-line value in ms (NOT a delta to add).
+        /// Computed as `max(airplay τ) − max(local τ)`; local τ is from
+        /// the bridge's direct synthesis which bypasses the delay-line,
+        /// so this is the delay-line setting to align all outputs.
+        /// Field name kept for ABI stability — was wrongly interpreted
+        /// as an additive delta in earlier versions.
+        public let deltaMs: Int
         public let confidence: Double         // 0.0–1.0
         public let perDeviceOffsetMs: [String: Int]
     }
@@ -422,9 +428,9 @@ public actor Router {
         //     single-stream architecture so per-device differentiation
         //     MUST be temporal; FDM in the AirPlay band is structurally
         //     impossible.
-        //   * Phase 3: delta = max(AirPlay τ) − max(local τ); ADD to
-        //     airplayDelayMs to align local outputs with the slowest
-        //     AirPlay receiver.
+        //   * Phase 3: delta = max(AirPlay τ) − max(local τ). ABSOLUTE
+        //     TARGET for airplayDelayMs (NOT a delta to add); see
+        //     `CalibrationDelta.deltaMs` doc.
         //
         // v3 (MuteDipCalibrator, retained as fallback) modulated the
         // user's MUSIC volume in TDMA slots and cross-correlated the
@@ -1633,7 +1639,8 @@ public actor Router {
             if let tau = lastFullCalibrationAirplayTau[id] { merged[id] = tau }
         }
         // Recompute delta = max(cached AirPlay τ) − max(fresh local τ).
-        // This is the value the continuous loop adds to the delay-line.
+        // ABSOLUTE TARGET delay-line value (the continuous loop SETs,
+        // not adds) — same semantics as the manual-calibrate path.
         var maxAir = Int.min, maxLoc = Int.min
         for id in enabledAirplayIDs {
             if let t = merged[id], t > maxAir { maxAir = t }
