@@ -169,6 +169,14 @@ public actor Router {
     /// the first whole-home transition and reused for all bridges.
     private var localFifoSocketPath: URL?
 
+    /// Diagnostic socket server: lets command-line callers
+    /// (`scripts/calibration_test.sh`) trigger a one-shot calibration
+    /// without driving the SwiftUI menubar. Lifecycle: bound when the
+    /// AppModel calls `startCalibrationDiagnosticServer` after entering
+    /// whole-home + running, torn down on every other state. nil when
+    /// idle / in stereo mode.
+    private var calibrationDiagnosticServer: CalibrationDiagnosticServer?
+
     /// Sockets used to talk to the Python sidecar. May be nil in unit tests
     /// or when running without AirPlay support.
     public struct SidecarSockets: Sendable {
@@ -280,6 +288,10 @@ public actor Router {
 
     public func stop() async {
         state = .stopping
+        // 0a. Tear down the diagnostic socket listener. Cheap; safe to
+        //     call even when not bound. Done first so a CLI client
+        //     can't race a request against the rest of the teardown.
+        stopCalibrationDiagnosticServer()
         // 0. Tear down whole-home bridges first (if any). They hold
         //    Unix sockets pointing at the sidecar and AUHALs on
         //    physical devices; both need to release before the rest of
@@ -518,6 +530,61 @@ public actor Router {
         }
     }
 
+    // MARK: - Calibration diagnostic socket
+    //
+    // Bring up / tear down the Unix-socket listener that lets
+    // `scripts/calibration_test.sh` run a calibration from the CLI.
+    // The provider closure supplies a snapshot (devices + mic id) at the
+    // moment the request lands; we don't cache device lists in the
+    // Router, so the closure is the bridge to AppModel's MainActor state.
+
+    /// Start the diagnostic listener. Idempotent. Caller is the AppModel,
+    /// which fires this after the engine is running in whole-home mode.
+    /// `provider` is invoked once per request to get the live device set;
+    /// returning nil signals "router not ready, reply with error".
+    public func startCalibrationDiagnosticServer(
+        socketPath: URL,
+        provider: @escaping CalibrationDiagnosticServer.Provider
+    ) {
+        if calibrationDiagnosticServer != nil { return }
+        let server = CalibrationDiagnosticServer(
+            socketPath: socketPath,
+            provider: provider,
+            runner: { [weak self] snap in
+                guard let self else {
+                    throw CalibrationFailure.engineFailed("router gone")
+                }
+                let delta = try await self.runCalibration(
+                    devices: snap.devices,
+                    microphoneDeviceID: snap.microphoneDeviceID,
+                    pulseCount: 5,
+                    progress: nil
+                )
+                return (
+                    deltaMs: delta.deltaMs,
+                    confidence: delta.confidence,
+                    perDeviceOffsetMs: delta.perDeviceOffsetMs
+                )
+            }
+        )
+        do {
+            try server.start()
+            calibrationDiagnosticServer = server
+            FileHandle.standardError.write(Data(
+                "[Router] calibration diagnostic socket bound at \(socketPath.path)\n".utf8
+            ))
+        } catch {
+            lastError = "calibration diagnostic socket: \(error)"
+        }
+    }
+
+    /// Stop the diagnostic listener. Idempotent. Called on whole-home
+    /// exit and from `Router.stop()`.
+    public func stopCalibrationDiagnosticServer() {
+        calibrationDiagnosticServer?.stop()
+        calibrationDiagnosticServer = nil
+    }
+
     /// Diagnostic: how many SCK audio sample buffers have been processed?
     /// Zero after a few seconds with system audio playing ⇒ Screen Recording
     /// permission denied or SCK stream silently failed.
@@ -642,7 +709,10 @@ public actor Router {
             // Going to stereo: kill every bridge. They're useless
             // without the sidecar broadcaster on the other end, and
             // leaving them running while the SCK→aggregate path is
-            // about to come up would double-play.
+            // about to come up would double-play. Also drop the
+            // calibration diagnostic socket — calibration is a
+            // whole-home feature and the socket file would be stale.
+            stopCalibrationDiagnosticServer()
             for (_, b) in localBridges { b.stop() }
             localBridges.removeAll()
         case .wholeHome:

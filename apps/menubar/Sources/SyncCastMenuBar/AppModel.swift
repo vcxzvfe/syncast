@@ -640,6 +640,7 @@ final class AppModel {
                 // receivers.
                 if mode == .wholeHome {
                     await router.startWholeHome(devices: snapshot)
+                    await installCalibrationDiagnosticSocket()
                 }
 
                 // After 1.5s, log the IOProc tick count to confirm CoreAudio
@@ -970,6 +971,41 @@ final class AppModel {
     /// on completed/failed states.
     func dismissCalibrationStatus() {
         calibrationStatus = .idle
+    }
+
+    /// Install the calibration diagnostic socket. Used by
+    /// `scripts/calibration_test.sh` to drive a one-shot calibration
+    /// from the CLI without touching the menubar UI. Whole-home only;
+    /// the Router tears the socket down on stop / mode-leave.
+    ///
+    /// Path is `/tmp/syncast-<uid>.calibration.sock` to mirror the
+    /// existing sidecar control-socket convention.
+    private func installCalibrationDiagnosticSocket() async {
+        let path = AppModel.calibrationDiagnosticSocketURL
+        // Provider closure: hops to the MainActor to snapshot the live
+        // device list + selected mic. Returning nil tells the server
+        // to reply with an error (router not ready).
+        await router.startCalibrationDiagnosticServer(
+            socketPath: path,
+            provider: { [weak self] in
+                await MainActor.run { [weak self] () -> CalibrationDiagnosticServer.Snapshot? in
+                    guard let self else { return nil }
+                    guard self.mode == .wholeHome,
+                          self.streamingState == .running else { return nil }
+                    return CalibrationDiagnosticServer.Snapshot(
+                        devices: self.devices,
+                        microphoneDeviceID: self.effectiveMicID
+                    )
+                }
+            }
+        )
+    }
+
+    /// Where the diagnostic socket lives. UID-scoped to match
+    /// `SidecarLauncher`'s convention so multiple users on the same
+    /// machine don't collide.
+    static var calibrationDiagnosticSocketURL: URL {
+        URL(fileURLWithPath: "/tmp/syncast-\(getuid()).calibration.sock")
     }
 
     // MARK: - Background passive calibration lifecycle
