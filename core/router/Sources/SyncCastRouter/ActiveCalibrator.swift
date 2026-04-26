@@ -136,21 +136,22 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     // MARK: - Configuration
 
-    /// Ultrasonic frequencies for local bridges. Selected from a real
-    /// frequency-response sweep on the user's hardware (MBP built-in mic
-    /// + speaker baseline measured 2026-04-26):
-    ///   16 kHz: SNR 39.5 dB ⭐ (mostly inaudible to adults)
-    ///   17 kHz: SNR 14.8 dB ❌ (mic/room notch — AVOID)
-    ///   18 kHz: SNR 33.5 dB ⭐⭐ (inaudible)
-    ///   18.5 kHz: SNR ~33 dB ⭐⭐ (inaudible — interpolated)
+    /// Ultrasonic frequencies for local bridges, ordered by INAUDIBILITY
+    /// to a typical adult listener. Index 0 (18 kHz) is used when there
+    /// is only one local device (single-bridge calibration); we want
+    /// THAT case to be the most imperceptible. Frequencies selected from
+    /// a real frequency-response sweep on the user's hardware (MBP +
+    /// Logitech mic, 2026-04-26):
+    ///   18 kHz: SNR 33.5 dB ⭐⭐ (inaudible to >95% of adults) — DEFAULT
     ///   19 kHz: SNR 32.2 dB ⭐⭐ (inaudible)
-    ///   20 kHz: SNR 16.0 dB (mic anti-alias edge)
-    /// Bandpass guard: ±100 Hz around each freq is fine since we're
-    /// spaced ≥500 Hz apart.
-    /// IMPORTANT: these frequencies allow calibration to run during
-    /// music playback without user-audible artifacts — the original
-    /// 1k/2k/3k/4k tones were clearly audible and required quiet rooms.
-    public static let localFrequencies: [Double] = [16000, 18000, 18500, 19000]
+    ///   18.5 kHz: SNR ~33 dB ⭐⭐ (inaudible — interpolated)
+    ///   16 kHz: SNR 39.5 dB ⭐ (audible to ~30% of young adults; fallback)
+    ///   17 kHz: SNR 14.8 dB ❌ (mic/room notch — AVOID; not in list)
+    ///   20 kHz+: mic anti-alias edge
+    /// Bandpass guard ±100 Hz; minimum 500 Hz spacing means zero
+    /// cross-talk between concurrent bridges. With 4 entries we support
+    /// up to 4 simultaneous local devices.
+    public static let localFrequencies: [Double] = [18000, 19000, 18500, 16000]
     /// Bumped from 0.05 to 0.15 because high-frequency speaker rolloff
     /// attenuates ultrasonic content significantly at the SPEAKER
     /// (the freq-resp sweep showed 18 kHz tone produced only -68 dBFS at

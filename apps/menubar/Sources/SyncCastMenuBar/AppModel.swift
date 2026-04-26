@@ -127,8 +127,14 @@ final class AppModel {
 
     static let airplayDelayMsKey = "syncast.airplayDelayMs"
     static let defaultAirplayDelayMs: Int = 1750
-    /// UI cap — sidecar still clamps to [0, 10000] ms; >3 s is user error.
-    static let airplayDelayMsRange: ClosedRange<Int> = 0...3000
+    /// UI cap. Bumped from 3000 to 5000 ms because empirical AirPlay
+    /// measurements (v4 ActiveCalibrator) found total command-to-mic
+    /// latencies of 2300–2700 ms. With local at ~10 ms, the recommended
+    /// delay-line value is in that 2300–2700 ms range, plus headroom
+    /// for slower AirPlay receivers (some HomePod variants buffer
+    /// 3–4 s). Sidecar still clamps to [0, 10000] for an absolute
+    /// safety bound.
+    static let airplayDelayMsRange: ClosedRange<Int> = 0...5000
 
     private static func loadPersistedDelayMs() -> Int {
         guard let raw = UserDefaults.standard.object(forKey: airplayDelayMsKey) as? Int
