@@ -1,3 +1,14 @@
+> ⚠️ DEPRECATED (2026-04-26)
+>
+> 此设计（mic + GCC-PHAT + Hybrid Tracker 闭环）已废弃。原因：
+>
+> - 业界 95% 不用 mic 闭环（Sonos / Roon / AirPlay 2 / shairport-sync 全是 PTP 时间同步 + 用户手动 slider）
+> - mic-vs-ear 物理误差只占 ~14ms / 400ms = 3.5%；剩下 386ms 是算法层（GCC-PHAT 在音乐上多峰歧义、PTP↔HostTime 锚点错配、broadcasterOverheadMs 过度补偿、median across devices 应该 max）
+> - 17.6-19 kHz "ultrasonic" 在 mic 端被 analog roll-off + AGC + macOS Voice Processing notch 三重打击，SNR 实际 3-8 dB 不是 12 dB
+> - 持续 mic 闭环做多设备同步 — 商业产品里没有先例
+>
+> 新方向见 round11_manual_first_design.md
+
 # SyncCast Calibration v2 Design — TDMA Mute-Dip with Music-Aware Probe
 
 **Status**: SUPERSEDED — kept as historical record. See `calibration_v4_status.md` for current shipping design.
