@@ -11,6 +11,14 @@ import os.lock
 /// `recommendedDelayMs = max(AirPlay) − max(local)`; confidence blends
 /// σ with median-vs-sample dispersion. Caller supplies a `ClickEmitter`.
 public final class CalibrationRunner: @unchecked Sendable {
+    /// Per-class trace gate. `false` ⇒ skip string construction entirely.
+    public static var verboseTracing: Bool = true
+    @inline(__always)
+    private static func trace(_ msg: @autoclosure () -> String) {
+        guard verboseTracing else { return }
+        CalibTrace.log(msg())
+    }
+
     public struct Result: Sendable {
         public let recommendedDelayMs: Int
         public let perDeviceOffsetMs: [String: Int]
@@ -57,15 +65,18 @@ public final class CalibrationRunner: @unchecked Sendable {
 
         let click = CalibrationSession.clickPulse(sampleRate: Self.sampleRate)
         let template = Self.toMono(click)
+        let templateEnergy = template.reduce(0) { $0 + $1 * $1 }
+        Self.trace("[CalibrationRunner] run: deviceIDs=\(deviceIDs) pulses=\(pulses) click_frames=\(click.first?.count ?? 0) template_energy=\(String(format: "%.2f", templateEnergy)) mic_caller_provided=\(microphoneDeviceID.map(String.init) ?? "nil")")
 
         var perDeviceSamples: [String: [Int]] = [:]
         for id in deviceIDs { perDeviceSamples[id] = [] }
 
-        for _ in 0..<pulses {
+        for pulseIdx in 0..<pulses {
             try checkCancelled()
             let anchorNs = Clock.nowNs() &+ Self.anchorOffsetNs
             let captureStartNs = Clock.nowNs() &- Self.preRollNs
             let captureEndNs = anchorNs &+ Self.postRollNs
+            Self.trace("[CalibrationRunner] pulse=\(pulseIdx + 1)/\(pulses) anchorNs=\(anchorNs) captureStart=\(captureStartNs) captureEnd=\(captureEndNs) windowMs=\((captureEndNs - captureStartNs) / 1_000_000)")
             // Concurrent capture + emit — capture arms the AU before
             // emit returns. Single capture window covers every requested
             // device; caller invokes once per device when isolation matters.
@@ -76,11 +87,21 @@ public final class CalibrationRunner: @unchecked Sendable {
             let buf = try await captured
             try checkCancelled()
 
-            guard let peak = Self.locatePeak(in: buf, template: template) else { continue }
+            // Zero captured_frames ⇒ AU dead (TCC #6 or render dead #3);
+            // mic_rms below ~−60 dBFS ⇒ no audible click in the window.
+            let bufRms = Self.rms(buf)
+            let bufDb = Self.dbfs(bufRms)
+            Self.trace("[CalibrationRunner] pulse=\(pulseIdx + 1) captured_frames=\(buf.count) mic_rms=\(bufDb)dB")
+
+            guard let peak = Self.locatePeak(in: buf, template: template) else {
+                Self.trace("[CalibrationRunner] pulse=\(pulseIdx + 1) NO_PEAK (template_energy=\(String(format: "%.2f", templateEnergy)) — score below 10% gate)")
+                continue
+            }
             let peakNs = captureStartNs &+ UInt64(
                 Double(peak.sampleIndex) / Self.sampleRate * 1_000_000_000.0
             )
             let offsetMs = Int((Int64(peakNs) - Int64(anchorNs)) / 1_000_000)
+            Self.trace("[CalibrationRunner] pulse=\(pulseIdx + 1) PEAK idx=\(peak.sampleIndex) score=\(String(format: "%.4f", peak.score)) offset=\(offsetMs)ms")
             for id in deviceIDs {
                 perDeviceSamples[id, default: []].append(offsetMs)
             }
@@ -90,11 +111,16 @@ public final class CalibrationRunner: @unchecked Sendable {
         var confidences: [Double] = []
         for id in deviceIDs {
             let s = perDeviceSamples[id] ?? []
-            guard !s.isEmpty else { throw CalibrationError.noClickDetected(deviceID: id) }
+            guard !s.isEmpty else {
+                Self.trace("[CalibrationRunner] FAIL device=\(id) zero peaks across all \(pulses) pulses — throwing noClickDetected")
+                throw CalibrationError.noClickDetected(deviceID: id)
+            }
             let sorted = s.sorted()
             let median = sorted[sorted.count / 2]
             perDeviceOffset[id] = median
-            confidences.append(Self.confidence(samples: s, median: median))
+            let conf = Self.confidence(samples: s, median: median)
+            confidences.append(conf)
+            Self.trace("[CalibrationRunner] device=\(id) samples=\(s) median=\(median)ms confidence=\(String(format: "%.2f", conf))")
         }
         let aggregate = confidences.min() ?? 0.0
 
@@ -109,6 +135,7 @@ public final class CalibrationRunner: @unchecked Sendable {
         if maxAir == Int.min { recommended = 0 }
         else if maxLoc == Int.min { recommended = max(0, maxAir) }
         else { recommended = max(0, maxAir - maxLoc) }
+        Self.trace("[CalibrationRunner] DONE recommended=\(recommended)ms aggregateConf=\(String(format: "%.2f", aggregate)) perDevice=\(perDeviceOffset)")
 
         return Result(
             recommendedDelayMs: recommended,
@@ -192,6 +219,20 @@ public final class CalibrationRunner: @unchecked Sendable {
             || s.contains("airplay2") || s.contains(":airplay")
     }
 
+    /// Linear-RMS for diagnostic logs. Same vDSP path as PassiveCalibrator.
+    private static func rms(_ x: [Float]) -> Float {
+        guard !x.isEmpty else { return 0 }
+        var ms: Float = 0
+        x.withUnsafeBufferPointer { ptr in
+            vDSP_measqv(ptr.baseAddress!, 1, &ms, vDSP_Length(ptr.count))
+        }
+        return sqrt(ms)
+    }
+    private static func dbfs(_ rms: Float) -> String {
+        if rms <= 0 { return "-inf" }
+        return String(format: "%.1f", 20.0 * Foundation.log10(Double(rms)))
+    }
+
     /// Sliding cross-correlation via vDSP_conv; |peak| (some DACs invert
     /// polarity) gated at 10 % of template autocorrelation energy.
     static func locatePeak(in signal: [Float], template: [Float]) -> (sampleIndex: Int, score: Float)? {
@@ -238,10 +279,24 @@ public final class CalibrationRunner: @unchecked Sendable {
         }
         let context = MicCaptureContext(buffer: buffer, capacity: frames)
         let opaque = Unmanaged.passUnretained(context).toOpaque()
-        let unit = try Self.openInputUnit(
-            deviceID: try resolveInputDeviceID(),
-            inputCallbackContext: opaque
-        )
+        let resolvedDevice: AudioDeviceID
+        do {
+            resolvedDevice = try resolveInputDeviceID()
+        } catch {
+            Self.trace("[CalibrationRunner] captureMic: FAILED to resolve mic device: \(error)")
+            throw error
+        }
+        let unit: AudioUnit
+        do {
+            unit = try Self.openInputUnit(
+                deviceID: resolvedDevice,
+                inputCallbackContext: opaque
+            )
+            Self.trace("[CalibrationRunner] captureMic: AU opened+started OK dev=\(resolvedDevice) target_frames=\(frames)")
+        } catch {
+            Self.trace("[CalibrationRunner] captureMic: AU FAILED (\(error)) — TCC (hyp #6) if .permissionDenied")
+            throw error
+        }
         setLiveUnit(unit)
         do {
             // Poll every 50 ms — honours ≤100 ms cancel SLA.
@@ -256,6 +311,7 @@ public final class CalibrationRunner: @unchecked Sendable {
         }
         disposeLiveUnit()
         let written = min(frames, context.writtenFrameCount())
+        Self.trace("[CalibrationRunner] captureMic: AU torn down written=\(written)/\(frames) frames")
         return [Float](unsafeUninitializedCapacity: written) { ptr, count in
             ptr.baseAddress!.update(from: buffer, count: written)
             count = written
