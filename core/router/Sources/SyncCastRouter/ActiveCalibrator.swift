@@ -136,13 +136,28 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     // MARK: - Configuration
 
-    /// Frequencies assigned to local bridges in order. With 4 entries we
-    /// support up to 4 simultaneous local devices; expand if you ever
-    /// support more. Spaced 1 kHz apart so the bandpass at ±100 Hz has
-    /// >800 Hz of guard band in either direction — effectively zero
-    /// cross-talk between devices.
-    public static let localFrequencies: [Double] = [1000, 2000, 3000, 4000]
-    public static let localToneAmplitude: Float = 0.05
+    /// Ultrasonic frequencies for local bridges. Selected from a real
+    /// frequency-response sweep on the user's hardware (MBP built-in mic
+    /// + speaker baseline measured 2026-04-26):
+    ///   16 kHz: SNR 39.5 dB ⭐ (mostly inaudible to adults)
+    ///   17 kHz: SNR 14.8 dB ❌ (mic/room notch — AVOID)
+    ///   18 kHz: SNR 33.5 dB ⭐⭐ (inaudible)
+    ///   18.5 kHz: SNR ~33 dB ⭐⭐ (inaudible — interpolated)
+    ///   19 kHz: SNR 32.2 dB ⭐⭐ (inaudible)
+    ///   20 kHz: SNR 16.0 dB (mic anti-alias edge)
+    /// Bandpass guard: ±100 Hz around each freq is fine since we're
+    /// spaced ≥500 Hz apart.
+    /// IMPORTANT: these frequencies allow calibration to run during
+    /// music playback without user-audible artifacts — the original
+    /// 1k/2k/3k/4k tones were clearly audible and required quiet rooms.
+    public static let localFrequencies: [Double] = [16000, 18000, 18500, 19000]
+    /// Bumped from 0.05 to 0.15 because high-frequency speaker rolloff
+    /// attenuates ultrasonic content significantly at the SPEAKER
+    /// (the freq-resp sweep showed 18 kHz tone produced only -68 dBFS at
+    /// the mic vs. -17 dBFS at 1 kHz, a 50 dB acoustic-path loss). The
+    /// digital tone amplitude needs to be higher to maintain SNR at
+    /// the mic. 0.15 is still well below clipping headroom.
+    public static let localToneAmplitude: Float = 0.15
     public static let localToneDurationMs: Int = 1500
     /// Mic capture window is the tone duration plus tail for any
     /// extra latency — locals are typically <100 ms but in whole-home
