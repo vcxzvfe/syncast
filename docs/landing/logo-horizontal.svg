@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 64" fill="none" role="img" aria-label="SyncCast">
+  <title>SyncCast</title>
+  <defs>
+    <linearGradient id="sch-grad" x1="16" y1="16" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A84FF"/>
+      <stop offset="1" stop-color="#5E5CE6"/>
+    </linearGradient>
+  </defs>
+  <!-- Icon (32x32 centered in 0..64 region, scaled from 64-unit master) -->
+  <g transform="translate(16 16) scale(0.5)">
+    <g stroke="url(#sch-grad)" stroke-width="3" stroke-linecap="round" fill="none">
+      <path d="M22 32a10 10 0 0 1 20 0"/>
+      <path d="M14 32a18 18 0 0 1 36 0"/>
+    </g>
+    <g fill="url(#sch-grad)">
+      <circle cx="14" cy="32" r="4"/>
+      <circle cx="50" cy="32" r="4"/>
+      <circle cx="32" cy="14" r="4"/>
+    </g>
+    <circle cx="32" cy="32" r="5" fill="#0A84FF"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="60" y="42"
+        font-family="-apple-system, system-ui, sans-serif"
+        font-size="26"
+        font-weight="600"
+        letter-spacing="-0.5"
+        fill="#0A84FF">SyncCast</text>
+</svg>
