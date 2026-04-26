@@ -111,6 +111,25 @@ public actor HybridDriftTracker {
     private var ticks: UInt64 = 0
     private var currentState: State = .coldStart
 
+    /// Cold-start gate: the controller cannot apply corrections until
+    /// it sees `coldStartGateCount` valid measurements whose residuals
+    /// agree within `coldStartGateTolMs`. Until then the loop only
+    /// observes (predict + update) and emits samples for diagnostics.
+    private static let coldStartGateCount: Int = 3
+    private static let coldStartGateTolMs: Double = 200.0
+    /// Outlier rejection threshold: reject any measurement whose
+    /// residual differs from the Kalman prediction by more than this.
+    /// Catches both passive false-peaks and active probes that landed
+    /// on a reverb tail or another speaker's chirp.
+    private static let outlierThresholdMs: Double = 500.0
+    /// Physical drift cap for crystal oscillators in consumer audio
+    /// hardware. Anything beyond ~±50 ppm is signal-loss, not real
+    /// frequency offset — clamping prevents runaway integral wind-up
+    /// when the passive path is starved for measurements.
+    private static let driftCapPpm: Double = 50.0
+    private var residualHistory: [Double] = []
+    private var gateOpen: Bool = false
+
     private var kalman: Kalman2D
     private var pi: PIController
     private var micCapture: HybridMicCapture?
@@ -155,6 +174,8 @@ public actor HybridDriftTracker {
         lastObservationAt = .distantPast; lastProbeAt = .distantPast
         lastConfidence = 0; quietFrames = 0; ticks = 0
         currentState = .coldStart
+        residualHistory.removeAll(keepingCapacity: true)
+        gateOpen = false
         kalman.reset(); pi.reset()
         do {
             micCapture = try HybridMicCapture.open(
@@ -203,42 +224,86 @@ public actor HybridDriftTracker {
         ticks &+= 1
         let dt = Double(configuration.tickIntervalMs) / 1000.0
         let now = Date()
-        var measured: Double? = nil
+        // Read the current delay-line value FIRST. Search bands and
+        // residual conversion both depend on it: the system runs with
+        // ~1740ms of AirPlay latency posted, so local audio at the mic
+        // arrives at ~1740ms (NOT 50–500ms), and the Kalman state
+        // tracks the *residual* lag = rawLag − currentDelay.
+        let baseDelay = await getCurrentDelayMs()
+        let baseDelayMs = Double(baseDelay)
+        var measuredRaw: Double? = nil    // raw lag (for trace)
+        var residual: Double? = nil       // raw lag − currentDelay
         var confidence: Double = 0
         var source: Source = .none
+        var outlierRejected: Bool = false
 
         switch transitionGate(now: now) {
         case .skip(let reason):
             CalibTrace.log("[HybridTracker] tick=\(ticks) gate=skip reason=\(reason)")
         case .passive:
-            if let obs = await passiveMeasure() {
-                (measured, confidence, source) = (obs.offsetMs, obs.confidence, .passive)
-                lastObservationAt = now
-                lastConfidence = obs.confidence
-                quietFrames = 0
+            if let obs = await passiveMeasure(currentDelayMs: baseDelayMs) {
+                measuredRaw = obs.rawLagMs
+                residual = obs.residualMs
+                confidence = obs.confidence
+                source = .passive
             } else { quietFrames += 1 }
         case .active:
             lastProbeAt = now
-            if let obs = await activeProbe() {
-                (measured, confidence, source) = (obs.offsetMs, obs.confidence, .active)
-                lastObservationAt = now
-                lastConfidence = obs.confidence
-                quietFrames = 0
+            if let obs = await activeProbe(currentDelayMs: baseDelayMs) {
+                measuredRaw = obs.rawLagMs
+                residual = obs.residualMs
+                confidence = obs.confidence
+                source = .active
             } else { quietFrames += 1 }
         }
 
-        // Kalman predict + (optional) update.
+        // Kalman predict.
         kalman.predict(dt: dt)
-        if let m = measured {
-            kalman.update(measurement: m, confidence: max(0.5, confidence))
+        // Outlier rejection: predicted residual vs measured residual.
+        // Fires both for false passive peaks and for active probes
+        // that lock to a reverb tail. We still keep the raw measurement
+        // in the emitted sample for diagnostic visibility.
+        if let r = residual {
+            let predicted = kalman.x[0]
+            if gateOpen && abs(r - predicted) > Self.outlierThresholdMs {
+                outlierRejected = true
+                CalibTrace.log(
+                    "[HybridTracker] tick=\(ticks) outlier_reject residual=\(String(format: "%.1f", r))ms predicted=\(String(format: "%.1f", predicted))ms |delta|>\(Int(Self.outlierThresholdMs))ms"
+                )
+            } else {
+                kalman.update(measurement: r, confidence: max(0.5, confidence))
+                kalman.clampDriftPpm(Self.driftCapPpm)
+                lastObservationAt = now
+                lastConfidence = confidence
+                quietFrames = 0
+                // Cold-start gate: collect first N residuals; only open
+                // the controller once they agree within ±tolerance.
+                if !gateOpen {
+                    residualHistory.append(r)
+                    if residualHistory.count >= Self.coldStartGateCount {
+                        let recent = residualHistory.suffix(Self.coldStartGateCount)
+                        let lo = recent.min() ?? 0
+                        let hi = recent.max() ?? 0
+                        if (hi - lo) <= Self.coldStartGateTolMs {
+                            gateOpen = true
+                            CalibTrace.log(
+                                "[HybridTracker] cold-start gate OPEN after \(residualHistory.count) measurements, spread=\(String(format: "%.1f", hi - lo))ms"
+                            )
+                        }
+                    }
+                }
+            }
         }
-        // PI controller drives kalman.offset → 0 on top of whatever
-        // delay is currently posted.
-        let baseDelay = await getCurrentDelayMs()
-        let u = pi.step(error: -kalman.x[0], dt: dt)
-        let target = max(0, min(10_000, Double(baseDelay) + u))
+        // PI controller drives residual → 0. Held inactive until the
+        // cold-start gate opens, otherwise the integral can wind up
+        // chasing a Kalman state that is still settling.
+        var u: Double = 0
+        if gateOpen {
+            u = pi.step(error: -kalman.x[0], dt: dt)
+        }
+        let target = max(0, min(10_000, baseDelayMs + u))
         let targetInt = Int(target.rounded())
-        if abs(targetInt - baseDelay) >= 1 && source != .none {
+        if gateOpen && abs(targetInt - baseDelay) >= 1 && source != .none && !outlierRejected {
             await applyDelayMs(targetInt)
         }
         currentState = nextState(now: now, source: source, conf: confidence)
@@ -246,15 +311,17 @@ public actor HybridDriftTracker {
             timestamp: now,
             kalmanOffsetMs: kalman.x[0],
             kalmanDriftPpm: kalman.x[1],
-            measuredOffsetMs: measured,
+            measuredOffsetMs: measuredRaw,
             confidence: confidence,
             source: source,
-            appliedCorrectionMs: target - Double(baseDelay),
+            appliedCorrectionMs: target - baseDelayMs,
             resultingDelayMs: target,
             state: currentState))
-        let mStr = measured.map { String(format: "%.1f", $0) } ?? "nil"
+        let mStr = measuredRaw.map { String(format: "%.1f", $0) } ?? "nil"
+        let rStr = residual.map { String(format: "%.1f", $0) } ?? "nil"
+        let gateStr = gateOpen ? "open" : "cold(\(residualHistory.count)/\(Self.coldStartGateCount))"
         CalibTrace.log(
-            "[HybridTracker] tick=\(ticks) src=\(describe(source: source)) measured=\(mStr)ms conf=\(String(format: "%.2f", confidence)) kalman.offset=\(String(format: "%.2f", kalman.x[0]))ms drift=\(String(format: "%.1f", kalman.x[1]))ppm u=\(String(format: "%.2f", u))ms base=\(baseDelay)ms applied=\(targetInt)ms state=\(describe(state: currentState))"
+            "[HybridTracker] tick=\(ticks) src=\(describe(source: source)) measured=\(mStr)ms residual=\(rStr)ms conf=\(String(format: "%.2f", confidence)) kalman.offset=\(String(format: "%.2f", kalman.x[0]))ms drift=\(String(format: "%.1f", kalman.x[1]))ppm u=\(String(format: "%.2f", u))ms base=\(baseDelay)ms applied=\(targetInt)ms gate=\(gateStr)\(outlierRejected ? " OUTLIER" : "") state=\(describe(state: currentState))"
         )
     }
 
@@ -285,19 +352,45 @@ public actor HybridDriftTracker {
     // MARK: - Passive measurement
 
     private struct Observation {
-        let offsetMs: Double
+        /// Raw GCC-PHAT lag from source-write to mic-arrival, in ms.
+        /// Equal to `currentDelay + bridge_overhead` when locked.
+        let rawLagMs: Double
+        /// `rawLagMs − currentDelayMs`. The Kalman observes this so its
+        /// state represents drift relative to the posted delay-line.
+        let residualMs: Double
         let confidence: Double
     }
 
-    private func passiveMeasure() async -> Observation? {
+    /// Compute the dynamic local search band, anchored on the current
+    /// delay-line value. With delay-line ≈ 1740 ms the local-music
+    /// peak at the mic arrives at ≈ 1740 ms + bridge overhead, NOT in
+    /// the static 50–500 ms band the original implementation searched.
+    /// Width 500 ms accommodates bridge_overhead variability + jitter.
+    private static func dynamicLocalBand(currentDelayMs d: Double) -> ClosedRange<Double> {
+        let lo = max(50.0, d - 200.0)
+        let hi = max(lo + 1.0, d + 300.0)
+        return lo...hi
+    }
+
+    /// AirPlay PTP latency is mostly fixed (1.8–2.5 s) but mic-arrival
+    /// shifts slightly with delay-line state. The /4 coupling matches
+    /// what we observed empirically — most of the 1740 ms lives in the
+    /// AirPlay path itself and is not added on top.
+    private static func dynamicAirBand(currentDelayMs d: Double) -> ClosedRange<Double> {
+        let bias = d / 4.0
+        return (1500.0 + bias)...(4000.0 + bias)
+    }
+
+    private func passiveMeasure(currentDelayMs: Double) async -> Observation? {
         guard let cap = micCapture else { return nil }
         let micSR = HybridMicCapture.sampleRate
         let windowFrames = Int(configuration.passiveWindowSeconds * micSR)
-        // Reach past air-band upper bound so the PHAT search window
-        // captures the full AirPlay PTP latency tail.
-        let maxLagFrames = Int(
-            (configuration.airBandMs.upperBound + 1000) / 1000.0 * micSR
-        )
+        let localBand = Self.dynamicLocalBand(currentDelayMs: currentDelayMs)
+        let airBand = Self.dynamicAirBand(currentDelayMs: currentDelayMs)
+        // Reach past whichever upper bound is larger so the PHAT search
+        // window captures the full latency tail.
+        let upperMs = max(localBand.upperBound, airBand.upperBound)
+        let maxLagFrames = Int((upperMs + 1000) / 1000.0 * micSR)
         let sourceFrames = windowFrames + maxLagFrames
 
         let micWindow = cap.snapshot(frames: windowFrames)
@@ -324,26 +417,28 @@ public actor HybridDriftTracker {
         func lagToMs(_ idx: Int) -> Double {
             Double(idx - leadingPad) / decSR * 1000.0
         }
-        let prior = kalman.x[0]
-        guard let local = bestPeak(
-                in: corr, begin: 0, end: corr.count,
-                bandMs: configuration.localBandMs,
-                lagToMs: lagToMs, prior: prior),
-              let air = bestPeak(
-                in: corr, begin: 0, end: corr.count,
-                bandMs: configuration.airBandMs,
-                lagToMs: lagToMs, prior: prior)
+        // Prior is in residual-space; convert to raw-lag space for the
+        // peak picker's tie-break term.
+        let priorRaw = kalman.x[0] + currentDelayMs
+        let local = bestPeak(
+            in: corr, begin: 0, end: corr.count,
+            bandMs: localBand, lagToMs: lagToMs, prior: priorRaw)
+        let air = bestPeak(
+            in: corr, begin: 0, end: corr.count,
+            bandMs: airBand, lagToMs: lagToMs, prior: priorRaw)
+        // Either band may legitimately have no peak (e.g. when local
+        // and air bands overlap at low delay-line values). Pick the
+        // surviving candidate with the highest confidence.
+        let candidates: [BandPeak] = [local, air].compactMap { $0 }
+            .filter { $0.confidence >= configuration.minPassiveConfidence }
+        guard let chosen = candidates.max(by: { $0.confidence < $1.confidence })
         else { return nil }
-        // Closer-to-prior wins; near-zero prior prefers air-band (the
-        // delay-line we actually drive).
-        let pickAir = abs(air.offsetMs - prior) <= abs(local.offsetMs - prior)
-            || abs(prior) < 1.0
-        let chosen = pickAir ? air : local
-        if local.confidence < configuration.minPassiveConfidence
-            || air.confidence < configuration.minPassiveConfidence {
-            return nil
-        }
-        return Observation(offsetMs: chosen.offsetMs, confidence: chosen.confidence)
+        let raw = chosen.offsetMs
+        return Observation(
+            rawLagMs: raw,
+            residualMs: raw - currentDelayMs,
+            confidence: chosen.confidence
+        )
     }
 
     /// Read the last `frames` of source PCM mixed to mono.
@@ -426,7 +521,7 @@ public actor HybridDriftTracker {
 
     // MARK: - Active probe
 
-    private func activeProbe() async -> Observation? {
+    private func activeProbe(currentDelayMs: Double) async -> Observation? {
         guard let cap = micCapture else { return nil }
         let micSR = HybridMicCapture.sampleRate
         let amp = Float(pow(10.0, configuration.probeAmplitudeDBFS / 20.0))
@@ -439,10 +534,14 @@ public actor HybridDriftTracker {
             durationMs: configuration.probeDurationMs,
             amplitude: 1.0, sampleRate: micSR)
 
+        // Search window tracks the delay-line: chirp injected into the
+        // ring is replayed via AirPlay with `currentDelayMs` of latency
+        // posted, so the mic-arrival lands inside the dynamic air band.
+        let airBand = Self.dynamicAirBand(currentDelayMs: currentDelayMs)
         // Anchor inject 100 ms past mic write position so the noise
         // floor window is captured first.
         let captureMs = configuration.probeDurationMs
-            + Int(configuration.airBandMs.upperBound) + 500
+            + Int(airBand.upperBound) + 500
         let captureFrames = Int(Double(captureMs) / 1000.0 * micSR)
         let captureStartNs = Clock.nowNs()
         let injectAtNs = captureStartNs &+ 100_000_000
@@ -459,20 +558,24 @@ public actor HybridDriftTracker {
             samples: mic, lowHz: 17_400, highHz: 19_000, sampleRate: micSR)
         let xc = HybridDSP.fftCrossCorrelation(env: bp, pattern: chirpMic)
         let injectFrame = Int(0.1 * micSR)  // anchor +100 ms
-        let kMin = injectFrame + Int(configuration.airBandMs.lowerBound / 1000.0 * micSR)
+        let kMin = injectFrame + Int(airBand.lowerBound / 1000.0 * micSR)
         let kMax = min(xc.count - 1,
-            injectFrame + Int(configuration.airBandMs.upperBound / 1000.0 * micSR))
+            injectFrame + Int(airBand.upperBound / 1000.0 * micSR))
         guard kMax > kMin else { return nil }
         let (peakIdx, peakVal) = HybridDSP.argmax(xc, begin: kMin, end: kMax + 1)
         let (bg, mad) = HybridDSP.backgroundStats(
             xc, excludingIdx: peakIdx, neighborhood: 64)
         let prominence = Double((abs(peakVal) - bg) / Float(max(mad, 1e-9)))
-        let offsetMs = Double(peakIdx - injectFrame) / micSR * 1000.0
+        let rawLagMs = Double(peakIdx - injectFrame) / micSR * 1000.0
         CalibTrace.log(
-            "[HybridTracker] probe: peak_idx=\(peakIdx) offset=\(String(format: "%.1f", offsetMs))ms prominence=\(String(format: "%.2f", prominence)) bg=\(String(format: "%.4f", bg)) mad=\(String(format: "%.4f", mad))"
+            "[HybridTracker] probe: peak_idx=\(peakIdx) raw_lag=\(String(format: "%.1f", rawLagMs))ms residual=\(String(format: "%.1f", rawLagMs - currentDelayMs))ms prominence=\(String(format: "%.2f", prominence)) bg=\(String(format: "%.4f", bg)) mad=\(String(format: "%.4f", mad)) air=[\(Int(airBand.lowerBound))..\(Int(airBand.upperBound))]"
         )
         guard prominence >= 4.0 else { return nil }
-        return Observation(offsetMs: offsetMs, confidence: prominence)
+        return Observation(
+            rawLagMs: rawLagMs,
+            residualMs: rawLagMs - currentDelayMs,
+            confidence: prominence
+        )
     }
 
     // MARK: - State machine
@@ -537,6 +640,22 @@ struct Kalman2D {
     }
 
     mutating func reset() { x = [0, 0]; P = [1, 0, 0, 1]; residualVariance = 0 }
+
+    /// Clamp the drift-rate state to ±`ppm`. Consumer-grade crystal
+    /// oscillators top out around 50 ppm; anything beyond that is
+    /// signal-loss leaking into the filter, not real frequency offset.
+    /// Also collapses the drift covariance when clamping fires so the
+    /// next predict step doesn't immediately re-inflate the estimate.
+    mutating func clampDriftPpm(_ ppm: Double) {
+        let bound = abs(ppm)
+        if x[1] > bound {
+            x[1] = bound
+            P[3] = min(P[3], 1.0)
+        } else if x[1] < -bound {
+            x[1] = -bound
+            P[3] = min(P[3], 1.0)
+        }
+    }
 
     /// x' = F x; P' = F P Fᵀ + Q.
     mutating func predict(dt: Double) {
