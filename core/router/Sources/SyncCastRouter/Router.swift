@@ -1484,7 +1484,7 @@ public actor Router {
             initialDelayMs: { [weak self] in
                 return await self?.continuousActiveDelaySnapshot() ?? 0
             },
-            onSample: { [weak self] sample in
+            onSample: { [weak self] (sample: ContinuousActiveCalibrator.Sample) in
                 guard let self else { return }
                 Task { await self.recordContinuousActiveSample(sample) }
                 onSample(sample)
