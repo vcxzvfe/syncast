@@ -601,11 +601,10 @@ public actor Router {
                     )
                 }
             },
-            // Round 10: hybrid drift tracker status snapshot. nil →
-            // `result: null` reply. `[weak self]` since Router owns server.
-            trackerStatusProvider: { [weak self] in
-                await self?.lastHybridTrackerSample()
-            }
+            // Round 11: hybrid drift tracker removed. Closure retained so
+            // CalibrationDiagnosticServer's signature stays satisfied; it
+            // always reports nil (`result: null`).
+            trackerStatusProvider: { nil }
         )
         do {
             try server.start()
@@ -1399,114 +1398,6 @@ public actor Router {
         return result as? [String: Any]
     }
 
-    // MARK: - Passive continuous calibration (DEPRECATED)
-    //
-    // Owns one PassiveCalibrator: a continuous mic AUHAL + a 30-s loop
-    // that GCC-PHATs the SCK ring against the live mic capture. The
-    // engine is unreliable in practice (single-peak detection on
-    // shared music can't distinguish per-device, gives ±100 ms
-    // run-to-run variance + bad absolute values) so this entire
-    // section is preserved only for source compatibility — current
-    // continuous calibration goes through
-    // `startContinuousActiveCalibration` below. The `@available`
-    // annotation suppresses deprecation warnings on the legacy
-    // PassiveCalibrator references kept here.
-    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
-    public private(set) var passiveCalibrator: PassiveCalibrator?
-    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
-    public private(set) var lastPassiveSample: PassiveCalibrator.Sample?
-    /// External subscriber, set by `startPassiveCalibration(...,onSampleAvailable:)`.
-    /// Invoked synchronously inside the actor in `handlePassiveSample`
-    /// (off the calibrator's own thread) so the UI sees samples promptly,
-    /// independent of the sidecar push latency.
-    @available(*, deprecated)
-    private var externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)? {
-        get { _externalPassiveSampleCallback }
-        set { _externalPassiveSampleCallback = newValue }
-    }
-    @available(*, deprecated)
-    private var _externalPassiveSampleCallback: (@Sendable (PassiveCalibrator.Sample) -> Void)?
-    /// Bumped on every Sample callback (above threshold). Useful for
-    /// diagnosing "engine alive vs. not converging".
-    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
-    public private(set) var passiveSampleCount: Int = 0
-
-    /// Begin passive calibration. Idempotent. `microphoneDeviceID = nil`
-    /// uses the system default input. Throws on mic-permission denial
-    /// or no-input-device.
-    @available(*, deprecated, message: "Use startContinuousActiveCalibration instead.")
-    public func startPassiveCalibration(
-        microphoneDeviceID: AudioDeviceID? = nil,
-        intervalSeconds: Int? = nil,
-        onSampleAvailable: (@Sendable (PassiveCalibrator.Sample) -> Void)? = nil
-    ) async throws {
-        if passiveCalibrator != nil { return }
-        externalPassiveSampleCallback = onSampleAvailable
-        let calibrator = PassiveCalibrator(
-            ringBuffer: sckCapture.ringBuffer,
-            microphoneDeviceID: microphoneDeviceID,
-            onSampleAvailable: { [weak self] sample in
-                guard let self else { return }
-                Task { await self.handlePassiveSample(sample) }
-            }
-        )
-        // Apply user-configured interval BEFORE start so the first
-        // measurement window matches the user's preference rather than
-        // the calibrator's internal default.
-        if let interval = intervalSeconds {
-            calibrator.measurementIntervalSeconds = Double(interval)
-        }
-        do {
-            try await calibrator.start()
-        } catch {
-            lastError = "passive calibration start failed: \(error)"
-            externalPassiveSampleCallback = nil
-            throw error
-        }
-        passiveCalibrator = calibrator
-    }
-
-    /// Stop passive calibration. Idempotent.
-    @available(*, deprecated, message: "Use stopContinuousActiveCalibration instead.")
-    public func stopPassiveCalibration() {
-        passiveCalibrator?.stop()
-        passiveCalibrator = nil
-        externalPassiveSampleCallback = nil
-    }
-
-    /// Cache + forward to the broadcaster. Clamp matches sidecar's own
-    /// [0, 10 000] range so a stray negative-lag peak doesn't trigger
-    /// spurious clamp warnings sidecar-side.
-    @available(*, deprecated)
-    private func handlePassiveSample(_ sample: PassiveCalibrator.Sample) async {
-        passiveSampleCount &+= 1
-        lastPassiveSample = sample
-        // Forward to UI subscriber (AppModel) BEFORE the sidecar push.
-        // The UI just displays the measurement; it shouldn't block on
-        // the JSON-RPC round-trip if the sidecar happens to be slow.
-        externalPassiveSampleCallback?(sample)
-        let clamped = max(0, min(10_000, sample.suggestedDelayMs))
-        do {
-            _ = try await setLocalFifoDelayMs(clamped)
-        } catch {
-            lastError = "passive set_delay_ms failed: \(error)"
-        }
-    }
-
-    /// Mutate tunables from outside the actor. No-op if calibrator
-    /// hasn't been started. Each parameter is independently optional.
-    @available(*, deprecated)
-    public func updatePassiveTunables(
-        correlationWindowSeconds: Double? = nil,
-        measurementIntervalSeconds: Double? = nil,
-        minConfidenceForUpdate: Double? = nil
-    ) {
-        guard let c = passiveCalibrator else { return }
-        if let v = correlationWindowSeconds { c.correlationWindowSeconds = v }
-        if let v = measurementIntervalSeconds { c.measurementIntervalSeconds = v }
-        if let v = minConfidenceForUpdate { c.minConfidenceForUpdate = v }
-    }
-
     // MARK: - Continuous v4 active calibration
     //
     // Wraps `ActiveCalibrator` in a periodic background loop. Each
@@ -1520,9 +1411,6 @@ public actor Router {
     /// `initialDelayMs` callback so each cycle's delta is computed
     /// against the freshest value rather than the original seed.
     private var continuousActiveCurrentDelayMs: Int = 1750
-    /// Mutex with `continuousActiveCalibrator` (AppModel enforces). Shares
-    /// the delay-line cache via apply/snapshot helpers below.
-    private var hybridTracker: HybridDriftTracker?
     public typealias ContinuousActiveDeviceProvider =
         @Sendable () async -> [Device]
 
@@ -1794,130 +1682,4 @@ public actor Router {
         }
     }
 
-    // MARK: - Hybrid drift tracker (Round 10)
-    // Sister actor to `ContinuousActiveCalibrator` — shares the
-    // delay-line cache + IPC path. AppModel enforces mutual exclusion.
-    // (`hybridTracker` field declared above, near `continuousActive*`.)
-
-    private var lastEmittedHybridSample: HybridDriftTracker.Sample?
-
-    /// True iff the most recent successful full calibration cached at
-    /// least one AirPlay τ value. AppModel gates hybrid tracking on this
-    /// because the tracker uses cached τ as its prior.
-    public var hasFullCalibrationCache: Bool {
-        !lastFullCalibrationAirplayTau.isEmpty
-    }
-
-    /// Inject a stereo chirp into the SCK ring at `atNs`. Sleeps if
-    /// future, writes immediately if past. Public so both
-    /// ActiveCalibrator (Phase 2) and HybridDriftTracker share one path.
-    public func injectChirpToRingForCalibration(
-        samples: [[Float]], atNs: UInt64
-    ) async {
-        let nowNs = Clock.nowNs()
-        if atNs > nowNs {
-            try? await Task.sleep(nanoseconds: atNs - nowNs)
-        }
-        guard samples.count >= 2,
-              !samples[0].isEmpty,
-              samples[0].count == samples[1].count
-        else { return }
-        let frames = samples[0].count
-        let ring = sckCapture.ringBuffer
-        samples[0].withUnsafeBufferPointer { ch0 in
-            samples[1].withUnsafeBufferPointer { ch1 in
-                let ptrArray: [UnsafePointer<Float>] = [
-                    ch0.baseAddress!, ch1.baseAddress!,
-                ]
-                ptrArray.withUnsafeBufferPointer { ptrs in
-                    ring.write(channels: ptrs.baseAddress!, frames: frames)
-                }
-            }
-        }
-    }
-
-    /// Begin closed-loop drift tracking. Idempotent.
-    public func startHybridTracker(
-        microphoneDeviceID: AudioDeviceID?,
-        configuration: HybridDriftTracker.Configuration = .init(),
-        onSample: @escaping @Sendable (HybridDriftTracker.Sample) -> Void
-    ) async throws {
-        if hybridTracker != nil { return }
-        // Wrap caller's onSample so we also retain the latest for the
-        // diagnostic JSON-RPC `tracker.status` query.
-        let wrappedOnSample: @Sendable (HybridDriftTracker.Sample) -> Void = { [weak self] sample in
-            onSample(sample)
-            Task { [weak self] in await self?.recordEmittedHybridSample(sample) }
-        }
-        let tracker = HybridDriftTracker(
-            ringBuffer: sckCapture.ringBuffer,
-            microphoneDeviceID: microphoneDeviceID,
-            currentDelayMs: { [weak self] in
-                await self?.continuousActiveDelaySnapshot() ?? 1750
-            },
-            applyDelayMs: { [weak self] ms in
-                await self?.applyContinuousActiveDelay(ms)
-            },
-            injectChirpToRing: { [weak self] samples, atNs in
-                await self?.injectChirpToRingForCalibration(
-                    samples: samples, atNs: atNs
-                ) ?? ()
-            },
-            onSample: wrappedOnSample,
-            configuration: configuration
-        )
-        try await tracker.start()
-        hybridTracker = tracker
-    }
-
-    /// Stop the hybrid drift tracker. Idempotent.
-    public func stopHybridTracker() async {
-        await hybridTracker?.stop()
-        hybridTracker = nil
-        lastEmittedHybridSample = nil
-    }
-
-    private func recordEmittedHybridSample(_ sample: HybridDriftTracker.Sample) {
-        lastEmittedHybridSample = sample
-    }
-
-    // MARK: - Hybrid drift tracker status snapshot (Round 10)
-
-    /// Snapshot of the hybrid drift tracker's most recent emitted sample,
-    /// serialised for the `tracker.status` JSON-RPC method. Returns nil
-    /// when the tracker isn't running OR has not yet emitted its first
-    /// sample. Wire contract documented in
-    /// `docs/round10_validation_protocol.md`. Field names must match
-    /// `drift_test_v2.sh`'s parser exactly.
-    public func lastHybridTrackerSample() async -> [String: Any]? {
-        guard let s = lastEmittedHybridSample else { return nil }
-        let sourceStr: String = {
-            switch s.source {
-            case .passive: return "passive"
-            case .active:  return "active"
-            case .none:    return "none"
-            }
-        }()
-        let stateStr: String = {
-            switch s.state {
-            case .coldStart:                return "coldStart"
-            case .warming(let p):           return "warming(\(String(format: "%.2f", p)))"
-            case .locked:                   return "locked"
-            case .drifting(let q):          return "drifting(\(String(format: "%.1f", q))s)"
-            case .lost(let r):              return "lost(\(r))"
-            }
-        }()
-        let measuredAny: Any = s.measuredOffsetMs.map { $0 as Any } ?? NSNull()
-        return [
-            "timestamp": ISO8601DateFormatter().string(from: s.timestamp),
-            "kalman_offset_ms": s.kalmanOffsetMs,
-            "kalman_drift_ppm": s.kalmanDriftPpm,
-            "measured_offset_ms": measuredAny,
-            "confidence": s.confidence,
-            "source": sourceStr,
-            "applied_correction_ms": s.appliedCorrectionMs,
-            "resulting_delay_ms": s.resultingDelayMs,
-            "state": stateStr,
-        ]
-    }
 }
