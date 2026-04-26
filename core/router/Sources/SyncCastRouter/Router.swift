@@ -1603,9 +1603,9 @@ public actor Router {
     /// (populated by the most recent successful `runCalibration`). The
     /// returned `Result.perDeviceTauMs` MERGES the freshly-measured
     /// local taus with the cached AirPlay taus, and `deltaMs` is
-    /// recomputed as `max(cachedAirplay) − max(freshLocal)` so the
-    /// continuous loop's drift policy still operates against an
-    /// AirPlay-vs-local delta.
+    /// recomputed as `max(0, median(cachedAirplay) − median(freshLocal)
+    /// − broadcasterOverheadMs)` so the continuous loop's drift policy
+    /// still operates against an AirPlay-vs-local delta.
     ///
     /// If the user has enabled AirPlay devices but never run a full
     /// Auto-calibrate (cache empty), throws `CalibrationFailure.engineFailed`
@@ -1638,21 +1638,28 @@ public actor Router {
         for id in enabledAirplayIDs {
             if let tau = lastFullCalibrationAirplayTau[id] { merged[id] = tau }
         }
-        // Recompute delta = max(cached AirPlay τ) − max(fresh local τ).
-        // ABSOLUTE TARGET delay-line value (the continuous loop SETs,
-        // not adds) — same semantics as the manual-calibrate path.
-        var maxAir = Int.min, maxLoc = Int.min
-        for id in enabledAirplayIDs {
-            if let t = merged[id], t > maxAir { maxAir = t }
-        }
-        for dev in enabled where dev.transport == .coreAudio {
-            if let t = raw.perDeviceTauMs[dev.id], t > maxLoc { maxLoc = t }
-        }
+        // Recompute delta = median(cached AirPlay τ) − median(fresh local τ)
+        // − broadcasterOverheadMs. ABSOLUTE TARGET delay-line value (the
+        // continuous loop SETs, not adds) — same semantics + same bug fix as
+        // the manual-calibrate path in `ActiveCalibrator.run`. Median is
+        // robust to per-device cycle drift; broadcaster-overhead corrects
+        // for Phase 1's tone bypassing the SCK→writer→sidecar→broadcaster
+        // chain that real music traverses.
+        let airplayCached: [Int] = enabledAirplayIDs.compactMap { merged[$0] }
+            .filter { $0 >= 0 }
+        let localFresh: [Int] = enabled
+            .filter { $0.transport == .coreAudio }
+            .compactMap { raw.perDeviceTauMs[$0.id] }
+            .filter { $0 >= 0 }
         let mergedDelta: Int
-        if maxAir == Int.min || maxLoc == Int.min {
+        if airplayCached.isEmpty || localFresh.isEmpty {
             mergedDelta = 0
         } else {
-            mergedDelta = maxAir - maxLoc
+            let airMed = ActiveCalibrator.medianInt(airplayCached)
+            let locMed = ActiveCalibrator.medianInt(localFresh)
+            let overheadMs = ActiveCalibrator.resolvedBroadcasterOverheadMs()
+            // Defensive clamp: never recommend a negative delay-line.
+            mergedDelta = max(0, airMed - locMed - overheadMs)
         }
         return ActiveCalibrator.Result(
             perDeviceTauMs: merged,
