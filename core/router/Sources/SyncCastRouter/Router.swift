@@ -1785,4 +1785,60 @@ public actor Router {
             throw CalibrationFailure.engineFailed("\(error)")
         }
     }
+
+    // MARK: - Round-10 Hybrid drift tracker
+    // Closed-loop drift tracker driven by `HybridDriftTracker`. Shares
+    // the cached delay snapshot with `continuousActiveCalibrator` via
+    // `applyContinuousActiveDelay`, so the two engines stay in sync if
+    // a UI accidentally enables both.
+
+    private var hybridTracker: HybridDriftTracker?
+
+    /// Begin closed-loop drift tracking. Idempotent.
+    public func startHybridTracker(
+        microphoneDeviceID: AudioDeviceID?,
+        configuration: HybridDriftTracker.Configuration = .init(),
+        onSample: @escaping @Sendable (HybridDriftTracker.Sample) -> Void
+    ) async throws {
+        if hybridTracker != nil { return }
+        let ring = sckCapture.ringBuffer
+        let injectChirp: @Sendable ([[Float]], UInt64) async -> Void = { samples, atNs in
+            let nowNs = Clock.nowNs()
+            if atNs > nowNs { try? await Task.sleep(nanoseconds: atNs - nowNs) }
+            guard samples.count >= 2,
+                  !samples[0].isEmpty,
+                  samples[0].count == samples[1].count
+            else { return }
+            let frames = samples[0].count
+            samples[0].withUnsafeBufferPointer { ch0 in
+                samples[1].withUnsafeBufferPointer { ch1 in
+                    let arr: [UnsafePointer<Float>] = [ch0.baseAddress!, ch1.baseAddress!]
+                    arr.withUnsafeBufferPointer { ptrs in
+                        ring.write(channels: ptrs.baseAddress!, frames: frames)
+                    }
+                }
+            }
+        }
+        let tracker = HybridDriftTracker(
+            ringBuffer: ring,
+            microphoneDeviceID: microphoneDeviceID,
+            currentDelayMs: { [weak self] in
+                await self?.continuousActiveDelaySnapshot() ?? 1750
+            },
+            applyDelayMs: { [weak self] ms in
+                await self?.applyContinuousActiveDelay(ms)
+            },
+            injectChirpToRing: injectChirp,
+            onSample: onSample,
+            configuration: configuration
+        )
+        try await tracker.start()
+        hybridTracker = tracker
+    }
+
+    /// Stop the hybrid drift tracker. Idempotent.
+    public func stopHybridTracker() async {
+        await hybridTracker?.stop()
+        hybridTracker = nil
+    }
 }
