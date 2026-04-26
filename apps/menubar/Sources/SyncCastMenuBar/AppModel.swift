@@ -5,6 +5,29 @@ import Observation
 import SyncCastDiscovery
 import SyncCastRouter
 
+/// Lock state for the whole-home AirPlay delay slider. `.unlocked` is the
+/// default (free-running); `.locked(at:)` carries the millisecond target
+/// the user has pinned. Calibrators consult this before applying any
+/// automated correction.
+public enum DelayLockState: Equatable {
+    case unlocked
+    case locked(at: Int)  // ms
+}
+
+/// A/B side identifier for the audition state machine. The audition flips
+/// the broadcast delay between baseline-150 ms (A) and baseline+150 ms (B)
+/// every 1.2 s within a single round.
+public enum AuditionSide: String, Equatable { case A, B }
+
+/// Audition state machine. Idle by default. `.running(round:side:)` carries
+/// the current round (1...4) and the side currently being played. Round 5
+/// auto-stops, restoring `airplayDelayMs` to the baseline that was active
+/// when `startAudition()` was first called.
+public enum AuditionState: Equatable {
+    case idle
+    case running(round: Int, side: AuditionSide)  // round 1...4
+}
+
 /// Top-level UI view-model. Owns the `DiscoveryService` and a `Router`,
 /// surfaces a snapshot of devices + routing for the SwiftUI tree.
 ///
@@ -77,9 +100,6 @@ final class AppModel {
     var selectedMicID: AudioDeviceID? {
         didSet {
             persistSelectedMic()
-            // Hybrid tracker captures mic id at start; restart so the
-            // live engine actually listens through the new pick.
-            restartHybridTrackerIfActive()
         }
     }
 
@@ -142,8 +162,25 @@ final class AppModel {
     static let airplayDelayMsRange: ClosedRange<Int> = 0...5000
 
     private static func loadPersistedDelayMs() -> Int {
+        // If the user previously locked the delay, prefer the locked value.
+        // The lock key stores 0 to mean "no lock", so guard on > 0.
+        let lockedAt = UserDefaults.standard.integer(forKey: airplayDelayLockedAtKey)
+        if lockedAt > 0 {
+            return min(max(lockedAt, airplayDelayMsRange.lowerBound),
+                       airplayDelayMsRange.upperBound)
+        }
         guard let raw = UserDefaults.standard.object(forKey: airplayDelayMsKey) as? Int
         else { return defaultAirplayDelayMs }
+        return min(max(raw, airplayDelayMsRange.lowerBound),
+                   airplayDelayMsRange.upperBound)
+    }
+
+    /// Read the persisted lock target (ms). Returns 0 when no lock has
+    /// been set. Used by init() to seed `delayLockState` so a user's
+    /// pinned value survives a relaunch.
+    private static func loadPersistedLockedAt() -> Int {
+        let raw = UserDefaults.standard.integer(forKey: airplayDelayLockedAtKey)
+        if raw <= 0 { return 0 }
         return min(max(raw, airplayDelayMsRange.lowerBound),
                    airplayDelayMsRange.upperBound)
     }
@@ -159,13 +196,7 @@ final class AppModel {
     var backgroundCalibrationEnabled: Bool = AppModel.loadPersistedBgEnabled() {
         didSet {
             UserDefaults.standard.set(backgroundCalibrationEnabled, forKey: AppModel.bgEnabledKey)
-            // Mutex with hybrid tracker — both drive the same delay-line
-            // cache; whichever the user just enabled wins.
-            if backgroundCalibrationEnabled && hybridTrackingEnabled {
-                hybridTrackingEnabled = false
-            }
             reconcileBackgroundCalibration()
-            reconcileHybridTracker()
         }
     }
     /// Sample interval (seconds, clamped to `bgIntervalRange`). Live
@@ -236,33 +267,52 @@ final class AppModel {
         return min(max(raw, bgIntervalRange.lowerBound), bgIntervalRange.upperBound)
     }
 
-    // MARK: - Hybrid drift tracker (closed-loop, ~4 Hz)
-    // Sister engine to `backgroundCalibrationEnabled`; mutually exclusive
-    // because both write the same delay-line cache. Mutex is enforced in
-    // the didSet observers below.
-    var hybridTrackingEnabled: Bool = AppModel.loadPersistedHybridEnabled() {
-        didSet {
-            UserDefaults.standard.set(hybridTrackingEnabled, forKey: AppModel.hybridEnabledKey)
-            if hybridTrackingEnabled && backgroundCalibrationEnabled {
-                backgroundCalibrationEnabled = false
-            }
-            reconcileHybridTracker()
-            reconcileBackgroundCalibration()
-        }
-    }
-    /// Most recent Sample from the hybrid loop, rendered by MainPopover.
-    var lastTrackerSample: HybridDriftTracker.Sample? = nil
-    /// 60 × ~250 ms = 15 s sliding window of recent samples.
-    var hybridTrackerHistory: [HybridDriftTracker.Sample] = []
-    static let hybridTrackerHistoryCapacity: Int = 60
-    /// True iff the engine is running (preconditions hold).
-    var hybridTrackerActive: Bool = false
+    // MARK: - Manual delay lock + audition state machine
+    //
+    // The whole-home delay slider has two ergonomic problems we solve here:
+    //   1. Background calibrators (continuous v4) and prior closed-loop
+    //      drivers occasionally jitter the delay value while the user is
+    //      happy with what they hear. The lock pins the broadcast-side
+    //      delay to a user-chosen value; calibrators can still RUN, but
+    //      external code can check `delayLockState` before applying any
+    //      automated correction.
+    //   2. Picking the "right" delay by feel is hard. The audition state
+    //      machine A/B-tests ±150 ms around a baseline, then narrows the
+    //      baseline by 75 ms on each user choice for 4 rounds. Total
+    //      ~10 s of A/B with deterministic convergence.
 
-    static let hybridEnabledKey = "syncast.hybridTrackingEnabled"
-    private static func loadPersistedHybridEnabled() -> Bool {
-        UserDefaults.standard.bool(forKey: hybridEnabledKey)
-    }
+    /// Persistence key for the manual lock target. Stored in milliseconds.
+    /// 0 means "no lock" — chosen because the slider's lower bound is 0
+    /// so there's no risk of confusing 0-as-locked with 0-as-not-locked
+    /// from a user-centric perspective (zero delay is rarely useful in
+    /// whole-home anyway). loadPersistedLockedAt() returns the canonical
+    /// "lock on / lock off" interpretation.
+    static let airplayDelayLockedAtKey = "syncast.airplayDelayLockedAt"
 
+    /// Locked-delay state. `.locked(at:)` carries the slider value (ms)
+    /// the user pinned. Persisted via `airplayDelayLockedAtKey` and
+    /// restored at init.
+    ///
+    /// `@Published` is intentionally omitted: this class is `@Observable`
+    /// (Swift 5.9 macros), which auto-observes all `var` mutations and
+    /// is incompatible with Combine's `@Published` property wrapper.
+    public private(set) var delayLockState: DelayLockState = .unlocked
+
+    /// Audition state machine. Idle until `startAudition()`; transitions
+    /// through 4 rounds of A/B side switching at 1.2 s cadence. Each
+    /// `chooseAuditionA` / `chooseAuditionB` narrows the baseline by
+    /// 75 ms before kicking off the next round.
+    public private(set) var auditionState: AuditionState = .idle
+
+    /// Snapshot of `airplayDelayMs` taken at `startAudition()` and
+    /// adjusted by the chooser methods. Restored on `stopAudition()`
+    /// (or when round 5 auto-stops). Private to keep the contract
+    /// surface small.
+    private var auditionBaselineMs: Int = 0
+
+    /// In-flight side-switching Task. Cancelled by stopAudition / chooseX
+    /// before launching a fresh per-round Task.
+    private var auditionSideSwitchTask: Task<Void, Never>?
 
     enum Mode: String, Sendable, CaseIterable, Identifiable {
         /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
@@ -345,6 +395,17 @@ final class AppModel {
     init() {
         self.discovery = DiscoveryService()
         self.router = Router()
+        // Restore manual lock from UserDefaults. When a lock is persisted,
+        // `loadPersistedDelayMs()` already chose the locked value so the
+        // slider matches the lock; we only need to seed the state enum.
+        let lockedAt = AppModel.loadPersistedLockedAt()
+        if lockedAt > 0 {
+            self.delayLockState = .locked(at: lockedAt)
+        }
+        // One-shot cleanup of the legacy hybrid-tracker pref. The
+        // toggle/engine has been removed; leaving the key behind would
+        // simply clutter the user's defaults plist forever.
+        UserDefaults.standard.removeObject(forKey: "syncast.hybridTrackingEnabled")
         Task { await self.bootstrap() }
     }
 
@@ -744,13 +805,11 @@ final class AppModel {
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
                 reconcileBackgroundCalibration()
-                reconcileHybridTracker()
             } catch {
                 SyncCastLog.log("reconcile: router.start FAILED: \(error)")
                 lastError = "engine: \(error.localizedDescription)"
                 streamingState = .error
                 reconcileBackgroundCalibration()
-                reconcileHybridTracker()
             }
         case (.running, false):
             SyncCastLog.log("reconcile: stopping (no enabled outputs)")
@@ -758,7 +817,6 @@ final class AppModel {
             await router.stop()
             streamingState = .idle
             reconcileBackgroundCalibration()
-            reconcileHybridTracker()
         case (.running, true):
             // ORDER MATTERS. Router holds its own copy of `routing`
             // (Router.routing) which `syncLocalOutputs` reads to decide
@@ -886,7 +944,6 @@ final class AppModel {
                     self.modeTransitioning = false
                     self.reconcileEngine()
                     self.reconcileBackgroundCalibration()
-                    self.reconcileHybridTracker()
                 }
             }
         } else {
@@ -894,7 +951,6 @@ final class AppModel {
             // No async work, so no need to flip the transition flag here.
             reconcileEngine()
             reconcileBackgroundCalibration()
-            reconcileHybridTracker()
         }
     }
 
@@ -1063,11 +1119,6 @@ final class AppModel {
             continuousPausedForManual = false
             reconcileBackgroundCalibration()
         }
-        // A successful full Auto-calibrate populates the AirPlay τ cache
-        // in the Router, which is a precondition for the hybrid tracker.
-        // Reconcile now so a user with `hybridTrackingEnabled = true`
-        // sees the tracker auto-start as soon as the cache is ready.
-        reconcileHybridTracker()
     }
 
     /// Clear a non-idle status. Bound to the popover's "Dismiss" button
@@ -1254,95 +1305,164 @@ final class AppModel {
         }
     }
 
-    // MARK: - Hybrid drift tracker lifecycle
+    // MARK: - Manual delay lock
 
-    /// Drive the hybrid tracker on or off. Idempotent. ACTIVE iff
-    /// wholeHome + running + enabled + mic-OK + cached AirPlay τ prior.
-    /// Mutex with `backgroundCalibrationEnabled` is enforced at the
-    /// toggle setter; here we only check positive preconditions.
-    func reconcileHybridTracker() {
-        Task { [weak self] in
-            guard let self else { return }
-            let cacheReady = await self.router.hasFullCalibrationCache
-            await MainActor.run { self.applyHybridReconcile(cacheReady: cacheReady) }
-        }
+    /// Pin the broadcast-side AirPlay delay to the current `airplayDelayMs`.
+    /// Subsequent calibrators / closed-loop drivers can read
+    /// `delayLockState` to decide whether to apply an automated correction.
+    /// The locked value is persisted in UserDefaults so it survives a
+    /// relaunch (see `loadPersistedDelayMs` + `loadPersistedLockedAt`).
+    public func lockAirplayDelay() {
+        let value = airplayDelayMs
+        UserDefaults.standard.set(value, forKey: AppModel.airplayDelayLockedAtKey)
+        delayLockState = .locked(at: value)
+        SyncCastLog.log("delayLock: locked at \(value)ms")
     }
 
-    private func applyHybridReconcile(cacheReady: Bool) {
-        let shouldRun = mode == .wholeHome && streamingState == .running
-            && hybridTrackingEnabled && hasMicrophonePermission && cacheReady
-        switch (hybridTrackerActive, shouldRun) {
-        case (false, true):
-            hybridTrackerActive = true
-            let micID = effectiveMicID
-            SyncCastLog.log("hybridTracker: starting mic=\(micID.map(String.init) ?? "default")")
-            Task { [weak self] in
+    /// Release the lock so calibrators can drive the slider again. Stores
+    /// 0 as the persisted lock target so a future launch sees "no lock".
+    public func unlockAirplayDelay() {
+        UserDefaults.standard.set(0, forKey: AppModel.airplayDelayLockedAtKey)
+        delayLockState = .unlocked
+        SyncCastLog.log("delayLock: unlocked")
+    }
+
+    /// Bump the broadcast delay by an integer ms delta (positive or
+    /// negative). Clamped to `airplayDelayMsRange` and routed through the
+    /// existing debounced setter so the sidecar gets the change. Lock
+    /// state is left untouched — a "nudge while locked" intentionally
+    /// drifts the in-memory slider without changing the locked target.
+    public func nudgeAirplayDelay(by deltaMs: Int) {
+        let next = airplayDelayMs + deltaMs
+        let clamped = max(
+            AppModel.airplayDelayMsRange.lowerBound,
+            min(AppModel.airplayDelayMsRange.upperBound, next)
+        )
+        setAirplayDelay(clamped)
+    }
+
+    // MARK: - Audition state machine
+
+    /// Side-switch cadence (seconds). The audition flips between A and B
+    /// every 1.2 s within a single round.
+    private static let auditionSideSwitchSeconds: Double = 1.2
+
+    /// Bracket size around the baseline (ms). Side A plays at
+    /// baseline-150 ms, side B at baseline+150 ms.
+    private static let auditionBracketMs: Int = 150
+
+    /// Per-choice baseline narrowing (ms). chooseAuditionA shifts the
+    /// baseline down by 75 ms; chooseAuditionB shifts it up.
+    private static let auditionNarrowingMs: Int = 75
+
+    /// Total user-decision rounds before auto-stop. Round 5 triggers
+    /// `stopAudition()`.
+    private static let auditionTotalRounds: Int = 4
+
+    /// Begin the A/B audition loop. No-op if an audition is already
+    /// running or if the slider is otherwise unavailable. The current
+    /// `airplayDelayMs` becomes the baseline; round 1 / side A is
+    /// applied immediately and the side-switching Task is started.
+    public func startAudition() {
+        guard auditionState == .idle else { return }
+        auditionBaselineMs = airplayDelayMs
+        SyncCastLog.log("audition: start baseline=\(auditionBaselineMs)ms")
+        auditionState = .running(round: 1, side: .A)
+        applyAuditionSide(.A)
+        startAuditionSideSwitchLoop()
+    }
+
+    /// Cancel any in-flight audition and restore the original baseline.
+    /// Idempotent — safe to call from `idle`. Matches the implicit
+    /// auto-stop that fires after round 4 chooses.
+    public func stopAudition() {
+        auditionSideSwitchTask?.cancel()
+        auditionSideSwitchTask = nil
+        if auditionState != .idle {
+            SyncCastLog.log("audition: stop, restoring baseline=\(auditionBaselineMs)ms")
+            // Restore the slider to whatever was active when start was
+            // called. Goes through the debounced setter so the sidecar
+            // is updated.
+            setAirplayDelay(auditionBaselineMs)
+        }
+        auditionState = .idle
+    }
+
+    /// User picked side A this round. Narrow the baseline downward by
+    /// 75 ms, advance to the next round, or auto-stop after round 4.
+    public func chooseAuditionA() {
+        chooseAuditionSide(narrowBy: -AppModel.auditionNarrowingMs)
+    }
+
+    /// User picked side B this round. Narrow the baseline upward by
+    /// 75 ms, advance to the next round, or auto-stop after round 4.
+    public func chooseAuditionB() {
+        chooseAuditionSide(narrowBy: +AppModel.auditionNarrowingMs)
+    }
+
+    /// Shared body for chooseAuditionA / chooseAuditionB. The sign of
+    /// `narrowBy` determines which way the baseline shifts.
+    private func chooseAuditionSide(narrowBy delta: Int) {
+        guard case .running(let round, _) = auditionState else { return }
+        let nextBaseline = max(
+            AppModel.airplayDelayMsRange.lowerBound,
+            min(AppModel.airplayDelayMsRange.upperBound,
+                auditionBaselineMs + delta)
+        )
+        auditionBaselineMs = nextBaseline
+        SyncCastLog.log("audition: round=\(round) choose Δ=\(delta)ms → baseline=\(nextBaseline)ms")
+        // Round 5 means we just heard the 4th pair and chose; auto-stop.
+        let nextRound = round + 1
+        if nextRound > AppModel.auditionTotalRounds {
+            // Apply final baseline as the new airplayDelayMs (NOT the
+            // restore behaviour — the user's choices are the result).
+            auditionSideSwitchTask?.cancel()
+            auditionSideSwitchTask = nil
+            setAirplayDelay(nextBaseline)
+            auditionState = .idle
+            SyncCastLog.log("audition: complete after \(AppModel.auditionTotalRounds) rounds at \(nextBaseline)ms")
+            return
+        }
+        // Otherwise restart the side-switch loop with the new baseline.
+        auditionState = .running(round: nextRound, side: .A)
+        applyAuditionSide(.A)
+        startAuditionSideSwitchLoop()
+    }
+
+    /// Apply baseline ± bracket to the slider. Bypasses the debounced
+    /// IPC path used by user drags because the audition wants the change
+    /// to land instantly; it still goes through `setAirplayDelay` to
+    /// share the clamp + sidecar push.
+    private func applyAuditionSide(_ side: AuditionSide) {
+        let target: Int
+        switch side {
+        case .A: target = auditionBaselineMs - AppModel.auditionBracketMs
+        case .B: target = auditionBaselineMs + AppModel.auditionBracketMs
+        }
+        setAirplayDelay(target)
+    }
+
+    /// Kick off (or restart) the 1.2 s flip Task for the current round.
+    /// The Task alternates side every 1.2 s and updates `auditionState`
+    /// in place. Cancelled by stopAudition / chooseX before each new
+    /// round and on app teardown via Task.isCancelled checks.
+    ///
+    /// The Task inherits `@MainActor` isolation from its surrounding
+    /// context (this method is on the `@MainActor`-isolated AppModel),
+    /// so the body runs on the main actor without an explicit hop.
+    private func startAuditionSideSwitchLoop() {
+        auditionSideSwitchTask?.cancel()
+        auditionSideSwitchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let nanos = UInt64(AppModel.auditionSideSwitchSeconds * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                if Task.isCancelled { return }
                 guard let self else { return }
-                do {
-                    try await self.router.startHybridTracker(
-                        microphoneDeviceID: micID,
-                        onSample: { sample in
-                            Task { @MainActor [weak self] in
-                                self?.handleHybridTrackerSample(sample)
-                            }
-                        }
-                    )
-                } catch {
-                    SyncCastLog.log("hybridTracker: start failed: \(error)")
-                    await MainActor.run { self.hybridTrackerActive = false }
-                }
+                guard case .running(let round, let side) = self.auditionState else { return }
+                let nextSide: AuditionSide = (side == .A) ? .B : .A
+                self.auditionState = .running(round: round, side: nextSide)
+                self.applyAuditionSide(nextSide)
             }
-        case (true, false):
-            SyncCastLog.log("hybridTracker: stopping")
-            stopHybridTrackerEngine()
-        default: break
-        }
-    }
-
-    /// Stop the engine without flipping the toggle (preserve user pref).
-    private func stopHybridTrackerEngine() {
-        Task { [weak self] in
-            guard let self else { return }
-            await self.router.stopHybridTracker()
-            await MainActor.run {
-                self.hybridTrackerActive = false
-                self.lastTrackerSample = nil
-                self.hybridTrackerHistory = []
-            }
-        }
-    }
-
-    /// Stop + reconcile so the next start picks up the new value
-    /// (currently used for mic-selection changes).
-    fileprivate func restartHybridTrackerIfActive() {
-        guard hybridTrackerActive else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            await self.router.stopHybridTracker()
-            await MainActor.run {
-                self.hybridTrackerActive = false
-                self.lastTrackerSample = nil
-                self.hybridTrackerHistory = []
-                self.reconcileHybridTracker()
-            }
-        }
-    }
-
-    /// Receive a Sample. Router has already applied the delay-line
-    /// correction; mirror `resultingDelayMs` into the slider field +
-    /// persist, and append to the history ring.
-    private func handleHybridTrackerSample(_ sample: HybridDriftTracker.Sample) {
-        lastTrackerSample = sample
-        var next = hybridTrackerHistory
-        next.append(sample)
-        if next.count > AppModel.hybridTrackerHistoryCapacity {
-            next.removeFirst(next.count - AppModel.hybridTrackerHistoryCapacity)
-        }
-        hybridTrackerHistory = next
-        let appliedInt = Int(sample.resultingDelayMs.rounded())
-        if airplayDelayMs != appliedInt {
-            airplayDelayMs = appliedInt
-            UserDefaults.standard.set(appliedInt, forKey: AppModel.airplayDelayMsKey)
         }
     }
 
