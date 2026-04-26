@@ -108,6 +108,16 @@ struct MainPopover: View {
                     .accessibilityIdentifier("calibrationMicPicker")
                 }
             }
+            // Live progress while sequential per-device sweep is running:
+            // "Calibrating <Device> (n/total)…". Sequential sweep takes
+            // ≈30s for 4 devices, so per-device feedback matters.
+            if case .running = model.calibrationStatus,
+               let progress = model.calibrationProgress {
+                Text(progress)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             // Per-status caption (result or error). Tap to dismiss.
             if case let .completed(delta, confidence) = model.calibrationStatus {
                 let sign = delta >= 0 ? "+" : ""

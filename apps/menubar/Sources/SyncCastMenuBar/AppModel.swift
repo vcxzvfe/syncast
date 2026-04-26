@@ -880,6 +880,13 @@ final class AppModel {
     }
 
     var calibrationStatus: CalibrationStatus = .idle
+    /// Live "Calibrating <Device> (n/total)…" progress string emitted by
+    /// Router.runCalibration's per-device sequential loop. nil unless the
+    /// runner is mid-sweep. The MainPopover renders this as a sub-caption
+    /// under the spinner so the user sees which device is being measured
+    /// (sequential calibration takes ≈30s for 4 devices, vs the previous
+    /// ≈15s simultaneous run that produced unusable output).
+    var calibrationProgress: String? = nil
 
     /// Kick off auto-calibration. Safe to call from the main actor on a
     /// button tap. Uses `effectiveMicID` (W3) as the input device.
@@ -923,13 +930,19 @@ final class AppModel {
         }
 
         calibrationStatus = .running
+        calibrationProgress = "Preparing…"
         let snapshot = devices  // immutable Sendable copy
         let micID = effectiveMicID
         do {
             let delta = try await router.runCalibration(
                 devices: snapshot,
                 microphoneDeviceID: micID,
-                pulseCount: 5
+                pulseCount: 5,
+                progress: { [weak self] msg in
+                    Task { @MainActor [weak self] in
+                        self?.calibrationProgress = msg
+                    }
+                }
             )
             // Apply as a *delta* on top of the current value. The
             // CalibrationRunner returns the signed correction needed:
@@ -945,6 +958,7 @@ final class AppModel {
         } catch {
             calibrationStatus = .failed("\(error)")
         }
+        calibrationProgress = nil
 
         if continuousPausedForManual {
             continuousPausedForManual = false
