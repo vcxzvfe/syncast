@@ -86,6 +86,21 @@ LOCAL_FIFO_OVERFLOW_MARGIN_S = 0.5
 # when the queue is empty or the next due-time is far in the future.
 LOCAL_FIFO_PUMP_WAIT_CAP_S = 0.1
 
+# Delay-change ramp window. A/B audition switching (Round 11) toggles
+# between two delay values rapidly; the previous behavior — apply new
+# delay value to all subsequent `feed()` calls instantly — caused an
+# audible click because the post-change packets entered the queue with
+# a sudden discontinuity in due-time spacing relative to the trailing
+# in-queue packets. We now linearly interpolate `_delay_seconds` from
+# the current value (possibly mid-ramp) to the new target over this
+# window, so new packets enter at progressively-spaced due-times. At
+# ~100 pkt/s input rate this is ~3 transition packets — inaudible. The
+# value 30 ms is short enough that a user dragging a slider doesn't
+# perceive lag, long enough to smooth the rate change. In-queue packets
+# retain their original due-times (we never retroactively rewrite them
+# — see set_delay_ms docstring).
+LOCAL_FIFO_DELAY_RAMP_S = 0.030
+
 # Maximum number of concurrent broadcaster clients. There's exactly one
 # bridge per active local CoreAudio output, so a few is plenty; this cap
 # keeps a buggy or runaway local process from exhausting fds before the
@@ -337,9 +352,25 @@ class LocalFifoBroadcaster:
         # (due_monotonic_s, enqueued_monotonic_s, packet_bytes). The
         # condition variable is signaled by `feed()` when a new item
         # arrives or by `stop()` when shutdown begins. Mutations to
-        # `_delay_queue` and `_delay_seconds` happen under the
-        # condition's underlying lock.
-        self._delay_seconds = max(0.0, delay_ms / 1000.0)
+        # `_delay_queue`, `_delay_seconds`, `_delay_seconds_target`,
+        # `_delay_ramp_start_monotonic`, and `_delay_ramp_start_value`
+        # happen under the condition's underlying lock.
+        #
+        # Round 11 ramp: `_delay_seconds` is the CURRENT (possibly
+        # mid-ramp) delay applied to new `feed()` calls.
+        # `_delay_seconds_target` is the value most recently passed to
+        # `set_delay_ms` (the "what the caller asked for" value the
+        # `delay_ms` property and diagnostics report). When the two
+        # differ, `_advance_delay_ramp(now)` linearly interpolates
+        # `_delay_seconds` toward target across `LOCAL_FIFO_DELAY_RAMP_S`
+        # starting at `_delay_ramp_start_monotonic` from
+        # `_delay_ramp_start_value`. When equal, we're in steady state
+        # and the ramp metadata is dormant.
+        initial = max(0.0, delay_ms / 1000.0)
+        self._delay_seconds = initial
+        self._delay_seconds_target = initial
+        self._delay_ramp_start_monotonic = 0.0
+        self._delay_ramp_start_value = initial
         self._delay_cond = threading.Condition()
         self._delay_queue: collections.deque[tuple[float, float, bytes]] = (
             collections.deque()
@@ -366,32 +397,110 @@ class LocalFifoBroadcaster:
 
     @property
     def delay_ms(self) -> int:
-        """Currently configured broadcast delay in milliseconds."""
-        return int(round(self._delay_seconds * 1000.0))
+        """Most recently requested broadcast delay (the ramp TARGET).
+
+        Reports the value most recently passed to ``set_delay_ms`` —
+        not the in-flight ramped current value. Callers issuing a
+        set→read round-trip expect to see what they just set;
+        surfacing the mid-ramp current value would be a behavior
+        change that breaks that contract. The ramp is an internal
+        click-suppression detail.
+        """
+        return int(round(self._delay_seconds_target * 1000.0))
+
+    def _advance_delay_ramp(self, now: float) -> float:
+        """Advance the delay ramp to ``now`` and return the current
+        (possibly mid-ramp) delay in seconds.
+
+        Caller MUST hold ``_delay_cond``'s underlying lock — both the
+        ramp-state fields and the returned value depend on consistent
+        reads. The function mutates ``_delay_seconds`` to the
+        interpolated value so subsequent reads (e.g. diagnostics)
+        observe the same value as the just-returned one.
+
+        Linear interpolation from ``_delay_ramp_start_value`` toward
+        ``_delay_seconds_target`` across ``LOCAL_FIFO_DELAY_RAMP_S``
+        starting at ``_delay_ramp_start_monotonic``. When elapsed ≥
+        ramp window, snap to target. When already at target (steady
+        state), the function is a no-op fast path.
+        """
+        target = self._delay_seconds_target
+        current = self._delay_seconds
+        if current == target:
+            return current
+        elapsed = now - self._delay_ramp_start_monotonic
+        if elapsed >= LOCAL_FIFO_DELAY_RAMP_S or elapsed < 0.0:
+            # Ramp complete, OR clock went backwards (defensive — snap
+            # to target rather than extrapolate negatively).
+            self._delay_seconds = target
+            return target
+        progress = elapsed / LOCAL_FIFO_DELAY_RAMP_S
+        start = self._delay_ramp_start_value
+        ramped = start + (target - start) * progress
+        # Clamp non-negative — `start` and `target` are both clamped
+        # to ≥ 0 at set time so this is belt-and-suspenders, but cheap.
+        if ramped < 0.0:
+            ramped = 0.0
+        self._delay_seconds = ramped
+        return ramped
 
     def set_delay_ms(self, delay_ms: int) -> int:
-        """Update the broadcast delay at runtime.
+        """Update the broadcast delay at runtime, with a 30 ms ramp.
 
         Negative values clamp to 0 (the synchronous cheap path).
-        Returns the actually-applied value (after clamping).
+        Returns the actually-applied (clamped) target value. The
+        return value is the TARGET, not the mid-ramp current value —
+        callers using set→read round-trip see what they asked for.
 
-        Switching to 0 *while* packets are queued causes those packets
-        to drain naturally at their original due-times — we don't
-        retroactively flush them, since flushing 1.7 s of audio at
-        once would punch a transient through whatever bridge clients
-        have. Switching FROM 0 to a positive value applies to all
-        future ``feed()`` calls; in-flight packets (none, since the 0
-        path is synchronous) are not affected.
+        Round 11 ramp behavior: instead of swapping ``_delay_seconds``
+        to the new value instantly, we capture the current (possibly
+        mid-ramp) value as the new ramp's start, set the target, and
+        let ``feed()`` read the linearly-interpolated value across
+        ``LOCAL_FIFO_DELAY_RAMP_S`` (30 ms). At ~100 pkt/s input that's
+        ~3 transition packets entering at progressively-spaced
+        due-times, so bridge clients see a smooth rate change rather
+        than a discontinuity. Eliminates the audible click on rapid
+        A/B audition switching of two delay values.
 
-        Thread-safe: takes the condition's underlying lock so the pump
-        thread sees a consistent value on its next iteration. Wakes
-        the pump so it re-evaluates its sleep budget against the new
-        delay.
+        Switching to 0 *while* packets are queued still causes those
+        packets to drain naturally at their original due-times — we
+        don't retroactively flush them, since flushing 1.7 s of audio
+        at once would punch a transient through bridge clients.
+        Switching FROM 0 to a positive value applies the ramped value
+        to all future ``feed()`` calls; in-flight packets (none, since
+        the 0 path was synchronous) are not affected.
+
+        Idempotent: calling with the value already at target is a
+        no-op (no ramp restart, no spurious notify_all wake).
+
+        Thread-safe: takes the condition's underlying lock so the
+        pump thread sees a consistent value on its next iteration.
+        Wakes the pump so it re-evaluates its sleep budget against
+        the new delay.
         """
         applied = max(0, int(delay_ms))
+        target_seconds = applied / 1000.0
+        now = time.monotonic()
         with self._delay_cond:
-            self._delay_seconds = applied / 1000.0
-            self._delay_cond.notify_all()
+            # Capture the CURRENT (possibly mid-ramp) delay as the
+            # new ramp start. Without this, hitting set_delay_ms in
+            # rapid succession before the previous ramp finished
+            # would jump the delay sideways instead of continuing
+            # smoothly toward the latest target.
+            current = self._advance_delay_ramp(now)
+            if current == target_seconds:
+                # Already at requested value — no ramp needed. Avoid
+                # spurious notify_all (the pump only needs waking on
+                # actual delay change).
+                self._delay_seconds_target = target_seconds
+            else:
+                self._delay_seconds_target = target_seconds
+                self._delay_ramp_start_monotonic = now
+                self._delay_ramp_start_value = current
+                # `_delay_seconds` is already `current` (set by
+                # `_advance_delay_ramp`). It will ramp toward
+                # `_delay_seconds_target` on subsequent reads.
+                self._delay_cond.notify_all()
         return applied
 
     def diagnostics(self) -> dict[str, object]:
@@ -400,6 +509,7 @@ class LocalFifoBroadcaster:
                 {"addr": str(c.addr), "chunks_dropped": c.chunks_dropped}
                 for c in self._clients
             ]
+        now = time.monotonic()
         with self._delay_cond:
             # Read all delay-line state under the same lock that gates
             # writes to it. Pulling `chunks_dropped_due_to_overflow` and
@@ -409,7 +519,13 @@ class LocalFifoBroadcaster:
             # locking discipline keeps us safe on PyPy / alternative
             # interpreters and against future refactors.
             pending_packets = len(self._delay_queue)
-            delay_ms = int(round(self._delay_seconds * 1000.0))
+            # `delay_ms` reports the TARGET (matches the property),
+            # `current_delay_ms` exposes the in-flight ramped value
+            # for tooling that wants to verify ramp progression.
+            delay_ms = int(round(self._delay_seconds_target * 1000.0))
+            current_delay_ms = int(
+                round(self._advance_delay_ramp(now) * 1000.0)
+            )
             actual_lag_ms = self._actual_delivery_lag_ms
             chunks_dropped = self.chunks_dropped_due_to_overflow
         return {
@@ -419,6 +535,7 @@ class LocalFifoBroadcaster:
             "fifo_open_failures": self.fifo_open_failures,
             "per_client": per_client,
             "delay_ms": delay_ms,
+            "current_delay_ms": current_delay_ms,
             "pending_packets": pending_packets,
             "chunks_dropped_due_to_overflow": chunks_dropped,
             "actual_delivery_lag_ms": actual_lag_ms,
@@ -660,10 +777,15 @@ class LocalFifoBroadcaster:
             return
         # Snapshot delay under the cond lock so we react to a recent
         # `set_delay_ms(0)` without a race window where one packet
-        # leaks past the pump.
+        # leaks past the pump. Round 11: read the ramped value via
+        # `_advance_delay_ramp(now)` so a recently-issued `set_delay_ms`
+        # doesn't take effect as a step — instead it linearly
+        # interpolates across `LOCAL_FIFO_DELAY_RAMP_S`. ~3 packets
+        # at 100 pkt/s see progressively-changing delays, smoothing
+        # the rate change at bridge clients.
         now = time.monotonic()
         with self._delay_cond:
-            delay = self._delay_seconds
+            delay = self._advance_delay_ramp(now)
             if delay <= 0.0:
                 # Cheap path: no queueing, dispatch synchronously.
                 # Fall through to the synchronous _broadcast call
