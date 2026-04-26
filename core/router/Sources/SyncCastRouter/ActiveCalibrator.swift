@@ -63,13 +63,15 @@ import SyncCastDiscovery
 ///   9. Restore the snapshotted volumes.
 ///
 /// **Phase 3 (compute alignment)**
-///   `delta = max(0, median(airplay τ) − median(local τ) −
+///   `delta = max(0, max(airplay τ) − median(local τ) −
 ///    broadcasterOverheadMs)`. ABSOLUTE TARGET value for `airplayDelayMs`
-///   (NOT a delta to add). Median across devices is robust to per-cycle
-///   AirPlay drift (the prior `max()` formula consistently picked the
-///   most drift-inflated cycle, biasing the recommendation 500–800 ms
-///   too high). The `broadcasterOverheadMs` constant compensates for
-///   Phase 1's tone bypassing the broadcaster chain — see `Result.deltaMs` doc.
+///   (NOT a delta to add). The across-devices AirPlay aggregator is
+///   `max()` because the delay-line must cover the slowest receiver —
+///   otherwise faster devices race ahead. Per-cycle aggregation within
+///   one device is still MEDIAN to reject single-cycle drift outliers.
+///   `broadcasterOverheadMs` defaults to 0 in v8 (was a compensating
+///   bug — Phase 2's chirp also traverses the SCK ring, so the
+///   overhead cancels). User-overridable via UserDefaults.
 ///
 /// All measurements are recorded via `CalibTrace.log` with the
 /// `[ActiveCalib]` prefix, mirroring `MuteDipCalibrator`'s tracing
@@ -123,17 +125,15 @@ public final class ActiveCalibrator: @unchecked Sendable {
         /// Worst (lowest) per-device confidence in this run.
         public let aggregateConfidence: Double
         /// ABSOLUTE TARGET delay-line value in ms (NOT a delta to add).
-        /// Computed as `max(0, median(AirPlay τ) − median(local τ) −
-        /// broadcasterOverheadMs)`. Median is robust to per-device cycle
-        /// drift (a single drift-inflated cycle no longer biases the
-        /// recommendation upward). The broadcaster-overhead subtraction
-        /// corrects for the fact that Phase 1's calibration tone bypasses
-        /// the SCK→writer→sidecar→broadcaster→bridge-socket chain that
-        /// real music traverses; `local τ` therefore underestimates the
-        /// real local-path latency by `broadcasterOverheadMs` (~200ms,
-        /// overridable via UserDefaults `syncast.broadcasterOverheadMs`).
-        /// Field name kept for ABI stability — was wrongly interpreted as
-        /// an additive delta in earlier versions.
+        /// Computed as `max(0, max(AirPlay τ) − median(local τ) −
+        /// broadcasterOverheadMs)`. Across-devices aggregation uses
+        /// `max()` for AirPlay so the delay-line covers the slowest
+        /// device (otherwise faster receivers see audio "ahead of"
+        /// slower ones). `broadcasterOverheadMs` defaults to 0 in v8 —
+        /// the prior 200 ms was a compensating bug since Phase 2's
+        /// chirp also traverses the SCK ring. Field name kept for ABI
+        /// stability — was wrongly interpreted as an additive delta in
+        /// earlier versions.
         public let deltaMs: Int
         public init(
             perDeviceTauMs: [String: Int],
@@ -285,25 +285,20 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// fully through the AirPlay receiver before the next inject.
     public static let airplayInterCycleGapMs: Int = 1500
 
-    /// Empirically-determined latency for music to traverse the path
-    /// SCK ringBuffer → AudioSocketWriter → sidecar reader → broadcaster
-    /// → bridge socket → bridge ring (BEFORE the bridge applies its
-    /// delay-line). Subtracted from the algorithm's raw delta because
-    /// Phase 1's calibration tone bypasses this whole chain (it's
-    /// synthesized inside bridge.render() directly), so `local_τ`
-    /// underestimates the real local path latency by this amount.
+    /// **v8 — set to 0 (was 200, a compensating bug).**
+    /// The original 200 ms was meant to compensate for Phase 1's
+    /// calibration tone bypassing the SCK→writer→sidecar→broadcaster→
+    /// bridge-socket chain. However, Phase 2's chirp ALSO traverses the
+    /// SCK ring (it is `injectChirpToRing(...)`-injected), so the same
+    /// broadcaster overhead exists on the AirPlay path and it cancels
+    /// out of `airplay_τ − local_τ`. Subtracting an extra 200 ms from
+    /// the delta consistently under-estimated the recommended delay by
+    /// ~200 ms vs. the user-measured ground truth (~2300 ms).
     ///
-    /// Initial value 200ms based on:
-    ///   - AudioSocketWriter wall-clock pacing: ~10ms per packet
-    ///   - sidecar reader → broadcaster transit: ~10ms
-    ///   - broadcaster's ~50ms internal jitter buffer
-    ///   - bridge socket transit: ~10ms
-    ///   - bridge ring latency: ~50ms
-    ///   - safety margin: ~70ms
-    ///
-    /// User can override this via UserDefaults key `syncast.broadcasterOverheadMs`
-    /// for fine-tuning if their setup differs systematically.
-    public static let broadcasterOverheadMs: Int = 200
+    /// Default 0; UserDefaults key `syncast.broadcasterOverheadMs`
+    /// remains available for users whose setup genuinely has an
+    /// uncompensated bias.
+    public static let broadcasterOverheadMs: Int = 0
 
     /// Resolves the broadcaster-overhead constant, allowing user
     /// override via UserDefaults key `syncast.broadcasterOverheadMs`.
@@ -321,6 +316,20 @@ public final class ActiveCalibrator: @unchecked Sendable {
 
     public let microphoneDeviceID: AudioDeviceID?
 
+    /// **v8 Phase-1 mute hooks.** Called immediately before the local
+    /// FDM phase and immediately after (in defer/finally). Used by the
+    /// caller (Router) to transiently mute every AirPlay receiver so
+    /// OwnTone's broadcast of the Phase-1 ultrasonic tones does NOT
+    /// echo back into the room mic — the AirPlay PTP buffer (~1.8 s)
+    /// caused the Phase-1 bandpass + first-rise threshold to lock onto
+    /// the AirPlay echo instead of the direct local-speaker arrival,
+    /// inflating local τ by ~1500–1800 ms and zeroing the calibration.
+    /// Both default to `nil` for backward compatibility — when not
+    /// wired up, behavior is identical to v7.
+    public typealias AsyncSideEffect = @Sendable () async -> Void
+    public let muteAirplayBeforeLocalPhase: AsyncSideEffect?
+    public let restoreAirplayAfterLocalPhase: AsyncSideEffect?
+
     // MARK: - State
 
     private let stateLock = OSAllocatedUnfairLock()
@@ -328,8 +337,14 @@ public final class ActiveCalibrator: @unchecked Sendable {
     private var _cancelled = false
     private var _liveUnit: AudioUnit?
 
-    public init(microphoneDeviceID: AudioDeviceID? = nil) {
+    public init(
+        microphoneDeviceID: AudioDeviceID? = nil,
+        muteAirplayBeforeLocalPhase: AsyncSideEffect? = nil,
+        restoreAirplayAfterLocalPhase: AsyncSideEffect? = nil
+    ) {
         self.microphoneDeviceID = microphoneDeviceID
+        self.muteAirplayBeforeLocalPhase = muteAirplayBeforeLocalPhase
+        self.restoreAirplayAfterLocalPhase = restoreAirplayAfterLocalPhase
     }
 
     // MARK: - Constants
@@ -433,15 +448,18 @@ public final class ActiveCalibrator: @unchecked Sendable {
         }
 
         // Phase 3: compute delta.
-        // **Bug fix (2026-04)**: previously used `max(airplay τ) - max(local τ)`,
-        // but `max()` consistently picks the most drift-inflated cycle of one
-        // AirPlay device (OwnTone queue drift between cycles/runs varies τ by
-        // hundreds of ms). Use MEDIAN across devices — robust to per-device
-        // outliers. Additionally subtract `broadcasterOverheadMs` because
-        // Phase 1's calibration tone is synthesized inside `bridge.render()`
-        // directly, bypassing the SCK→writer→sidecar→broadcaster→bridge-socket
-        // path that real music traverses; raw `local τ` therefore underestimates
-        // the true local-path latency by ~150–250 ms.
+        // **v8 across-devices aggregation**: AirPlay uses `max()` (was
+        // `median()`). Within one device the per-cycle aggregator stays
+        // MEDIAN — that rejects per-cycle drift outliers on the SAME
+        // device. Across devices, however, the delay-line MUST cover
+        // the SLOWEST receiver: every device renders the same audio,
+        // and any device whose τ exceeds the delay-line will be heard
+        // "ahead of" the others. Median across devices systematically
+        // under-shoots the slowest-device floor by half the inter-
+        // device spread. Local stays MEDIAN — it's the per-output baseline
+        // used to subtract Phase 1's anchor latency, and a stray local
+        // outlier (e.g. one bridge slow to start its tone) shouldn't
+        // shift the answer.
         let airplayValues = airplayProbes
             .compactMap { perDeviceTau[$0.deviceID] }
             .filter { $0 >= 0 }
@@ -453,21 +471,22 @@ public final class ActiveCalibrator: @unchecked Sendable {
         if airplayValues.isEmpty || localValues.isEmpty {
             delta = 0
         } else {
-            let airMed = Self.medianInt(airplayValues)
+            let airSlowest = airplayValues.max() ?? 0
             let locMed = Self.medianInt(localValues)
             // Defensive clamp: never recommend a negative delay-line. 0 means
             // "delay-line not needed" — e.g. user has only local devices, or
             // the AirPlay path is somehow already faster than the local path.
-            delta = max(0, airMed - locMed - overheadMs)
+            delta = max(0, airSlowest - locMed - overheadMs)
         }
         let aggregate = perDeviceConf.values.min() ?? 0
 
-        // **v5**: surface AirPlay median + uncertainty in the final
-        // trace so operators get a one-line health summary.
+        // **v8**: trace surfaces the slowest-device AirPlay τ used for
+        // the delay-line plus median (for comparison) and uncertainty.
         let airplayTaus = airplayProbes
             .compactMap { perDeviceTau[$0.deviceID] }.filter { $0 >= 0 }
         let airplayUnc = airplayProbes
             .compactMap { perDeviceUncertainty[$0.deviceID] }
+        let maxStr = airplayTaus.isEmpty ? "n/a" : "\(airplayTaus.max() ?? 0)ms"
         let medStr = airplayTaus.isEmpty ? "n/a" : "\(Self.medianInt(airplayTaus))ms"
         let uncStr = airplayUnc.isEmpty ? "n/a" : "\(Self.medianInt(airplayUnc))ms"
         let localMedStr = localValues.isEmpty ? "n/a" : "\(Self.medianInt(localValues))ms"
@@ -475,7 +494,7 @@ public final class ActiveCalibrator: @unchecked Sendable {
             localProbes.contains { $0.deviceID == id }
         }
         Self.trace(
-            "[ActiveCalib] DONE local=\(localStr) local_median=\(localMedStr) airplay_median=\(medStr) airplay_uncertainty=\(uncStr) overhead=\(overheadMs)ms delta=\(delta)ms confidence=\(String(format: "%.2f", aggregate))"
+            "[ActiveCalib] DONE local=\(localStr) local_median=\(localMedStr) airplay_max=\(maxStr) airplay_median=\(medStr) airplay_uncertainty=\(uncStr) overhead=\(overheadMs)ms delta=\(delta)ms confidence=\(String(format: "%.2f", aggregate))"
         )
 
         return Result(
@@ -532,6 +551,53 @@ public final class ActiveCalibrator: @unchecked Sendable {
     /// simultaneously while the mic captures the superposition. Per-device
     /// onset times are recovered via per-frequency bandpass + envelope.
     private func runLocalPhase(probes: [LocalProbe]) async throws -> PhaseResult {
+        // **v8 mute-AirPlay-during-Phase-1 hook.** OwnTone broadcasts
+        // anything that hits the SCK ring to every AirPlay receiver,
+        // and although Phase 1's tones are written directly into each
+        // local bridge's render callback (NOT through the SCK ring),
+        // any music currently flowing through SCK is still re-radiated
+        // by the AirPlay devices. The ~1.8 s PTP buffer means the mic
+        // hears that re-radiation 1.5–2 s after capture starts —
+        // overlapping the post-tone-start envelope window. Bandpass +
+        // first-rise threshold can lock onto the AirPlay echo's
+        // ultrasonic tail, inflating local τ by ~1500–1800 ms and
+        // erasing the calibration. The hook is owned by the caller
+        // (Router) and defaults to nil for backward compatibility.
+        if let mute = muteAirplayBeforeLocalPhase {
+            await mute()
+            CalibTrace.log(
+                "[ActiveCalib] phase=local_FDM AirPlay receivers muted via caller hook"
+            )
+        }
+        // Capture the restore closure before the do-block so we can
+        // call it on every exit path. (Swift `defer` cannot `await`,
+        // so we cannot use the same idiom as the bridge-volume restore.)
+        let restoreAirplay = restoreAirplayAfterLocalPhase
+
+        do {
+            let result = try await runLocalPhaseBody(probes: probes)
+            if let restore = restoreAirplay {
+                await restore()
+                CalibTrace.log(
+                    "[ActiveCalib] phase=local_FDM AirPlay receivers restored via caller hook"
+                )
+            }
+            return result
+        } catch {
+            if let restore = restoreAirplay {
+                await restore()
+                CalibTrace.log(
+                    "[ActiveCalib] phase=local_FDM AirPlay receivers restored via caller hook (after error)"
+                )
+            }
+            throw error
+        }
+    }
+
+    /// Inner Phase-1 body — extracted so the outer `runLocalPhase` can
+    /// wrap it in the AirPlay-mute / AirPlay-restore async hooks (which
+    /// `defer` cannot do, since `defer` blocks cannot `await`).
+    private func runLocalPhaseBody(probes: [LocalProbe]) async throws -> PhaseResult {
         var freqByDevice: [String: Double] = [:]
         for (i, p) in probes.enumerated() {
             // Wrap if more devices than allocated frequencies (unlikely
@@ -1184,17 +1250,32 @@ public final class ActiveCalibrator: @unchecked Sendable {
         return sorted[sorted.count / 2]
     }
 
-    /// **v5 multi-cycle averaging helpers.** Lower-middle median for
-    /// odd N (cycles=3 → element 1 of sorted array) and even N alike.
-    /// Lower median is a well-behaved robust estimator; we never need
-    /// continuous mid-range interpolation here.
+    /// **v8: standard median** — average of the two middle elements
+    /// for even N, middle element for odd N. The prior `(count-1)/2`
+    /// lower-median was systematically biased low: N=2 returned the
+    /// minimum, N=4 returned element 1 of 4 (33rd-percentile-ish),
+    /// pulling cross-device aggregations toward the fastest receiver.
+    /// `cycles=3` (odd) is unaffected; cross-device counts ∈ {1, 2, 4}
+    /// are common and ARE affected.
     static func medianInt(_ x: [Int]) -> Int {
         guard !x.isEmpty else { return 0 }
-        return x.sorted()[(x.count - 1) / 2]
+        let sorted = x.sorted()
+        let count = sorted.count
+        if count % 2 == 0 {
+            return (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+        } else {
+            return sorted[count / 2]
+        }
     }
     static func medianDouble(_ x: [Double]) -> Double {
         guard !x.isEmpty else { return 0 }
-        return x.sorted()[(x.count - 1) / 2]
+        let sorted = x.sorted()
+        let count = sorted.count
+        if count % 2 == 0 {
+            return (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0
+        } else {
+            return sorted[count / 2]
+        }
     }
     /// Median absolute deviation — robust dispersion estimator. A
     /// single outlier shifts σ arbitrarily; MAD's nested-median caps
