@@ -171,6 +171,26 @@ final class AppModel {
     /// Most recent Sample emitted by the continuous loop. The popover
     /// renders this in the "Continuous" status caption.
     var lastCalibrationSample: ContinuousActiveCalibrator.Sample? = nil
+    /// Sliding-window history of the last `calibrationHistoryCapacity`
+    /// samples emitted by the continuous calibrator. Drives the trend
+    /// timeline + drift indicators in `MainPopover.liveStatusBlock`.
+    /// Append-and-trim happens in `handleBackgroundCalibrationSample`;
+    /// cleared whenever the engine stops so a fresh start doesn't show
+    /// stale post-restart drift.
+    var calibrationSampleHistory: [ContinuousActiveCalibrator.Sample] = []
+    static let calibrationHistoryCapacity: Int = 20
+    /// Most recent non-zero delta the continuous calibrator pushed into
+    /// `airplayDelayMs`. Computed as the signed difference of the two
+    /// latest samples' `appliedDelayMs`. `nil` until at least two
+    /// samples have arrived OR when the latest delta was zero (steady
+    /// state).
+    var lastAppliedDelta: Int? {
+        guard calibrationSampleHistory.count >= 2 else { return nil }
+        let n = calibrationSampleHistory.count
+        let delta = calibrationSampleHistory[n - 1].appliedDelayMs
+                  - calibrationSampleHistory[n - 2].appliedDelayMs
+        return delta == 0 ? nil : delta
+    }
     /// True iff the engine is running (toggle on + bad preconditions → false).
     var backgroundCalibrationActive: Bool = false
     /// Toggle on but mic permission denied/restricted.
@@ -1107,6 +1127,10 @@ final class AppModel {
             await MainActor.run {
                 self.backgroundCalibrationActive = false
                 self.lastCalibrationSample = nil
+                // Drop history too; if we keep it, the trend timeline
+                // mixes stale-pre-restart values with fresh post-restart
+                // ones and the user reads phantom drift.
+                self.calibrationSampleHistory = []
                 if thenReconcile { self.reconcileBackgroundCalibration() }
             }
         }
@@ -1124,6 +1148,16 @@ final class AppModel {
     /// reality and surface the sample for the UI caption.
     private func handleBackgroundCalibrationSample(_ sample: ContinuousActiveCalibrator.Sample) {
         lastCalibrationSample = sample
+        // Ring-buffer semantics: append, then drop the oldest when over
+        // capacity. We replace the array (vs in-place mutation) so the
+        // @Observable invalidation fires on every cycle, redrawing the
+        // trend timeline + drift indicators in MainPopover.
+        var next = calibrationSampleHistory
+        next.append(sample)
+        if next.count > AppModel.calibrationHistoryCapacity {
+            next.removeFirst(next.count - AppModel.calibrationHistoryCapacity)
+        }
+        calibrationSampleHistory = next
         SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDeltaMs)ms applied=\(sample.appliedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
         // Mirror the loop-applied value so the slider stays in sync.
         // We bypass `setAirplayDelay`'s debounced sidecar push — the

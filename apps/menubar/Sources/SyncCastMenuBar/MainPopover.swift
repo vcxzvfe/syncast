@@ -172,9 +172,155 @@ struct MainPopover: View {
                     .foregroundStyle(model.backgroundCalibrationMicDenied ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
                     .lineLimit(2)
             }
+            if model.backgroundCalibrationActive {
+                liveStatusBlock
+                    .accessibilityIdentifier("continuousCalibrationLiveStatus")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+    }
+
+    // MARK: - Live continuous-calibration status block
+    //
+    // Three rows: per-device τ strip, trend timeline, cycle info.
+    // Reads `model.lastCalibrationSample` + `calibrationSampleHistory`;
+    // @Observable invalidates on mutation. The "Xs ago" string updates
+    // each second because `syncSection` already re-renders on the
+    // existing `measuredLagMs` 1 Hz poller.
+    @ViewBuilder
+    private var liveStatusBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            perDeviceLatencyStrip
+            trendTimelineRow
+            cycleInfoRow
+        }
+        .padding(.top, 2)
+    }
+
+    /// One row per entry in `lastCalibrationSample?.perDeviceTauMs`.
+    /// Empty until the integrator swaps in `ContinuousActiveCalibrator.Sample`.
+    @ViewBuilder
+    private var perDeviceLatencyStrip: some View {
+        let entries = sortedPerDeviceEntries
+        if entries.isEmpty {
+            Text("Per-device τ: awaiting first cycle")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+        } else {
+            // Bar scale: τ_d / τ_max so the 15 ms locals render as
+            // pips next to ~2400 ms AirPlay, matching the spec mock.
+            let tauMax = max(1, entries.map(\.1).max() ?? 1)
+            VStack(alignment: .leading, spacing: 1) {
+                ForEach(entries, id: \.0) { entry in
+                    perDeviceRow(name: entry.0, tau: entry.1, tauMax: tauMax)
+                }
+            }
+        }
+    }
+
+    /// Stable display order: largest τ first, so AirPlay receivers
+    /// (the dominant latency contributors) sit at the top.
+    private var sortedPerDeviceEntries: [(String, Int)] {
+        guard let sample = model.lastCalibrationSample else { return [] }
+        return sample.perDeviceTauMs
+            .map { ($0.key, $0.value) }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    /// One device row: name, τ, proportional bar, drift indicator.
+    @ViewBuilder
+    private func perDeviceRow(name: String, tau: Int, tauMax: Int) -> some View {
+        let frac = max(0, min(1.0, Double(tau) / Double(tauMax)))
+        HStack(spacing: 6) {
+            Text(truncate(name, max: 10))
+                .frame(width: 70, alignment: .leading)
+            Text("\(tau) ms")
+                .frame(width: 56, alignment: .trailing)
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Color.secondary.opacity(0.12))
+                    .frame(width: 60, height: 6)
+                Rectangle().fill(Color.accentColor.opacity(0.55))
+                    .frame(width: max(2, CGFloat(frac) * 60), height: 6)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 1))
+            Text(driftLabel(for: name, tau: tau))
+                .foregroundStyle(driftColor(for: name, tau: tau))
+                .frame(width: 64, alignment: .leading)
+        }
+        .font(.system(size: 10, design: .monospaced))
+        .foregroundStyle(.secondary)
+    }
+
+    /// "steady" / "+Xms drift" / "−Xms drift" against the same
+    /// device's τ in the previous sample. "—" on first cycle.
+    private func driftLabel(for device: String, tau: Int) -> String {
+        guard let prev = previousTau(for: device) else { return "—" }
+        let delta = tau - prev
+        if abs(delta) <= 2 { return "steady" }
+        return "\(delta > 0 ? "+" : "−")\(abs(delta))ms drift"
+    }
+
+    private func driftColor(for device: String, tau: Int) -> Color {
+        guard let prev = previousTau(for: device) else { return .secondary }
+        let d = abs(tau - prev)
+        return d <= 2 ? .secondary : (d <= 10 ? .yellow : .orange)
+    }
+
+    /// Previous-sample τ for `device`, or nil if no comparison frame.
+    private func previousTau(for device: String) -> Int? {
+        let h = model.calibrationSampleHistory
+        return h.count >= 2 ? h[h.count - 2].perDeviceTauMs[device] : nil
+    }
+
+    /// Trend timeline — last 10 sliding samples' appliedDelayMs,
+    /// comma-joined. Truncates on overflow.
+    @ViewBuilder
+    private var trendTimelineRow: some View {
+        let recent = Array(model.calibrationSampleHistory.suffix(10))
+        if !recent.isEmpty {
+            let parts = recent.map { String($0.appliedDelayMs) }
+            let spanS = model.backgroundCalibrationIntervalS * max(1, recent.count - 1)
+            let span = spanS >= 60 ? "\(spanS / 60)m" : "\(spanS)s"
+            HStack(spacing: 4) {
+                Text("Recent:")
+                Text(parts.joined(separator: ", "))
+                    .lineLimit(1).truncationMode(.tail)
+                Text("(\(span) sliding)")
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Cycle info: age, confidence, last applied delta. The threshold
+    /// figure shown in the spec mock is engine-side (CalibrationRunner.
+    /// deltaApplyThresholdMs); if the integrator exposes it on the new
+    /// Sample, surface it here.
+    @ViewBuilder
+    private var cycleInfoRow: some View {
+        if let sample = model.lastCalibrationSample {
+            let age = max(0, Int(Date().timeIntervalSince(sample.timestamp)))
+            let conf = String(format: "%.1f", sample.confidence * 100)
+            let lastDelta = model.lastAppliedDelta
+                .map { $0 >= 0 ? "+\($0) ms" : "\($0) ms" } ?? "0 ms"
+            HStack(spacing: 6) {
+                Text("Last: \(age)s ago")
+                Text("•")
+                Text("Conf: \(conf)")
+                Text("•")
+                Text("Δ: \(lastDelta)")
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Truncate `s` to `n` characters with an ellipsis on overflow.
+    private func truncate(_ s: String, max n: Int) -> String {
+        s.count <= n ? s : String(s.prefix(max(1, n - 1))) + "…"
     }
 
     /// One of: mic-denied / inactive / waiting / active-with-sample.
@@ -562,3 +708,6 @@ private struct VolumeSlider: View {
             .accessibilityValue(Text("\(Int(value * 100))%"))
     }
 }
+
+// (Per-device-τ shim removed: ContinuousActiveCalibrator.Sample now
+// natively exposes perDeviceTauMs, so no extension fallback is needed.)
