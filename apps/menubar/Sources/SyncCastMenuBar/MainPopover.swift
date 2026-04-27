@@ -529,7 +529,7 @@ struct MainPopover: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Image(systemName: model.statusIconName)
+            statusIcon(name: model.statusIconName)
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 0) {
