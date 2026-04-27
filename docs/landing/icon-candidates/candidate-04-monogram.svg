@@ -1,0 +1,56 @@
+<!-- Concept: Monogram — a geometric, angular capital "S" rendered as an abstract bracket-like mark, readable at any size and timeless as a brand glyph. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="SyncCast monogram icon">
+  <defs>
+    <linearGradient id="bg04" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5E5CE6"/>
+      <stop offset="1" stop-color="#BF5AF2"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="232" ry="232" fill="url(#bg04)"/>
+  <path d="M 760 280
+           L 360 280
+           A 80 80 0 0 0 280 360
+           L 280 460
+           A 80 80 0 0 0 360 540
+           L 664 540
+           A 80 80 0 0 1 744 620
+           L 744 664
+           A 80 80 0 0 1 664 744
+           L 264 744
+           L 264 624
+           L 612 624
+           A 16 16 0 0 0 628 608
+           L 628 596
+           A 16 16 0 0 0 612 580
+           L 360 580
+           A 220 220 0 0 1 140 360
+           L 140 320
+           A 160 160 0 0 1 300 160
+           L 760 160
+           Z"
+        fill="#FFFFFF" fill-opacity="0.0"/>
+  <path d="M 768 240
+           L 360 240
+           A 132 132 0 0 0 228 372
+           L 228 432
+           A 132 132 0 0 0 360 564
+           L 660 564
+           A 36 36 0 0 1 696 600
+           L 696 644
+           A 36 36 0 0 1 660 680
+           L 256 680
+           L 256 784
+           L 668 784
+           A 140 140 0 0 0 808 644
+           L 808 588
+           A 140 140 0 0 0 668 448
+           L 364 448
+           A 28 28 0 0 1 336 420
+           L 336 384
+           A 28 28 0 0 1 364 356
+           L 768 356
+           Z"
+        fill="#FFFFFF"/>
+  <circle cx="820" cy="240" r="42" fill="#FFFFFF" opacity="0.85"/>
+  <circle cx="204" cy="784" r="42" fill="#FFFFFF" opacity="0.85"/>
+</svg>
