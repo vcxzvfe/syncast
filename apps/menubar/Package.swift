@@ -17,7 +17,9 @@ let package = Package(
             ],
             path: "Sources/SyncCastMenuBar",
             resources: [
-                .process("Resources/Assets.xcassets"),
+                .copy("Resources/MenubarIcon.png"),
+                .copy("Resources/MenubarIcon@2x.png"),
+                .copy("Resources/MenubarIcon@3x.png"),
             ]
         ),
     ]
