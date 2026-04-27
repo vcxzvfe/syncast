@@ -85,6 +85,22 @@ Sub-components:
 - **Xcode 15+** and **Python 3.11+** — only if you're building from source.
 - An AirPlay 2 receiver and/or a CoreAudio output device — preferably both, that's the point.
 
+## Download
+
+Pre-built `.app` bundles are published as GitHub Releases:
+[github.com/vcxzvfe/syncast/releases](https://github.com/vcxzvfe/syncast/releases)
+
+The latest alpha is signed with a self-signed certificate. To run it:
+
+```bash
+unzip SyncCast.app.zip
+mv SyncCast.app /Applications/
+xattr -dr com.apple.quarantine /Applications/SyncCast.app
+open /Applications/SyncCast.app
+```
+
+Or build from source — see below.
+
 ## Build and install (from source)
 
 SyncCast isn't notarized yet, so you build it locally. Three steps:

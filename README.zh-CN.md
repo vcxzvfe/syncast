@@ -63,6 +63,24 @@ macOS 自带的音频多路输出方案各有缺陷:
 
 ---
 
+## 下载
+
+预编译 `.app` 通过 GitHub Releases 发布:
+[github.com/vcxzvfe/syncast/releases](https://github.com/vcxzvfe/syncast/releases)
+
+最新 alpha 用 self-signed 证书签的。运行方式:
+
+```bash
+unzip SyncCast.app.zip
+mv SyncCast.app /Applications/
+xattr -dr com.apple.quarantine /Applications/SyncCast.app
+open /Applications/SyncCast.app
+```
+
+或者从源码编译 — 见下方。
+
+---
+
 ## 安装
 
 目前仅支持源码编译。预编译版本待 v1 release。
