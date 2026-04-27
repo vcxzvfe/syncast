@@ -63,7 +63,15 @@ struct SyncCastApp: App {
             Label {
                 Text("SyncCast")
             } icon: {
-                Image(systemName: model.statusIconName)
+                if model.statusIconName.hasPrefix("sf:") {
+                    // Error / fallback state — keep SF Symbol
+                    Image(systemName: String(model.statusIconName.dropFirst(3)))
+                } else {
+                    // Custom Liquid-Glass-simplified template silhouette;
+                    // system auto-tints for dark/light menu bar.
+                    Image(model.statusIconName, bundle: .module)
+                        .renderingMode(.template)
+                }
             }
         }
         .menuBarExtraStyle(.window)

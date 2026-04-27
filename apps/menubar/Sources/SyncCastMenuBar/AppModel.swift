@@ -348,13 +348,16 @@ final class AppModel {
         case idle, starting, running, stopping, error
     }
 
+    /// Status-bar icon identifier. Custom asset names resolve through the
+    /// SwiftPM resource bundle; SF Symbol fallbacks are prefixed with `sf:`
+    /// so the view layer can route to `Image(systemName:)`.
     var statusIconName: String {
         switch streamingState {
-        case .idle:     return "speaker.wave.2"
-        case .starting: return "speaker.wave.2.bubble"
-        case .running:  return "speaker.wave.3.fill"
-        case .stopping: return "speaker.wave.2.bubble"
-        case .error:    return "speaker.slash"
+        case .idle:     return "MenubarIcon"
+        case .starting: return "MenubarIcon"
+        case .running:  return "MenubarIcon"
+        case .stopping: return "MenubarIcon"
+        case .error:    return "sf:speaker.slash"
         }
     }
 

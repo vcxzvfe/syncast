@@ -15,7 +15,10 @@ let package = Package(
                 .product(name: "SyncCastDiscovery", package: "discovery"),
                 .product(name: "SyncCastRouter", package: "router"),
             ],
-            path: "Sources/SyncCastMenuBar"
+            path: "Sources/SyncCastMenuBar",
+            resources: [
+                .process("Resources/Assets.xcassets"),
+            ]
         ),
     ]
 )
