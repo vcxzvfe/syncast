@@ -34,6 +34,15 @@ public enum SyncCastLog {
     }
 }
 
+@inline(__always)
+private func menubarTemplateImage(name: String) -> NSImage {
+    let img = Bundle.module.image(forResource: NSImage.Name(name))
+        ?? NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: nil)
+        ?? NSImage()
+    img.isTemplate = true
+    return img
+}
+
 @main
 struct SyncCastApp: App {
     @State private var model = AppModel()
@@ -67,10 +76,10 @@ struct SyncCastApp: App {
                     // Error / fallback state — keep SF Symbol
                     Image(systemName: String(model.statusIconName.dropFirst(3)))
                 } else {
-                    // Custom Liquid-Glass-simplified template silhouette;
-                    // system auto-tints for dark/light menu bar.
-                    Image(model.statusIconName, bundle: .module)
-                        .renderingMode(.template)
+                    // Custom Liquid-Glass-simplified template silhouette.
+                    // Load via Bundle.module.image() — SwiftPM CLI doesn't compile xcassets,
+                    // so we ship loose PNG and read by name. AppKit auto-picks @2x/@3x.
+                    Image(nsImage: menubarTemplateImage(name: model.statusIconName))
                 }
             }
         }
