@@ -34,13 +34,23 @@ public enum SyncCastLog {
     }
 }
 
+/// Resolve a status icon name (either `sf:<symbol>` for SF Symbols, or
+/// the basename of a flat PNG in the SwiftPM resource bundle) to a
+/// SwiftUI `Image`. Used by both `MenuBarExtra` and `MainPopover` header
+/// so a future status-icon-name change can't desync them.
 @inline(__always)
-private func menubarTemplateImage(name: String) -> NSImage {
-    let img = Bundle.module.image(forResource: NSImage.Name(name))
-        ?? NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: nil)
-        ?? NSImage()
-    img.isTemplate = true
-    return img
+func statusIcon(name: String) -> Image {
+    if name.hasPrefix("sf:") {
+        return Image(systemName: String(name.dropFirst(3)))
+    }
+    if let ns = Bundle.module.image(forResource: NSImage.Name(name)) {
+        ns.isTemplate = true
+        return Image(nsImage: ns)
+    }
+    SyncCastLog.log("statusIcon('\(name)'): Bundle.module.image nil; falling back to SF speaker.wave.2")
+    let fallback = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: nil) ?? NSImage()
+    fallback.isTemplate = true
+    return Image(nsImage: fallback)
 }
 
 @main
@@ -72,15 +82,7 @@ struct SyncCastApp: App {
             Label {
                 Text("SyncCast")
             } icon: {
-                if model.statusIconName.hasPrefix("sf:") {
-                    // Error / fallback state — keep SF Symbol
-                    Image(systemName: String(model.statusIconName.dropFirst(3)))
-                } else {
-                    // Custom Liquid-Glass-simplified template silhouette.
-                    // Load via Bundle.module.image() — SwiftPM CLI doesn't compile xcassets,
-                    // so we ship loose PNG and read by name. AppKit auto-picks @2x/@3x.
-                    Image(nsImage: menubarTemplateImage(name: model.statusIconName))
-                }
+                statusIcon(name: model.statusIconName)
             }
         }
         .menuBarExtraStyle(.window)
