@@ -365,6 +365,17 @@
     </div>
   </section>
 
+  <section id="download" class="wrap">
+    <h2>Download</h2>
+    <p class="tagline">Pre-built alpha bundles: <a href="https://github.com/vcxzvfe/syncast/releases" target="_blank" rel="noopener" style="color:#b29dff;">github.com/vcxzvfe/syncast/releases</a></p>
+
+<pre class="code"><span class="c"># Unzip, install, clear quarantine</span>
+unzip SyncCast.app.zip
+<span class="p">mv</span> SyncCast.app /Applications/
+xattr -dr com.apple.quarantine /Applications/SyncCast.app
+<span class="p">open</span> /Applications/SyncCast.app</pre>
+  </section>
+
   <section id="install" class="wrap">
     <h2>Install in three commands</h2>
     <p class="tagline">Clone, build, install. No package manager wrappers, no installers — just the source you can read.</p>
