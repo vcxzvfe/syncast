@@ -51,6 +51,8 @@ rm -rf "$APP"
 mkdir -p "$MACOS_DIR" "$RES_DIR" "$FW_DIR" "$SIDECAR_DIR" "$OWNTONE_DIR"
 cp "$SWIFT_BIN" "$MACOS_DIR/SyncCastMenuBar"
 cp "$REPO_ROOT/apps/menubar/Resources/Info.plist" "$CONTENTS/Info.plist"
+mkdir -p "$RES_DIR"
+cp -f "$REPO_ROOT/apps/menubar/Resources/AppIcon.icns" "$RES_DIR/AppIcon.icns"
 cat > "$CONTENTS/PkgInfo" <<'EOF'
 APPL????
 EOF
