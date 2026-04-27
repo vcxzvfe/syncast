@@ -53,6 +53,30 @@ cp "$SWIFT_BIN" "$MACOS_DIR/SyncCastMenuBar"
 cp "$REPO_ROOT/apps/menubar/Resources/Info.plist" "$CONTENTS/Info.plist"
 mkdir -p "$RES_DIR"
 cp -f "$REPO_ROOT/apps/menubar/Resources/AppIcon.icns" "$RES_DIR/AppIcon.icns"
+# SwiftPM resource bundle (Assets.xcassets — menubar template image)
+# Bundle.module loads from <binary-dir>/<Target>_<Target>.bundle. We add a
+# minimal Info.plist at root so codesign accepts the bundle as shallow.
+SPM_BUNDLE="$REPO_ROOT/apps/menubar/.build/release/SyncCastMenuBar_SyncCastMenuBar.bundle"
+if [[ -d "$SPM_BUNDLE" ]]; then
+  DEST_BUNDLE="$MACOS_DIR/SyncCastMenuBar_SyncCastMenuBar.bundle"
+  cp -R "$SPM_BUNDLE" "$DEST_BUNDLE"
+  cat > "$DEST_BUNDLE/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleIdentifier</key><string>com.syncast.SyncCastMenuBar.resources</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>SyncCastMenuBar_SyncCastMenuBar</string>
+  <key>CFBundlePackageType</key><string>BNDL</string>
+  <key>CFBundleSignature</key><string>????</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+</dict>
+</plist>
+PLIST
+fi
 cat > "$CONTENTS/PkgInfo" <<'EOF'
 APPL????
 EOF
