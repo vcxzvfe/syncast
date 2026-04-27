@@ -1,0 +1,29 @@
+<!-- Concept: Speaker Stack — four front-facing speaker silhouettes layered with descending opacity, expressing synchronized playback across multiple devices. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="SyncCast speaker stack icon">
+  <defs>
+    <linearGradient id="bg02" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5E5CE6"/>
+      <stop offset="1" stop-color="#0A84FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="232" ry="232" fill="url(#bg02)"/>
+  <g>
+    <g opacity="0.22" transform="translate(372 252)">
+      <rect x="0" y="0" width="280" height="420" rx="44" ry="44" fill="#FFFFFF"/>
+    </g>
+    <g opacity="0.42" transform="translate(352 268)">
+      <rect x="0" y="0" width="320" height="460" rx="50" ry="50" fill="#FFFFFF"/>
+    </g>
+    <g opacity="0.65" transform="translate(330 286)">
+      <rect x="0" y="0" width="364" height="500" rx="56" ry="56" fill="#FFFFFF"/>
+    </g>
+    <g transform="translate(304 308)">
+      <rect x="0" y="0" width="416" height="540" rx="64" ry="64" fill="#FFFFFF"/>
+      <circle cx="208" cy="160" r="44" fill="#5E5CE6"/>
+      <circle cx="208" cy="160" r="22" fill="#FFFFFF"/>
+      <circle cx="208" cy="370" r="118" fill="#0A84FF"/>
+      <circle cx="208" cy="370" r="68" fill="#5E5CE6"/>
+      <circle cx="208" cy="370" r="28" fill="#FFFFFF"/>
+    </g>
+  </g>
+</svg>

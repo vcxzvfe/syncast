@@ -1,0 +1,25 @@
+<!-- Concept: Sync Arc — a bold arc cradles a center hub with three aligned dots, conveying alignment and timing precision across endpoints. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="SyncCast sync arc icon">
+  <defs>
+    <linearGradient id="bg03" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0A84FF"/>
+      <stop offset="1" stop-color="#BF5AF2"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="232" ry="232" fill="url(#bg03)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+    <path d="M 232 640 A 280 280 0 0 1 792 640" stroke-width="44" stroke-opacity="0.95"/>
+    <path d="M 312 640 A 200 200 0 0 1 712 640" stroke-width="28" stroke-opacity="0.55"/>
+  </g>
+  <g fill="#FFFFFF">
+    <circle cx="232" cy="640" r="44"/>
+    <circle cx="512" cy="360" r="60"/>
+    <circle cx="792" cy="640" r="44"/>
+  </g>
+  <rect x="232" y="780" width="560" height="20" rx="10" ry="10" fill="#FFFFFF" opacity="0.85"/>
+  <g fill="#FFFFFF" opacity="0.55">
+    <circle cx="232" cy="790" r="22"/>
+    <circle cx="512" cy="790" r="22"/>
+    <circle cx="792" cy="790" r="22"/>
+  </g>
+</svg>
