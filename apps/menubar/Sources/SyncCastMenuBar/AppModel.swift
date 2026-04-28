@@ -1709,6 +1709,12 @@ final class AppModel {
     /// safe to call from `bootstrap` once. Observers live until the
     /// AppModel itself is torn down (see `deinit`).
     fileprivate func startPowerEventWatch() {
+        // Dedup guard: re-bootstrap (hot-reload during dev, or future
+        // bootstrap-retry path) must not double-register observers.
+        guard sleepWakeObservers.isEmpty else {
+            SyncCastLog.log("AppModel: startPowerEventWatch skipped (observers already registered)")
+            return
+        }
         let nc = NSWorkspace.shared.notificationCenter
         let names: [Notification.Name] = [
             NSWorkspace.didWakeNotification,
@@ -1776,7 +1782,8 @@ final class AppModel {
                     return (true, snap)
                 }
             guard snapshot.shouldRebuild else {
-                SyncCastLog.log("AppModel: post-wake rebuild skipped (mode/state/enabled gate)")
+                let modeName = await MainActor.run { String(describing: self.mode) }
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (mode=\(modeName) — only stereo auto-rebuilds; AirPlay self-heals via OwnTone RTSP retry)")
                 return
             }
             guard !snapshot.devices.isEmpty else {
@@ -1788,8 +1795,63 @@ final class AppModel {
             // mirrors AppModel's call sites for `reconcileLocalDriver`,
             // which itself filters by `routing[dev.id].enabled`.
             let allDevices = await MainActor.run { self.devices }
-            await self.router.forceLocalDriverRebuild(devices: allDevices)
+            // Retry-with-backoff (1s, 3s, 5s): coreaudiod IPC can block
+            // longer than 1.5s on deep DPMS sleep recovery (HDMI HPD
+            // renegotiation + EDID + audio-engine republish). Verify
+            // each enabled UID resolves to a live AudioDeviceID before
+            // declaring success; if any UID still missing, sleep and retry.
+            let targetUIDs = snapshot.devices.compactMap(\.coreAudioUID)
+            let backoffs: [UInt64] = [
+                1_000_000_000,  // 1s
+                3_000_000_000,  // 3s
+                5_000_000_000,  // 5s
+            ]
+            for (attempt, backoff) in backoffs.enumerated() {
+                await self.router.forceLocalDriverRebuild(devices: allDevices)
+                let allResolved = await Self.allUIDsResolveToLiveDeviceID(targetUIDs)
+                if allResolved {
+                    if attempt > 0 {
+                        SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(backoffs.count)")
+                    }
+                    return
+                }
+                SyncCastLog.log("AppModel: post-wake rebuild attempt \(attempt + 1) — UIDs not all live yet, sleeping \(backoff / 1_000_000_000)s")
+                try? await Task.sleep(nanoseconds: backoff)
+            }
+            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(backoffs.count) retries — UID(s) never returned")
         }
+    }
+
+    /// Verify each UID resolves to a non-zero `AudioDeviceID` via the
+    /// HAL `kAudioHardwarePropertyTranslateUIDToDevice` translator. If
+    /// any UID still maps to `kAudioObjectUnknown` (0), the post-wake
+    /// device republish hasn't completed and the rebuild can't be
+    /// trusted. Returns true only when all target UIDs resolve.
+    private static func allUIDsResolveToLiveDeviceID(_ uids: [String]) async -> Bool {
+        for uid in uids {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var deviceID: AudioDeviceID = kAudioObjectUnknown
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            let cfUID = uid as CFString
+            let status = withUnsafePointer(to: cfUID) { uidPtr -> OSStatus in
+                AudioObjectGetPropertyData(
+                    AudioObjectID(kAudioObjectSystemObject),
+                    &addr,
+                    UInt32(MemoryLayout<CFString>.size),
+                    uidPtr,
+                    &size,
+                    &deviceID
+                )
+            }
+            if status != noErr || deviceID == kAudioObjectUnknown {
+                return false
+            }
+        }
+        return true
     }
 
     // No `deinit` cleanup for `sleepWakeObservers`: AppModel is
