@@ -1763,31 +1763,48 @@ final class AppModel {
             // Snapshot all the predicates + the device list on MainActor
             // in one hop, so we don't race with a user toggle that
             // could change the gate state mid-rebuild.
-            let snapshot: (shouldRebuild: Bool, devices: [Device]) =
-                await MainActor.run {
-                    let gate =
-                        self.mode == .stereo &&
-                        self.streamingState == .running &&
-                        self.routing.values.contains(where: {
-                            $0.enabled
-                        })
-                    if !gate { return (false, []) }
-                    // Only enabled CoreAudio devices participate in the
-                    // local driver; AirPlay receivers (irrelevant in
-                    // stereo mode anyway) are filtered.
-                    let snap = self.devices.filter { dev in
-                        dev.transport == .coreAudio &&
-                            (self.routing[dev.id]?.enabled ?? false)
-                    }
-                    return (true, snap)
+            // Snapshot all the predicates + the device list on MainActor
+            // in one hop, so we don't race with a user toggle. Capture
+            // each gate predicate separately so the skip log can name
+            // the actual reason instead of lumping all causes together.
+            let snapshot: (
+                isStereo: Bool,
+                isRunning: Bool,
+                hasEnabledRouting: Bool,
+                modeName: String,
+                stateName: String,
+                devices: [Device]
+            ) = await MainActor.run {
+                let isStereo = self.mode == .stereo
+                let isRunning = self.streamingState == .running
+                let hasEnabledRouting = self.routing.values.contains(where: { $0.enabled })
+                let snap = self.devices.filter { dev in
+                    dev.transport == .coreAudio &&
+                        (self.routing[dev.id]?.enabled ?? false)
                 }
-            guard snapshot.shouldRebuild else {
-                let modeName = await MainActor.run { String(describing: self.mode) }
-                SyncCastLog.log("AppModel: post-wake rebuild skipped (mode=\(modeName) — only stereo auto-rebuilds; AirPlay self-heals via OwnTone RTSP retry)")
+                return (
+                    isStereo,
+                    isRunning,
+                    hasEnabledRouting,
+                    String(describing: self.mode),
+                    String(describing: self.streamingState),
+                    snap
+                )
+            }
+            guard snapshot.isStereo else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (mode=\(snapshot.modeName) — only stereo auto-rebuilds; AirPlay self-heals via OwnTone RTSP retry)")
+                return
+            }
+            guard snapshot.isRunning else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (engine \(snapshot.stateName), nothing to recover)")
+                return
+            }
+            guard snapshot.hasEnabledRouting else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled outputs in routing)")
                 return
             }
             guard !snapshot.devices.isEmpty else {
-                SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled CoreAudio devices)")
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled CoreAudio devices in current device list)")
                 return
             }
             SyncCastLog.log("AppModel: post-wake force rebuild local driver (\(snapshot.devices.count) outputs)")
