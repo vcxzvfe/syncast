@@ -744,7 +744,6 @@ public actor Router {
     ///   local driver was rebuilt cleanly. `false` if the SCK restart
     ///   failed (caller should retry — driver is half-rebuilt without
     ///   a source, "no sound" state). Codex must-fix #3.
-    @discardableResult
     public func forceLocalDriverRebuild(devices: [Device]) async -> Bool {
         FileHandle.standardError.write(Data(
             "[Router] forceLocalDriverRebuild: tearing down + rebuilding (incl. SCK)\n".utf8
