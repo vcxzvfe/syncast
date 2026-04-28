@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreAudio
 import Foundation
@@ -423,6 +424,12 @@ final class AppModel {
         // require microphone access; the actual TCC prompt is deferred
         // until the user explicitly taps "Auto-calibrate".
         startInputDeviceWatch()
+        // Auto-recover the local audio driver after display sleep / system
+        // wake. Display DPMS sleep yanks HDMI/DP audio sub-devices from
+        // CoreAudio entirely; on wake the device reappears with the same
+        // UID but a fresh AudioDeviceID. Without this watch the user has
+        // to deselect + reselect both outputs to recover. See Round 12.
+        startPowerEventWatch()
         // Tahoe sometimes lies: the System Settings switch shows ON but
         // CGPreflightScreenCaptureAccess returns false. Poll every 2s
         // and update the model when the state flips, so the user doesn't
@@ -1652,4 +1659,144 @@ final class AppModel {
             }
         }
     }
+
+    // MARK: - Sleep/wake auto-recovery (Round 12)
+    //
+    // Symptom: in stereo (local) mode with HDMI/DisplayPort speakers as
+    // a sub-device of the private aggregate, the user's monitor went to
+    // DPMS sleep after ~20 minutes of inactivity. On wake, audio was
+    // silent. The manual workaround was to deselect + reselect each
+    // CoreAudio device, which deterministically recovered.
+    //
+    // Root cause: when the display goes to DPMS sleep, the HDMI audio
+    // sub-device disappears from `kAudioHardwarePropertyDevices` entirely.
+    // On wake, it reappears with the SAME `coreAudioUID` (stable property)
+    // but a FRESH `AudioDeviceID` (a transient UInt32 the kernel assigns
+    // per-attach). The active AggregateDevice still references the dead
+    // AudioDeviceID; AUHAL render doesn't error, it just produces silence.
+    //
+    // `reconcileLocalDriver`'s `alreadyCorrect` short-circuit looks at the
+    // enabled UID set, sees no change, and skips the rebuild — so even a
+    // toggle of an unrelated property won't recover. The deselect+reselect
+    // dance forced two `tearDownLocalDriver` + rebuild rounds, which is
+    // why it worked.
+    //
+    // Fix: observe BOTH `NSWorkspace.didWakeNotification` (full system
+    // sleep, e.g. lid close) AND `screensDidWakeNotification` (display-only
+    // sleep, the user's case). On wake, debounce, wait 1.5 s for
+    // coreaudiod IPC to settle, then call `router.forceLocalDriverRebuild`
+    // which bypasses the short-circuit.
+    //
+    // We do NOT auto-rebuild in whole-home mode: AirPlay receivers have
+    // their own RTSP reconnect logic in OwnTone, and the local CoreAudio
+    // bridges are driven by the sidecar's broadcaster (different code
+    // path). The user only reported the issue in stereo mode.
+
+    /// Holds NSWorkspace observer tokens (`NSObjectProtocol`). One per
+    /// notification name we subscribe to. Kept as `[Any]` per the
+    /// `NSObjectProtocol` token contract (these are not the same type
+    /// as our other listener storage).
+    private var sleepWakeObservers: [NSObjectProtocol] = []
+
+    /// Timestamp of the most recent post-wake forceLocalDriverRebuild.
+    /// Used to debounce: HAL fires both `didWake` and `screensDidWake`
+    /// within ~100 ms of a single physical wake, plus CoreAudio sends
+    /// 3–6 device-change callbacks per logical change. Skipping when we
+    /// just rebuilt < 1 s ago coalesces the burst into one rebuild.
+    private var lastWakeRebuildAt: Date = .distantPast
+
+    /// Subscribe to NSWorkspace sleep/wake notifications. Idempotent —
+    /// safe to call from `bootstrap` once. Observers live until the
+    /// AppModel itself is torn down (see `deinit`).
+    fileprivate func startPowerEventWatch() {
+        let nc = NSWorkspace.shared.notificationCenter
+        let names: [Notification.Name] = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+        ]
+        for name in names {
+            // The observer block runs on the main queue (queue: .main).
+            // We hop to MainActor explicitly because the stored closure
+            // is `@Sendable` from NSWorkspace's perspective and not
+            // implicitly bound to MainActor.
+            let token = nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                Task { @MainActor [weak self] in
+                    self?.handleWake(notification: note)
+                }
+            }
+            sleepWakeObservers.append(token)
+        }
+        SyncCastLog.log("AppModel: registered NSWorkspace sleep/wake observers (didWake + screensDidWake)")
+    }
+
+    /// Wake-event handler. Runs on MainActor.
+    /// - Debounces tight bursts of wake notifications.
+    /// - Waits 1.5 s for `coreaudiod` to finish its post-wake IPC catch-up
+    ///   (empirically the window when HAL calls block or return stale ids).
+    /// - Only acts in stereo mode + when streaming is running + at least
+    ///   one CoreAudio output is enabled. Other states have nothing to
+    ///   recover.
+    /// - Forces a full local-driver tear-down + rebuild via the new
+    ///   `Router.forceLocalDriverRebuild` API, which bypasses the
+    ///   `alreadyCorrect` short-circuit.
+    private func handleWake(notification: Notification) {
+        SyncCastLog.log("AppModel: wake event \(notification.name.rawValue)")
+        let now = Date()
+        guard now.timeIntervalSince(lastWakeRebuildAt) > 1.0 else {
+            SyncCastLog.log("AppModel: wake event debounced (< 1s since last rebuild)")
+            return
+        }
+        lastWakeRebuildAt = now
+
+        Task { [weak self] in
+            // Wait for coreaudiod IPC to settle. Empirically ~1.5 s on
+            // M1/M2 hardware after display DPMS wake; full-system wake
+            // (S3) can take a touch longer but 1.5 s covers both.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self else { return }
+            // Snapshot all the predicates + the device list on MainActor
+            // in one hop, so we don't race with a user toggle that
+            // could change the gate state mid-rebuild.
+            let snapshot: (shouldRebuild: Bool, devices: [Device]) =
+                await MainActor.run {
+                    let gate =
+                        self.mode == .stereo &&
+                        self.streamingState == .running &&
+                        self.routing.values.contains(where: {
+                            $0.enabled
+                        })
+                    if !gate { return (false, []) }
+                    // Only enabled CoreAudio devices participate in the
+                    // local driver; AirPlay receivers (irrelevant in
+                    // stereo mode anyway) are filtered.
+                    let snap = self.devices.filter { dev in
+                        dev.transport == .coreAudio &&
+                            (self.routing[dev.id]?.enabled ?? false)
+                    }
+                    return (true, snap)
+                }
+            guard snapshot.shouldRebuild else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (mode/state/enabled gate)")
+                return
+            }
+            guard !snapshot.devices.isEmpty else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled CoreAudio devices)")
+                return
+            }
+            SyncCastLog.log("AppModel: post-wake force rebuild local driver (\(snapshot.devices.count) outputs)")
+            // Pass the FULL device list (not just enabled) — the Router
+            // mirrors AppModel's call sites for `reconcileLocalDriver`,
+            // which itself filters by `routing[dev.id].enabled`.
+            let allDevices = await MainActor.run { self.devices }
+            await self.router.forceLocalDriverRebuild(devices: allDevices)
+        }
+    }
+
+    // No `deinit` cleanup for `sleepWakeObservers`: AppModel is
+    // process-lifetime (the menubar app's only top-level model), so
+    // the observers naturally die with the process. The same convention
+    // applies to `inputDeviceListener` above. Adding a deinit would
+    // require unsafe-isolation gymnastics around `@MainActor` for zero
+    // real benefit (NSWorkspace's notification center cleans up
+    // observers on process exit anyway).
 }

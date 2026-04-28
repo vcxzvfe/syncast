@@ -697,6 +697,33 @@ public actor Router {
         replan()
     }
 
+    /// Force a complete local-driver tear-down + rebuild, bypassing the
+    /// `alreadyCorrect` short-circuit in `reconcileLocalDriver`. Used by
+    /// `AppModel`'s sleep/wake handler when display sleep + wake invalidates
+    /// the underlying AudioDeviceID for HDMI / DisplayPort sub-devices even
+    /// though their `coreAudioUID` is the same — `reconcileLocalDriver`
+    /// would otherwise see "same enabled UID set" and skip the rebuild,
+    /// leaving the existing AggregateDevice pointing at dead AudioDeviceIDs
+    /// (silent underrun, the user-reported "no sound after monitor wakes"
+    /// bug). The manual workaround was deselect + reselect each device,
+    /// which produced exactly this tear-down → rebuild sequence; this
+    /// helper automates it.
+    ///
+    /// Caller is expected to have already waited ~1.5s for coreaudiod IPC
+    /// to settle after the wake event; the extra 200 ms cushion below is
+    /// belt-and-suspenders against tight wake-event clusters where a
+    /// burst of CoreAudio device-change callbacks can still be in flight
+    /// when the rebuild starts.
+    public func forceLocalDriverRebuild(devices: [Device]) async {
+        FileHandle.standardError.write(Data(
+            "[Router] forceLocalDriverRebuild: tearing down + rebuilding local driver\n".utf8
+        ))
+        tearDownLocalDriver()
+        try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms cushion
+        reconcileLocalDriver(devices: devices)
+        replan()
+    }
+
     // MARK: - Whole-home AirPlay mode (Strategy 1)
     //
     // Two public entry points the menubar app drives:
