@@ -36,6 +36,17 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
     public let sampleRate: Double
     public let channelCount: Int
 
+    /// Fired from `stream(_:didStopWithError:)` whenever SCK terminates the
+    /// capture stream on its own — most commonly `connectionInvalid (-3805)`
+    /// after display sleep breaks system-audio capture. The Router wires
+    /// this in `init` so it can restart SCK as part of the wake-recovery
+    /// `forceLocalDriverRebuild` path; without the notification the Router
+    /// has no way to know capture is dead, the new aggregate device has no
+    /// source, and the user hears silence until they manually deselect /
+    /// reselect each device. Marked @Sendable + invoked from a detached
+    /// Task so we never block the SCK delegate queue.
+    public var onUnexpectedStop: (@Sendable () -> Void)?
+
     /// Diagnostic — incremented on every audio sample buffer received.
     /// If this stays at zero after start, capture isn't actually flowing.
     public private(set) var tickCount: UInt64 = 0
@@ -408,8 +419,17 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
 extension SCKCapture: SCStreamDelegate {
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
         // Clear our reference so a retry can rebuild cleanly.
+        let msg = "[SCKCapture] stream stopped with error: \(error.localizedDescription) — notifying router\n"
+        FileHandle.standardError.write(Data(msg.utf8))
         self.stream = nil
         self.output = nil
+        // Snapshot the closure before dispatch — protects against a racing
+        // unset (e.g. caller resetting the callback while SCK is tearing
+        // down). Detached so we never re-enter SCK's delegate queue.
+        let cb = onUnexpectedStop
+        Task.detached {
+            cb?()
+        }
     }
 }
 
