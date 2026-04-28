@@ -1859,9 +1859,7 @@ final class AppModel {
             // Pass the FULL device list (not just enabled) — the Router
             // mirrors AppModel's call sites for `reconcileLocalDriver`,
             // which itself filters by `routing[dev.id].enabled`.
-            let allDevices = await MainActor.run { self.devices }
-
-            // Retry-with-backoff fixed off-by-one (codex #2): sleep
+            // Retry-with-backoff fixed off-by-one (codex Cycle 1 #2): sleep
             // BEFORE the next attempt, not after the previous one. This
             // way the final 5s wait isn't wasted — if the UID returns
             // during it, the next attempt observes success.
@@ -1881,6 +1879,12 @@ final class AppModel {
                     try? await Task.sleep(nanoseconds: backoffs[attempt - 1])
                     if Task.isCancelled { return }
                 }
+                // Codex Cycle 2 must-fix: re-snapshot device list each
+                // attempt. If a device reappears during backoff, the
+                // rebuild MUST include it, otherwise sckOK && allResolved
+                // can both go true while the rebuilt driver still uses
+                // the stale list missing the new device.
+                let allDevices = await MainActor.run { self.devices }
                 let sckOK = await self.router.forceLocalDriverRebuild(devices: allDevices)
                 let allResolved = await Self.allUIDsResolveToLiveDeviceID(allTargetUIDs)
                 // Codex must-fix #3: success requires BOTH SCK restart

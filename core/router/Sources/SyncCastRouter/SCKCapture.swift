@@ -140,7 +140,18 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
                 self.stream = nil
                 self.output = nil
             }
+            try? s.removeStreamOutput(out, type: .audio)
             throw error
+        }
+        // Codex Cycle 2 must-fix: verify-then-act gap. If
+        // didStopWithError fired during the startCapture() await,
+        // delegate cleared self.stream to nil (line 440 same-stream
+        // guard). Without this check, start() returns success but
+        // capture is dead → sckOK=true → wake loop declares win
+        // erroneously. Throw so caller observes the failure.
+        guard self.stream === s else {
+            try? s.removeStreamOutput(out, type: .audio)
+            throw CaptureError.streamError("stream stopped during start (didStopWithError fired before startCapture returned)")
         }
     }
 
