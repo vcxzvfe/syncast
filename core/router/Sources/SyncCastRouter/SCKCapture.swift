@@ -124,9 +124,24 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
         let s = SCStream(filter: filter, configuration: cfg, delegate: self)
         let out = AudioStreamOutput(owner: self)
         try s.addStreamOutput(out, type: .audio, sampleHandlerQueue: audioQueue)
-        try await s.startCapture()
+        // Codex must-fix #2: assign BEFORE startCapture so a racing
+        // didStopWithError fired during the start() await window finds
+        // self.stream === s (instead of nil), correctly nils it, and
+        // we observe the failure here. Without this, start() could
+        // return success while self.stream points at a dead stream.
         self.stream = s
         self.output = out
+        do {
+            try await s.startCapture()
+        } catch {
+            // Clean up the assignments on throw — avoid a "registered
+            // but never started" stream lingering in self.stream.
+            if self.stream === s {
+                self.stream = nil
+                self.output = nil
+            }
+            throw error
+        }
     }
 
     public func stop() {
@@ -418,7 +433,15 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
 @available(macOS 13.0, *)
 extension SCKCapture: SCStreamDelegate {
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        // Clear our reference so a retry can rebuild cleanly.
+        // Codex must-fix #1: guard same-stream identity. An old stream's
+        // deferred didStopWithError callback can land AFTER stop()+start()
+        // has assigned a new stream; without this guard we'd null out
+        // the new stream and silently lose capture.
+        guard stream === self.stream else {
+            let stale = "[SCKCapture] stale didStopWithError ignored (old stream after restart): \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(stale.utf8))
+            return
+        }
         let msg = "[SCKCapture] stream stopped with error: \(error.localizedDescription) — notifying router\n"
         FileHandle.standardError.write(Data(msg.utf8))
         self.stream = nil

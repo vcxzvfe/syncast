@@ -740,7 +740,12 @@ public actor Router {
     /// belt-and-suspenders against tight wake-event clusters where a
     /// burst of CoreAudio device-change callbacks can still be in flight
     /// when the rebuild starts.
-    public func forceLocalDriverRebuild(devices: [Device]) async {
+    /// - Returns: `true` if both the SCK restart succeeded AND the
+    ///   local driver was rebuilt cleanly. `false` if the SCK restart
+    ///   failed (caller should retry — driver is half-rebuilt without
+    ///   a source, "no sound" state). Codex must-fix #3.
+    @discardableResult
+    public func forceLocalDriverRebuild(devices: [Device]) async -> Bool {
         FileHandle.standardError.write(Data(
             "[Router] forceLocalDriverRebuild: tearing down + rebuilding (incl. SCK)\n".utf8
         ))
@@ -762,24 +767,26 @@ public actor Router {
         //    We replicate that restart here.
         sckCapture.stop()
         try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms cushion
+        var sckOK = false
         do {
             try await sckCapture.start()
+            sckOK = true
             FileHandle.standardError.write(Data(
                 "[Router] forceLocalDriverRebuild: SCK restart OK\n".utf8
             ))
         } catch {
-            // Don't bail — the local driver rebuild below may still help
-            // (e.g. transient SCK alreadyRunning if the delegate hasn't
-            // cleared yet) and a subsequent wake event will retry. Logging
-            // only matches the existing "best effort" pattern in start().
             FileHandle.standardError.write(Data(
                 "[Router] forceLocalDriverRebuild: SCK restart failed — \(error.localizedDescription)\n".utf8
             ))
         }
 
         // 3. Rebuild the local driver against the post-wake device snapshot.
+        //    We always do this even if SCK failed — the new aggregate is
+        //    correctly wired and the next wake-handler retry can attempt
+        //    SCK restart again without re-tearing the driver.
         reconcileLocalDriver(devices: devices)
         replan()
+        return sckOK
     }
 
     // MARK: - Whole-home AirPlay mode (Strategy 1)

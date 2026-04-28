@@ -1877,20 +1877,26 @@ final class AppModel {
                     return
                 }
                 if attempt > 0 {
-                    SyncCastLog.log("AppModel: post-wake rebuild attempt \(attempt) — UIDs not all live yet, sleeping \(backoffs[attempt - 1] / 1_000_000_000)s")
+                    SyncCastLog.log("AppModel: post-wake rebuild attempt \(attempt) — recovery incomplete, sleeping \(backoffs[attempt - 1] / 1_000_000_000)s")
                     try? await Task.sleep(nanoseconds: backoffs[attempt - 1])
                     if Task.isCancelled { return }
                 }
-                await self.router.forceLocalDriverRebuild(devices: allDevices)
+                let sckOK = await self.router.forceLocalDriverRebuild(devices: allDevices)
                 let allResolved = await Self.allUIDsResolveToLiveDeviceID(allTargetUIDs)
-                if allResolved {
+                // Codex must-fix #3: success requires BOTH SCK restart
+                // AND every target UID resolving. If only UIDs resolve
+                // but SCK is dead, the driver is silent — must retry.
+                if sckOK && allResolved {
                     if attempt > 0 {
-                        SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(maxAttempts)")
+                        SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(maxAttempts) (sck=ok, uids=live)")
+                    } else {
+                        SyncCastLog.log("AppModel: post-wake rebuild succeeded first try (sck=ok, uids=live)")
                     }
                     return
                 }
+                SyncCastLog.log("AppModel: post-wake attempt \(attempt + 1) incomplete — sck=\(sckOK ? "ok" : "FAIL"), uids=\(allResolved ? "live" : "stale")")
             }
-            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(maxAttempts) attempts — UID(s) never returned")
+            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(maxAttempts) attempts")
         }
     }
 
