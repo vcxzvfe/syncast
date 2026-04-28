@@ -215,6 +215,32 @@ public actor Router {
             // crashes start happening.
             print("[Router] swept \(reaped) orphan aggregate device(s) at init")
         }
+        // Wire SCKCapture's "I died" notification into the actor. Display
+        // sleep can break SCStream system-audio capture (Apple emits
+        // `connectionInvalid -3805` on `didStopWithError`); without this
+        // hop the Router would never learn the stream was gone and the
+        // wake-time `forceLocalDriverRebuild` would rebuild a silent
+        // aggregate. We deliberately just record the event here — the
+        // wake handler in AppModel still drives `forceLocalDriverRebuild`,
+        // which is the single chokepoint that performs the SCK restart.
+        sckCapture.onUnexpectedStop = { [weak self] in
+            Task { await self?.handleSCKDied() }
+        }
+    }
+
+    /// Called from `SCKCapture.onUnexpectedStop` when SCK terminates the
+    /// capture stream on its own (the most common cause being display
+    /// sleep → `connectionInvalid -3805`). We deliberately do NOT restart
+    /// SCK here — `forceLocalDriverRebuild` is the single chokepoint that
+    /// owns SCK lifecycle during wake recovery, and racing it with this
+    /// callback would double-start SCK or interleave with an in-flight
+    /// rebuild. Logging only is sufficient: the AppModel wake handler
+    /// fires `forceLocalDriverRebuild` after every wake event, which now
+    /// stops + restarts SCK as part of its rebuild sequence.
+    private func handleSCKDied() {
+        FileHandle.standardError.write(Data(
+            "[Router] SCK died unexpectedly — wake handler's forceLocalDriverRebuild will restart it\n".utf8
+        ))
     }
 
     public func attachSidecar(_ sockets: SidecarSockets) async throws {
@@ -716,10 +742,42 @@ public actor Router {
     /// when the rebuild starts.
     public func forceLocalDriverRebuild(devices: [Device]) async {
         FileHandle.standardError.write(Data(
-            "[Router] forceLocalDriverRebuild: tearing down + rebuilding local driver\n".utf8
+            "[Router] forceLocalDriverRebuild: tearing down + rebuilding (incl. SCK)\n".utf8
         ))
+        // 1. Tear down the local driver (aggregate device + any AUHALs).
         tearDownLocalDriver()
+
+        // 2. Stop + restart the SCK capture stream.
+        //
+        //    Display sleep is observed to break SCStream system-audio
+        //    capture: SCK fires `didStopWithError` with `connectionInvalid`
+        //    (-3805) and our delegate clears `stream`/`output` so a retry
+        //    can rebuild cleanly. Before this fix the Router rebuilt only
+        //    the aggregate + AUHAL — perfectly silent because no source
+        //    was feeding the new ring. Field log
+        //    (~/Library/Logs/SyncCast/launch.log, 2026-04-28 21:25:27)
+        //    shows zero SCK report lines for 75 s after wake until the
+        //    user manually deselected + reselected each device, which
+        //    routed through `start()` and triggered `sckCapture.start()`.
+        //    We replicate that restart here.
+        sckCapture.stop()
         try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms cushion
+        do {
+            try await sckCapture.start()
+            FileHandle.standardError.write(Data(
+                "[Router] forceLocalDriverRebuild: SCK restart OK\n".utf8
+            ))
+        } catch {
+            // Don't bail — the local driver rebuild below may still help
+            // (e.g. transient SCK alreadyRunning if the delegate hasn't
+            // cleared yet) and a subsequent wake event will retry. Logging
+            // only matches the existing "best effort" pattern in start().
+            FileHandle.standardError.write(Data(
+                "[Router] forceLocalDriverRebuild: SCK restart failed — \(error.localizedDescription)\n".utf8
+            ))
+        }
+
+        // 3. Rebuild the local driver against the post-wake device snapshot.
         reconcileLocalDriver(devices: devices)
         replan()
     }
