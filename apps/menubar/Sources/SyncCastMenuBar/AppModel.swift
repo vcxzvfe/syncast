@@ -574,6 +574,12 @@ final class AppModel {
             switch event {
             case .appeared(let dev):
                 SyncCastLog.log("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))".replacingOccurrences(of: "[SyncCast] ", with: ""))
+                // Round 12: device came back. Clear it from the
+                // "transiently missing while user-intent-enabled" set
+                // (used by the post-wake recovery handler).
+                if let uid = dev.coreAudioUID {
+                    transientlyMissingEnabledCoreAudioUIDs.remove(uid)
+                }
                 // If a logical device with the same coreAudioUID / host+name
                 // already exists under a DIFFERENT id (e.g. discovery layer
                 // minted a fresh UUID after a rename or socket flap), migrate
@@ -621,6 +627,18 @@ final class AppModel {
                 }
                 detectBlackHole(in: dev)
             case .disappeared(let id):
+                // Round 12: capture the device's coreAudioUID before we
+                // remove it, so the wake handler can recover the user's
+                // intended routing even when DPMS sleep transiently drops
+                // an HDMI subdevice. Codex caught this race: without this
+                // shadow set, wake handler sees an empty enabled list and
+                // silently no-ops in the canonical bug scenario.
+                if let goneDev = devices.first(where: { $0.id == id }),
+                   let goneUID = goneDev.coreAudioUID,
+                   goneDev.transport == .coreAudio,
+                   (routing[id]?.enabled ?? false) {
+                    transientlyMissingEnabledCoreAudioUIDs.insert(goneUID)
+                }
                 devices.removeAll { $0.id == id }
                 // Drop the routing entry for the gone device too. Otherwise
                 // it sits orphan in the dict and shows up as "?=on/off" in
@@ -1705,6 +1723,21 @@ final class AppModel {
     /// just rebuilt < 1 s ago coalesces the burst into one rebuild.
     private var lastWakeRebuildAt: Date = .distantPast
 
+    /// Single-flight wake recovery task. Cancel-and-replace pattern: a
+    /// second wake event during an in-flight recovery cancels the prior
+    /// retry loop and starts fresh. Without this, two waves <1s apart
+    /// could stack two parallel recoveries fighting each other.
+    private var wakeRecoveryTask: Task<Void, Never>?
+
+    /// Round 12 — Codex-found race fix. When DPMS sleep transiently
+    /// drops an HDMI subdevice, the discovery `.disappeared` path
+    /// removes the routing entry. Without this shadow set, the wake
+    /// handler would see an empty enabled-CoreAudio list and silently
+    /// no-op. We capture the UID here on disappearance (only if the
+    /// user had it enabled), and the wake handler treats it as a
+    /// "must come back" target. `.appeared` path clears the entry.
+    private var transientlyMissingEnabledCoreAudioUIDs: Set<String> = []
+
     /// Subscribe to NSWorkspace sleep/wake notifications. Idempotent —
     /// safe to call from `bootstrap` once. Observers live until the
     /// AppModel itself is torn down (see `deinit`).
@@ -1754,7 +1787,12 @@ final class AppModel {
         }
         lastWakeRebuildAt = now
 
-        Task { [weak self] in
+        // Single-flight: cancel any in-flight recovery from a prior
+        // wake event and replace with a fresh task. Codex caught this
+        // race where two waves <1s apart could stack parallel recovery
+        // loops fighting each other.
+        wakeRecoveryTask?.cancel()
+        wakeRecoveryTask = Task { [weak self] in
             // Wait for coreaudiod IPC to settle. Empirically ~1.5 s on
             // M1/M2 hardware after display DPMS wake; full-system wake
             // (S3) can take a touch longer but 1.5 s covers both.
@@ -1799,43 +1837,60 @@ final class AppModel {
                 SyncCastLog.log("AppModel: post-wake rebuild skipped (engine \(snapshot.stateName), nothing to recover)")
                 return
             }
-            guard snapshot.hasEnabledRouting else {
+            // Round 12 — Codex race fix: also include UIDs that
+            // disappeared while the user had them enabled. DPMS sleep
+            // can transiently drop HDMI subdevices; without merging
+            // these, snapshot.devices may be empty and recovery would
+            // silently no-op in the canonical bug scenario.
+            let transientUIDs = await MainActor.run { Array(self.transientlyMissingEnabledCoreAudioUIDs) }
+            let liveTargetUIDs = snapshot.devices.compactMap(\.coreAudioUID)
+            let allTargetUIDs = Array(Set(liveTargetUIDs + transientUIDs))
+
+            guard snapshot.hasEnabledRouting || !transientUIDs.isEmpty else {
                 SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled outputs in routing)")
                 return
             }
-            guard !snapshot.devices.isEmpty else {
-                SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled CoreAudio devices in current device list)")
+            guard !allTargetUIDs.isEmpty else {
+                SyncCastLog.log("AppModel: post-wake rebuild skipped (no target UIDs — neither live nor transiently-missing)")
                 return
             }
-            SyncCastLog.log("AppModel: post-wake force rebuild local driver (\(snapshot.devices.count) outputs)")
+
+            SyncCastLog.log("AppModel: post-wake force rebuild local driver (live=\(liveTargetUIDs.count), transient=\(transientUIDs.count) UIDs)")
             // Pass the FULL device list (not just enabled) — the Router
             // mirrors AppModel's call sites for `reconcileLocalDriver`,
             // which itself filters by `routing[dev.id].enabled`.
             let allDevices = await MainActor.run { self.devices }
-            // Retry-with-backoff (1s, 3s, 5s): coreaudiod IPC can block
-            // longer than 1.5s on deep DPMS sleep recovery (HDMI HPD
-            // renegotiation + EDID + audio-engine republish). Verify
-            // each enabled UID resolves to a live AudioDeviceID before
-            // declaring success; if any UID still missing, sleep and retry.
-            let targetUIDs = snapshot.devices.compactMap(\.coreAudioUID)
+
+            // Retry-with-backoff fixed off-by-one (codex #2): sleep
+            // BEFORE the next attempt, not after the previous one. This
+            // way the final 5s wait isn't wasted — if the UID returns
+            // during it, the next attempt observes success.
             let backoffs: [UInt64] = [
-                1_000_000_000,  // 1s
-                3_000_000_000,  // 3s
-                5_000_000_000,  // 5s
+                1_000_000_000,  // before attempt 2: 1s
+                3_000_000_000,  // before attempt 3: 3s
+                5_000_000_000,  // before attempt 4: 5s
             ]
-            for (attempt, backoff) in backoffs.enumerated() {
+            let maxAttempts = backoffs.count + 1  // 4 total
+            for attempt in 0..<maxAttempts {
+                if Task.isCancelled {
+                    SyncCastLog.log("AppModel: post-wake rebuild cancelled (newer wake event)")
+                    return
+                }
+                if attempt > 0 {
+                    SyncCastLog.log("AppModel: post-wake rebuild attempt \(attempt) — UIDs not all live yet, sleeping \(backoffs[attempt - 1] / 1_000_000_000)s")
+                    try? await Task.sleep(nanoseconds: backoffs[attempt - 1])
+                    if Task.isCancelled { return }
+                }
                 await self.router.forceLocalDriverRebuild(devices: allDevices)
-                let allResolved = await Self.allUIDsResolveToLiveDeviceID(targetUIDs)
+                let allResolved = await Self.allUIDsResolveToLiveDeviceID(allTargetUIDs)
                 if allResolved {
                     if attempt > 0 {
-                        SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(backoffs.count)")
+                        SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(maxAttempts)")
                     }
                     return
                 }
-                SyncCastLog.log("AppModel: post-wake rebuild attempt \(attempt + 1) — UIDs not all live yet, sleeping \(backoff / 1_000_000_000)s")
-                try? await Task.sleep(nanoseconds: backoff)
             }
-            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(backoffs.count) retries — UID(s) never returned")
+            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(maxAttempts) attempts — UID(s) never returned")
         }
     }
 
@@ -1844,7 +1899,10 @@ final class AppModel {
     /// any UID still maps to `kAudioObjectUnknown` (0), the post-wake
     /// device republish hasn't completed and the rebuild can't be
     /// trusted. Returns true only when all target UIDs resolve.
-    private static func allUIDsResolveToLiveDeviceID(_ uids: [String]) async -> Bool {
+    ///
+    /// `nonisolated` per codex #3 — `AudioObjectGetPropertyData` blocks
+    /// on coreaudiod IPC after wake, would stall the MainActor otherwise.
+    nonisolated private static func allUIDsResolveToLiveDeviceID(_ uids: [String]) async -> Bool {
         for uid in uids {
             var addr = AudioObjectPropertyAddress(
                 mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
