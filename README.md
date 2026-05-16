@@ -2,9 +2,9 @@
 
 # SyncCast
 
-**Open-source macOS menubar app for synchronized multi-device audio routing.**
+**Open-source macOS menubar app for experimental multi-device audio routing.**
 
-One song. Every speaker in the house. In sync.
+Local Stereo is the stable path today. Local + AirPlay sync is active R&D.
 
 [English](README.md) · [中文](README.zh-CN.md)
 
@@ -19,24 +19,25 @@ One song. Every speaker in the house. In sync.
 
 ## The problem
 
-You have a HomePod in the living room, an AirPlay speaker in the kitchen, and a USB DAC in the bedroom. You want to play **one song everywhere, in sync**, from your Mac.
+You have a HomePod in the living room, an AirPlay speaker in the kitchen, and a USB DAC in the bedroom. You want to play **one song everywhere** from your Mac, without giving up local speakers.
 
 macOS gives you two half-solutions:
 
 1. **Audio MIDI Setup → Multi-Output Device** — works for local outputs, but AirPlay 2 receivers drift and there's no per-device volume.
 2. **Control Center AirPlay multi-room** — works for AirPlay 2 receivers only. The moment you AirPlay anywhere, you lose your local speakers.
 
-Neither lets you fan one stream out to **local CoreAudio devices and AirPlay 2 receivers at the same time**. SyncCast does.
+Neither gives you a dependable Local + AirPlay mix with per-device control. SyncCast is an alpha attempt at that, with a stable local Stereo mode and an experimental AirPlay mode.
 
 ## What it does
 
-- Captures the **system audio stream** on macOS using Apple's [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) — no virtual audio driver, no kernel extension, no root.
+- Captures the **system audio stream** on macOS for AirPlay/capture-dependent paths. Local Stereo now defaults to a Direct Stereo CoreAudio output path so local video playback does not need ScreenCaptureKit or Screen Recording.
 - Routes the captured stream to **multiple destinations simultaneously**:
   - Local CoreAudio outputs (built-in speakers, USB / HDMI / Thunderbolt DACs)
   - AirPlay 2 receivers (HomePod, Apple TV, Xiaomi Sound, third-party speakers, other Macs running AirPlay Receiver)
 - Two mutually-exclusive modes, swapped in one click:
-  - **Whole-home mode** — all selected outputs go through the AirPlay 2 pipeline, locked to a single PTP master for tight multi-room sync (~1.8 s latency, no video sync).
-  - **Stereo mode** — local CoreAudio outputs only, via an Aggregate Device (~50 ms latency, video sync OK, no AirPlay).
+  - **AirPlay experimental mode** — local + AirPlay routing through the OwnTone-backed AirPlay pipeline. Multiple AirPlay receivers are generally handled by AirPlay's own timing domain, but Local + AirPlay delay still needs robust passive calibration and can drift after AirPlay interruptions, volume changes, or route changes.
+  - **Stereo mode** — local CoreAudio outputs only, defaulting to Direct Stereo. This is the currently stable path and is suitable for video.
+- Active acoustic calibration tones are disabled in normal builds. The current calibration R&D path is passive no-probe measurement from real program audio plus a microphone, with fail-closed confidence gates.
 - Lives quietly in the menubar. Pure user-space Swift + a small Python sidecar.
 
 ## Architecture
@@ -48,7 +49,7 @@ Neither lets you fan one stream out to **local CoreAudio devices and AirPlay 2 r
                                      │   System audio
                                      ▼
         ┌─────────────────────────────────────────────────────────────┐
-        │  ScreenCaptureKit  ── system-wide audio tap (no driver)     │
+        │  Capture backend  ── SCK today, Process Tap in progress     │
         └────────────────────────────┬────────────────────────────────┘
                                      ▼
         ┌─────────────────────────────────────────────────────────────┐
@@ -80,8 +81,9 @@ Sub-components:
 
 ## Requirements
 
-- **macOS 14 (Sonoma) or later** — ScreenCaptureKit audio capture is required.
-- **Screen Recording permission** — you'll be prompted on first launch. (Despite the name, this permission gates audio capture too — there's no microphone or virtual driver involved.)
+- **macOS 14 (Sonoma) or later** — required for the current alpha.
+- **Screen Recording permission** — not required for the default local Stereo path. It is still required for ScreenCaptureKit fallback/capture-dependent paths such as AirPlay unless Process Tap is selected.
+- **Microphone permission** — optional and only for explicit passive diagnostics. Normal playback and Stereo mode do not use the microphone or play calibration tones.
 - **Xcode 15+** and **Python 3.11+** — only if you're building from source.
 - An AirPlay 2 receiver and/or a CoreAudio output device — preferably both, that's the point.
 
@@ -125,32 +127,36 @@ Then launch:
 open /Applications/SyncCast.app
 ```
 
-> **Why install to `/Applications`?** macOS Tahoe's TCC silently denies Screen Recording for apps running from arbitrary paths. `install-app.sh` also re-signs in place so the signature matches the final bundle path.
+> **Why install to `/Applications`?** macOS Tahoe's TCC silently denies capture permissions for apps running from arbitrary paths. `install-app.sh` also re-signs in place so the signature matches the final bundle path.
 
-A self-signed identity named `SyncCast Dev` (created via Keychain Access → Certificate Assistant) is detected automatically and gives you stable Screen Recording grants across rebuilds. Without it, you fall back to ad-hoc signing — works, but TCC will re-prompt every time.
+Development installs use ad-hoc signing by default. That is fine for the default local Stereo / Direct Stereo path, which does not need Screen Recording. If you need stable TCC grants while testing SCK fallback or other capture-dependent paths, create a self-signed code-signing identity named `SyncCast Dev` and run package/install with `SYNCAST_USE_SYNCCAST_DEV=1`.
 
 ## Usage
 
 1. **Launch SyncCast.** Look for the icon in the macOS menubar.
-2. **Grant Screen Recording** when prompted, then quit and reopen once.
+2. **Grant Screen Recording** only if you use an SCK capture path and macOS prompts for it, then quit and reopen once.
 3. **Pick a mode** in the popover:
-   - *Whole-home* — all your AirPlay receivers and local outputs are streamed via AirPlay 2 (PTP-synced).
+   - *AirPlay experimental* — AirPlay receivers plus selected local outputs. Expect latency and calibration limitations.
    - *Stereo* — local outputs only, low-latency aggregate device, suitable for video.
 4. **Tick the devices you want.** Discovery runs continuously; new AirPlay receivers and audio devices appear within a few seconds.
-5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. SyncCast captures it system-wide.
+5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the Direct Stereo output; capture-dependent modes use the selected capture backend.
 
 ## Project status
 
 > **Alpha. Experimental. Use at your own risk.**
 
 What works:
-- System audio capture via ScreenCaptureKit
-- Local multi-output routing through an Aggregate Device
+- Local Stereo default path that bypasses ScreenCaptureKit
+- System audio capture via ScreenCaptureKit for fallback/capture-dependent paths
+- Local Stereo routing through an Aggregate Device
 - AirPlay 2 multi-target streaming via the OwnTone-backed sidecar
 - Mode switching, device discovery, per-device volume
 - Local `.app` bundling with self-signed codesigning
 
 What's still rough:
+- Local + AirPlay automatic alignment is not production-reliable yet. Passive no-probe measurement and conservative correction gates are under active development.
+- ScreenCaptureKit can trigger DRM playback blocks; Local Stereo now defaults to Direct Stereo, while Process Tap / AirPlay capture validation remains in progress.
+- Active acoustic probe calibration is lab-only and disabled by default because high-band tones were audible on real hardware.
 - Not notarized — Gatekeeper warnings are normal on first launch.
 - No first-run wizard yet; `bootstrap.sh` is the on-ramp.
 - AirPlay device pairing flow is minimal (relies on `pyatv`).

@@ -13,6 +13,7 @@
 #
 # Usage:
 #   bash scripts/drift_test.sh [cycles] [interval_sec]
+#   bash scripts/drift_test.sh --summarize-csv <csv_path> [cycles] [interval_sec]
 #   bash scripts/drift_test.sh --help
 #
 # Defaults: 10 cycles × 60 s = 10 minutes total.
@@ -22,15 +23,19 @@
 # A second terminal running `bash scripts/calibration_watch.sh` is helpful
 # but not required.
 #
-# Exit codes: 0 success, 1 missing socket, 2 RPC error on cycle 1, 3 parse
-# failure, 4 user passed an invalid argument.
+# Exit codes: 0 success, 1 missing socket, 2 every calibration cycle failed,
+# 3 inconclusive/non-numeric summary, 4 invalid argument, 5 unhealthy drift.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOCKET="/tmp/syncast-$(id -u).calibration.sock"
 DEFAULTS_DOMAIN="io.syncast.menubar"
-DEFAULTS_KEY="syncast.airplayDelayMs"
+DELAY_KEY="syncast.airplayDelayMs"
+LOCK_KEY="syncast.airplayDelayLockedAt"
+DEFAULT_AIRPLAY_DELAY_MS=1750
+MIN_AIRPLAY_DELAY_MS=0
+MAX_AIRPLAY_DELAY_MS=5000
 
 print_help() {
     cat <<'EOF'
@@ -38,6 +43,7 @@ drift_test.sh — measure SyncCast sync drift over a long window
 
 USAGE
   bash scripts/drift_test.sh [cycles] [interval_sec]
+  bash scripts/drift_test.sh --summarize-csv <csv_path> [cycles] [interval_sec]
   bash scripts/drift_test.sh --help
 
 ARGUMENTS
@@ -51,14 +57,19 @@ OUTPUT
   CSV log    /tmp/syncast_drift_<unix-ts>.csv  (one row per cycle, header
              included). Persisted across reboots so you can diff runs.
   stdout     Per-cycle line printed live + a summary at the end.
+             Exit code 5 means the run produced data but failed a health gate.
 
 WHAT IT VALIDATES
   Continuous calibration (parallel WIP) is supposed to keep airplayDelayMs
   auto-tracking the per-device drift. After 10 cycles you can answer:
 
-    1. Total drift cycle 1 → cycle N — did the recommended deltaMs change?
+    1. Total drift cycle 1 → cycle N — did the recommended target delay change?
        Stable system: |Δ| < ~30 ms across 10 minutes.
        Broken system: linear growth → continuous calibrator is silent.
+
+    1b. Applied-vs-recommended error — is the persisted airplayDelayMs still
+        close to the measured target? A stable target 150 ms away from the
+        applied delay is still a sync problem.
 
     2. Per-cycle drift — does each successive cycle show a small, random
        delta (system is converged), or a monotone trend (system is chasing
@@ -78,6 +89,9 @@ EXAMPLES
 
   # Stress test — 30 cycles × 120 s = ~1 hour
   bash scripts/drift_test.sh 30 120
+
+  # Re-run the summary / health gates on a saved CSV without probing audio
+  bash scripts/drift_test.sh --summarize-csv /tmp/syncast_drift_123.csv 10 60
 EOF
 }
 
@@ -86,6 +100,27 @@ EOF
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     print_help
     exit 0
+fi
+
+if [[ "${1:-}" == "--summarize-csv" ]]; then
+    CSV_PATH="${2:-}"
+    CYCLES="${3:-1}"
+    INTERVAL="${4:-60}"
+    if [[ -z "$CSV_PATH" || ! -r "$CSV_PATH" ]]; then
+        echo "ERROR: --summarize-csv requires a readable CSV path" >&2
+        exit 4
+    fi
+    if ! [[ "$CYCLES" =~ ^[0-9]+$ ]] || (( CYCLES < 1 )); then
+        echo "ERROR: cycles must be a positive integer (got '$CYCLES')" >&2
+        exit 4
+    fi
+    if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || (( INTERVAL < 1 )); then
+        echo "ERROR: interval_sec must be a positive integer (got '$INTERVAL')" >&2
+        exit 4
+    fi
+    echo "=== drift_test summary ==="
+    python3 "$SCRIPT_DIR/drift_summary.py" "$CSV_PATH" "$CYCLES" "$INTERVAL"
+    exit $?
 fi
 
 CYCLES="${1:-10}"
@@ -121,19 +156,53 @@ fi
 
 # ---- helpers ---------------------------------------------------------------
 
-# Read the persisted airplayDelayMs from UserDefaults. Reading the
-# sidecar's `local_fifo.diagnostics` over the control socket would
-# steal the Router's connection (sidecar accepts only one client at a
-# time), so we fall back to the AppModel-persisted copy. This value is
-# written every time the slider commits or the calibrator applies a
-# delta, so it is always the authoritative current setting.
-read_current_delay() {
+# Read an integer UserDefaults key only when it is actually typed as an
+# integer. This mirrors AppModel.loadPersistedDelayMs(), which ignores
+# string-typed values even if `defaults read` prints something numeric.
+read_int_default_or_empty() {
+    local key="$1"
+    local type
+    type=$(defaults read-type "$DEFAULTS_DOMAIN" "$key" 2>/dev/null || true)
+    if ! printf '%s' "$type" | grep -qi 'integer'; then
+        echo ""
+        return
+    fi
     local v
-    v=$(defaults read "$DEFAULTS_DOMAIN" "$DEFAULTS_KEY" 2>/dev/null || echo "")
-    if [[ -z "$v" ]]; then
-        echo "0"   # unset → AppModel default; treat as 0 for the CSV
-    else
+    v=$(defaults read "$DEFAULTS_DOMAIN" "$key" 2>/dev/null || true)
+    if [[ "$v" =~ ^-?[0-9]+$ ]]; then
         echo "$v"
+    else
+        echo ""
+    fi
+}
+
+clamp_delay() {
+    local value="$1"
+    if (( value < MIN_AIRPLAY_DELAY_MS )); then
+        echo "$MIN_AIRPLAY_DELAY_MS"
+    elif (( value > MAX_AIRPLAY_DELAY_MS )); then
+        echo "$MAX_AIRPLAY_DELAY_MS"
+    else
+        echo "$value"
+    fi
+}
+
+# Read the app-effective airplayDelayMs from UserDefaults. This follows
+# AppModel.loadPersistedDelayMs(): a positive lock overrides the plain
+# delay key, an unset/untyped delay falls back to 1750ms, and values are
+# clamped to the shared 0...5000ms UI/diagnostic range.
+read_current_delay() {
+    local locked delay
+    locked=$(read_int_default_or_empty "$LOCK_KEY")
+    if [[ "$locked" =~ ^-?[0-9]+$ ]] && (( locked > 0 )); then
+        clamp_delay "$locked"
+        return
+    fi
+    delay=$(read_int_default_or_empty "$DELAY_KEY")
+    if [[ "$delay" =~ ^-?[0-9]+$ ]]; then
+        clamp_delay "$delay"
+    else
+        echo "$DEFAULT_AIRPLAY_DELAY_MS"
     fi
 }
 
@@ -162,7 +231,7 @@ TS_START=$(date +%s)
 # Write CSV header up front so the file is self-describing even if the
 # test is interrupted by Ctrl-C.
 {
-    printf 'cycle,unix_ts,t_elapsed_s,status,delta_ms,confidence,airplay_delay_ms,raw_per_device\n'
+    printf 'cycle,unix_ts,t_elapsed_s,status,delta_ms,confidence,airplay_delay_ms,raw_per_device,raw_per_device_confidence,raw_per_device_uncertainty\n'
 } > "$CSV_PATH"
 
 echo "drift_test starting"
@@ -171,11 +240,6 @@ echo "  interval    : ${INTERVAL}s"
 echo "  csv log     : $CSV_PATH"
 echo "  socket      : $SOCKET"
 echo
-
-# Track if any cycle succeeded; if cycle 1 fails outright we exit non-zero
-# so CI / loops surface it.
-ANY_OK=0
-FIRST_FAIL_EXIT=2
 
 for ((i = 1; i <= CYCLES; i++)); do
     NOW=$(date +%s)
@@ -202,6 +266,8 @@ csv_path, cycle, unix_ts, t_elapsed, status, body, delay_after = sys.argv[1:8]
 delta_ms = ""
 confidence = ""
 per_dev_json = ""
+per_dev_conf_json = ""
+per_dev_unc_json = ""
 
 if status == "OK":
     try:
@@ -219,33 +285,45 @@ if status == "OK":
             delta_ms = res.get("deltaMs", "")
             confidence = res.get("confidence", "")
             offsets = res.get("perDeviceOffsetMs") or {}
+            per_dev_conf = res.get("perDeviceConfidence") or {}
+            per_dev_unc = res.get("perDeviceUncertaintyMs") or {}
             per_dev_json = json.dumps(offsets, sort_keys=True,
                                       ensure_ascii=False)
+            per_dev_conf_json = json.dumps(per_dev_conf, sort_keys=True,
+                                           ensure_ascii=False)
+            per_dev_unc_json = json.dumps(per_dev_unc, sort_keys=True,
+                                          ensure_ascii=False)
 
 with open(csv_path, "a", newline="") as f:
     w = csv.writer(f)
     w.writerow([cycle, unix_ts, t_elapsed, status, delta_ms, confidence,
-                delay_after, per_dev_json])
+                delay_after, per_dev_json, per_dev_conf_json,
+                per_dev_unc_json])
 
 # One-line live summary
 if status == "OK":
     short = ""
+    metrics = ""
     if per_dev_json:
         try:
             parsed = json.loads(per_dev_json)
             short = " τ=" + ",".join(
-                f"{k[:8]}:{v}ms" for k, v in sorted(parsed.items()))
+                f"{k[:16]}:{v}ms" for k, v in sorted(parsed.items()))
+        except Exception:
+            pass
+    if per_dev_unc_json:
+        try:
+            parsed_unc = json.loads(per_dev_unc_json)
+            if parsed_unc:
+                metrics = " MAD=" + ",".join(
+                    f"{k[:16]}:{v}ms" for k, v in sorted(parsed_unc.items()))
         except Exception:
             pass
     print(f"  -> deltaMs={delta_ms} confidence={confidence}"
-          f" airplayDelayMs={delay_after}{short}")
+          f" airplayDelayMs={delay_after}{short}{metrics}")
 else:
     print(f"  -> {status}: {body}")
 PYEOF
-
-    if [[ "$STATUS" == "OK" ]]; then
-        ANY_OK=1
-    fi
 
     # Skip the inter-cycle sleep on the last iteration so total wall-clock
     # is ~cycles*interval, not cycles*interval+interval.
@@ -259,155 +337,5 @@ done
 echo
 echo "=== drift_test summary ==="
 
-# All summary stats are computed by python3 reading the CSV. This keeps
-# the bash side simple and lets us reuse json/statistics modules.
-python3 - "$CSV_PATH" "$CYCLES" "$INTERVAL" <<'PYEOF'
-import csv, json, statistics, sys
-
-csv_path, cycles, interval = sys.argv[1:4]
-cycles = int(cycles)
-interval = int(interval)
-
-with open(csv_path) as f:
-    rows = list(csv.DictReader(f))
-
-ok_rows = [r for r in rows if r["status"] == "OK"]
-err_rows = [r for r in rows if r["status"] != "OK"]
-
-print(f"Duration: {len(rows)} cycles over ~{(len(rows) - 1) * interval}s")
-print(f"CSV log:  {csv_path}")
-
-if not ok_rows:
-    print("VERDICT: NO_DATA — every cycle failed. Inspect CSV + launch.log.")
-    if err_rows:
-        print("First error: " + err_rows[0].get("raw_per_device", "(none)"))
-    sys.exit(0)
-
-if err_rows:
-    print(f"WARN: {len(err_rows)} cycle(s) failed; summary uses {len(ok_rows)} OK rows.")
-
-# Parse per-device τ history. Each row's raw_per_device is a JSON dict
-# {device_id -> tau_ms}. We aggregate across rows so we can report each
-# device's drift independently.
-devices: dict[str, list[int]] = {}
-for r in ok_rows:
-    try:
-        d = json.loads(r["raw_per_device"]) if r["raw_per_device"] else {}
-    except json.JSONDecodeError:
-        d = {}
-    for k, v in d.items():
-        devices.setdefault(k, []).append(int(v))
-
-initial = ok_rows[0]
-final = ok_rows[-1]
-
-def fmt_dev_state(row):
-    try:
-        d = json.loads(row["raw_per_device"]) if row["raw_per_device"] else {}
-    except json.JSONDecodeError:
-        return "(parse-fail)"
-    if not d:
-        return "(none)"
-    return ", ".join(f"{k[:8]} τ={v}" for k, v in sorted(d.items()))
-
-print(f"Initial state: airplayDelayMs={initial['airplay_delay_ms']}, "
-      f"deltaMs={initial['delta_ms']}, {fmt_dev_state(initial)}")
-print(f"Final state:   airplayDelayMs={final['airplay_delay_ms']}, "
-      f"deltaMs={final['delta_ms']}, {fmt_dev_state(final)}")
-
-# Total drift = how much did the *recommended* delta change from cycle 1
-# to cycle N. If continuous calibration is doing its job, the absolute
-# delta should stay near zero — the system has converged and the next
-# recommendation is "do nothing". A growing |delta| indicates drift.
-try:
-    d1 = int(initial["delta_ms"])
-    dn = int(final["delta_ms"])
-    total_drift = dn - d1
-    print(f"Δ deltaMs over {len(ok_rows)} cycles: "
-          f"{total_drift:+d} ms (cycle 1: {d1:+d} → cycle {len(ok_rows)}: {dn:+d})")
-except (ValueError, TypeError):
-    total_drift = None
-    print("Δ deltaMs over window: n/a (non-numeric values)")
-
-# Per-cycle drift = consecutive differences in deltaMs. Mean ≈ 0 with
-# small stdev = stable; growing magnitude or drift trend = unstable.
-deltas = []
-for r in ok_rows:
-    try:
-        deltas.append(int(r["delta_ms"]))
-    except (ValueError, TypeError):
-        pass
-per_cycle = [b - a for a, b in zip(deltas, deltas[1:])]
-if per_cycle:
-    pc_mean = statistics.mean(per_cycle)
-    pc_stdev = statistics.stdev(per_cycle) if len(per_cycle) > 1 else 0.0
-    print(f"Per-cycle Δ:   mean={pc_mean:+.1f}ms stdev={pc_stdev:.1f}ms "
-          f"(n={len(per_cycle)})")
-
-# Confidence stats — single number because the calibrate result only
-# returns one aggregate. A drop mid-test suggests environment changed.
-confs = []
-for r in ok_rows:
-    try:
-        confs.append(float(r["confidence"]))
-    except (ValueError, TypeError):
-        pass
-if confs:
-    c_mean = statistics.mean(confs)
-    c_stdev = statistics.stdev(confs) if len(confs) > 1 else 0.0
-    print(f"Confidence:    {c_mean:.1f} ± {c_stdev:.1f} "
-          f"(min={min(confs):.1f}, max={max(confs):.1f})")
-
-# Per-device drift breakdown.
-if devices:
-    print("Per-device τ drift (final − initial):")
-    for k in sorted(devices.keys()):
-        vals = devices[k]
-        if len(vals) < 2:
-            continue
-        diff = vals[-1] - vals[0]
-        std = statistics.stdev(vals) if len(vals) > 2 else 0.0
-        print(f"  {k[:8]:8s}  τ₁={vals[0]:>5d}  τN={vals[-1]:>5d}  "
-              f"Δ={diff:+5d}ms  stdev={std:5.1f}ms")
-
-# Verdict heuristic. The 30 ms threshold matches the perceptual sync
-# tolerance most listeners can detect on consonant transients (~30 ms
-# is roughly the Haas-effect ceiling for non-localized ensemble audio).
-print()
-if total_drift is None:
-    print("Verdict: INCONCLUSIVE — non-numeric deltaMs values in log.")
-elif abs(total_drift) <= 30:
-    print(f"Verdict: STABLE — total drift {total_drift:+d} ms "
-          f"is within ±30 ms threshold.")
-elif abs(total_drift) <= 100:
-    print(f"Verdict: MARGINAL — drift {total_drift:+d} ms exceeds the "
-          "±30 ms target but is below the 100 ms mismatch ceiling.")
-else:
-    print(f"Verdict: UNSTABLE — drift {total_drift:+d} ms is "
-          "audible-tier. Continuous calibration is not tracking.")
-
-# ---- per-cycle table ----
-print()
-print("Per-cycle table:")
-print(f"  {'cycle':>5} {'time_s':>6} {'status':>8} {'delta':>7} "
-      f"{'conf':>6} {'aplyDly':>7}  per-device")
-for r in rows:
-    pd = ""
-    try:
-        d = json.loads(r["raw_per_device"]) if r["raw_per_device"] else {}
-        if d:
-            pd = " ".join(f"{k[:8]}={v}" for k, v in sorted(d.items()))
-    except json.JSONDecodeError:
-        pd = "(bad-json)"
-    print(f"  {r['cycle']:>5} {r['t_elapsed_s']:>6} "
-          f"{r['status']:>8} "
-          f"{(r['delta_ms'] or '-'):>7} "
-          f"{(r['confidence'] or '-'):>6} "
-          f"{r['airplay_delay_ms']:>7}  {pd}")
-PYEOF
-
-# If every cycle failed, propagate that as a non-zero exit so CI surfaces it.
-if (( ANY_OK == 0 )); then
-    exit "$FIRST_FAIL_EXIT"
-fi
-exit 0
+python3 "$SCRIPT_DIR/drift_summary.py" "$CSV_PATH" "$CYCLES" "$INTERVAL"
+exit $?

@@ -55,6 +55,17 @@ public final class AudioSocketWriter: @unchecked Sendable {
     /// second concurrent writer — the same 2.2× over-rate bug feb56ca
     /// originally fixed.
     private var writerGeneration: UInt64 = 0
+    private struct ScheduledOverlay {
+        let startNs: UInt64
+        let samples: [[Float]]
+        let frames: Int
+        var mixedFrames: Int = 0
+    }
+    private var scheduledOverlays: [ScheduledOverlay] = []
+    public private(set) var overlaysScheduled: UInt64 = 0
+    public private(set) var overlayFramesScheduled: UInt64 = 0
+    public private(set) var overlayFramesMixed: UInt64 = 0
+    public private(set) var overlaysDroppedLate: UInt64 = 0
 
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
@@ -107,10 +118,38 @@ public final class AudioSocketWriter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if fd >= 0 { Darwin.close(fd); fd = -1 }
         writerActive = false
+        scheduledOverlays.removeAll()
         // Invalidate any in-flight Task cleanup from a previous
         // generation so a stop()+start() cycle's stale Task exit
         // cannot clobber the new generation's `writerActive`.
         writerGeneration &+= 1
+    }
+
+    /// Schedule a short stereo probe to be mixed into the outgoing
+    /// AirPlay-bound PCM at a wall-clock time. This is used by
+    /// `ActiveCalibrator` instead of writing probes into `RingBuffer`:
+    /// writing into the ring advances its write cursor and permanently
+    /// adds backlog, which made repeated 100 ms chirps appear about
+    /// 100 ms later on every cycle. Overlay mixing preserves the capture
+    /// queue's timeline while still sending the probe through OwnTone.
+    @discardableResult
+    public func scheduleStereoOverlay(samples: [[Float]], atNs: UInt64) -> Bool {
+        guard samples.count >= channelCount,
+              !samples[0].isEmpty,
+              samples[0].count == samples[1].count
+        else { return false }
+        let frames = samples[0].count
+        return lock.withLock {
+            guard writerActive, fd >= 0 else { return false }
+            scheduledOverlays.append(.init(
+                startNs: atNs,
+                samples: Array(samples.prefix(channelCount)),
+                frames: frames
+            ))
+            overlaysScheduled &+= 1
+            overlayFramesScheduled &+= UInt64(frames)
+            return true
+        }
     }
 
     private func connect() throws {
@@ -169,7 +208,7 @@ public final class AudioSocketWriter: @unchecked Sendable {
         )
 
         var nextRead: Int64 = -1
-        var startNs = DispatchTime.now().uptimeNanoseconds
+        var startNs = Clock.nowNs()
         var packetsConsumed: UInt64 = 0
 
         while !Task.isCancelled {
@@ -184,12 +223,14 @@ public final class AudioSocketWriter: @unchecked Sendable {
             //    s16le framing. The invariant we restore is:
             //        packetsConsumed * packetIntervalNs ≈ now - startNs
             let targetNs = startNs &+ packetsConsumed &* packetIntervalNs
-            let nowNs = DispatchTime.now().uptimeNanoseconds
-            if nowNs < targetNs {
-                try? await Task.sleep(nanoseconds: targetNs &- nowNs)
+            var packetStartNs = targetNs
+            let nowNs = Clock.nowNs()
+            if nowNs < packetStartNs {
+                try? await Task.sleep(nanoseconds: packetStartNs &- nowNs)
                 if Task.isCancelled { return }
-            } else if nowNs > targetNs &+ (packetIntervalNs &* 2) {
+            } else if nowNs > packetStartNs &+ (packetIntervalNs &* 2) {
                 startNs = nowNs &- packetsConsumed &* packetIntervalNs
+                packetStartNs = nowNs
             }
 
             // 2. Pull one packet's worth of frames from the ring. If the
@@ -216,49 +257,152 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 // wild: airplayWriter=pkts:142 underrun:141 (99% silence
                 // on the wire) and AirPlay receivers playing one initial
                 // burst then going silent forever.
-                for i in 0..<packet.count { packet[i] = 0 }
+                for ch in 0..<channelCount {
+                    for f in 0..<frameCount { planar[ch][f] = 0 }
+                }
                 underrunPackets &+= 1
             } else {
                 let outPtrs = planar.indices.map { i in
                     planar[i].withUnsafeMutableBufferPointer { $0.baseAddress! }
                 }
                 ring.read(at: nextRead, frames: frameCount, into: outPtrs)
-                for f in 0..<frameCount {
-                    for ch in 0..<channelCount {
-                        let v = planar[ch][f]
-                        let clamped = max(-1.0, min(1.0, v))
-                        packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
-                    }
-                }
                 nextRead &+= Int64(frameCount)
             }
 
-            // 3. Send one packet down the Unix socket to the sidecar.
-            let sent = packet.withUnsafeBytes { raw -> Int in
-                let s = lock.withLock { fd }
-                guard s >= 0 else { return -1 }
-                return Darwin.send(s, raw.baseAddress, bytesPerPacket, 0)
+            mixScheduledOverlays(
+                into: &planar, packetStartNs: packetStartNs,
+                packetIntervalNs: packetIntervalNs
+            )
+            for f in 0..<frameCount {
+                for ch in 0..<channelCount {
+                    let v = planar[ch][f]
+                    let clamped = max(-1.0, min(1.0, v))
+                    packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
+                }
             }
-            if sent < 0 {
-                let e = errno
-                lastSendError = "send errno=\(e)"
-                if e == EINTR { continue }
+
+            // 3. Send one well-framed packet down the Unix stream socket.
+            // Darwin.send() may legally write only part of the buffer. For
+            // raw s16le over SOCK_STREAM, continuing with the next packet
+            // after a short write permanently shifts the receiver's frame
+            // boundaries, so loop until this packet is complete or stop the
+            // writer on a hard error.
+            let sendResult = packet.withUnsafeBytes { raw -> (
+                bytes: Int, error: Int32, partials: UInt64
+            ) in
+                guard let base = raw.baseAddress else {
+                    return (0, EINVAL, 0)
+                }
+                var offset = 0
+                var partials: UInt64 = 0
+                while offset < bytesPerPacket {
+                    let remaining = bytesPerPacket - offset
+                    let s = lock.withLock { fd }
+                    guard s >= 0 else { return (offset, EBADF, partials) }
+                    let n = Darwin.send(
+                        s, base.advanced(by: offset), remaining, 0
+                    )
+                    if n < 0 {
+                        let e = errno
+                        if e == EINTR { continue }
+                        return (offset, e, partials)
+                    }
+                    if n == 0 {
+                        return (offset, EPIPE, partials)
+                    }
+                    if n < remaining {
+                        partials &+= 1
+                    }
+                    offset += n
+                }
+                return (offset, 0, partials)
+            }
+            if sendResult.partials > 0 {
+                partialSends &+= sendResult.partials
+                lastSendError =
+                    "short send recovered n=\(sendResult.bytes)"
+            }
+            if sendResult.error != 0 {
+                lastSendError =
+                    "send errno=\(sendResult.error) after \(sendResult.bytes) bytes"
                 break
             }
-            // packetsSent reflects only well-framed packets the receiver
-            // can decode. A short send mis-aligns the s16le stream, so we
-            // count it separately and DON'T advance packetsSent — that
-            // way the diagnostic rate (pkts/s) only ticks when real audio
-            // crosses the wire. packetsConsumed advances regardless so
-            // the wall-clock pacer stays anchored to elapsed real time.
-            if sent == bytesPerPacket {
-                packetsSent &+= 1
-                bytesSent &+= UInt64(sent)
-            } else {
-                partialSends &+= 1
-                lastSendError = "short send n=\(sent)"
-            }
+            packetsSent &+= 1
+            bytesSent &+= UInt64(sendResult.bytes)
             packetsConsumed &+= 1
+        }
+    }
+
+    private func mixScheduledOverlays(
+        into planar: inout [[Float]],
+        packetStartNs: UInt64,
+        packetIntervalNs: UInt64
+    ) {
+        let packetEndNs = packetStartNs &+ packetIntervalNs
+        lock.withLock {
+            var droppedLate = 0
+            scheduledOverlays.removeAll { overlay in
+                let durationNs = UInt64(
+                    Double(overlay.frames) / sampleRate * 1_000_000_000.0
+                )
+                let expired = overlay.startNs &+ durationNs <= packetStartNs
+                if expired, overlay.mixedFrames < overlay.frames {
+                    droppedLate += 1
+                }
+                return expired
+            }
+            if droppedLate > 0 {
+                overlaysDroppedLate &+= UInt64(droppedLate)
+            }
+            for index in scheduledOverlays.indices {
+                let overlay = scheduledOverlays[index]
+                let durationNs = UInt64(
+                    Double(overlay.frames) / sampleRate * 1_000_000_000.0
+                )
+                let overlayEndNs = overlay.startNs &+ durationNs
+                if overlay.startNs >= packetEndNs || overlayEndNs <= packetStartNs {
+                    continue
+                }
+
+                let packetFrameStart: Int
+                let overlayFrameStart: Int
+                if overlay.startNs > packetStartNs {
+                    packetFrameStart = min(
+                        frameCount,
+                        Int(ceil(
+                            Double(overlay.startNs - packetStartNs)
+                                / 1_000_000_000.0 * sampleRate
+                        ))
+                    )
+                    overlayFrameStart = 0
+                } else {
+                    packetFrameStart = 0
+                    overlayFrameStart = min(
+                        overlay.frames,
+                        Int(floor(
+                            Double(packetStartNs - overlay.startNs)
+                                / 1_000_000_000.0 * sampleRate
+                        ))
+                    )
+                }
+
+                var mixedFramesThisPacket = 0
+                for f in packetFrameStart..<frameCount {
+                    let overlayIndex = overlayFrameStart + f - packetFrameStart
+                    if overlayIndex >= overlay.frames { break }
+                    for ch in 0..<min(channelCount, overlay.samples.count) {
+                        planar[ch][f] += overlay.samples[ch][overlayIndex]
+                    }
+                    mixedFramesThisPacket += 1
+                }
+                if mixedFramesThisPacket > 0 {
+                    scheduledOverlays[index].mixedFrames = min(
+                        overlay.frames,
+                        scheduledOverlays[index].mixedFrames + mixedFramesThisPacket
+                    )
+                    overlayFramesMixed &+= UInt64(mixedFramesThisPacket)
+                }
+            }
         }
     }
 }

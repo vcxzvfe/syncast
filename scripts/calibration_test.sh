@@ -43,13 +43,17 @@ if "error" in r:
     sys.exit(2)
 result = r.get("result") or {}
 offsets = result.get("perDeviceOffsetMs") or {}
+conf = result.get("perDeviceConfidence") or {}
+unc = result.get("perDeviceUncertaintyMs") or {}
 print("Per-device latencies (ms, relative to common anchor):")
 if not offsets:
     print("  (none reported)")
 else:
     for dev, ms in sorted(offsets.items(), key=lambda kv: kv[1]):
-        print("  %-30s  %+5d ms" % (dev, ms))
+        print("  %-30s  %+5d ms   conf=%6.2f  MAD=%3s ms" % (
+            dev, ms, float(conf.get(dev, 0.0)), str(unc.get(dev, "-"))))
 print()
 print("Recommended airplayDelayMs (absolute target): %d ms" % result.get("deltaMs", 0))
 print("Confidence: %.2f" % result.get("confidence", 0.0))
+print("Applied: %s" % result.get("applied", False))
 ' "$RESP"

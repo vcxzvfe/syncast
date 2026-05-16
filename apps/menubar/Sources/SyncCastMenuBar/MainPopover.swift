@@ -38,11 +38,11 @@ struct MainPopover: View {
         VStack(alignment: .leading, spacing: 6) {
             // Header: title + lock pill + reset
             HStack {
-                Text("AirPlay Delay")
+                Text("Local + AirPlay Delay")
                     .font(.system(size: 11, weight: .semibold))
                 Spacer()
                 LockStatePill(state: model.delayLockState)
-                Button("Reset") { model.airplayDelayMs = 2200 }
+                Button("Reset") { model.resetAirplayDelayToDefault() }
                     .buttonStyle(.borderless)
                     .font(.system(size: 10))
                     .accessibilityIdentifier("syncResetButton")
@@ -52,8 +52,8 @@ struct MainPopover: View {
             HStack(spacing: 8) {
                 Slider(value: Binding(
                     get: { Double(model.airplayDelayMs) },
-                    set: { model.airplayDelayMs = Int($0) }
-                ), in: 0...5000, step: 10)
+                    set: { model.setAirplayDelay(Int($0)) }
+                ), in: airplayDelaySliderRange, step: 10)
                     .controlSize(.small)
                     .accessibilityIdentifier("airplayDelaySlider")
                 Text("\(model.airplayDelayMs) ms")
@@ -91,8 +91,23 @@ struct MainPopover: View {
                 .help("Stevens method bracketing: alternates ±150ms every 1.2s for 4 rounds")
                 .accessibilityIdentifier("auditionButton")
 
+                if model.activeAcousticDiagnosticsEnabled {
+                    Button(action: {
+                        Task { await model.runAutoCalibrate() }
+                    }) {
+                        Label(autoCalibrateLabel, systemImage: "tuningfork")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(autoCalibrateDisabled)
+                    .help(autoCalibrateHelp)
+                    .accessibilityIdentifier("primaryAutoCalibrateButton")
+                }
+
                 Spacer()
             }
+
+            passiveAutosyncRow
 
             // A/B running prompt
             if case .running(let round, _) = model.auditionState {
@@ -122,9 +137,9 @@ struct MainPopover: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            // Advanced disclosure: existing Auto-calibrate + Continuous toggle.
+            // Diagnostics disclosure: active tone tools are lab-gated.
             // Hybrid Tracking UI is intentionally removed here.
-            DisclosureGroup("Advanced") {
+            DisclosureGroup("Diagnostics") {
                 advancedSection
             }
             .font(.system(size: 10))
@@ -150,15 +165,60 @@ struct MainPopover: View {
         }
     }
 
-    // MARK: - Advanced (Auto-calibrate + Continuous)
+    @ViewBuilder
+    private var passiveAutosyncRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Button(action: {
+                    model.runPassiveAutosyncOnce()
+                }) {
+                    Label(passiveAutosyncButtonLabel,
+                          systemImage: "waveform.path.ecg")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!model.canRunPassiveAutosync)
+                .accessibilityIdentifier("passiveAutosyncButton")
+
+                if model.passiveAutosyncRunning {
+                    Button(action: {
+                        model.cancelPassiveAutosync()
+                    }) {
+                        Label("Stop", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("passiveAutosyncStopButton")
+                }
+
+                Spacer()
+            }
+
+            if let status = model.passiveAutosyncStatusText {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundStyle(model.passiveAutosyncStatusIsError ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("passiveAutosyncStatus")
+            }
+        }
+    }
+
+    // MARK: - Diagnostics (lab-gated active calibration)
     //
-    // Demoted from headline UI. Auto-calibrate is renamed to
-    // "Estimate (rough)" to set expectations: it gives a starting point,
-    // not the final number. Continuous calibration is preserved verbatim.
+    // Manual tuning remains the headline flow, but the automatic acoustic
+    // measurement needs to be discoverable and truthfully named.
     @ViewBuilder
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Estimate (rough) row: button + mic picker + status indicator.
+            if !model.activeAcousticDiagnosticsEnabled {
+                Text("Active tone diagnostics are disabled. Passive no-probe measurement is the default path.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+            // Diagnostic Calibrate row: button + mic picker + status indicator.
             HStack(spacing: 8) {
                 Button(action: {
                     Task { await model.runAutoCalibrate() }
@@ -209,10 +269,11 @@ struct MainPopover: View {
                     .lineLimit(1)
             }
             // Per-status caption (result or error). Tap to dismiss.
-            if case let .completed(delta, confidence) = model.calibrationStatus {
-                let sign = delta >= 0 ? "+" : ""
-                let pct = Int((confidence * 100).rounded())
-                Text("Adjusted \(sign)\(delta) ms (confidence \(pct)%) — tap to dismiss")
+            if case let .completed(delta, confidence, applied) = model.calibrationStatus {
+                let score = String(format: "%.1f", confidence)
+                let prefix = applied ? "Set delay to" : "Measured target"
+                let suffix = applied ? "" : " — not applied"
+                Text("\(prefix) \(delta) ms (confidence score \(score))\(suffix) — tap to dismiss")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .onTapGesture { model.dismissCalibrationStatus() }
@@ -241,7 +302,7 @@ struct MainPopover: View {
                 }
                 .toggleStyle(.switch).controlSize(.mini)
                 .accessibilityIdentifier("continuousCalibrationToggle")
-                .help("Continuous Calibration runs full Auto-calibrate every N minutes.")
+                .help("Lab diagnostic: may play active test tones after route or AirPlay events.")
                 if model.backgroundCalibrationEnabled {
                     Stepper(value: Binding(
                         get: { model.backgroundCalibrationIntervalS },
@@ -267,6 +328,7 @@ struct MainPopover: View {
             if model.backgroundCalibrationActive {
                 liveStatusBlock
                     .accessibilityIdentifier("continuousCalibrationLiveStatus")
+            }
             }
 
             // Measured-lag readout (was inline in v1 syncSection).
@@ -301,6 +363,22 @@ struct MainPopover: View {
             return "A/B test"
         }
         return "Stop A/B"
+    }
+
+    private var passiveAutosyncButtonLabel: String {
+        if model.passiveAutosyncRequestingPermission {
+            return "Waiting..."
+        }
+        if model.passiveAutosyncCanceling {
+            return "Stopping..."
+        }
+        if model.passiveAutosyncRunning {
+            return "Checking..."
+        }
+        if model.passiveAutosyncNeedsMicrophoneGrant {
+            return "Grant Mic"
+        }
+        return "Passive Check"
     }
 
     private var coachingHint: String {
@@ -477,20 +555,39 @@ struct MainPopover: View {
     }
 
     private var autoCalibrateLabel: String {
+        if !model.activeAcousticDiagnosticsEnabled {
+            return "Diagnostics Off"
+        }
         switch model.calibrationStatus {
-        case .idle:                  return "Estimate (rough)"
+        case .idle:                  return "Diagnostic Calibrate"
         case .requestingPermission:  return "Asking…"
-        case .running:               return "Estimating…"
-        case .completed:             return "Estimate (rough)"
-        case .failed:                return "Estimate (rough)"
+        case .running:               return "Calibrating…"
+        case .completed(_, _, _):    return "Diagnostic Calibrate"
+        case .failed(_):             return "Diagnostic Calibrate"
         }
     }
 
     private var autoCalibrateDisabled: Bool {
+        if !model.activeAcousticDiagnosticsEnabled {
+            return true
+        }
         switch model.calibrationStatus {
         case .running, .requestingPermission: return true
         default: return false
         }
+    }
+
+    private var autoCalibrateHelp: String {
+        if model.activeAcousticDiagnosticsEnabled {
+            return "Lab diagnostic: may play audible active test tones."
+        }
+        return "Active test tones are disabled; use passive no-probe diagnostics."
+    }
+
+    private var airplayDelaySliderRange: ClosedRange<Double> {
+        let lower = Double(AppModel.airplayDelayMsRange.lowerBound)
+        let upper = Double(AppModel.airplayDelayMsRange.upperBound)
+        return lower...upper
     }
 
     private var micPickerBinding: Binding<AudioDeviceID?> {
@@ -638,11 +735,19 @@ struct MainPopover: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Button(action: {}) {
-                Label("Calibrate", systemImage: "tuningfork")
-            }
-            Button(action: {}) {
-                Label("Settings", systemImage: "gearshape")
+            if model.activeAcousticDiagnosticsEnabled {
+                Button(action: {
+                    Task { await model.runAutoCalibrate() }
+                }) {
+                    Label("Diagnostics", systemImage: "tuningfork")
+                }
+                .disabled(model.mode != .wholeHome || autoCalibrateDisabled)
+                .accessibilityIdentifier("footerAutoCalibrateButton")
+                .accessibilityLabel("Diagnostics")
+                .accessibilityHint(autoCalibrateHelp)
+                .help(model.mode == .wholeHome
+                      ? autoCalibrateHelp
+                      : "Switch to Whole-home mode to open diagnostics")
             }
             Spacer()
             Button("Quit") {

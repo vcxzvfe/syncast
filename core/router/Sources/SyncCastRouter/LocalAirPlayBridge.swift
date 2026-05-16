@@ -93,6 +93,7 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     private var refConOpaque: UnsafeMutableRawPointer?
     /// Pre-allocated channel pointer slot for the render callback.
     private let outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    private let outPtrPlaceholder: UnsafeMutablePointer<Float>
     /// Pre-allocated planar Float32 staging buffer used by the SOCKET
     /// reader to convert s16le interleaved → Float32 non-interleaved
     /// once per packet, then `RingBuffer.write` straight into the ring.
@@ -171,6 +172,16 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// mode where the envelope sums against music.
     private var _calibToneRampSamples: Int = 0
     private static let calibToneRampMs: Double = 20.0
+    /// vNext calibration probe: a pre-windowed coded waveform
+    /// (frequency-hopping / chirp-like sequence) mixed additively by the
+    /// render callback. This replaces long steady sine pilots for local
+    /// acoustic calibration; the mic detects the whole fingerprint with a
+    /// matched filter instead of thresholding one frequency bin.
+    private var _calibProbeBuffer: UnsafeMutablePointer<Float>?
+    private var _calibProbeCount: Int = 0
+    private var _calibProbeIndex: Int = 0
+    private var _calibProbeRetiredBuffer: UnsafeMutablePointer<Float>?
+    private var _calibProbeRetiredCount: Int = 0
 
     // MARK: - Drift-resync diagnostics (FIX 2d)
     // render() stamps event metadata under the lock; the non-RT
@@ -185,6 +196,12 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// Stringification happens in the non-RT drain function.
     private var _resyncReason: StaticString = ""
     public private(set) var driftResyncCount: UInt64 = 0
+    public var lastDriftResyncReason: String {
+        stateLock.withLock { String(describing: _resyncReason) }
+    }
+    public var lastDriftResyncFrameDelta: Int64 {
+        stateLock.withLock { abs(_resyncFromCursor - _resyncToTarget) }
+    }
 
     public init(
         deviceID: AudioObjectID,
@@ -200,6 +217,7 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         placeholder.initialize(to: 0)
         ptrs.initialize(repeating: placeholder, count: 2)
         self.outPtrs = ptrs
+        self.outPtrPlaceholder = placeholder
         // 480 frames per Swift packet (1920 B / 4 B-per-frame for s16 stereo).
         // Matches the sidecar tee's per-packet framing at 48 kHz, which in
         // turn matches Swift's AudioSocketWriter.frameCount.
@@ -225,7 +243,27 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
     deinit {
         stop()
+        let probeBuffers = stateLock.withLock { () -> [(UInt, Int)] in
+            var buffers: [(UInt, Int)] = []
+            if let p = _calibProbeBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeCount))
+            }
+            if let p = _calibProbeRetiredBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeRetiredCount))
+            }
+            _calibProbeBuffer = nil
+            _calibProbeCount = 0
+            _calibProbeIndex = 0
+            _calibProbeRetiredBuffer = nil
+            _calibProbeRetiredCount = 0
+            return buffers
+        }
+        for (raw, count) in probeBuffers {
+            Self.releaseProbeBuffer(raw: raw, count: count, delayNs: 0)
+        }
         outPtrs.deallocate()
+        outPtrPlaceholder.deinitialize(count: 1)
+        outPtrPlaceholder.deallocate()
         chansPtr.deallocate()
         for p in scratchFloat {
             p.deinitialize(count: scratchFramesPerPacket)
@@ -267,14 +305,51 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     public func startCalibrationTone(
         frequencyHz: Double, amplitude: Float = 0.05
     ) {
+        guard ActiveAcousticDiagnosticsGate.isEnabled() else { return }
         let amp = max(0, min(1, amplitude))
         let rampSamples = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
-        stateLock.withLock {
+        let retired = stateLock.withLock { () -> [(UInt, Int, UInt64)] in
+            var buffers: [(UInt, Int, UInt64)] = []
+            if let p = _calibProbeBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeCount, 100_000_000))
+            }
+            if let p = _calibProbeRetiredBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeRetiredCount, 0))
+            }
+            _calibProbeBuffer = nil
+            _calibProbeCount = 0
+            _calibProbeIndex = 0
+            _calibProbeRetiredBuffer = nil
+            _calibProbeRetiredCount = 0
             _calibToneActive = true
             _calibToneFreqHz = frequencyHz
             _calibToneAmp = amp
             _calibTonePhase = 0
             _calibToneRampSamples = rampSamples  // > 0 ⇒ fade-in
+            return buffers
+        }
+        for (raw, count, delay) in retired {
+            Self.releaseProbeBuffer(raw: raw, count: count, delayNs: delay)
+        }
+    }
+
+    private static func releaseProbeBuffer(
+        raw: UInt,
+        count: Int,
+        delayNs: UInt64
+    ) {
+        func release() {
+            let p = UnsafeMutablePointer<Float>(bitPattern: raw)
+            p?.deinitialize(count: max(0, count))
+            p?.deallocate()
+        }
+        guard delayNs > 0 else {
+            release()
+            return
+        }
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: delayNs)
+            release()
         }
     }
 
@@ -282,11 +357,68 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// uninterrupted (FIX 1).
     public func stopCalibrationTone() {
         let rampSamples = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
-        stateLock.withLock {
+        let state = stateLock.withLock { () -> ([(UInt, Int, UInt64)], Bool) in
+            var retired: [(UInt, Int, UInt64)] = []
+            var stoppedProbe = false
+            if let p = _calibProbeBuffer {
+                retired.append((UInt(bitPattern: p), _calibProbeCount, 100_000_000))
+                _calibProbeBuffer = nil
+                _calibProbeCount = 0
+                _calibProbeIndex = 0
+                _calibToneActive = false
+                _calibToneRampSamples = 0
+                stoppedProbe = true
+            }
+            if let p = _calibProbeRetiredBuffer {
+                retired.append((UInt(bitPattern: p), _calibProbeRetiredCount, 0))
+                _calibProbeRetiredBuffer = nil
+                _calibProbeRetiredCount = 0
+            }
+            if stoppedProbe {
+                return (retired, true)
+            }
             // We mark the tone as still "active" but with a negative
             // ramp count, so the render path knows to fade OUT and then
             // flip `_calibToneActive=false` when the ramp completes.
             _calibToneRampSamples = -rampSamples
+            return (retired, false)
+        }
+        for (raw, count, delay) in state.0 {
+            Self.releaseProbeBuffer(raw: raw, count: count, delayNs: delay)
+        }
+    }
+
+    /// Mix a finite coded calibration probe additively on top of the
+    /// bridge output. `samples` must already include its own windowing and
+    /// amplitude. The render callback advances through it once and then
+    /// clears it automatically.
+    public func startCalibrationProbe(samples: [Float]) {
+        guard ActiveAcousticDiagnosticsGate.isEnabled() else { return }
+        guard !samples.isEmpty else { return }
+        let pointer = UnsafeMutablePointer<Float>.allocate(capacity: samples.count)
+        pointer.initialize(from: samples, count: samples.count)
+        let pointerRaw = UInt(bitPattern: pointer)
+        let sampleCount = samples.count
+        let retired = stateLock.withLock { () -> [(UInt, Int, UInt64)] in
+            var buffers: [(UInt, Int, UInt64)] = []
+            if let p = _calibProbeBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeCount, 100_000_000))
+            }
+            if let p = _calibProbeRetiredBuffer {
+                buffers.append((UInt(bitPattern: p), _calibProbeRetiredCount, 0))
+            }
+            _calibToneActive = false
+            _calibToneRampSamples = 0
+            _calibTonePhase = 0
+            _calibProbeBuffer = UnsafeMutablePointer<Float>(bitPattern: pointerRaw)
+            _calibProbeCount = sampleCount
+            _calibProbeIndex = 0
+            _calibProbeRetiredBuffer = nil
+            _calibProbeRetiredCount = 0
+            return buffers
+        }
+        for (raw, count, delay) in retired {
+            Self.releaseProbeBuffer(raw: raw, count: count, delayNs: delay)
         }
     }
 
@@ -408,20 +540,39 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
     /// Pulls 1408-byte packets off the broadcast socket, converts s16le
     /// interleaved → Float32 non-interleaved, writes into the ring.
-    /// Runs forever until cancelled or the socket EOFs (sidecar
-    /// shutdown / mode switch back to stereo).
+    /// Runs forever until cancelled. Sidecar mode changes and broadcaster
+    /// resets can briefly close the accepted client socket; whole-home
+    /// should reconnect instead of rendering permanent silence.
     private func runReader() async {
         // One-time scaling constant for s16 → float.
         let invInt16Max: Float = 1.0 / 32_767.0
         var buffer = [UInt8](repeating: 0, count: packetBytes)
         while !Task.isCancelled {
+            if fd < 0 {
+                do {
+                    try openSocket()
+                } catch BridgeError.socketConnectFailed(let err) {
+                    lastError = "socket reconnect errno=\(err)"
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    continue
+                } catch {
+                    lastError = "socket reconnect failed"
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    continue
+                }
+            }
             // Read EXACTLY one OwnTone packet per iteration. The
             // sidecar's broadcaster sends one full packet per send(),
             // but TCP-shaped Unix sockets coalesce, so we MUST loop on
             // recv until we have packetBytes bytes — otherwise we'd
             // mis-frame the s16le stream and play noise.
             let ok = await readExactly(into: &buffer, count: packetBytes)
-            if !ok { return }
+            if !ok {
+                closeSocket()
+                if Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                continue
+            }
             // De-interleave + convert in-place. The packet contains
             // `framesPerPacket` frames of stereo s16le — read from
             // buffer in 2-byte LE pairs, write into scratchFloat[ch].
@@ -454,8 +605,10 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             chansPtr[1] = UnsafePointer(scratchFloat[1])
             ring.write(channels: chansPtr, frames: n)
             packetsReceived &+= 1
+            if !lastError.isEmpty { lastError = "" }
             // Drain drift-resync events (FIX 2d, non-RT side).
             drainDriftResyncLog()
+            drainRetiredProbeBuffer()
         }
     }
 
@@ -679,7 +832,11 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             var toneActive: Bool
             var toneFreqHz: Double
             var toneAmp: Float
+            var tonePhase: Double
             var toneRampSamples: Int
+            var probeAddress: UInt
+            var probeCount: Int
+            var probeIndex: Int
         }
         let snapshot: RenderSnapshot = stateLock.withLock {
             RenderSnapshot(
@@ -689,7 +846,11 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
                 toneActive: self._calibToneActive,
                 toneFreqHz: self._calibToneFreqHz,
                 toneAmp: self._calibToneAmp,
-                toneRampSamples: self._calibToneRampSamples
+                tonePhase: self._calibTonePhase,
+                toneRampSamples: self._calibToneRampSamples,
+                probeAddress: self._calibProbeBuffer.map { UInt(bitPattern: $0) } ?? 0,
+                probeCount: self._calibProbeCount,
+                probeIndex: self._calibProbeIndex
             )
         }
 
@@ -769,10 +930,30 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // by `snapshot.toneAmp` and the start/stop ramp envelope —
         // user volume is intentionally NOT applied (see render()
         // doc comment for v7 reorder rationale).
-        var phase = _calibTonePhase
+        var phase = snapshot.tonePhase
         var rampRemaining = snapshot.toneRampSamples
         var toneEndedThisBlock = false
-        if snapshot.toneActive {
+        var probeIndex = snapshot.probeIndex
+        var probeEndedThisBlock = false
+        let activeProbeAddress = snapshot.probeAddress
+        if let probe = UnsafeMutablePointer<Float>(bitPattern: activeProbeAddress),
+           snapshot.probeCount > 0 {
+            for i in 0..<frames {
+                if probeIndex < snapshot.probeCount {
+                    let s = probe[probeIndex]
+                    probeIndex += 1
+                    for ch in 0..<channelCount {
+                        outPtrs[ch][i] += s
+                    }
+                } else {
+                    probeEndedThisBlock = true
+                    break
+                }
+            }
+            if probeIndex >= snapshot.probeCount {
+                probeEndedThisBlock = true
+            }
+        } else if snapshot.toneActive {
             let omega = 2.0 * Double.pi * snapshot.toneFreqHz / inboundSampleRate
             let baseAmp = snapshot.toneAmp
             let rampTotal = Int(Self.calibToneRampMs / 1000.0 * inboundSampleRate)
@@ -813,6 +994,8 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         let phaseSnapshot = phase
         let rampSnapshot = rampRemaining
         let toneEndedSnapshot = toneEndedThisBlock
+        let probeIndexSnapshot = probeIndex
+        let probeEndedSnapshot = probeEndedThisBlock
         let endFrame = startFrame &+ Int64(frames)
         let gainCurrentSnapshot = newGainCurrent
         let resyncFiredSnapshot = needsResync
@@ -822,11 +1005,34 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         let resyncReasonSnapshot = resyncReasonLocal
         stateLock.withLock {
             self.readCursor = endFrame
-            self._calibTonePhase = phaseSnapshot
-            self._calibToneRampSamples = rampSnapshot
-            if toneEndedSnapshot {
-                self._calibToneActive = false
-                self._calibToneRampSamples = 0
+            let currentProbeAddress =
+                self._calibProbeBuffer.map { UInt(bitPattern: $0) } ?? 0
+            if activeProbeAddress != 0 {
+                if currentProbeAddress == activeProbeAddress {
+                    if probeEndedSnapshot {
+                        if self._calibProbeRetiredBuffer == nil {
+                            self._calibProbeRetiredBuffer = UnsafeMutablePointer<Float>(
+                                bitPattern: activeProbeAddress
+                            )
+                            self._calibProbeRetiredCount = self._calibProbeCount
+                            self._calibProbeBuffer = nil
+                            self._calibProbeCount = 0
+                        }
+                        self._calibProbeIndex = 0
+                    } else {
+                        self._calibProbeIndex = probeIndexSnapshot
+                    }
+                }
+            } else if currentProbeAddress == 0,
+                      self._calibToneActive == snapshot.toneActive,
+                      self._calibToneFreqHz == snapshot.toneFreqHz,
+                      self._calibToneAmp == snapshot.toneAmp {
+                self._calibTonePhase = phaseSnapshot
+                self._calibToneRampSamples = rampSnapshot
+                if toneEndedSnapshot {
+                    self._calibToneActive = false
+                    self._calibToneRampSamples = 0
+                }
             }
             self._volumeGainCurrent = gainCurrentSnapshot
             if resyncFiredSnapshot {
@@ -851,6 +1057,22 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     }
 
     // MARK: - Drift-resync log drain (non-RT)
+
+    /// Release probe buffers retired by render(). Called from the reader task,
+    /// not the AUHAL callback, so heap work stays off the real-time path.
+    private func drainRetiredProbeBuffer() {
+        let retired = stateLock.withLock { () -> (UInt, Int)? in
+            guard let p = self._calibProbeRetiredBuffer else { return nil }
+            let raw = UInt(bitPattern: p)
+            let count = self._calibProbeRetiredCount
+            self._calibProbeRetiredBuffer = nil
+            self._calibProbeRetiredCount = 0
+            return (raw, count)
+        }
+        if let retired {
+            Self.releaseProbeBuffer(raw: retired.0, count: retired.1, delayNs: 0)
+        }
+    }
 
     /// Drain drift-resync events stamped by render() and emit one
     /// `CalibTrace.log` per batch. Called from the reader task — safe

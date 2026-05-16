@@ -1,5 +1,7 @@
 # ScreenCaptureKit System-Audio Capture — Implementation Brief
 
+> 2026-05-13 note: historical implementation brief only. ScreenCaptureKit remains useful as a fallback/reference backend, but its Screen Recording semantics are a DRM blocker and it must not be the default always-on Stereo path.
+
 **Target**: SyncCast (`io.syncast.menubar`), macOS 13+ minimum, validated on macOS Tahoe 26.4, ad-hoc signed.
 **Goal**: Replace BlackHole + HAL IOProc capture path with `ScreenCaptureKit` (SCK) audio-only capture, feeding the existing `RingBuffer` (Float32 non-interleaved planar, 48 kHz stereo).
 
