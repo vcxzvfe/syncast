@@ -157,13 +157,32 @@ public final class SCKCapture: NSObject, @unchecked Sendable {
 
     public func stop() {
         guard let s = stream else { return }
+        let out = output
+        clearStreamState()
         Task {
-            do { try await s.stopCapture() } catch {}
+            await Self.stopStream(s, output: out)
         }
+    }
+
+    public func stopAndWait() async {
+        guard let s = stream else { return }
+        let out = output
+        clearStreamState()
+        await Self.stopStream(s, output: out)
+    }
+
+    private func clearStreamState() {
         stream = nil
         output = nil
         converter = nil
         sourceFormat = nil
+    }
+
+    private static func stopStream(_ stream: SCStream, output: AudioStreamOutput?) async {
+        do { try await stream.stopCapture() } catch {}
+        if let output {
+            try? stream.removeStreamOutput(output, type: .audio)
+        }
     }
 
     deinit { stop() }
@@ -482,5 +501,14 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
                 of type: SCStreamOutputType) {
         guard type == .audio else { return }
         owner?.handle(sampleBuffer: sb)
+    }
+}
+
+@available(macOS 13.0, *)
+extension SCKCapture: SystemAudioCapture {
+    public var backendName: String { "sck" }
+
+    public func diagnosticReport() -> String {
+        "backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) readback=\(String(format: "%.4f", debugReadbackPeak))@\(debugReadbackPos) last=\(debugLastReason)"
     }
 }

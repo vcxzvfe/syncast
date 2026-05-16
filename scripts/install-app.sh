@@ -16,6 +16,42 @@ DST="/Applications/SyncCast.app"
 log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 
+choose_sign_identity() {
+    SIGN_IDENTITY="-"
+    SIGN_LABEL="ad-hoc"
+    if [[ "${SYNCAST_USE_SYNCCAST_DEV:-0}" == "1" ]] \
+        && security find-identity -v -p codesigning 2>/dev/null | grep -q '"SyncCast Dev"'; then
+        local probe="${TMPDIR:-/tmp}/syncast-sign-probe-$$"
+        cp /usr/bin/true "$probe"
+        if codesign --force --sign "SyncCast Dev" "$probe" >/dev/null 2>&1 \
+            && codesign --verify "$probe" >/dev/null 2>&1; then
+            SIGN_IDENTITY="SyncCast Dev"
+            SIGN_LABEL="SyncCast Dev (self-signed)"
+        else
+            log "SyncCast Dev identity is present but not verifiable; falling back to ad-hoc"
+        fi
+        rm -f "$probe"
+    fi
+}
+
+sign_bundle() {
+    local bundle="$1"
+    choose_sign_identity
+    log "Re-codesigning with $SIGN_LABEL"
+    codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$bundle"
+    sleep 1
+    if ! codesign --verify --verbose=2 "$bundle" >/dev/null 2>&1; then
+        if [[ "$SIGN_IDENTITY" != "-" ]]; then
+            log "$SIGN_LABEL signature did not verify; re-codesigning with ad-hoc"
+            SIGN_IDENTITY="-"
+            SIGN_LABEL="ad-hoc"
+            codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$bundle"
+            sleep 1
+        fi
+    fi
+    codesign --verify --verbose=2 "$bundle"
+}
+
 [[ -d "$SRC" ]] || fail "no $SRC — run scripts/package-app.sh first"
 
 log "Stopping any running instance"
@@ -46,14 +82,7 @@ xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
 # embeds the bundle's own absolute path into resource manifests; signing
 # at /Users/.../dist and then moving to /Applications can leave subtle
 # resource-rule mismatches.
-SIGN_IDENTITY="-"
-SIGN_LABEL="ad-hoc"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q '"SyncCast Dev"'; then
-    SIGN_IDENTITY="SyncCast Dev"
-    SIGN_LABEL="SyncCast Dev (self-signed)"
-fi
-log "Re-codesigning with $SIGN_LABEL"
-codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$DST"
+sign_bundle "$DST"
 
 log "Verifying signature"
 codesign --verify --verbose=2 "$DST" 2>&1 | tail -3
@@ -62,14 +91,19 @@ log "Done. Launch with:  open $DST"
 
 cat <<'EOF'
 
-If this is a FIRST install (or the cert just changed), you'll likely
-need to grant Screen Recording one more time:
+Local Stereo now defaults to Direct Stereo, which does not use
+ScreenCaptureKit or Screen Recording. If you switch to AirPlay mode, or if
+you explicitly set SYNCAST_STEREO_PATH=capture / sck, the capture path may
+need Screen Recording one more time:
 
-  1. Open SyncCast (System Settings → Privacy → Screen Recording panel
-     should appear automatically when the app first calls SCK).
+  1. Open SyncCast. macOS may show the System Settings → Privacy →
+     Screen Recording panel when the app first enters an SCK path.
   2. Toggle SyncCast ON.
   3. Click "Quit & Reopen" if prompted.
 
-After that, future rebuilds keep the grant — that's the whole point of
-using a stable signing identity.
+Direct Stereo and Process Tap (`SYNCAST_CAPTURE_BACKEND=tap`) validation
+should not depend on this Screen Recording grant. After an SCK grant is set,
+future rebuilds keep it only when the app is signed with a stable identity
+such as `SyncCast Dev`. Default ad-hoc development installs may need a fresh
+TCC grant for capture-dependent paths after rebuilds.
 EOF

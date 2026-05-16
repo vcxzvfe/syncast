@@ -220,22 +220,27 @@ class OwnToneBackend:
             fd = self._fifo_fd
             if fd is None:
                 return 0
+        written = 0
+        view = memoryview(data)
         try:
-            return os.write(fd, data)
-        except BlockingIOError:
-            return 0
+            while written < len(data):
+                n = os.write(fd, view[written:])
+                if n <= 0:
+                    break
+                written += n
+            return written
         except BrokenPipeError:
             logger.warning("fifo_broken_pipe")
             # Best-effort; if a concurrent caller already cleared this we
             # don't care.
             self._fifo_fd = None
-            return 0
+            return written
         except OSError as e:
             # fd might have been reused by another part of the process; in
             # that case writes are silently sent elsewhere, but we cannot
             # detect it. The snapshot at the top minimizes the window.
             logger.warning("fifo_write_failed", extra={"errno": e.errno})
-            return 0
+            return written
 
     # ---------- REST helpers ----------
 
@@ -415,6 +420,10 @@ fifo {{
             self._fifo_fd = None
             return
         self._fifo_fd = fd
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
         if getattr(self, "_fifo_logged_miss", False):
             logger.info("fifo_reader_attached")
             self._fifo_logged_miss = False

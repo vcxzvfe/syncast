@@ -3,17 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="SyncCast — open-source macOS menubar app that captures system audio with ScreenCaptureKit and routes it in sync to local speakers and AirPlay 2 receivers.">
+<meta name="description" content="SyncCast — open-source macOS menubar app for local Stereo audio routing and experimental AirPlay sync research.">
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
 <link rel="icon" type="image/x-icon" href="favicon.ico">
 <meta property="og:title" content="SyncCast — Multi-device audio sync for macOS">
-<meta property="og:description" content="Open-source macOS menubar app for synchronized multi-device audio routing — local CoreAudio + AirPlay 2.">
+<meta property="og:description" content="Open-source macOS menubar app for stable local Stereo routing and experimental Local + AirPlay sync.">
 <meta property="og:image" content="https://github.com/vcxzvfe/syncast/raw/main/.github/og-image.png">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
-<title>SyncCast — One audio source. Every speaker in the house.</title>
+<title>SyncCast — macOS multi-output audio routing</title>
 <style>
   /* ---------- reset + base ---------- */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -245,8 +245,8 @@
 
   <header class="hero">
     <span class="pill"><span class="dot"></span>Open source · macOS</span>
-    <h1>One audio source.<br><span class="accent">Every speaker</span> in the house.</h1>
-    <p class="lede">SyncCast captures macOS system audio via ScreenCaptureKit and fans it out to local speakers and AirPlay 2 receivers — in sync, with no driver, no root, no fuss.</p>
+    <h1>One audio source.<br><span class="accent">Local Stereo</span> first.</h1>
+    <p class="lede">SyncCast is a macOS menubar app for stable local multi-output playback through a Direct Stereo path, with an experimental Local + AirPlay mode under active calibration and DRM-capture work.</p>
     <div class="cta-row">
       <a class="btn primary" href="https://github.com/vcxzvfe/syncast" target="_blank" rel="noopener">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.6v-2c-3.2.7-3.8-1.5-3.8-1.5-.5-1.3-1.3-1.6-1.3-1.6-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.2-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.5-1.5 7.8-5.8 7.8-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
@@ -268,8 +268,8 @@
         <div class="icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 18 0"/><path d="M6 12a6 6 0 0 1 12 0"/><circle cx="12" cy="12" r="2"/></svg>
         </div>
-        <h3>Whole-home AirPlay sync</h3>
-        <p>Send the same stream to every AirPlay 2 receiver in your home — HomePods, Apple TVs, third-party speakers — locked to PTP for tight cross-room timing.</p>
+        <h3>AirPlay experimental mode</h3>
+        <p>Send audio to AirPlay 2 receivers through the OwnTone-backed sidecar while the project develops safer passive Local + AirPlay delay control.</p>
       </article>
 
       <article class="feature">
@@ -277,15 +277,15 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 9v6"/><path d="M15 9v6"/></svg>
         </div>
         <h3>Stereo local mix</h3>
-        <p>Keep video sync intact for low-latency local playback. A separate Stereo mode routes the built-in speakers and any USB or HDMI outputs through one aggregate device.</p>
+        <p>Keep video sync intact for low-latency local playback. Stereo routes the built-in speakers and any USB or HDMI outputs through a normal CoreAudio output path.</p>
       </article>
 
       <article class="feature">
         <div class="icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8"/><path d="M12 18v4"/><path d="M7 9l3 3-3 3"/><path d="M14 15h3"/></svg>
         </div>
-        <h3>ScreenCaptureKit native</h3>
-        <p>Apple's first-class capture API — no virtual driver to install, no kernel extension, no kext signing. SyncCast runs entirely in user-space.</p>
+        <h3>Capture path in transition</h3>
+        <p>The alpha still supports ScreenCaptureKit, but Process Tap and direct local routing are being developed to avoid protected-video playback failures.</p>
       </article>
 
       <article class="feature">
@@ -300,12 +300,12 @@
 
   <section id="architecture" class="wrap">
     <h2>How it works</h2>
-    <p class="tagline">Capture once. Route many. Mode switching is mutually exclusive — Whole-home or Stereo, never both.</p>
+    <p class="tagline">Capture once. Route many. Mode switching is mutually exclusive — AirPlay experimental or Stereo, never both.</p>
 
     <div class="diagram">
       <svg viewBox="0 0 880 360" role="img" aria-labelledby="diagTitle diagDesc" xmlns="http://www.w3.org/2000/svg">
         <title id="diagTitle">SyncCast architecture</title>
-        <desc id="diagDesc">macOS system audio captured by ScreenCaptureKit, routed through SyncCast to either local CoreAudio outputs or AirPlay 2 receivers.</desc>
+        <desc id="diagDesc">macOS system audio routed through SyncCast to either local CoreAudio outputs or experimental AirPlay 2 receivers.</desc>
         <defs>
           <linearGradient id="gradPurple" x1="0%" y1="0%" x2="100%" y2="100%">
             <stop offset="0%" stop-color="#5E5CE6"/>
@@ -324,7 +324,7 @@
         <g>
           <rect x="40" y="140" width="180" height="80" rx="12" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.18)"/>
           <text x="130" y="170" text-anchor="middle" fill="#e6e8eb" font-family="-apple-system, system-ui, sans-serif" font-size="14" font-weight="600">macOS audio</text>
-          <text x="130" y="192" text-anchor="middle" fill="#a4a8b0" font-family="-apple-system, system-ui, sans-serif" font-size="12">ScreenCaptureKit</text>
+          <text x="130" y="192" text-anchor="middle" fill="#a4a8b0" font-family="-apple-system, system-ui, sans-serif" font-size="12">Direct · SCK · Tap</text>
         </g>
 
         <!-- arrow source -> router -->
@@ -335,7 +335,7 @@
           <rect x="340" y="120" width="200" height="120" rx="14" fill="url(#gradPurple)" opacity="0.95"/>
           <text x="440" y="160" text-anchor="middle" fill="#fff" font-family="-apple-system, system-ui, sans-serif" font-size="16" font-weight="700">SyncCast</text>
           <text x="440" y="184" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-family="-apple-system, system-ui, sans-serif" font-size="12">Router · Mode switch</text>
-          <text x="440" y="206" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-family="-apple-system, system-ui, sans-serif" font-size="11">Whole-home  |  Stereo</text>
+          <text x="440" y="206" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-family="-apple-system, system-ui, sans-serif" font-size="11">AirPlay exp.  |  Stereo</text>
         </g>
 
         <!-- arrows out -->
@@ -360,7 +360,7 @@
 
         <!-- Mode tags -->
         <text x="600" y="115" text-anchor="middle" fill="#7d8590" font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">Stereo mode</text>
-        <text x="600" y="265" text-anchor="middle" fill="#7d8590" font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">Whole-home mode</text>
+        <text x="600" y="265" text-anchor="middle" fill="#7d8590" font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">AirPlay experimental</text>
       </svg>
     </div>
   </section>

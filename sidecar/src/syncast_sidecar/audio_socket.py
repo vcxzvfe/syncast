@@ -202,11 +202,13 @@ class AudioSocketReader:
             return
         listen.settimeout(1.0)
         client: socket.socket | None = None
+        pending = bytearray()
         while not self._stop_event.is_set():
             if client is None:
                 try:
                     client, _ = listen.accept()
                     client.settimeout(1.0)
+                    pending.clear()
                     logger.info("audio_client_connected")
                 except socket.timeout:
                     continue
@@ -219,37 +221,36 @@ class AudioSocketReader:
             except OSError:
                 logger.info("audio_client_disconnected")
                 client = None
+                pending.clear()
                 continue
             if not data:
                 client = None
+                pending.clear()
                 continue
-            written = self._sink(data)
-            if written < len(data):
-                logger.debug("fifo_short_write",
-                             extra={"received": len(data), "written": written})
-            # Tee the same PCM to the whole-home broadcaster (if any).
-            # This is the post-b0543d5 architecture: bridges no longer
-            # read OwnTone's fifo OUTPUT module (which had unfixable
-            # multi-reader / self-flushing problems). Instead we deliver
-            # Swift's native PCM straight to the bridges from here. Both
-            # paths get the same bytes; AirPlay receivers go through
-            # OwnTone (their PTP-anchored playout naturally aligns the
-            # network destinations), bridges go through this tee.
-            #
-            # NB: this means local-bridge audio is roughly real-time
-            # (~50 ms behind capture) while AirPlay receivers are ~1.8 s
-            # behind. They're NOT in lockstep. Synchronization across
-            # local + AirPlay in whole-home mode requires a separate
-            # delay-line in the broadcaster (TODO P2). For now: bridges
-            # get audio reliably, which is the user's primary ask.
-            tee = self._broadcaster_tee
-            if tee is not None:
-                try:
-                    tee(data)
-                except Exception:  # noqa: BLE001
-                    # Never let a broadcaster failure kill the OwnTone
-                    # pipe writer — that would silence AirPlay too.
-                    logger.exception("broadcaster_tee_failed")
+            pending.extend(data)
+            while len(pending) >= self._packet_bytes:
+                packet = bytes(pending[:self._packet_bytes])
+                del pending[:self._packet_bytes]
+                written = self._sink(packet)
+                if written < len(packet):
+                    logger.debug(
+                        "fifo_short_write",
+                        extra={"received": len(packet), "written": written},
+                    )
+                    continue
+                # Tee the exact same complete PCM frame to the
+                # whole-home broadcaster (if any). We tee only after
+                # OwnTone accepted the frame so AirPlay and local never
+                # intentionally diverge by one side receiving bytes the
+                # other side missed.
+                tee = self._broadcaster_tee
+                if tee is not None:
+                    try:
+                        tee(packet)
+                    except Exception:  # noqa: BLE001
+                        # Never let a broadcaster failure kill the OwnTone
+                        # pipe writer — that would silence AirPlay too.
+                        logger.exception("broadcaster_tee_failed")
 
 
 class _BroadcastClient:
@@ -638,6 +639,15 @@ class LocalFifoBroadcaster:
         # anything that lists the directory.
         Path(self._socket_path).unlink(missing_ok=True)
 
+    def reset(self) -> None:
+        """Drop delayed audio and reset timing diagnostics for a new epoch."""
+        with self._delay_cond:
+            self._delay_queue.clear()
+            self._actual_delivery_lag_ms = 0.0
+            self.chunks_dropped_due_to_overflow = 0
+            self._delay_cond.notify_all()
+        logger.info("local_fifo_broadcaster_reset")
+
     # ---------- internals ----------
 
     def _open_listener(self) -> None:
@@ -950,7 +960,19 @@ class LocalFifoBroadcaster:
                 # capped at LOCAL_FIFO_CLIENT_SNDBUF and a non-blocking
                 # socket, the typical outcome is full-acceptance during
                 # normal flow, EAGAIN under backpressure.
-                c.sock.send(packet)
+                sent = c.sock.send(packet)
+                if sent < len(packet):
+                    c.chunks_dropped += 1
+                    logger.warning(
+                        "local_fifo_client_short_send",
+                        extra={
+                            "addr": str(c.addr),
+                            "sent": sent,
+                            "expected": len(packet),
+                            "total_dropped": c.chunks_dropped,
+                        },
+                    )
+                    dead.append(c)
             except BlockingIOError:
                 # Buffer full — client is behind. Drop this packet for
                 # this client. Other clients still see it.

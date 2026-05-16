@@ -25,15 +25,19 @@
     <!-- Hide from Dock — menubar-only -->
     <key>LSUIElement</key>
     <true/>
-    <!-- System audio capture goes through ScreenCaptureKit (Screen
-         Recording TCC class). The microphone is used only by the
-         optional auto-calibration flow described below. -->
+    <!-- System audio capture currently defaults to ScreenCaptureKit. Tap
+         mode should use the system-audio capture permission instead of
+         Screen Recording once fully shipped. The microphone is used only by
+         explicit diagnostic measurement flows; normal playback does not
+         open the mic or emit calibration tones. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>SyncCast captures system audio so it can play the same audio through the output devices you enable.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>SyncCast plays brief click sounds and listens with the microphone to measure how far behind your AirPlay receivers are versus your local speakers, so audio plays in sync. The microphone is only accessed when you explicitly tap "Auto-calibrate".</string>
+    <string>SyncCast can use the microphone only when you explicitly run diagnostics to compare room audio timing. Normal playback and Stereo mode do not use the microphone or play calibration tones.</string>
     <!-- Required since macOS Sequoia for any app that browses mDNS / Bonjour
          services. Without this key the OS denies the browse silently. -->
     <key>NSLocalNetworkUsageDescription</key>
-    <string>SyncCast browses the local network for AirPlay 2 receivers (HomePod, Xiaomi Sound, other Macs) so you can include them in synchronized playback.</string>
+    <string>SyncCast browses the local network for AirPlay 2 receivers (HomePod, Xiaomi Sound, other Macs) so you can choose them as audio outputs.</string>
     <!-- Bonjour service types we actively browse for -->
     <key>NSBonjourServices</key>
     <array>

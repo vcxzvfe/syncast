@@ -68,24 +68,34 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
     public typealias SampleSink = @Sendable (Sample) -> Void
 
     /// 1200 s (20 min). Continuous mode now runs **Phase 1 only**
-    /// (local-bridge ultrasonic FDM, ~1.5 s of inaudible 18–20 kHz
-    /// tones). The Phase-2 AirPlay TDMA mute-dip — which had to silence
-    /// every other AirPlay device + local bridge for ~24 s per cycle —
-    /// is reserved for the manual Auto-calibrate button. With only a
-    /// brief inaudible probe per cycle we can space cycles much further
-    /// apart; 20 min catches slow thermal/network drift without making
-    /// the room feel "always probing".
+    /// (local-bridge high-band coded probes; the default comfort profile
+    /// uses roughly 20.85-22.25 kHz at low level). The Phase-2 AirPlay TDMA
+    /// mute-dip — which had to silence every other AirPlay device + local
+    /// bridge for ~24 s per cycle — is reserved for the manual
+    /// Auto-calibrate button. With only a brief, fail-closed probe per cycle
+    /// we can space cycles much further apart; 20 min catches slow
+    /// thermal/network drift without making the room feel "always probing".
+    /// High-band does not guarantee inaudibility on every speaker.
     public var measurementIntervalSeconds: Double = 1200
     /// 30 ms — below human perception of inter-channel latency for
     /// music; also above `ActiveCalibrator`'s ±15 ms run-to-run noise
     /// floor. Below this we don't apply, avoiding audible "wobble"
     /// from constant micro-adjustments to the delay-line.
     public var driftThresholdMs: Int = 30
-    /// 4.0 — one notch above the calibrator's 3.0 detection threshold.
-    /// The continuous loop is more conservative than the manual
-    /// one-shot because a wrong value applied every 30 s is much more
-    /// damaging than one the user can immediately re-trigger.
-    public var confidenceFloor: Double = 4.0
+    public var applyEnterThresholdMs: Int = 60
+    public var applyExitThresholdMs: Int = 25
+    public var requiredStableCycles: Int = 2
+    public var maxApplyStepMs: Int = 150
+    /// ActiveCalibrator's own accept floor is 3.0 and it now layers
+    /// repeated-cycle MAD/range/slope gates on top. Field-stable
+    /// Local + AirPlay group runs often aggregate to 3.1-3.4 because
+    /// the local direct path is the lowest-confidence device; a 4.0
+    /// loop floor made continuous correction permanently inert.
+    public var confidenceFloor: Double = 3.0
+    /// Maximum accepted run-to-run uncertainty for any tau that participates
+    /// in a continuous correction. Full Auto Calibrate stores AirPlay group
+    /// MAD in the cache; local-only cycles provide fresh local MAD.
+    public var maxUncertaintyMs: Int = 15
     /// Sequential failed cycles before we log a one-time `WARN`. Reset
     /// on success. Loop never backs off / gives up — `stop()` is the
     /// only exit.
@@ -103,6 +113,8 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
     private var _consecutiveFailures: Int = 0
     private var _warnedOnFailureStreak: Bool = false
     private var _iterationCount: UInt64 = 0
+    private var _pendingTargetMs: Int?
+    private var _pendingStableCycles: Int = 0
 
     public init(
         runner: @escaping Runner,
@@ -129,6 +141,8 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
             _consecutiveFailures = 0
             _warnedOnFailureStreak = false
             _iterationCount = 0
+            _pendingTargetMs = nil
+            _pendingStableCycles = 0
             return false
         }
         if alreadyRunning { return }
@@ -156,6 +170,13 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
         Self.trace("[ContActiveCalib] stop: requested")
     }
 
+    /// Called when another control path changes the delay-line. Clears the
+    /// two-cycle hysteresis accumulator so a stale pending target cannot be
+    /// applied against the user's new baseline on the next cycle.
+    public func noteExternalDelayChange() {
+        resetPendingTarget()
+    }
+
     private func isStopRequested() -> Bool {
         stateLock.withLock { _stopRequested }
     }
@@ -169,8 +190,8 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
         }
         while !isStopRequested() {
             let interval = measurementIntervalSeconds
-            let threshold = driftThresholdMs
-            let confFloor = confidenceFloor
+        let threshold = driftThresholdMs
+        let confFloor = confidenceFloor
             let iter: UInt64 = stateLock.withLockUnchecked {
                 _iterationCount &+= 1
                 return _iterationCount
@@ -204,6 +225,17 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
 
         let delta = result.deltaMs
         let confidence = result.aggregateConfidence
+        if let reason = uncertaintyRejectReason(result) {
+            recordFailure(reason: reason)
+            Self.trace(
+                "[ContActiveCalib] skip cycle: \(reason) iter=\(iter) delta=\(delta)ms"
+            )
+            emitSample(
+                measuredDelta: delta, appliedDelay: beforeDelayMs,
+                perDeviceTau: result.perDeviceTauMs, confidence: confidence
+            )
+            return
+        }
 
         if confidence < confFloor {
             recordFailure(
@@ -221,10 +253,23 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
         // `delta` is an ABSOLUTE TARGET; the drift threshold is on the
         // *change* we'd apply, i.e. `target − current`.
         let drift = delta - beforeDelayMs
-        if abs(drift) < threshold {
+        if abs(drift) < applyExitThresholdMs {
+            resetPendingTarget()
             recordSuccess()
             Self.trace(
-                "[ContActiveCalib] iter=\(iter) target=\(delta)ms drift=\(drift)ms within threshold ±\(threshold)ms — no action confidence=\(String(format: "%.2f", confidence))"
+                "[ContActiveCalib] iter=\(iter) target=\(delta)ms drift=\(drift)ms within exit deadband ±\(applyExitThresholdMs)ms — no action confidence=\(String(format: "%.2f", confidence))"
+            )
+            emitSample(
+                measuredDelta: delta, appliedDelay: beforeDelayMs,
+                perDeviceTau: result.perDeviceTauMs, confidence: confidence
+            )
+            return
+        }
+        let enter = max(threshold, applyEnterThresholdMs)
+        if abs(drift) < enter {
+            recordSuccess()
+            Self.trace(
+                "[ContActiveCalib] iter=\(iter) target=\(delta)ms drift=\(drift)ms below enter threshold ±\(enter)ms — no action confidence=\(String(format: "%.2f", confidence))"
             )
             emitSample(
                 measuredDelta: delta, appliedDelay: beforeDelayMs,
@@ -233,13 +278,33 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
             return
         }
         let clamped = min(5000, max(0, delta))
-        await applyDelayMs(clamped)
+        let stable = recordPendingTarget(target: clamped)
+        guard stable >= max(1, requiredStableCycles) else {
+            recordSuccess()
+            Self.trace(
+                "[ContActiveCalib] iter=\(iter) target=\(clamped)ms drift=\(drift)ms pending stable cycle \(stable)/\(requiredStableCycles) — no apply"
+            )
+            emitSample(
+                measuredDelta: delta, appliedDelay: beforeDelayMs,
+                perDeviceTau: result.perDeviceTauMs, confidence: confidence
+            )
+            return
+        }
+        let step = max(1, maxApplyStepMs)
+        let applied: Int
+        if abs(clamped - beforeDelayMs) > step {
+            applied = beforeDelayMs + (clamped > beforeDelayMs ? step : -step)
+        } else {
+            applied = clamped
+        }
+        await applyDelayMs(applied)
+        resetPendingTarget()
         recordSuccess()
         Self.trace(
-            "[ContActiveCalib] iter=\(iter) target=\(delta)ms applied: \(beforeDelayMs)ms -> \(clamped)ms confidence=\(String(format: "%.2f", confidence))"
+            "[ContActiveCalib] iter=\(iter) target=\(delta)ms applied: \(beforeDelayMs)ms -> \(applied)ms confidence=\(String(format: "%.2f", confidence))"
         )
         emitSample(
-            measuredDelta: delta, appliedDelay: clamped,
+            measuredDelta: delta, appliedDelay: applied,
             perDeviceTau: result.perDeviceTauMs, confidence: confidence
         )
     }
@@ -255,6 +320,20 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
         ))
     }
 
+    private func uncertaintyRejectReason(
+        _ result: ActiveCalibrator.Result
+    ) -> String? {
+        for key in result.perDeviceTauMs.keys.sorted() {
+            guard let uncertainty = result.perDeviceUncertaintyMs[key] else {
+                return "missing_uncertainty \(key)"
+            }
+            if uncertainty > maxUncertaintyMs {
+                return "high_uncertainty \(key)=\(uncertainty)ms max=\(maxUncertaintyMs)ms"
+            }
+        }
+        return nil
+    }
+
     private func recordSuccess() {
         stateLock.withLockUnchecked {
             _consecutiveFailures = 0
@@ -262,9 +341,31 @@ public final class ContinuousActiveCalibrator: @unchecked Sendable {
         }
     }
 
+    private func recordPendingTarget(target: Int) -> Int {
+        stateLock.withLockUnchecked {
+            if let prior = _pendingTargetMs,
+               abs(prior - target) <= 30 {
+                _pendingStableCycles += 1
+            } else {
+                _pendingTargetMs = target
+                _pendingStableCycles = 1
+            }
+            return _pendingStableCycles
+        }
+    }
+
+    private func resetPendingTarget() {
+        stateLock.withLockUnchecked {
+            _pendingTargetMs = nil
+            _pendingStableCycles = 0
+        }
+    }
+
     private func recordFailure(reason: String) {
         let (count, shouldWarn): (Int, Bool) = stateLock.withLockUnchecked {
             _consecutiveFailures &+= 1
+            _pendingTargetMs = nil
+            _pendingStableCycles = 0
             let n = _consecutiveFailures
             let warn = !_warnedOnFailureStreak
                 && n >= consecutiveFailureLimit

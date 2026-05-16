@@ -203,7 +203,7 @@ public final class AggregateDevice {
     ///
     /// Best-effort — failure is silently tolerated, and the caller falls
     /// back to (B) by reading the resulting channel count.
-    private static func tryNarrowOutputStreamsToStereo(_ aggregateID: AudioObjectID) {
+    static func tryNarrowOutputStreamsToStereo(_ aggregateID: AudioObjectID) {
         var streamsAddr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
             mScope: kAudioDevicePropertyScopeOutput,

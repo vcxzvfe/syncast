@@ -3,6 +3,7 @@
 > Audience: SyncCast core engineers (Scheduler, AirPlay sidecar, CoreAudio tap).
 > Goal: align playback between local CoreAudio (5–20 ms HW latency) and AirPlay 2
 > (≈1.5–2 s buffered) within an audible-tolerance budget of **≤30 ms**.
+> 2026-05-13 status: historical strategy brief. Current SyncCast uses the OwnTone sidecar path, fixed/manual/click calibration is not a product solution, and passive no-probe real-program evidence is preferred before any automatic Local + AirPlay control loop.
 
 ---
 

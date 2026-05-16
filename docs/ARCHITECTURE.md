@@ -1,15 +1,16 @@
 # SyncCast Architecture
 
-> Last updated: 2026-04-25 · Status: living document, P0–P3 design phase
+> Last updated: 2026-05-16 · Status: living alpha document
 
 ## 1. Goals & non-goals
 
 ### Goals (in priority order)
-1. **Sync quality**: ≤30 ms perceived offset across all enabled outputs at steady state.
-2. **Per-device volume**: independent linear gain 0.0–1.0, plus mute, persisted across launches.
-3. **Pluggable transports**: adding a new device class (Snapcast, generic RTP, Chromecast) should be a new module under `core/router/Transports/`, not a rewrite.
-4. **Reliability**: a misbehaving AirPlay receiver must not stall the local outputs. Network glitches recover within 1 s.
-5. **Usable UX**: one-click "Whole-house mode" that "just works" once devices are added.
+1. **Preserve the stable local Stereo path**: local CoreAudio outputs must stay low-latency and reliable.
+2. **Improve Local + AirPlay sync quality**: target ≤30 ms perceived offset at steady state, but treat it as unresolved until passive real-room evidence proves it.
+3. **Per-device volume**: independent linear gain 0.0–1.0, plus mute, persisted across launches.
+4. **Pluggable transports**: adding a new device class (Snapcast, generic RTP, Chromecast) should be a new module under `core/router/Transports/`, not a rewrite.
+5. **Reliability**: a misbehaving AirPlay receiver must not stall the local outputs.
+6. **Honest UX**: label AirPlay as experimental until automatic Local + AirPlay delay control is proven.
 
 ### Non-goals (for v1)
 - Multi-zone audio (different streams to different rooms). One source, fanned out.
@@ -24,9 +25,10 @@
                                 │
                                 ▼
                    ┌────────────────────────────┐
-                   │   BlackHole 2ch (kext)     │ ← system default output
+                   │ Capture backend             │
+                   │ Direct Stereo · SCK/Tap     │
                    └─────────────┬──────────────┘
-                                 │ CoreAudio IOProc
+                                 │ system audio frames
                                  ▼
    ┌─────────────────────────────────────────────────────────┐
    │                  SyncCast Router (Swift)                 │
@@ -68,15 +70,15 @@
 | Module | Language | Responsibility |
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | Capture from BlackHole, ring buffer, scheduler, AUHAL fan-out, IPC client to sidecar. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, IPC client to sidecar, passive diagnostic capture. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
-| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes "Whole-house mode" + per-device controls. |
+| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls. |
 
 ## 4. Audio data path
 
-1. **Capture (real-time thread, CoreAudio IOProc)**: BlackHole 2ch delivers Float32 non-interleaved frames at the system sample rate (we lock 48 kHz). Capture writes them into `RingBuffer`.
+1. **Capture / local output**: local Stereo defaults to Direct Stereo, which makes a normal CoreAudio output/aggregate the system default and avoids capture. AirPlay and other capture-dependent paths still write Float32 frames into `RingBuffer` through ScreenCaptureKit or Process Tap.
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
 4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, applies the per-device gain, writes into AUHAL's output buffer.
@@ -87,15 +89,22 @@
 See [research/sync-brief.md](research/sync-brief.md) for the full discussion. Headline:
 
 - **Master clock**: `mach_absolute_time()` on the host. Wall-clock is not used — we are NTP-discipline-agnostic.
-- **Strategy**: pad-the-fast-path. The local AUHAL renders are pre-rolled by `T_master − L_local` so they line up with AirPlay's late delivery.
-- **Latency probe**: at session start, the sidecar reports each AirPlay receiver's RTSP-derived latency and updates it via `event.measured_latency`. The router re-plans when the worst-case latency moves by >20 ms.
-- **Drift**: a slow PI loop monitors per-device buffer fill and inserts/drops one local sample per ~30 s if needed. Handled inside the AUHAL render callback, no resampling required.
+- **AirPlay receiver group**: multiple AirPlay receivers are delegated to the AirPlay/OwnTone timing domain. SyncCast should not invent per-receiver truth unless the evidence can distinguish them.
+- **Local + AirPlay strategy**: pad the fast local path until it matches AirPlay's late delivery. Manual delay can align a room; automatic correction is not product-ready.
+- **Timing evidence**: active acoustic probes are lab-only and disabled by default because high-band probes were audible on real hardware. The current safe path is passive no-probe measurement: compare the captured reference ring with a microphone recording of real program audio, reject weak/mismatched evidence, and avoid writes unless repeated sessions agree.
+- **Route mutations**: AirPlay connection, route, delay, and volume changes bump an AirPlay timing epoch. Passive baselines must not cross epochs.
+
+Passive control pipeline:
+
+`passive_status -> passive_capture -> passive_capture_estimate -> passive_drift_monitor -> passive_delay_decision -> passive_session_audit/finalize -> passive_correction_gate -> passive_apply_candidate`
+
+Safety invariants: passive capture emits no probes; the microphone opens only after a no-mic readiness preflight; monitor evidence is scoped to route context, current delay, delay-lock state, enabled AirPlay count, AirPlay timing epoch, and capture backend; and delay writes are forbidden until repeat-confirmed candidates pass the app-side guard. The estimator defaults to dual waveform/envelope agreement and exposes drift fields (`slope_ms_per_min`, `drift_ppm`, `fitted_drift_span_ms`) as evidence, not as proof of product reliability by themselves.
 
 ## 6. Concurrency model
 
 | Thread / actor | Lives in | Access pattern |
 |---|---|---|
-| BlackHole IOProc thread | CoreAudio | Real-time. Allocations forbidden. Only writes to `RingBuffer`. |
+| Capture callback thread | ScreenCaptureKit / Process Tap | Real-time-ish. Writes to `RingBuffer`; avoids blocking router work. |
 | Per-device AUHAL render thread | CoreAudio | Real-time. Reads from `RingBuffer`. Holds its own read cursor. |
 | `DiscoveryService` actor | Swift concurrency | Aggregates events from CoreAudio + Bonjour. UI reads via subscribe(). |
 | `Router` actor | Swift concurrency | Owns Scheduler state, plans, IPC. Mutated only inside the actor. |
@@ -119,7 +128,7 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 |---|---|---|
 | Per-device routing (`enabled`, `volume`, `mute`, `manualDelayMs`) | `~/Library/Application Support/SyncCast/devices.json` | Survives launches |
 | Stable device IDs | same file | Map from CoreAudio UID / AirPlay device key → SyncCast UUID |
-| Last calibration result per AirPlay receiver | same file | Skip re-calibration unless user requests |
+| Last passive baseline / diagnostic artifacts | session output directories, future persisted store | Used only after fail-closed audit; stale route/timing epochs are rejected |
 
 Atomic writes via temp-file + `rename`. No SQLite — overkill at this scale.
 
@@ -128,7 +137,7 @@ Atomic writes via temp-file + `rename`. No SQLite — overkill at this scale.
 - Swift Packages built with the Xcode 15+ toolchain (`swift build`).
 - Python sidecar bundled inside the .app via PyInstaller into a single binary; no system-Python dependency.
 - Notarized via `xcrun notarytool`. Distributed as a `.pkg` from GitHub Releases.
-- BlackHole bootstrap: app detects missing BlackHole and runs `installer -pkg /path/to/BlackHole2ch.pkg -target /` after admin auth (or hands off to a bundled .pkg).
+- No BlackHole bootstrap is required for the current alpha. Local Stereo defaults to Direct Stereo; Process Tap is the intended replacement for ScreenCaptureKit on capture-dependent paths.
 
 ## 10. ADRs
 

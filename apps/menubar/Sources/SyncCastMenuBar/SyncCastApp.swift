@@ -53,23 +53,59 @@ func statusIcon(name: String) -> Image {
     return Image(nsImage: fallback)
 }
 
+@MainActor
+final class AppTerminationCoordinator {
+    static let shared = AppTerminationCoordinator()
+    var model: AppModel?
+}
+
+final class SyncCastAppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            let canTerminate =
+                await AppTerminationCoordinator.shared.model?
+                    .shutdownForTermination() ?? true
+            sender.reply(toApplicationShouldTerminate: canTerminate)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct SyncCastApp: App {
+    @NSApplicationDelegateAdaptor(SyncCastAppDelegate.self) private var appDelegate
     @State private var model = AppModel()
 
     init() {
         SyncCastLog.log("=== SyncCast process starting (pid \(getpid())) ===")
         NSApp?.setActivationPolicy(.accessory)
 
-        // Trigger Screen Recording permission. SyncCast captures system
-        // audio via ScreenCaptureKit, which lives behind the Screen
-        // Recording TCC class. Mic permission is no longer required.
-        let pre = CGPreflightScreenCaptureAccess()
-        SyncCastLog.log("screen-recording preflight: \(pre)")
-        if !pre {
-            SyncCastLog.log("requesting screen-recording access — expect a system prompt")
-            let granted = CGRequestScreenCaptureAccess()
-            SyncCastLog.log("screen-recording request immediate=\(granted) (Tahoe: real grant requires app restart)")
+        // Only ScreenCaptureKit needs Screen Recording. Tap mode and Direct
+        // Stereo mode must not trip this TCC class, otherwise DRM validation
+        // is meaningless.
+        let captureBackend = ProcessInfo.processInfo
+            .environment["SYNCAST_CAPTURE_BACKEND"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let selectedStereoPath = StereoOutputPathPolicy.selectedPath()
+        let initialMode = ProcessInfo.processInfo
+            .environment["SYNCAST_INITIAL_MODE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let startsWholeHome = initialMode == "wholehome" || initialMode == "whole_home"
+        let skipScreenRecordingPreflight =
+            captureBackend == "tap" || (selectedStereoPath == .direct && !startsWholeHome)
+        if skipScreenRecordingPreflight {
+            SyncCastLog.log("screen-recording preflight skipped: capture=\(captureBackend ?? "sck") stereoPath=\(selectedStereoPath.rawValue)")
+        } else {
+            let pre = CGPreflightScreenCaptureAccess()
+            SyncCastLog.log("screen-recording preflight: \(pre)")
+            if !pre {
+                SyncCastLog.log("requesting screen-recording access — expect a system prompt")
+                let granted = CGRequestScreenCaptureAccess()
+                SyncCastLog.log("screen-recording request immediate=\(granted) (Tahoe: real grant requires app restart)")
+            }
         }
     }
 

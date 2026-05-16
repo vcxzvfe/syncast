@@ -94,6 +94,7 @@ class DeviceManager:
         self._notify = notify
         self._devices: dict[str, Device] = {}
         self._streaming: bool = False
+        self._active_stream_device_ids: tuple[str, ...] | None = None
         # asyncio.Lock created lazily on first use (must be inside the loop;
         # see the same note in server.py).
         self._lock: asyncio.Lock | None = None
@@ -302,10 +303,33 @@ class DeviceManager:
                 raise jsonrpc.RpcError(
                     jsonrpc.DEVICE_NOT_FOUND, f"unknown: {missing}",
                 )
+            requested_stream = tuple(sorted(device_ids))
+            if (
+                self._streaming
+                and self._active_stream_device_ids == requested_stream
+                and self._owntone is not None
+                and self._audio_reader is not None
+                and self._owntone.is_alive()
+            ):
+                logger.info(
+                    "start_stream_noop",
+                    extra={
+                        "device_ids": list(requested_stream),
+                        "reason": "same active set",
+                    },
+                )
+                return {
+                    "started": True,
+                    "device_count": len(device_ids),
+                    "noop": True,
+                }
             await self._ensure_owntone()
             await self._reconcile_outputs(device_ids)
             await self._ensure_audio_reader(audio_socket)
-            self._owntone.play_pipe()  # idempotent: tells OwnTone to start consuming the FIFO
+            if self._broadcaster is not None:
+                self._broadcaster.reset()
+            self._owntone.play_pipe()
+            self._active_stream_device_ids = requested_stream
             for d in device_ids:
                 dev = self._devices[d]
                 dev.state = "streaming"
@@ -349,6 +373,8 @@ class DeviceManager:
             if mode == "whole_home":
                 await self._ensure_owntone()
                 self._ensure_broadcaster()
+                if self._broadcaster is not None:
+                    self._broadcaster.reset()
                 # POST-TEE ARCHITECTURE (b0543d5+1):
                 # The fifo OUTPUT enable + play_pipe priming below is a
                 # belt-and-suspenders for AirPlay-capable receivers — it
@@ -493,6 +519,8 @@ class DeviceManager:
         return {"delay_ms": applied}
 
     async def flush(self) -> dict[str, Any]:
+        if self._broadcaster is not None:
+            self._broadcaster.reset()
         if self._owntone is None:
             return {"flushed": True}
         try:
@@ -511,6 +539,16 @@ class DeviceManager:
         # `stream.start` calls play_pipe → urlopen fails → audio is silent.
         if self._owntone is not None and not self._owntone.is_alive():
             logger.warning("owntone_dead_will_respawn")
+            if self._audio_reader is not None:
+                self._audio_reader.set_broadcaster_tee(None)
+                self._audio_reader.stop()
+                self._audio_reader = None
+            if self._broadcaster is not None:
+                try:
+                    self._broadcaster.stop()
+                except Exception:  # noqa: BLE001
+                    logger.exception("broadcaster_stop_failed")
+                self._broadcaster = None
             # Drop fd / state but don't await stop() — proc is already gone.
             self._owntone = None
             # Reset every device's owntone_output_id; OwnTone reassigns
@@ -520,6 +558,8 @@ class DeviceManager:
             # Same reasoning for the fifo output id we cached for
             # whole-home mode — it's per-OwnTone-process.
             self._fifo_output_id = None
+            self._active_stream_device_ids = None
+            self._streaming = False
         if self._owntone is not None:
             return
         try:
@@ -540,6 +580,8 @@ class DeviceManager:
                 jsonrpc.INTERNAL_ERROR, f"owntone start failed: {e}",
             ) from e
         self._owntone = backend
+        if self._mode == "whole_home":
+            self._ensure_broadcaster()
 
     def _ensure_broadcaster(self) -> None:
         """Spin up the LocalFifoBroadcaster if not already running.
@@ -979,8 +1021,11 @@ class DeviceManager:
             prior.cancel()
         self._deferred_reconcile_task = None
         if self._audio_reader is not None:
+            self._audio_reader.set_broadcaster_tee(None)
             self._audio_reader.stop()
             self._audio_reader = None
+        if self._broadcaster is not None:
+            self._broadcaster.reset()
         if self._owntone is not None:
             try:
                 self._owntone.flush()
@@ -993,3 +1038,4 @@ class DeviceManager:
                     "device_id": dev.id, "state": "connected",
                 })
         self._streaming = False
+        self._active_stream_device_ids = None

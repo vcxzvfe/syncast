@@ -35,6 +35,42 @@ OWNTONE_BIN_SRC="$OWNTONE_PREFIX/usr/sbin/owntone"
 log() { printf '\033[1;34m[pkg]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[pkg]\033[0m %s\n' "$*" >&2; exit 1; }
 
+choose_sign_identity() {
+    SIGN_IDENTITY="-"
+    SIGN_LABEL="ad-hoc (capture TCC grants may re-prompt after rebuilds)"
+    if [[ "${SYNCAST_USE_SYNCCAST_DEV:-0}" == "1" ]] \
+        && security find-identity -v -p codesigning 2>/dev/null | grep -q '"SyncCast Dev"'; then
+        local probe="${TMPDIR:-/tmp}/syncast-sign-probe-$$"
+        cp /usr/bin/true "$probe"
+        if codesign --force --sign "SyncCast Dev" "$probe" >/dev/null 2>&1 \
+            && codesign --verify "$probe" >/dev/null 2>&1; then
+            SIGN_IDENTITY="SyncCast Dev"
+            SIGN_LABEL="self-signed cert: SyncCast Dev (TCC stable across rebuilds)"
+        else
+            log "SyncCast Dev identity is present but not verifiable; falling back to ad-hoc"
+        fi
+        rm -f "$probe"
+    fi
+}
+
+sign_bundle() {
+    local bundle="$1"
+    choose_sign_identity
+    log "Codesigning with $SIGN_LABEL"
+    codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$bundle"
+    sleep 1
+    if ! codesign --verify --verbose=2 "$bundle" >/dev/null 2>&1; then
+        if [[ "$SIGN_IDENTITY" != "-" ]]; then
+            log "$SIGN_LABEL signature did not verify; re-codesigning with ad-hoc"
+            SIGN_IDENTITY="-"
+            SIGN_LABEL="ad-hoc (capture TCC grants may re-prompt after rebuilds)"
+            codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$bundle"
+            sleep 1
+        fi
+    fi
+    codesign --verify --verbose=2 "$bundle"
+}
+
 [[ "$(uname -s)" == "Darwin" ]] || fail "macOS only"
 [[ -x "$OWNTONE_BIN_SRC" ]] || fail "OwnTone not built. Run scripts/build-owntone.sh first."
 [[ -d "$REPO_ROOT/sidecar/.venv" ]] || fail "Python venv missing. Run scripts/bootstrap.sh first."
@@ -53,6 +89,13 @@ cp "$SWIFT_BIN" "$MACOS_DIR/SyncCastMenuBar"
 cp "$REPO_ROOT/apps/menubar/Resources/Info.plist" "$CONTENTS/Info.plist"
 mkdir -p "$RES_DIR"
 cp -f "$REPO_ROOT/apps/menubar/Resources/AppIcon.icns" "$RES_DIR/AppIcon.icns"
+PASSIVE_TOOLS_DIR="$RES_DIR/passive-tools"
+mkdir -p "$PASSIVE_TOOLS_DIR/scripts"
+cp "$REPO_ROOT/scripts/passive_"*.py "$PASSIVE_TOOLS_DIR/scripts/"
+cp "$REPO_ROOT/scripts/passive_drift_session.sh" "$PASSIVE_TOOLS_DIR/scripts/"
+cp "$REPO_ROOT/scripts/coreaudio_default_output_guard.sh" "$PASSIVE_TOOLS_DIR/scripts/"
+cp "$REPO_ROOT/scripts/coreaudio_default_output.c" "$PASSIVE_TOOLS_DIR/scripts/"
+chmod +x "$PASSIVE_TOOLS_DIR/scripts/passive_drift_session.sh"
 # SwiftPM resource bundle (Assets.xcassets — menubar template image)
 # Bundle.module loads from <binary-dir>/<Target>_<Target>.bundle. We add a
 # minimal Info.plist at root so codesign accepts the bundle as shallow.
@@ -126,24 +169,12 @@ fi
 # microphone / screen-recording requests without showing a prompt. For a
 # real distribution build we'd sign with a Developer ID + notarize, which
 # does NEED hardened runtime. Track that for the v1 .pkg release.
-# Pick the strongest stable signing identity we have.
-#
-# 1) Apple Developer ID — best, but most users don't have one.
-# 2) "SyncCast Dev" — a self-signed Code Signing cert from Keychain
-#    Assistant. With this, TCC anchors permission grants to the cert
-#    identity (not per-build CDHash), so Screen Recording, Microphone,
-#    etc. survive every rebuild. Strongly recommended for development.
-# 3) Ad-hoc (-) — the fallback. Works once but TCC re-prompts on every
-#    rebuild because each ad-hoc CDHash is treated as a fresh app.
-SIGN_IDENTITY="-"
-SIGN_LABEL="ad-hoc (TCC will re-prompt every rebuild)"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q '"SyncCast Dev"'; then
-    SIGN_IDENTITY="SyncCast Dev"
-    SIGN_LABEL="self-signed cert: SyncCast Dev (TCC stable across rebuilds)"
-fi
-
-log "Codesigning with $SIGN_LABEL"
-codesign --force --deep --sign "$SIGN_IDENTITY" --identifier io.syncast.menubar "$APP" || true
+# Default to ad-hoc signing so packaging does not touch Keychain identities.
+# This is fine for the default Direct Stereo path, which does not need TCC
+# capture grants. Set SYNCAST_USE_SYNCCAST_DEV=1 to opt into a stable
+# self-signed identity for SCK/Tap/microphone development when that identity
+# verifies cleanly on this machine.
+sign_bundle "$APP"
 
 log "Done: $APP"
 ls -la "$APP/Contents/MacOS"

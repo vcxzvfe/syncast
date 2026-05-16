@@ -7,7 +7,7 @@
 - [ ] Slider value persists across app restart (UserDefaults `syncast.airplayDelayMs`)
 - [ ] Lock button writes UserDefaults `syncast.airplayDelayLockedAt`
 - [ ] Lock state pill shows "Unlocked" / "Locked at NNNN ms"
-- [ ] Reset button restores 2200ms (default whole-home)
+- [ ] Reset button restores 1750ms (default whole-home)
 - [ ] ←/→ keyboard nudges ±10ms when popover focused (audition idle)
 - [ ] Shift+←/→ nudges ±100ms
 - [ ] Slider drag pushes new delay to sidecar in real-time
@@ -23,11 +23,12 @@
 - [ ] After 4 rounds: returns to `.idle`, final value = sum of picks × 75 from baseline
 - [ ] "Stop A/B" button restores original baseline and returns to `.idle`
 
-## Functional — Demoted Auto
+## Functional — Auto Calibrate
 
-- [ ] "Estimate (rough)" button is in Advanced disclosure (collapsed by default)
-- [ ] Description: "Best-effort algorithmic estimate. Use as rough start, fine-tune with the slider."
-- [ ] Estimate result writes to `airplayDelayMs` only if `delayLockState == .unlocked` (does NOT overwrite locked value silently)
+- [ ] Visible "Auto Calibrate" button appears in Whole-home mode's `Local + AirPlay Delay` row
+- [ ] Advanced disclosure still contains an "Auto Calibrate" row plus microphone picker
+- [ ] Footer "Auto Calibrate" button calls the same real calibration path and is disabled outside Whole-home
+- [ ] Auto Calibrate writes `airplayDelayMs` only when `delayLockState == .unlocked` and quality/uncertainty gates pass (does NOT overwrite locked value silently)
 
 ## Removed (must NOT exist after refactor)
 
@@ -80,13 +81,13 @@
 4. Drag slider — hear delay change in real-time, no clicks
 5. Use ← to nudge -10ms, Shift+← to -100ms
 6. Slider lands at 2300ms — hit "Lock 2300 ms"
-7. Pill turns green "Locked at 2300 ms"
+7. Hint reads "Locked at 2300 ms"
 8. Quit SyncCast, reopen — slider at 2300, locked, music still in sync
 9. Click "A/B test" — hear 1.2s of -150ms then 1.2s of +150ms, alternating
 10. Pick A four times — baseline drops by 4 × 75 = 300ms (now at 2000)
 11. Hit "Stop A/B" first time — restores to 2300 (test stop button)
-12. Click "Estimate (rough)" — Auto-calibrate runs, value shown but NOT applied (locked)
-13. Unlock — Estimate now offers Apply
+12. Click "Auto Calibrate" — calibration runs, value shown but NOT applied while locked
+13. Unlock — Auto Calibrate can apply only if the run passes quality/uncertainty gates
 
 ## Pass / Fail
 
