@@ -71,6 +71,28 @@ class PassiveAutosyncControllerTests(unittest.TestCase):
         self.assertFalse(plan["appliesDelay"])
         self.assertIsNone(plan["command"])
 
+    def test_zero_capture_ticks_readiness_blocks_without_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = _plan(
+                {
+                    "verdict": "not_ready",
+                    "stage": "passive_status",
+                    "reason": "passive capture reference has not received system-audio frames: captureTickCount=0",
+                    "nextAction": "verify capture backend before opening the microphone",
+                    "opensMicrophone": False,
+                    "emitsAudio": False,
+                    "appliesDelay": False,
+                },
+                Path(tmp),
+            )
+        self.assertEqual(plan["verdict"], "blocked")
+        self.assertEqual(plan["readinessStage"], "passive_status")
+        self.assertIn("system-audio frames", plan["reason"])
+        self.assertIsNone(plan["command"])
+        self.assertFalse(plan["opensMicrophone"])
+        self.assertFalse(plan["emitsAudio"])
+        self.assertFalse(plan["appliesDelay"])
+
     def test_not_ready_with_auto_start_targets_plans_readiness_bootstrap(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

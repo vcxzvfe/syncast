@@ -168,6 +168,7 @@ def _ready_status(**overrides):
         "currentDelayMs": 2200,
         "delayLocked": False,
         "contextSignature": "mode=wholeHome|enabled=local,airplay",
+        "captureTickCount": 12,
     }
     status.update(overrides)
     return status
@@ -455,6 +456,25 @@ class PassiveCaptureEstimateTests(unittest.TestCase):
     def test_passive_status_ready_accepts_full_route_context(self):
         pce._check_passive_status_ready(_ready_status())
 
+    def test_passive_status_ready_rejects_zero_capture_ticks(self):
+        with self.assertRaisesRegex(RuntimeError, "system-audio frames"):
+            pce._check_passive_status_ready(
+                _ready_status(
+                    captureTickCount=0,
+                    captureDiagnostic="backend=tap seen=0 written=0 ticks=0",
+                )
+            )
+
+    def test_passive_status_ready_rejects_missing_or_invalid_capture_ticks(self):
+        bad_values = (None, True, -1, "12")
+        for value in bad_values:
+            with self.subTest(value=value):
+                status = _ready_status(captureTickCount=value)
+                if value is None:
+                    del status["captureTickCount"]
+                with self.assertRaisesRegex(RuntimeError, "system-audio frames"):
+                    pce._check_passive_status_ready(status)
+
     def test_passive_status_ready_rejects_bad_status_result(self):
         with self.assertRaisesRegex(RuntimeError, "passive_status returned unexpected"):
             pce._check_passive_status_ready(_ready_status(ok=False))
@@ -568,6 +588,31 @@ class PassiveCaptureEstimateTests(unittest.TestCase):
 
         self.assertEqual(rc, pce.EXIT_CAPTURE_FAILED)
         capture_once.assert_not_called()
+
+    def test_main_rejects_zero_capture_ticks_before_capture(self):
+        with mock.patch.object(pce, "_parse_args", return_value=_main_args()), \
+             mock.patch.object(pce, "_validate_args"), \
+             mock.patch.object(pce, "_check_socket_ready"), \
+             mock.patch.object(
+                 pce,
+                 "_passive_status",
+                 return_value=_ready_status(
+                     captureTickCount=0,
+                     captureDiagnostic="backend=tap seen=0 written=0 ticks=0",
+                 ),
+             ), \
+             mock.patch.object(pce, "_capture_once") as capture_once, \
+             mock.patch("sys.stderr", io.StringIO()) as stderr:
+            rc = pce.main()
+
+        self.assertEqual(rc, pce.EXIT_CAPTURE_FAILED)
+        capture_once.assert_not_called()
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["verdict"], "capture_failed")
+        self.assertIn("system-audio frames", result["error"])
+        self.assertFalse(result["opensMicrophone"])
+        self.assertFalse(result["emitsAudio"])
+        self.assertFalse(result["appliesDelay"])
 
     def test_main_preflight_only_exits_before_capture(self):
         with mock.patch.object(pce, "_parse_args", return_value=_main_args(preflight_only=True)), \

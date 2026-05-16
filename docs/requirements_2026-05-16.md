@@ -162,3 +162,27 @@ Stereo 默认走 Direct Stereo；capture-dependent 路径继续推进 Process Ta
 - `/private/tmp/syncast-passive-bundled-review-fix-check.json`
 
 这些 artifact 都在打开麦克风、发声或应用 delay 前失败。最新 headless bootstrap 证明当前 Codex 子进程能启动 runner，但 `headless_status.json` 停在 `stage=targets_failed`，direct CoreAudio 输出为 0，AirPlay browse 为 `ServiceNotRunning`。post-install bundled passive-tools safe-fail run 证明 `/Applications/SyncCast.app` 存在且已包含 `Passive Check` / bundled passive tools；22:59 重新打开 app 后，`SyncCastMenuBar` 已运行并发现设备。这个结果不代表算法失败，只说明真实 live corpus 需要从桌面 app 的 Whole-home `Passive Check` 收集，而不是从当前 Codex shell/headless 路径硬跑。
+
+## 7. 23:43 现场复测后的需求修订
+
+本轮在用户设备保持在线时从 Codex 重新尝试 Local + AirPlay 自动同步。系统默认输出先从 macOS `多输出设备` 切到普通 `PG27UCDM`，避免测试同时叠加一个不可控的系统 Multi-Output timeline。Tap auto-start 成功打开 SyncCast、进入 Whole-home，并选中 `PG27UCDM`、`MacBook Pro扬声器`、`Xiaomi Sound-6853`；Xiaomi AirPlay receiver 成功 connected。但 180 秒 readiness window 内 Tap capture 一直是 `backend=tap seen=0 written=0 ticks=0 peak=0/0 last=started`，AirPlay writer 和本地 bridges 都在 underrun/silence 路径上推进。因此本轮没有打开麦克风、没有采集 corpus、没有发 probe、没有写 delay。
+
+SCK 对照复测也失败在权限/DRM 风险链路：日志显示 `screen-recording preflight: false`、`screen-recording status: notDetermined`、`router.start FAILED: screen recording permission denied`，随后 diagnostic socket 不出现。SCK 仍只能作为手动授权后的 fallback 验证路径，不能作为默认产品方向；Local Stereo / DRM-safe 路线仍应优先 Direct Stereo 和 Process Tap。
+
+由此新增 P0/P1 实施要求：
+
+- `passive_status` 不能只看 backend 名称与 route ready；如果 capture reference 没有收到系统音频帧，`passiveCaptureAvailable` 必须 fail closed。Swift diagnostic server 与 Python readiness/capture preflight 都要拒绝 `captureTickCount` 缺失、非整数或 `<=0`，并且在打开麦克风前失败。
+- app-owned passive autosync 不能只依赖 `pgrep -x SyncCastMenuBar`；菜单栏 app 启动 bundled controller 时必须传入自己的 PID，readiness 脚本要用这个 PID 作为辅助 liveness 证据，避免“app 明明在运行但 controller 规划成 process missing / no executable command”。
+- Whole-home 启动和运行中 reconcile 后必须把当前 `airplayDelayMs` 重新推给 sidecar `local_fifo.set_delay_ms`。用户手动或持久化 delay 的意义是“本地 FIFO delay line 当前实际应用了这个值”；如果 sidecar broadcaster 使用默认值或重启后没重新应用，Local + AirPlay 听感会随机漂移。
+- Active coded probes 继续视为 audible-risk lab diagnostic，不得作为默认自动同步路线。当前 `comfort-21k` 的 24ms symbol grid 和多载波差频在真实音箱/DSP 上仍可能产生可闻低频重复感；默认产品路径仍是 passive/no-probe。
+
+上述前三项已在本轮代码中落实，并于 2026-05-17 00:02 CEST 重新 package/install 到 `/Applications/SyncCast.app`：source 与 bundled passive tools 的 `passive_capture_estimate.py`、`passive_readiness_report.py`、`passive_autosync_controller.py` SHA-256 已一致，installed bundled readiness/capture/autosync tests 通过。该版本仍不宣称自动 Local + AirPlay 同步已完成；它把不可用 capture、app-owned process 误判、Whole-home delay 未重推这三类现场风险先收紧。
+
+本轮新增 safe-fail artifact：
+
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/readiness.json`
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/auto_start_capture_preflight.json`
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/control_report.json`
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/readiness.json`
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/auto_start_capture_preflight.json`
+- `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/control_report.json`

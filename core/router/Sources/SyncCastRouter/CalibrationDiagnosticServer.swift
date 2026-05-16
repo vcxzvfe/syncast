@@ -252,7 +252,7 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         return nil
     }
 
-    private static func passiveSnapshotRejection(
+    public static func passiveSnapshotRejection(
         snapshot: Snapshot,
         passiveStatus: PassiveStatus?,
         passiveAvailable: Bool,
@@ -277,6 +277,15 @@ public final class CalibrationDiagnosticServer: @unchecked Sendable {
         let backend = passiveStatus?.captureBackend ?? ""
         guard backend == "sck" || backend == "tap" else {
             return "passive_capture backend is not ready or unsupported: \(backend.isEmpty ? "missing" : backend)"
+        }
+        guard let tickCount = passiveStatus?.tickCount, tickCount > 0 else {
+            let diagnostic = passiveStatus?.captureDiagnostic
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let detail = diagnostic.isEmpty ? "" : "; \(diagnostic)"
+            let tickText = passiveStatus?.tickCount.map { String($0) } ?? "missing"
+            return "passive_capture reference has not received system-audio frames: "
+                + "captureTickCount=\(tickText)"
+                + detail
         }
         guard !snapshot.syncContextState.isEmpty else {
             return "passive_capture sync context state is missing"
