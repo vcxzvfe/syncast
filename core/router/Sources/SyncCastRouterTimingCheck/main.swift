@@ -817,6 +817,23 @@ func checkPassiveEvidenceIntentClassifiesSyncContext() throws {
     )
 }
 
+func checkPassiveSnapshotRejectsZeroCaptureTicks() throws {
+    let rejection = CalibrationDiagnosticServer.passiveSnapshotRejection(
+        snapshot: passiveSnapshot(),
+        passiveStatus: CalibrationDiagnosticServer.PassiveStatus(
+            captureBackend: "tap",
+            captureDiagnostic: "backend=tap seen=0 written=0 ticks=0",
+            tickCount: 0
+        ),
+        passiveAvailable: true,
+        busy: false
+    )
+    try expect(
+        rejection?.contains("system-audio frames") == true,
+        "passive snapshot must reject zero-tick capture before opening the microphone"
+    )
+}
+
 let checks = [
     checkFullyPreArmCallbackDropsAllFrames,
     checkStraddlingCallbackDropsOnlyPreArmFrames,
@@ -840,6 +857,7 @@ let checks = [
     checkCalibrateApplyRejectsStaleFreshness,
     checkPassiveBaselineMarkGuard,
     checkPassiveEvidenceIntentClassifiesSyncContext,
+    checkPassiveSnapshotRejectsZeroCaptureTicks,
 ]
 
 do {

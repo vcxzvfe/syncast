@@ -27,6 +27,17 @@ def _default_socket_path() -> Path:
     return Path(f"/tmp/syncast-{os.getuid()}.calibration.sock")
 
 
+def _default_process_pid() -> int | None:
+    raw = os.environ.get("SYNCAST_PASSIVE_PROCESS_PID")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
 def _process_pids(process_name: str) -> list[int]:
     try:
         result = subprocess.run(
@@ -46,6 +57,27 @@ def _process_pids(process_name: str) -> list[int]:
         except ValueError:
             continue
     return pids
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _process_pids_with_expected(process_name: str, expected_pid: int | None) -> list[int]:
+    pids = _process_pids(process_name)
+    if expected_pid is not None and _pid_is_running(expected_pid) and expected_pid not in pids:
+        pids.append(expected_pid)
+    return sorted(pids)
 
 
 def _base_payload(
@@ -339,15 +371,18 @@ def build_report(
     socket_path: Path,
     app_path: Path,
     process_name: str,
+    expected_pid: int | None = None,
     timeout_sec: float,
 ) -> dict[str, Any]:
-    pids = _process_pids(process_name)
+    pids = _process_pids_with_expected(process_name, expected_pid)
     payload = _base_payload(
         socket_path=socket_path,
         app_path=app_path,
         process_name=process_name,
         pids=pids,
     )
+    if expected_pid is not None:
+        payload["expectedProcessPid"] = expected_pid
 
     if not payload["appExists"]:
         return _not_ready(
@@ -454,6 +489,7 @@ def wait_for_report(
     socket_path: Path,
     app_path: Path,
     process_name: str,
+    expected_pid: int | None = None,
     timeout_sec: float,
     wait_sec: float,
     interval_sec: float,
@@ -473,6 +509,7 @@ def wait_for_report(
             socket_path=socket_path,
             app_path=app_path,
             process_name=process_name,
+            expected_pid=expected_pid,
             timeout_sec=timeout_sec,
         )
         attempts.append(
@@ -528,6 +565,7 @@ def _parse_args() -> argparse.Namespace:
         default=Path("/Applications/SyncCast.app"),
     )
     parser.add_argument("--process-name", default="SyncCastMenuBar")
+    parser.add_argument("--process-pid", type=int, default=_default_process_pid())
     parser.add_argument("--timeout-sec", type=float, default=2.0)
     parser.add_argument(
         "--wait-sec",
@@ -552,6 +590,7 @@ def main() -> int:
             socket_path=args.socket,
             app_path=args.app,
             process_name=args.process_name,
+            expected_pid=args.process_pid,
             timeout_sec=args.timeout_sec,
             wait_sec=args.wait_sec,
             interval_sec=args.interval_sec,

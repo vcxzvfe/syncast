@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import time
+import os
 import unittest
 from unittest import mock
 
@@ -26,6 +27,7 @@ def _ready_status(**overrides) -> dict:
         "syncContextReason": "AirPlay connection changed",
         "syncContextRevision": 4,
         "syncContextUpdatedUnix": 1778887421.0,
+        "captureTickCount": 12,
     }
     status.update(overrides)
     return status
@@ -65,6 +67,23 @@ class PassiveReadinessReportTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "not_ready")
         self.assertEqual(report["stage"], "process")
         self.assertIn("start SyncCast", report["nextAction"])
+
+    def test_expected_process_pid_counts_when_pgrep_misses_parent_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "SyncCast.app"
+            app.mkdir()
+            with mock.patch.object(prr, "_process_pids", return_value=[]):
+                report = prr.build_report(
+                    socket_path=Path(tmp) / "missing.sock",
+                    app_path=app,
+                    process_name="SyncCastMenuBar",
+                    expected_pid=os.getpid(),
+                    timeout_sec=0.1,
+                )
+        self.assertEqual(report["stage"], "socket")
+        self.assertTrue(report["processRunning"])
+        self.assertIn(os.getpid(), report["processPids"])
+        self.assertEqual(report["expectedProcessPid"], os.getpid())
 
     def test_headless_not_running_names_headless_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,6 +154,32 @@ class PassiveReadinessReportTests(unittest.TestCase):
         self.assertEqual(report["stage"], "passive_status")
         self.assertEqual(report["status"], bad_status)
         self.assertIn("AirPlay", report["reason"])
+
+    def test_zero_capture_ticks_are_not_ready_before_microphone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "SyncCast.app"
+            app.mkdir()
+            socket = Path(tmp) / "sock"
+            socket.touch()
+            bad_status = _ready_status(
+                captureTickCount=0,
+                captureDiagnostic="backend=tap seen=0 written=0 ticks=0",
+            )
+            with mock.patch.object(prr, "_process_pids", return_value=[123]), \
+                 mock.patch.object(prr.pce, "_json_rpc", return_value={"ok": True}), \
+                 mock.patch.object(prr.pce, "_passive_status", return_value=bad_status):
+                report = prr.build_report(
+                    socket_path=socket,
+                    app_path=app,
+                    process_name="SyncCastMenuBar",
+                    timeout_sec=0.1,
+                )
+        self.assertEqual(report["verdict"], "not_ready")
+        self.assertEqual(report["stage"], "passive_status")
+        self.assertIn("system-audio frames", report["reason"])
+        self.assertFalse(report["opensMicrophone"])
+        self.assertFalse(report["emitsAudio"])
+        self.assertFalse(report["appliesDelay"])
 
     def test_ready_status_passes(self):
         with tempfile.TemporaryDirectory() as tmp:

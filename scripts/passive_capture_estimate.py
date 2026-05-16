@@ -188,6 +188,20 @@ def _check_passive_status_ready(status: dict[str, Any]) -> None:
             "passive capture backend is not ready or unsupported: "
             f"{backend or 'missing'}"
         )
+    capture_tick_count = status.get("captureTickCount")
+    if (
+        isinstance(capture_tick_count, bool)
+        or not isinstance(capture_tick_count, int)
+        or capture_tick_count <= 0
+    ):
+        diagnostic = str(status.get("captureDiagnostic") or "").strip()
+        detail = f"; {diagnostic}" if diagnostic else ""
+        raise RuntimeError(
+            "passive capture reference has not received system-audio frames; "
+            "keep real program audio playing and verify the capture backend "
+            f"before opening the microphone: captureTickCount={capture_tick_count!r}"
+            f"{detail}"
+        )
 
     enabled_airplay_count = status.get("enabledAirplayCount")
     if (
@@ -1137,6 +1151,9 @@ def main() -> int:
         payload = {
             "verdict": "capture_failed",
             "error": str(exc),
+            "opensMicrophone": False,
+            "emitsAudio": False,
+            "appliesDelay": False,
         }
         if getattr(args, "report_path", None) is not None:
             try:

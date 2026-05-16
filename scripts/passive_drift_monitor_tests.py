@@ -85,6 +85,7 @@ def _ready_status(**overrides):
         "delayLocked": False,
         "syncContextState": "suspect",
         "syncContextRevision": 7,
+        "captureTickCount": 12,
     }
     status.update(overrides)
     return status
@@ -565,6 +566,12 @@ class PassiveDriftMonitorTests(unittest.TestCase):
             "captureBackend": "tap",
             "passiveCaptureAvailable": True,
             "inProgress": False,
+            "activeAirplayCount": 1,
+            "airplayTimingEpoch": 1,
+            "syncContextState": "suspect",
+            "syncContextRevision": 7,
+            "delayLocked": False,
+            "captureTickCount": 12,
         }
         with mock.patch.object(pdm, "_parse_args", return_value=args), \
              mock.patch.object(pdm, "_validate_args") as validate_args, \
@@ -639,6 +646,30 @@ class PassiveDriftMonitorTests(unittest.TestCase):
         payload = json.loads(stderr.getvalue())
         self.assertEqual(payload["verdict"], "capture_failed")
         self.assertIn("enabled AirPlay", payload["error"])
+
+    def test_zero_capture_ticks_preflight_never_enters_capture_loop(self):
+        args = _monitor_args(preflight_only=False)
+        stderr = io.StringIO()
+        with mock.patch.object(pdm, "_parse_args", return_value=args), \
+             mock.patch.object(pdm, "_validate_args"), \
+             mock.patch.object(pdm.pce, "_check_socket_ready"), \
+             mock.patch.object(
+                 pdm.pce,
+                 "_passive_capture_preflight",
+                 side_effect=RuntimeError(
+                     "passive capture reference has not received system-audio frames: captureTickCount=0"
+                 ),
+             ), \
+             mock.patch.object(pdm, "_capture_sample") as capture_sample, \
+             mock.patch.object(sys, "stdout", io.StringIO()), \
+             mock.patch.object(sys, "stderr", stderr):
+            rc = pdm.main()
+
+        self.assertEqual(rc, pdm.EXIT_CAPTURE_FAILED)
+        capture_sample.assert_not_called()
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["verdict"], "capture_failed")
+        self.assertIn("system-audio frames", payload["error"])
 
     def test_capture_sample_rechecks_status_before_later_cycles(self):
         captures = [

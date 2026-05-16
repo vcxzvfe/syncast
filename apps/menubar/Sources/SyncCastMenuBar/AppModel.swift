@@ -1813,6 +1813,9 @@ final class AppModel {
                 // receivers.
                 if mode == .wholeHome {
                     await router.startWholeHome(devices: snapshot)
+                    await reapplyWholeHomeDelayLine(
+                        reason: "whole-home route started"
+                    )
                     await installCalibrationDiagnosticSocket()
                     markSyncContextSuspect(
                         reason: "whole-home route started; passive baseline required"
@@ -1886,6 +1889,9 @@ final class AppModel {
                 await router.syncLocalOutputs(devices: devices)
             case .wholeHome:
                 await router.startWholeHome(devices: devices)
+                await reapplyWholeHomeDelayLine(
+                    reason: "whole-home route reconciled"
+                )
                 // Re-install calibration diagnostic socket. The Router's
                 // installer is idempotent (returns early if a server is
                 // already bound), so this is safe on every reconcile and
@@ -2233,6 +2239,19 @@ final class AppModel {
             SyncCastLog.log("airplayDelay apply failed: \(error.localizedDescription)")
             return false
         }
+    }
+
+    @discardableResult
+    private func reapplyWholeHomeDelayLine(reason: String) async -> Bool {
+        guard mode == .wholeHome else { return false }
+        let requested = airplayDelayMs
+        let applied = await commitAirplayDelay(requested)
+        if applied {
+            SyncCastLog.log(
+                "airplayDelay re-applied to whole-home FIFO: \(airplayDelayMs)ms reason=\(reason)"
+            )
+        }
+        return applied
     }
 
     /// Reset the slider to the canonical default — same path as a drag.
@@ -3510,6 +3529,7 @@ final class AppModel {
             "scripts/passive_autosync_controller.py",
             "--state-root", stateRoot.path,
             "--socket", AppModel.calibrationDiagnosticSocketURL.path,
+            "--process-pid", "\(ProcessInfo.processInfo.processIdentifier)",
             "--samples", "\(AppModel.passiveAutosyncSamples)",
             "--sample-interval-sec", "\(AppModel.passiveAutosyncSampleIntervalSec)",
             "--duration-sec", "\(AppModel.passiveAutosyncDurationSec)",
@@ -3530,6 +3550,8 @@ final class AppModel {
             "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
         environment["SYNCAST_PASSIVE_SOCKET"] =
             AppModel.calibrationDiagnosticSocketURL.path
+        environment["SYNCAST_PASSIVE_PROCESS_PID"] =
+            "\(ProcessInfo.processInfo.processIdentifier)"
         environment["SYNCAST_PASSIVE_WORKFLOW_GUARD"] = "enforce"
         environment.removeValue(forKey: "SYNCAST_ENABLE_ACTIVE_CALIBRATION")
         environment.removeValue(forKey: "SYNCAST_ALLOW_AUDIBLE_PROBES")

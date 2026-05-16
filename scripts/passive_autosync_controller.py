@@ -107,6 +107,7 @@ def _load_readiness(args: argparse.Namespace) -> dict[str, Any]:
         socket_path=args.socket,
         app_path=args.app,
         process_name=args.process_name,
+        expected_pid=args.process_pid,
         timeout_sec=args.timeout_sec,
         wait_sec=args.wait_sec,
         interval_sec=args.interval_sec,
@@ -1452,6 +1453,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--socket", type=Path, default=_default_socket_path())
     parser.add_argument("--app", type=Path, default=Path("/Applications/SyncCast.app"))
     parser.add_argument("--process-name", default="SyncCastMenuBar")
+    parser.add_argument(
+        "--process-pid",
+        type=int,
+        default=readiness_report._default_process_pid(),
+    )
     parser.add_argument("--timeout-sec", type=float, default=2.0)
     parser.add_argument("--wait-sec", type=float, default=0.0)
     parser.add_argument("--interval-sec", type=float, default=2.0)
