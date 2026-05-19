@@ -629,6 +629,7 @@ final class AppModel {
     private let router: Router
     private let sidecarLauncher = SidecarLauncher()
     var sidecarRunning: Bool = false
+    private var systemVolumeKeyController: SystemVolumeKeyController?
 
     /// Debounce guard for `reconcileEngine`. Each call cancels the
     /// previous timer; only the last call within an 80 ms quiet window
@@ -674,6 +675,13 @@ final class AppModel {
         if !Self.activeAcousticCalibrationEnabled {
             UserDefaults.standard.set(false, forKey: Self.bgEnabledKey)
         }
+        let volumeController = SystemVolumeKeyController { [weak self] action in
+            Task { @MainActor [weak self] in
+                self?.handleSystemVolumeKey(action)
+            }
+        }
+        volumeController.start()
+        self.systemVolumeKeyController = volumeController
         Task { await self.bootstrap() }
     }
 
@@ -2126,6 +2134,146 @@ final class AppModel {
         scheduleEventDrivenCalibration(reason: "device toggled \(name)")
     }
 
+    private struct DirectVolumeTarget {
+        let device: Device
+        let route: DeviceRouting
+        let uid: String
+    }
+
+    private var directStereoVolumeKeyEligible: Bool {
+        mode == .stereo
+            && Self.selectedStereoOutputPath == .direct
+            && streamingState == .running
+    }
+
+    private func enabledDirectStereoVolumeTargets() -> [DirectVolumeTarget] {
+        devices.compactMap { device in
+            guard device.transport == .coreAudio,
+                  let route = routing[device.id],
+                  route.enabled,
+                  let uid = device.coreAudioUID
+            else {
+                return nil
+            }
+            return DirectVolumeTarget(device: device, route: route, uid: uid)
+        }
+    }
+
+    private func directStereoReferenceVolume(
+        targets: [DirectVolumeTarget]
+    ) -> Float {
+        for target in targets {
+            if let hardware = AggregateDevice.readHardwareVolume(uid: target.uid) {
+                return hardware
+            }
+        }
+        return targets
+            .map { $0.route.muted ? Float(0) : $0.route.volume }
+            .max() ?? 1.0
+    }
+
+    private func directStereoReferenceMute(
+        targets: [DirectVolumeTarget]
+    ) -> Bool {
+        for target in targets {
+            if let muted = AggregateDevice.readHardwareMute(uid: target.uid) {
+                return muted
+            }
+        }
+        return targets.allSatisfy { $0.route.muted }
+    }
+
+    private func handleSystemVolumeKey(_ action: SystemVolumeKeyAction) {
+        guard directStereoVolumeKeyEligible else { return }
+        let targets = enabledDirectStereoVolumeTargets()
+        guard !targets.isEmpty else { return }
+        let step = Float(1.0 / 16.0)
+        switch action {
+        case .volumeUp, .volumeDown:
+            let current = directStereoReferenceVolume(targets: targets)
+            let direction: Float = action == .volumeUp ? 1 : -1
+            let next = max(Float(0), min(Float(1), current + direction * step))
+            let unmute = action == .volumeUp
+            applyDirectStereoSystemVolume(
+                targets: targets,
+                volume: next,
+                muted: unmute ? false : nil,
+                reason: action == .volumeUp ? "volumeUp" : "volumeDown"
+            )
+        case .mute:
+            let nextMuted = !directStereoReferenceMute(targets: targets)
+            applyDirectStereoSystemVolume(
+                targets: targets,
+                volume: nil,
+                muted: nextMuted,
+                reason: nextMuted ? "mute" : "unmute"
+            )
+        }
+    }
+
+    private func applyDirectStereoSystemVolume(
+        targets: [DirectVolumeTarget],
+        volume: Float?,
+        muted: Bool?,
+        reason: String
+    ) {
+        var changedIDs: [String] = []
+        for target in targets {
+            var route = target.route
+            if let volume {
+                route.volume = max(0, min(1, volume))
+            }
+            if let muted {
+                route.muted = muted
+            }
+            if route != target.route {
+                routing[target.device.id] = route
+                changedIDs.append(String(target.device.id.prefix(8)))
+            }
+            applyDirectStereoHardwareVolume(
+                device: target.device,
+                route: route,
+                uid: target.uid
+            )
+        }
+        guard !changedIDs.isEmpty else { return }
+        pendingAutoCalibrationApply = nil
+        reconcileEngine()
+        reconcileBackgroundCalibration()
+        let label = volume.map { String(format: "%.2f", $0) } ?? "unchanged"
+        SyncCastLog.log(
+            "systemVolumeKey: direct stereo \(reason) volume=\(label) targets=\(changedIDs.joined(separator: ","))"
+        )
+    }
+
+    private func applyDirectStereoHardwareVolumeIfNeeded(for id: String) {
+        guard directStereoVolumeKeyEligible,
+              let device = devices.first(where: { $0.id == id }),
+              device.transport == .coreAudio,
+              let uid = device.coreAudioUID,
+              let route = routing[id],
+              route.enabled
+        else {
+            return
+        }
+        applyDirectStereoHardwareVolume(device: device, route: route, uid: uid)
+    }
+
+    private func applyDirectStereoHardwareVolume(
+        device: Device,
+        route: DeviceRouting,
+        uid: String
+    ) {
+        Task { [router] in
+            await router.applyDirectStereoHardwareVolume(
+                deviceID: device.id,
+                uid: uid,
+                volume: route.volume,
+                muted: route.muted
+            )
+        }
+    }
+
     func setVolume(_ value: Float, for id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         let old = r.volume
@@ -2137,6 +2285,7 @@ final class AppModel {
         if changedEnoughForResync {
             pendingAutoCalibrationApply = nil
         }
+        applyDirectStereoHardwareVolumeIfNeeded(for: id)
         reconcileEngine()
         reconcileBackgroundCalibration()
         if changedEnoughForResync {
@@ -2162,6 +2311,7 @@ final class AppModel {
         r.muted = muted
         routing[id] = r
         pendingAutoCalibrationApply = nil
+        applyDirectStereoHardwareVolumeIfNeeded(for: id)
         reconcileEngine()
         reconcileBackgroundCalibration()
         let name = devices.first(where: { $0.id == id })?.name ?? id

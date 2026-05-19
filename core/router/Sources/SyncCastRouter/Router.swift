@@ -987,7 +987,15 @@ public actor Router {
             hwVolInfo += " hwVolRejected[\(uid.prefix(6))]=\(count)"
         }
         let directInfo = directStereoOutput.map { " \($0.diagnostic)" } ?? ""
-        return "\(capture.diagnosticReport())\(driverInfo)\(directInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)\(hwVolInfo)"
+        let captureInfo: String
+        if mode == .stereo,
+           let direct = directStereoOutput,
+           direct.isActive {
+            captureInfo = "backend=directNoCapture seen=0 written=0 ticks=0 peak=0.0000/0.0000 readback=0.0000@-1 last=directStereo"
+        } else {
+            captureInfo = capture.diagnosticReport()
+        }
+        return "\(captureInfo)\(driverInfo)\(directInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)\(hwVolInfo)"
     }
 
     /// Backward-compatible wrapper for older diagnostic call sites.
@@ -1009,6 +1017,43 @@ public actor Router {
             reconcileLocalDriver(devices: devices)
         }
         replan()
+    }
+
+    /// Best-effort hardware volume/mute write for Direct Stereo.
+    ///
+    /// Direct Stereo has no AUHAL render callback and therefore no software
+    /// gain stage. A user-visible volume change can only be reflected on
+    /// physical devices whose CoreAudio driver exposes writable output
+    /// volume/mute controls. Unsupported devices (typical HDMI/DP displays)
+    /// are logged once and otherwise left to their own OSD/hardware control.
+    @discardableResult
+    public func applyDirectStereoHardwareVolume(
+        deviceID: String,
+        uid: String,
+        volume: Float,
+        muted: Bool
+    ) -> Bool {
+        guard mode == .stereo,
+              stereoOutputPath == .direct,
+              let direct = directStereoOutput,
+              direct.covers(uid: uid)
+        else {
+            return false
+        }
+        let ok = direct.applyHardwareVolume(uid: uid, volume: volume, muted: muted)
+        if ok {
+            return true
+        }
+        aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
+        aggregateHwVolumeUnsupportedUIDs.insert(uid)
+        if !loggedHwVolumeRejectionUIDs.contains(uid) {
+            loggedHwVolumeRejectionUIDs.insert(uid)
+            FileHandle.standardError.write(Data(
+                ("[Router] direct stereo hardware volume unsupported for \(uid.prefix(20)) — system/media-key volume cannot control this device through CoreAudio; use the device OSD or hardware controls\n").utf8
+            ))
+        }
+        _ = deviceID
+        return false
     }
 
     /// Force a complete local-driver tear-down + rebuild, bypassing the

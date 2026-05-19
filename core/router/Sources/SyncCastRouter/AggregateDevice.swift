@@ -691,6 +691,94 @@ public final class AggregateDevice {
         return Self.applyHardwareVolume(physicalID: physicalID, volume: clamped)
     }
 
+    /// Read the best available output volume scalar for a physical device UID.
+    ///
+    /// Aggregate devices created by Direct Stereo do not expose their own
+    /// VolumeScalar property, so UI/media-key bridges need to read from a real
+    /// subdevice such as the built-in speaker. Element 0 is preferred because
+    /// that is the normal macOS "master" output volume. If a driver only
+    /// exposes per-channel elements, return their average so a balanced stereo
+    /// device still maps to one scalar.
+    public static func readHardwareVolume(uid: String) -> Float? {
+        guard let physicalID = try? deviceIDForUID(uid) else { return nil }
+        if let master = readVolumeScalar(physicalID, element: 0) {
+            return max(0, min(1, master))
+        }
+        var values: [Float] = []
+        var consecutiveMisses = 0
+        for elem in 1...32 {
+            let element = AudioObjectPropertyElement(elem)
+            if let value = readVolumeScalar(physicalID, element: element) {
+                values.append(max(0, min(1, value)))
+                consecutiveMisses = 0
+            } else {
+                consecutiveMisses += 1
+                if consecutiveMisses >= 4 { break }
+            }
+        }
+        guard !values.isEmpty else { return nil }
+        return values.reduce(Float(0), +) / Float(values.count)
+    }
+
+    /// Best-effort write of hardware volume for a physical CoreAudio device UID.
+    ///
+    /// This intentionally does not snapshot/restore: callers use it to mirror
+    /// the user's explicit system/UI volume intent, so persistence should match
+    /// normal macOS output volume behavior.
+    @discardableResult
+    public static func applyHardwareVolume(uid: String, volume: Float) -> Bool {
+        guard let physicalID = try? deviceIDForUID(uid) else { return false }
+        let clamped = max(Float(0), min(Float(1), volume))
+        return applyHardwareVolume(physicalID: physicalID, volume: clamped)
+    }
+
+    /// Read the best available output mute state for a physical device UID.
+    public static func readHardwareMute(uid: String) -> Bool? {
+        guard let physicalID = try? deviceIDForUID(uid) else { return nil }
+        if let master = readMute(physicalID, element: 0) {
+            return master
+        }
+        var values: [Bool] = []
+        var consecutiveMisses = 0
+        for elem in 1...32 {
+            let element = AudioObjectPropertyElement(elem)
+            if let value = readMute(physicalID, element: element) {
+                values.append(value)
+                consecutiveMisses = 0
+            } else {
+                consecutiveMisses += 1
+                if consecutiveMisses >= 4 { break }
+            }
+        }
+        guard !values.isEmpty else { return nil }
+        return values.allSatisfy { $0 }
+    }
+
+    /// Best-effort write of output mute for a physical CoreAudio device UID.
+    @discardableResult
+    public static func applyHardwareMute(uid: String, muted: Bool) -> Bool {
+        guard let physicalID = try? deviceIDForUID(uid) else { return false }
+        if isMuteWritable(physicalID, element: 0),
+           writeMute(physicalID, element: 0, muted: muted) {
+            return true
+        }
+        var anyWrite = false
+        var consecutiveMisses = 0
+        for elem in 1...32 {
+            let element = AudioObjectPropertyElement(elem)
+            if isMuteWritable(physicalID, element: element) {
+                if writeMute(physicalID, element: element, muted: muted) {
+                    anyWrite = true
+                }
+                consecutiveMisses = 0
+            } else {
+                consecutiveMisses += 1
+                if consecutiveMisses >= 4 { break }
+            }
+        }
+        return anyWrite
+    }
+
     /// First-write-only snapshot of the per-element volume scalars for the
     /// given physical device. Subsequent calls are no-ops. Captures every
     /// element our writer would target — element 0 (if writable) and
@@ -920,6 +1008,56 @@ public final class AggregateDevice {
         guard AudioObjectHasProperty(id, &addr) else { return false }
         var value = volume
         let size = UInt32(MemoryLayout<Float>.size)
+        let status = AudioObjectSetPropertyData(id, &addr, 0, nil, size, &value)
+        return status == noErr
+    }
+
+    private static func readMute(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement
+    ) -> Bool? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return nil }
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value)
+        return status == noErr ? value != 0 : nil
+    }
+
+    private static func isMuteWritable(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var settable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(id, &addr, &settable) == noErr else {
+            return false
+        }
+        return settable.boolValue
+    }
+
+    private static func writeMute(
+        _ id: AudioObjectID,
+        element: AudioObjectPropertyElement,
+        muted: Bool
+    ) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return false }
+        var value: UInt32 = muted ? 1 : 0
+        let size = UInt32(MemoryLayout<UInt32>.size)
         let status = AudioObjectSetPropertyData(id, &addr, 0, nil, size, &value)
         return status == noErr
     }
