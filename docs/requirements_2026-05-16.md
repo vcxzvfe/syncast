@@ -186,3 +186,28 @@ SCK 对照复测也失败在权限/DRM 风险链路：日志显示 `screen-recor
 - `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/readiness.json`
 - `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/auto_start_capture_preflight.json`
 - `/Users/zifan/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/control_report.json`
+
+## 8. 2026-05-19 Direct Stereo 系统音量需求
+
+用户新增需求：Stereo Direct Output 模式不需要录屏权限，因此本地 `MacBook Pro扬声器 + PG27UCDM` 这类低延迟播放应尽量能用 macOS 音量键/鼠标音量键快速调节，不必每次打开 SyncCast UI。
+
+现场 CoreAudio 探测结果：
+
+- 当前 `SyncCast Direct Stereo Output` public stacked aggregate 没有 `kAudioDevicePropertyVolumeScalar` / `kAudioDevicePropertyMute`。
+- `AudioHardwareServiceDeviceProperty_VirtualMainVolume` / `VirtualMainBalance` 在该 aggregate 上也不存在、不可写。
+- `MacBook Pro扬声器` 暴露可写 master volume/mute；`PG27UCDM` HDMI/DP 输出没有可写 CoreAudio volume/mute，仍只能用显示器 OSD 或硬件路径控制。
+
+因此本轮不伪装成“系统音量面板原生支持 SyncCast aggregate”。公共 aggregate 在当前 macOS/硬件组合下没有系统级音量属性；若未来必须让 Control Center / Sound 面板显示一个真正可写的 SyncCast 输出滑杆，工程方向应升级为 Audio Server Plug-In/虚拟声卡，代价是安装、签名、公证和 driver lifecycle，不属于轻量 Direct Stereo 修补。
+
+本轮落地的可行改进：
+
+- 新增 `SystemVolumeKeyController`，监听系统 media volume up/down/mute 事件，不拦截事件，只把键盘/鼠标音量快捷键映射到 Direct Stereo 的本地 enabled CoreAudio routes。
+- `AppModel` 在 Direct Stereo running 时把系统音量键作为 group volume：音量加/减按 1/16 步进更新当前 enabled 本地设备的 SyncCast route volume；mute 键切换本地 routes mute 状态。
+- `Router.applyDirectStereoHardwareVolume` 和 `DirectStereoOutput.applyHardwareVolume` 会把这些用户意图写到底层物理设备的 CoreAudio hardware volume/mute。可写设备（例如 MacBook Pro 内置扬声器）会跟随；不可写设备（典型 PG27UCDM/HDMI/DP 显示器）fail closed 并只记录一次日志，不能声称已被软件控制。
+- SyncCast UI 的 per-device volume/mute 在 Direct Stereo running 时也会触发同一 hardware-volume 写入路径；启动 Direct Stereo 时不会用默认 `1.0` 主动覆盖用户当前系统音量，避免突然放大。
+
+验证状态：
+
+- `swift build --package-path apps/menubar` 通过。
+- `swift build --package-path core/router --product SyncCastRouterTimingCheck` 通过。
+- 现场 probe 证明当前 aggregate 的原生系统音量属性不可用；后续测试重点是实际键盘/鼠标音量键是否能被 app 进程收到，并确认 MBP speaker 跟随、PG27UCDM 明确不被误报为可控。

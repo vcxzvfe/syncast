@@ -248,6 +248,32 @@ public final class DirectStereoOutput {
         activeDefaultOutputUID = aggregate.uid
     }
 
+    public func covers(uid: String) -> Bool {
+        coveredUIDs.contains(uid)
+    }
+
+    /// Apply an explicit user volume/mute intent to one physical subdevice.
+    ///
+    /// Direct Stereo intentionally has no render callback: ordinary media apps
+    /// render straight into the public aggregate/default output to avoid
+    /// ScreenCaptureKit and preserve DRM playback. That means software gain is
+    /// impossible here; the only safe volume path is the underlying device's
+    /// CoreAudio hardware volume/mute property. HDMI/DP monitors often expose
+    /// neither, so this is best-effort and returns false when the hardware
+    /// refuses control.
+    @discardableResult
+    public func applyHardwareVolume(
+        uid: String,
+        volume: Float,
+        muted: Bool
+    ) -> Bool {
+        guard isActive, coveredUIDs.contains(uid) else { return false }
+        let target = muted ? Float(0) : max(Float(0), min(Float(1), volume))
+        let muteOK = AggregateDevice.applyHardwareMute(uid: uid, muted: muted)
+        let volumeOK = AggregateDevice.applyHardwareVolume(uid: uid, volume: target)
+        return muteOK || volumeOK
+    }
+
     private static func deduplicate(_ targets: [Target]) -> [Target] {
         var seen = Set<String>()
         var result: [Target] = []
