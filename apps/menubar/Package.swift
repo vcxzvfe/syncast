@@ -22,5 +22,10 @@ let package = Package(
                 .copy("Resources/MenubarIcon@3x.png"),
             ]
         ),
+        .testTarget(
+            name: "SyncCastMenuBarTests",
+            dependencies: ["SyncCastMenuBar"],
+            path: "Tests/SyncCastMenuBarTests"
+        ),
     ]
 )

@@ -132,8 +132,16 @@ final class AppModel {
     /// to sync them is to delay the local path by 1.8 s, which destroys
     /// the reason to use it. Every commercial multi-room product
     /// (Sonos, Apple Music + AirPlay 2, Roon) makes this same split.
-    var mode: Mode = .stereo
-    var streamingState: StreamingState = .idle
+    var mode: Mode = .stereo {
+        didSet { updateVolumeKeyEligibility(reason: "mode → \(mode.rawValue)") }
+    }
+    var streamingState: StreamingState = .idle {
+        didSet {
+            updateVolumeKeyEligibility(
+                reason: "streamingState → \(streamingState.rawValue)"
+            )
+        }
+    }
     var lastError: String?
     /// Screen Recording TCC permission state. We replaced the old
     /// "BlackHole microphone" gate with this.
@@ -631,6 +639,76 @@ final class AppModel {
     var sidecarRunning: Bool = false
     private var systemVolumeKeyController: SystemVolumeKeyController?
 
+    /// How media volume keys are currently captured (event tap / monitor
+    /// fallback / permission missing). Mirrored from the controller so
+    /// the popover can render the Accessibility hint reactively.
+    private(set) var volumeKeyCaptureState: SystemVolumeKeyCaptureState =
+        .needsPermission
+
+    /// Per-device hardware volume backend for the Direct Stereo covered
+    /// set, keyed by SyncCast device id (NOT CoreAudio UID). `.none`
+    /// devices get a "volume not controllable" hint in their row.
+    /// Populated by `refreshDirectStereoVolumeState`.
+    private(set) var directStereoVolumeBackends:
+        [String: DirectStereoVolumeBackend] = [:]
+
+    /// Watches covered devices' hardware volume/mute so external changes
+    /// (System Settings, Audio MIDI Setup) flow back into `routing` and
+    /// the popover sliders stay truthful. Lazily created on first Direct
+    /// Stereo run.
+    private var hardwareVolumeObserver: HardwareVolumeObserver?
+
+    /// In-flight hardware-state snapshot task; cancelled by the next
+    /// refresh so a stale read never overwrites a newer one.
+    private var directStereoVolumeSyncTask: Task<Void, Never>?
+
+    /// Media-key gate on the enter-running hardware snapshot (Codex P2):
+    /// eligibility flips on synchronously, but until the async snapshot
+    /// lands the routing values are last session's persisted sliders — a
+    /// key press in that window would step from and WRITE those stale
+    /// levels to hardware. Pure transitions live in
+    /// `DirectStereoVolumeLogic.SnapshotGate` (harness-checked); this is
+    /// just the live state plus the fallback timer that guarantees keys
+    /// can never stay dead when a snapshot stalls or fails.
+    private var volumeKeySnapshotGate = DirectStereoVolumeLogic.SnapshotGate.State()
+    private var volumeKeySnapshotGateFallbackTask: Task<Void, Never>?
+    /// Episode that already logged a dropped key, so holding a volume key
+    /// (autorepeat ~33 ms) during the gate window logs once, not 70 times.
+    private var volumeKeyGateDropLoggedEpisode: UInt64?
+    /// Upper bound on how long the gate may hold keys. Generous against
+    /// `DDCDisplayVolumeController.settleTimeoutSeconds` (2 s) plus the
+    /// HAL reads, yet short enough that a wedged snapshot degrades to the
+    /// old behavior (keys live on possibly-stale routing) instead of
+    /// permanently dead keys.
+    private static let volumeKeySnapshotGateFallbackSeconds: Double = 2.5
+
+    /// Covered-set fingerprint — (SyncCast device id, CoreAudio UID)
+    /// pairs — captured by the last hardware snapshot. The reconcile path
+    /// re-snapshots ONLY when this changes; `nil` (never snapshotted /
+    /// left eligibility) always triggers. Rationale: plain volume/mute
+    /// writes also funnel through `reconcileEngine`, but DDC writes are
+    /// queued and CoreAudio writes are async on the router actor — a
+    /// snapshot racing such a write reads the OLD hardware value and
+    /// writes it back into `routing`, visibly yanking the slider the user
+    /// just dragged. Snapshots are therefore gated to (a) direct stereo
+    /// entering running (`updateVolumeKeyEligibility`), (b) covered-set
+    /// changes (here), and (c) explicit events like wake (`handleWake`).
+    ///
+    /// The fingerprint must include the device id, not just the UID:
+    /// discovery can republish the same UID under a new device id while
+    /// playback continues, and `directStereoVolumeBackends` plus the
+    /// hardware observer are keyed by device id — a UID-only fingerprint
+    /// left both on the dead id (see
+    /// `DirectStereoVolumeLogic.coveredSetFingerprint`).
+    private var lastDirectStereoSnapshotFingerprint:
+        Set<DirectStereoVolumeLogic.CoveredDeviceKey>?
+
+    /// One-shot flag key for the Accessibility permission prompt — the
+    /// system dialog should appear at most once, on the first "direct
+    /// stereo running without permission" transition.
+    private static let accessibilityPromptShownKey =
+        "syncast.accessibilityPromptShown"
+
     /// Debounce guard for `reconcileEngine`. Each call cancels the
     /// previous timer; only the last call within an 80 ms quiet window
     /// actually fires the reconciler. Keeps "user mashes toggle rows" from
@@ -675,13 +753,23 @@ final class AppModel {
         if !Self.activeAcousticCalibrationEnabled {
             UserDefaults.standard.set(false, forKey: Self.bgEnabledKey)
         }
-        let volumeController = SystemVolumeKeyController { [weak self] action in
-            Task { @MainActor [weak self] in
-                self?.handleSystemVolumeKey(action)
+        let volumeController = SystemVolumeKeyController(
+            onAction: { [weak self] action in
+                // Called from the tap thread (or an NSEvent monitor) —
+                // hop to the main actor before touching model state.
+                Task { @MainActor [weak self] in
+                    self?.handleSystemVolumeKey(action)
+                }
+            },
+            onStateChange: { [weak self] state in
+                Task { @MainActor [weak self] in
+                    self?.volumeKeyCaptureState = state
+                }
             }
-        }
+        )
         volumeController.start()
         self.systemVolumeKeyController = volumeController
+        updateVolumeKeyEligibility(reason: "init")
         Task { await self.bootstrap() }
     }
 
@@ -1895,6 +1983,28 @@ final class AppModel {
             switch mode {
             case .stereo:
                 await router.syncLocalOutputs(devices: devices)
+                // The covered set may have changed (toggle / hot-plug /
+                // discovery republishing a UID under a new device id)
+                // without a streamingState transition, so the didSet hook
+                // doesn't fire — refresh capabilities + hardware volumes
+                // for the new set here. GATED on the (id, uid) set
+                // actually changing: volume/mute writes also land in this
+                // arm via reconcileEngine, and snapshotting on those reads
+                // racy hardware state (queued DDC / async router-actor
+                // writes) and would shove stale values back into
+                // routing. Enter-running and wake snapshots are handled
+                // by updateVolumeKeyEligibility / handleWake.
+                let coveredFingerprint =
+                    DirectStereoVolumeLogic.coveredSetFingerprint(
+                        idUIDPairs: enabledDirectStereoVolumeTargets().map {
+                            (id: $0.device.id, uid: $0.uid)
+                        }
+                    )
+                if coveredFingerprint != lastDirectStereoSnapshotFingerprint {
+                    refreshDirectStereoVolumeState(
+                        reason: "reconcile covered set changed"
+                    )
+                }
             case .wholeHome:
                 await router.startWholeHome(devices: devices)
                 await reapplyWholeHomeDelayLine(
@@ -2159,90 +2269,111 @@ final class AppModel {
         }
     }
 
-    private func directStereoReferenceVolume(
-        targets: [DirectVolumeTarget]
-    ) -> Float {
-        for target in targets {
-            if let hardware = AggregateDevice.readHardwareVolume(uid: target.uid) {
-                return hardware
-            }
-        }
-        return targets
-            .map { $0.route.muted ? Float(0) : $0.route.volume }
-            .max() ?? 1.0
-    }
-
-    private func directStereoReferenceMute(
-        targets: [DirectVolumeTarget]
-    ) -> Bool {
-        for target in targets {
-            if let muted = AggregateDevice.readHardwareMute(uid: target.uid) {
-                return muted
-            }
-        }
-        return targets.allSatisfy { $0.route.muted }
-    }
-
     private func handleSystemVolumeKey(_ action: SystemVolumeKeyAction) {
         guard directStereoVolumeKeyEligible else { return }
+        // Snapshot gate (Codex P2): until the enter-running hardware
+        // snapshot lands, `routing` still holds last session's persisted
+        // slider values — stepping from them would write stale levels to
+        // hardware. Drop the action (the tap already consumed the event,
+        // so macOS shows no "forbidden" OSD); the fallback timer bounds
+        // the window to a few seconds at worst.
+        guard volumeKeySnapshotGate.allowsKeys else {
+            if volumeKeyGateDropLoggedEpisode != volumeKeySnapshotGate.episode {
+                volumeKeyGateDropLoggedEpisode = volumeKeySnapshotGate.episode
+                SyncCastLog.log(
+                    "systemVolumeKey: \(action) dropped — enter-running hardware snapshot still in flight (episode \(volumeKeySnapshotGate.episode))"
+                )
+            }
+            return
+        }
         let targets = enabledDirectStereoVolumeTargets()
         guard !targets.isEmpty else { return }
-        let step = Float(1.0 / 16.0)
         switch action {
-        case .volumeUp, .volumeDown:
-            let current = directStereoReferenceVolume(targets: targets)
-            let direction: Float = action == .volumeUp ? 1 : -1
-            let next = max(Float(0), min(Float(1), current + direction * step))
-            let unmute = action == .volumeUp
-            applyDirectStereoSystemVolume(
-                targets: targets,
-                volume: next,
-                muted: unmute ? false : nil,
-                reason: action == .volumeUp ? "volumeUp" : "volumeDown"
-            )
+        case .volumeUp:
+            applyDirectStereoVolumeKeyChange(
+                targets: targets, reason: "volumeUp"
+            ) { route in
+                var next = route
+                next.volume = DirectStereoVolumeLogic.steppedVolume(
+                    from: route.volume, direction: .up
+                )
+                if DirectStereoVolumeLogic.unmutesOnStep(.up) {
+                    next.muted = false
+                }
+                return next
+            }
+        case .volumeDown:
+            applyDirectStereoVolumeKeyChange(
+                targets: targets, reason: "volumeDown"
+            ) { route in
+                var next = route
+                next.volume = DirectStereoVolumeLogic.steppedVolume(
+                    from: route.volume, direction: .down
+                )
+                return next
+            }
         case .mute:
-            let nextMuted = !directStereoReferenceMute(targets: targets)
-            applyDirectStereoSystemVolume(
-                targets: targets,
-                volume: nil,
-                muted: nextMuted,
-                reason: nextMuted ? "mute" : "unmute"
+            let muteAll = DirectStereoVolumeLogic.groupMuteTarget(
+                currentlyMuted: targets.map(\.route.muted)
             )
+            applyDirectStereoVolumeKeyChange(
+                targets: targets, reason: muteAll ? "mute" : "unmute"
+            ) { route in
+                var next = route
+                next.muted = muteAll
+                return next
+            }
         }
     }
 
-    private func applyDirectStereoSystemVolume(
+    /// Apply one media-key action across the covered set.
+    ///
+    /// Each device is transformed RELATIVE to its own current route (its
+    /// own volume ± 1/16) — never set to a shared absolute value — so the
+    /// per-device balance the user dialed in survives. The old behavior
+    /// (read one device's hardware volume as a "reference", write that
+    /// absolute value everywhere) collapsed the MBP-speakers-vs-monitor
+    /// balance on the first key press, and synchronously read CoreAudio
+    /// on the main thread per press.
+    ///
+    /// Deliberately does NOT call reconcileEngine() /
+    /// reconcileBackgroundCalibration():
+    ///   - a volume key cannot change the covered device set (enabled
+    ///     flags are untouched), so reconcile's syncLocalOutputs pass is
+    ///     a guaranteed no-op for the direct path;
+    ///   - background calibration is gated on mode == .wholeHome and
+    ///     cannot apply here;
+    ///   - a held key repeats every ~33 ms and each reconcile pass logs
+    ///     multiple lines, which flooded launch.log without changing any
+    ///     engine state.
+    /// The Router's routing copy is kept in sync with a targeted
+    /// setRouting push instead.
+    private func applyDirectStereoVolumeKeyChange(
         targets: [DirectVolumeTarget],
-        volume: Float?,
-        muted: Bool?,
-        reason: String
+        reason: String,
+        transform: (DeviceRouting) -> DeviceRouting
     ) {
-        var changedIDs: [String] = []
+        var changedSummaries: [String] = []
         for target in targets {
-            var route = target.route
-            if let volume {
-                route.volume = max(0, min(1, volume))
-            }
-            if let muted {
-                route.muted = muted
-            }
-            if route != target.route {
-                routing[target.device.id] = route
-                changedIDs.append(String(target.device.id.prefix(8)))
-            }
+            let next = transform(target.route)
+            guard next != target.route else { continue }
+            routing[target.device.id] = next
+            changedSummaries.append(
+                "\(target.device.id.prefix(8))=\(String(format: "%.2f", next.volume))\(next.muted ? "(muted)" : "")"
+            )
             applyDirectStereoHardwareVolume(
                 device: target.device,
-                route: route,
+                route: next,
                 uid: target.uid
             )
+            Task { [router] in
+                await router.setRouting(next)
+            }
         }
-        guard !changedIDs.isEmpty else { return }
+        guard !changedSummaries.isEmpty else { return }
         pendingAutoCalibrationApply = nil
-        reconcileEngine()
-        reconcileBackgroundCalibration()
-        let label = volume.map { String(format: "%.2f", $0) } ?? "unchanged"
         SyncCastLog.log(
-            "systemVolumeKey: direct stereo \(reason) volume=\(label) targets=\(changedIDs.joined(separator: ","))"
+            "systemVolumeKey: direct stereo \(reason) → \(changedSummaries.joined(separator: ", "))"
         )
     }
 
@@ -2264,6 +2395,10 @@ final class AppModel {
         route: DeviceRouting,
         uid: String
     ) {
+        // Announce our write BEFORE it lands so the hardware observer's
+        // suppression window is already open when CoreAudio fires the
+        // property listener (prevents our own echo re-entering routing).
+        hardwareVolumeObserver?.noteAppInitiatedWrite(uid: uid)
         Task { [router] in
             await router.applyDirectStereoHardwareVolume(
                 deviceID: device.id,
@@ -2272,6 +2407,311 @@ final class AppModel {
                 muted: route.muted
             )
         }
+    }
+
+    // MARK: - Direct Stereo volume-key plumbing
+
+    /// Push the "direct stereo running" gate into the volume-key
+    /// controller (read synchronously by the event-tap thread), trigger
+    /// the one-shot Accessibility prompt on first eligible transition,
+    /// and (re)sync routes from hardware. Called from `mode` /
+    /// `streamingState` didSet plus init, so every state transition is
+    /// covered without sprinkling calls over the reconcile paths.
+    private func updateVolumeKeyEligibility(reason: String) {
+        let eligible = directStereoVolumeKeyEligible
+        systemVolumeKeyController?.setEligible(eligible)
+        if eligible {
+            // Snapshot gate (Codex P2): keys stay held (tap consumes,
+            // AppModel drops) until the snapshot below lands or the
+            // fallback fires. Only a closed→waiting transition arms the
+            // timer; eligible→eligible re-entries leave an open gate open.
+            let decision = DirectStereoVolumeLogic.SnapshotGate
+                .becameEligible(volumeKeySnapshotGate)
+            volumeKeySnapshotGate = decision.state
+            if decision.shouldArmFallback {
+                armVolumeKeySnapshotGateFallback(
+                    episode: decision.state.episode
+                )
+            }
+            maybePromptForAccessibility()
+            refreshDirectStereoVolumeState(reason: reason)
+        } else {
+            volumeKeySnapshotGate = DirectStereoVolumeLogic.SnapshotGate
+                .becameIneligible(volumeKeySnapshotGate)
+            volumeKeySnapshotGateFallbackTask?.cancel()
+            volumeKeySnapshotGateFallbackTask = nil
+            directStereoVolumeSyncTask?.cancel()
+            directStereoVolumeSyncTask = nil
+            hardwareVolumeObserver?.setWatchedDevices([])
+            // Next eligible entry must always take a fresh snapshot —
+            // hardware may have moved while we weren't watching.
+            lastDirectStereoSnapshotFingerprint = nil
+        }
+    }
+
+    /// Bounded release for the snapshot gate: if the enter-running
+    /// snapshot stalls (wedged I2C probe, HAL hang) or fails without
+    /// reaching `applyDirectStereoVolumeSnapshot`, the keys must degrade
+    /// to the old behavior — live, stepping from possibly-stale routing —
+    /// rather than stay dead. The episode pairing makes a timer that
+    /// outlives a quick leave/re-enter of running inert.
+    private func armVolumeKeySnapshotGateFallback(episode: UInt64) {
+        volumeKeySnapshotGateFallbackTask?.cancel()
+        volumeKeySnapshotGateFallbackTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(
+                    Self.volumeKeySnapshotGateFallbackSeconds
+                        * 1_000_000_000
+                )
+            )
+            if Task.isCancelled { return }
+            guard let self else { return }
+            let next = DirectStereoVolumeLogic.SnapshotGate.fallbackFired(
+                self.volumeKeySnapshotGate, episode: episode
+            )
+            if next != self.volumeKeySnapshotGate {
+                SyncCastLog.log(
+                    "systemVolumeKey: snapshot gate opened by fallback timeout (episode \(episode)) — snapshot never settled, volume keys released"
+                )
+            }
+            self.volumeKeySnapshotGate = next
+        }
+    }
+
+    /// Show the system Accessibility prompt at most once, and only when
+    /// direct stereo is actually running without the permission —
+    /// prompting at launch (before the user ever plays audio) would be
+    /// noise.
+    private func maybePromptForAccessibility() {
+        guard volumeKeyCaptureState == .needsPermission else { return }
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.accessibilityPromptShownKey) else {
+            return
+        }
+        defaults.set(true, forKey: Self.accessibilityPromptShownKey)
+        systemVolumeKeyController?.promptForAccessibilityPermission()
+    }
+
+    /// One-shot sync of route volumes/mutes to REAL hardware state when
+    /// direct stereo enters running (or the covered set changes), plus
+    /// backend capability capture and hardware-observer wiring.
+    ///
+    /// Why: the popover slider persists across sessions while hardware
+    /// volume does not (or was changed externally). Without this sync the
+    /// first media-key press "jumps" every device to stale slider values
+    /// — one source of the user-reported "volume control feels off".
+    private func refreshDirectStereoVolumeState(reason: String) {
+        directStereoVolumeSyncTask?.cancel()
+        guard directStereoVolumeKeyEligible else { return }
+        let targets = enabledDirectStereoVolumeTargets()
+        // Record the fingerprint so the reconcile path skips redundant
+        // snapshots until the covered (id, uid) set changes again.
+        lastDirectStereoSnapshotFingerprint =
+            DirectStereoVolumeLogic.coveredSetFingerprint(
+                idUIDPairs: targets.map { (id: $0.device.id, uid: $0.uid) }
+            )
+        guard !targets.isEmpty else {
+            directStereoVolumeBackends = [:]
+            hardwareVolumeObserver?.setWatchedDevices([])
+            // Nothing to snapshot — the gate must not hold keys hostage
+            // for a covered set that doesn't exist (keys would no-op on
+            // zero targets anyway, but the episode should settle).
+            volumeKeySnapshotGate = DirectStereoVolumeLogic.SnapshotGate
+                .snapshotSettled(volumeKeySnapshotGate)
+            return
+        }
+        directStereoVolumeSyncTask = Task { [weak self] in
+            guard let self else { return }
+            let capabilities = await self.router.directStereoVolumeCapabilities()
+            var volumes: [String: Float] = [:]
+            for target in targets {
+                if Task.isCancelled { return }
+                if let v = await self.router.readDirectStereoVolume(uid: target.uid) {
+                    volumes[target.uid] = v
+                }
+            }
+            let hardwareUIDs = targets.map(\.uid)
+                .filter { capabilities[$0] == .coreAudioHardware }
+            let mutes = await Self.readHardwareMutes(uids: hardwareUIDs)
+            if Task.isCancelled { return }
+            self.applyDirectStereoVolumeSnapshot(
+                capabilities: capabilities,
+                volumes: volumes,
+                mutes: mutes,
+                reason: reason
+            )
+        }
+    }
+
+    /// HAL mute reads off the main actor — `refreshDirectStereoVolumeState`
+    /// must not block key handling or the UI on CoreAudio IPC.
+    private nonisolated static func readHardwareMutes(
+        uids: [String]
+    ) async -> [String: Bool] {
+        await Task.detached(priority: .utility) {
+            var result: [String: Bool] = [:]
+            for uid in uids {
+                if let muted = AggregateDevice.readHardwareMute(uid: uid) {
+                    result[uid] = muted
+                }
+            }
+            return result
+        }.value
+    }
+
+    private func applyDirectStereoVolumeSnapshot(
+        capabilities: [String: DirectStereoVolumeBackend],
+        volumes: [String: Float],
+        mutes: [String: Bool],
+        reason: String
+    ) {
+        guard directStereoVolumeKeyEligible else { return }
+        let targets = enabledDirectStereoVolumeTargets()
+        var backends: [String: DirectStereoVolumeBackend] = [:]
+        var synced: [String] = []
+        for target in targets {
+            let backend = capabilities[target.uid]
+                ?? DirectStereoVolumeBackend.none
+            backends[target.device.id] = backend
+            var route = target.route
+            // Same pure mirror decision as the hardware-observer path: a
+            // muted route with a hardware scalar parked at ≈0 (emulated
+            // mute, or a driver zeroing the scalar while muted) must keep
+            // its saved volume, or a mid-mute refresh destroys the level
+            // unmute would restore.
+            let decision = DirectStereoVolumeLogic.externalHardwareChange(
+                routeVolume: route.volume,
+                routeMuted: route.muted,
+                observedVolume: volumes[target.uid],
+                observedMuted: mutes[target.uid]
+            )
+            if let volume = decision.volume {
+                route.volume = volume
+            }
+            if let muted = decision.muted {
+                route.muted = muted
+            }
+            if decision.changesAnything {
+                routing[target.device.id] = route
+                synced.append(
+                    "\(target.device.id.prefix(8))=\(String(format: "%.2f", route.volume))\(route.muted ? "(muted)" : "")"
+                )
+                Task { [router, route] in
+                    await router.setRouting(route)
+                }
+            }
+        }
+        directStereoVolumeBackends = backends
+        let watched = targets
+            .filter { backends[$0.device.id] == .coreAudioHardware }
+            .map {
+                HardwareVolumeObserver.WatchedDevice(
+                    deviceID: $0.device.id, uid: $0.uid
+                )
+            }
+        ensureHardwareVolumeObserver().setWatchedDevices(watched)
+        // Routing now mirrors real hardware — release the media keys
+        // (no-op unless this is the enter-running snapshot the gate was
+        // armed for; see SnapshotGate).
+        volumeKeySnapshotGate = DirectStereoVolumeLogic.SnapshotGate
+            .snapshotSettled(volumeKeySnapshotGate)
+        let backendSummary = backends
+            .map { "\($0.key.prefix(8))=\($0.value.rawValue)" }
+            .sorted()
+            .joined(separator: ",")
+        SyncCastLog.log(
+            "systemVolumeKey: hardware snapshot (\(reason)) backends=[\(backendSummary)] synced=\(synced.isEmpty ? "none" : synced.joined(separator: ","))"
+        )
+    }
+
+    private func ensureHardwareVolumeObserver() -> HardwareVolumeObserver {
+        if let hardwareVolumeObserver {
+            return hardwareVolumeObserver
+        }
+        let observer = HardwareVolumeObserver { [weak self] change in
+            // Observer callback arrives on its private queue.
+            Task { @MainActor [weak self] in
+                self?.handleExternalHardwareVolumeChange(change)
+            }
+        }
+        hardwareVolumeObserver = observer
+        return observer
+    }
+
+    /// External (non-SyncCast) hardware volume/mute change — mirror it
+    /// into routing so the popover slider matches reality. No hardware
+    /// write-back here: hardware is already at this value, and writing
+    /// would risk a feedback loop.
+    ///
+    /// The mirror decision is the pure
+    /// `DirectStereoVolumeLogic.externalHardwareChange`: it drops the
+    /// mute-echo case (route muted, report still muted, observed volume
+    /// ≈ 0) so our own mute write — deferred past the observer's
+    /// suppression window and republished here — can never overwrite the
+    /// saved `route.volume` with 0 (Codex P1).
+    private func handleExternalHardwareVolumeChange(
+        _ change: HardwareVolumeObserver.ExternalChange
+    ) {
+        guard directStereoVolumeKeyEligible,
+              var route = routing[change.deviceID],
+              route.enabled
+        else { return }
+        let decision = DirectStereoVolumeLogic.externalHardwareChange(
+            routeVolume: route.volume,
+            routeMuted: route.muted,
+            observedVolume: change.volume,
+            observedMuted: change.muted
+        )
+        if let volume = decision.volume {
+            route.volume = volume
+        }
+        if let muted = decision.muted {
+            route.muted = muted
+        }
+        guard decision.changesAnything else { return }
+        routing[change.deviceID] = route
+        Task { [router, route] in
+            await router.setRouting(route)
+        }
+        SyncCastLog.log(
+            "systemVolumeKey: external hardware change \(change.deviceID.prefix(8)) → volume=\(String(format: "%.2f", route.volume)) muted=\(route.muted)"
+        )
+    }
+
+    // MARK: - Volume-key UI surface
+
+    /// Popover hint visibility: direct stereo is running but the event
+    /// tap can't exist without Accessibility.
+    var volumeKeyNeedsAccessibilityHint: Bool {
+        directStereoVolumeKeyEligible
+            && volumeKeyCaptureState == .needsPermission
+    }
+
+    /// Re-check Accessibility trust (popover open). Installs the tap
+    /// immediately if the user granted permission since the last check.
+    func recheckVolumeKeyPermission() {
+        systemVolumeKeyController?.recheckPermission(reason: "popover opened")
+    }
+
+    func openAccessibilitySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+        SyncCastLog.log("systemVolumeKey: opened Accessibility settings pane")
+    }
+
+    /// Per-device-row hint for devices whose hardware volume cannot be
+    /// controlled at all (backend == .none, e.g. DisplayPort audio with
+    /// no DDC path). `.ddc` and `.coreAudioHardware` return nil — their
+    /// sliders work normally.
+    func volumeControlHint(for deviceID: String) -> String? {
+        guard directStereoVolumeKeyEligible,
+              routing[deviceID]?.enabled == true,
+              directStereoVolumeBackends[deviceID]
+                == DirectStereoVolumeBackend.none
+        else { return nil }
+        return "音量不可控 — 请用显示器按键/OSD 调节"
     }
 
     func setVolume(_ value: Float, for id: String) {
@@ -5070,6 +5510,18 @@ final class AppModel {
                         SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(maxAttempts) (capture=ok, uids=live)")
                     } else {
                         SyncCastLog.log("AppModel: post-wake rebuild succeeded first try (capture=ok, uids=live)")
+                    }
+                    // Explicit post-wake hardware snapshot (gate (c) of
+                    // the snapshot policy — see
+                    // lastDirectStereoSnapshotFingerprint). DPMS wake reissues
+                    // AudioDeviceIDs for the same UIDs: the refresh both
+                    // re-reads real hardware volume/mute into routing
+                    // and re-wires HardwareVolumeObserver's listeners
+                    // onto the fresh ids via setWatchedDevices.
+                    await MainActor.run {
+                        self.refreshDirectStereoVolumeState(
+                            reason: "post-wake rebuild"
+                        )
                     }
                     return
                 }

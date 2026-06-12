@@ -14,6 +14,10 @@ struct MainPopover: View {
             Divider().padding(.horizontal, 12)
             debugStrip
             Divider().padding(.horizontal, 12)
+            if model.volumeKeyNeedsAccessibilityHint {
+                volumeKeyPermissionHint
+                Divider().padding(.horizontal, 12)
+            }
             deviceList
             // Sync slider is only meaningful in whole-home mode.
             if model.mode == .wholeHome {
@@ -24,6 +28,33 @@ struct MainPopover: View {
             footer
         }
         .padding(.vertical, 8)
+        .onAppear {
+            // Re-check Accessibility on every popover open: if the user
+            // just granted it in System Settings, the media-key event
+            // tap installs immediately — no app restart.
+            model.recheckVolumeKeyPermission()
+        }
+    }
+
+    /// Shown only while Direct Stereo is running WITHOUT Accessibility
+    /// permission — the CGEventTap that captures media volume keys
+    /// cannot be created until the user grants it in System Settings.
+    private var volumeKeyPermissionHint: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "keyboard.badge.exclamationmark")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+            Text("音量键控制需要辅助功能权限")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("打开设置") { model.openAccessibilitySettings() }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .accessibilityIdentifier("volumeKeyPermissionButton")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
     }
 
     // MARK: - Sync section (manual-first)
@@ -853,6 +884,16 @@ private struct DeviceRow: View {
                                 set: { model.setVolume(Float($0), for: deviceID) }
                             )
                         )
+                    }
+                    // Direct Stereo: devices with no controllable hardware
+                    // volume (backend == .none — no CoreAudio volume, no
+                    // DDC path) get a one-line hint; .ddc and CoreAudio
+                    // hardware backends render the normal slider only.
+                    if let hint = model.volumeControlHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
                 // One-line failure breadcrumb. Only shown when the

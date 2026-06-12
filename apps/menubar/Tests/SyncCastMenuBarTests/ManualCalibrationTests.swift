@@ -109,6 +109,11 @@ final class ManualCalibrationTests: XCTestCase {
         m.airplayDelayMs = 1800
         m.startAudition()
         XCTAssertEqual(m.auditionState, .running(round: 1, side: .A))
+        // startAudition applies side A IMMEDIATELY: the slider moves to
+        // baseline - bracket (1800 - 150) the moment the audition starts,
+        // so the user hears side A right away instead of the baseline.
+        XCTAssertEqual(m.airplayDelayMs, 1650,
+                       "startAudition must apply side A (baseline - 150) immediately")
     }
 
     func test_startAudition_when_already_running_is_noop() {
@@ -127,20 +132,25 @@ final class ManualCalibrationTests: XCTestCase {
         let m = makeModel()
         m.airplayDelayMs = 1800
         m.startAudition()
-        // After startAudition: baseline = 1800. A and B sides differ from
-        // baseline by ±75. chooseAuditionA picks A → baseline -= 75 = 1725.
+        // After startAudition: baseline = 1800, slider already at side A
+        // (baseline - 150 = 1650). chooseAuditionA narrows the baseline
+        // down by 75 (→ 1725) AND immediately applies the next round's
+        // side A bracket: 1725 - 150 = 1575. The observable slider value
+        // is therefore baseline' - bracket, not the bare baseline.
         m.chooseAuditionA()
-        XCTAssertEqual(m.airplayDelayMs, 1725,
-                       "chooseAuditionA must subtract 75 ms from the audition baseline")
+        XCTAssertEqual(m.airplayDelayMs, 1575,
+                       "chooseAuditionA must narrow the baseline by -75 and apply the next round's side A (baseline' - 150)")
     }
 
     func test_chooseAuditionB_increases_by_75() {
         let m = makeModel()
         m.airplayDelayMs = 1800
         m.startAudition()
+        // Baseline 1800 → +75 = 1875; next round's side A applies
+        // 1875 - 150 = 1725 to the slider.
         m.chooseAuditionB()
-        XCTAssertEqual(m.airplayDelayMs, 1875,
-                       "chooseAuditionB must add 75 ms to the audition baseline")
+        XCTAssertEqual(m.airplayDelayMs, 1725,
+                       "chooseAuditionB must narrow the baseline by +75 and apply the next round's side A (baseline' - 150)")
     }
 
     func test_audition_4_rounds_returns_to_idle() {
@@ -162,19 +172,27 @@ final class ManualCalibrationTests: XCTestCase {
         m.chooseAuditionB() // round 4 → done
         XCTAssertEqual(m.auditionState, .idle,
                        "audition must return to idle after 4 decisions")
+        // On completion the BARE final baseline is applied (not a side
+        // bracket): 1800 -75 +75 -75 +75 = 1800.
+        XCTAssertEqual(m.airplayDelayMs, 1800,
+                       "audition completion must apply the final narrowed baseline")
     }
 
     func test_stopAudition_restores_baseline() {
         let m = makeModel()
         m.airplayDelayMs = 2000
-        m.startAudition()  // baseline = 2000
-        m.chooseAuditionA() // 2000 - 75 = 1925
-        XCTAssertEqual(m.airplayDelayMs, 1925)
+        m.startAudition()  // baseline = 2000, slider at side A = 1850
+        m.chooseAuditionA() // baseline 2000 - 75 = 1925, slider at 1775
+        XCTAssertEqual(m.airplayDelayMs, 1775,
+                       "after one A choice the slider sits at the new round's side A (1925 - 150)")
         m.stopAudition()
         XCTAssertEqual(m.auditionState, .idle,
                        "stopAudition must reset auditionState to .idle")
-        XCTAssertEqual(m.airplayDelayMs, 2000,
-                       "stopAudition must restore the original baseline")
+        // stopAudition restores the CURRENT audition baseline — i.e. the
+        // user's partial choices survive an early stop (here 1925 after
+        // one A choice), it does not rewind to the pre-audition 2000.
+        XCTAssertEqual(m.airplayDelayMs, 1925,
+                       "stopAudition must restore the current (narrowed) baseline, keeping partial choices")
     }
 
     // MARK: - Persistence
