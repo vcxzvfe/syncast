@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SyncCastRouter
 
 struct TimingCheckError: Error, CustomStringConvertible {
@@ -834,6 +835,474 @@ func checkPassiveSnapshotRejectsZeroCaptureTicks() throws {
     )
 }
 
+func checkDDCPacketConstructionAndChecksum() throws {
+    // Golden vectors verified against real hardware (ASUS ExternalDisplay over
+    // DisplayPort, SyncCastDDCProbe 2026-06-12).
+    try expect(
+        DDCPacket.readRequest(vcp: 0x62) == [0x82, 0x01, 0x62, 0x8F],
+        "DDC read request for VCP 0x62 must match the verified packet"
+    )
+    try expect(
+        DDCPacket.writeRequest(vcp: 0x62, value: 80)
+            == [0x84, 0x03, 0x62, 0x00, 0x50, 0x8A],
+        "DDC write request for VCP 0x62=80 must match the verified packet"
+    )
+    try expect(
+        DDCPacket.checksum(seed: 0x6E, bytes: [0x82, 0x01, 0x62][0...2]) == 0x8F,
+        "DDC XOR checksum seed/fold must match the spec"
+    )
+
+    // Reply captured from the ExternalDisplay: current=75 max=100.
+    let volumeReply: [UInt8] = [
+        0x6E, 0x88, 0x02, 0x00, 0x62, 0x00, 0x00, 0x64, 0x00, 0x4B, 0xF9,
+    ]
+    let parsedVolume = DDCPacket.parseReadReply(volumeReply, vcp: 0x62)
+    try expect(
+        parsedVolume?.current == 75 && parsedVolume?.max == 100,
+        "DDC volume reply must parse current=75 max=100"
+    )
+
+    // Mute reply captured from the ExternalDisplay: current=2 (unmuted) max=2.
+    let muteReply: [UInt8] = [
+        0x6E, 0x88, 0x02, 0x00, 0x8D, 0x00, 0x00, 0x02, 0x00, 0x02, 0x39,
+    ]
+    let parsedMute = DDCPacket.parseReadReply(muteReply, vcp: 0x8D)
+    try expect(
+        parsedMute?.current == 2 && parsedMute?.max == 2,
+        "DDC mute reply must parse current=2 max=2"
+    )
+
+    var corrupted = volumeReply
+    corrupted[10] ^= 0xFF
+    try expect(
+        DDCPacket.parseReadReply(corrupted, vcp: 0x62) == nil,
+        "DDC reply with a bad checksum must fail closed"
+    )
+    try expect(
+        DDCPacket.parseReadReply(volumeReply, vcp: 0x10) == nil,
+        "DDC reply with a mismatched opcode echo must fail closed"
+    )
+    var errorResult = volumeReply
+    errorResult[3] = 0x01  // result code: unsupported VCP
+    errorResult[10] = DDCPacket.checksum(seed: 0x50, bytes: errorResult[0...9])
+    try expect(
+        DDCPacket.parseReadReply(errorResult, vcp: 0x62) == nil,
+        "DDC reply with a non-zero result code must fail closed"
+    )
+    try expect(
+        DDCPacket.parseReadReply([0x6E, 0x88], vcp: 0x62) == nil,
+        "short DDC reply must fail closed"
+    )
+    try expect(
+        DDCPacket.parseReadReply(
+            [UInt8](repeating: 0, count: 11), vcp: 0x62
+        ) == nil,
+        "all-zero DDC reply must fail closed"
+    )
+}
+
+func checkDDCVolumeScaleConversion() throws {
+    try expect(
+        DDCVolumeScale.toVCPValue(normalized: 0.75, max: 100) == 75,
+        "0.75 of max 100 must map to VCP 75"
+    )
+    try expect(
+        DDCVolumeScale.toVCPValue(normalized: 0, max: 100) == 0
+            && DDCVolumeScale.toVCPValue(normalized: 1, max: 100) == 100,
+        "scale endpoints must map exactly"
+    )
+    try expect(
+        DDCVolumeScale.toVCPValue(normalized: -0.5, max: 100) == 0
+            && DDCVolumeScale.toVCPValue(normalized: 1.5, max: 100) == 100,
+        "out-of-range scalars must clamp"
+    )
+    try expect(
+        DDCVolumeScale.toVCPValue(normalized: 0.5, max: 0) == 0,
+        "degenerate max=0 must map to 0"
+    )
+    try expect(
+        DDCVolumeScale.toVCPValue(normalized: .nan, max: 100) == 0,
+        "non-finite scalars must fail closed to 0"
+    )
+    try expect(
+        DDCVolumeScale.toNormalized(current: 75, max: 100) == 0.75,
+        "VCP 75/100 must normalize to 0.75"
+    )
+    try expect(
+        DDCVolumeScale.toNormalized(current: 2, max: 2) == 1.0,
+        "VCP current==max must normalize to 1"
+    )
+    try expect(
+        DDCVolumeScale.toNormalized(current: 5, max: 0) == nil,
+        "degenerate max=0 must not normalize"
+    )
+}
+
+func checkDDCDisplayMatchingDecision() throws {
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "ExternalDisplay",
+            isHDMIOrDisplayPortTransport: false,
+            displayProductNames: ["ExternalDisplay"]
+        ) == 0,
+        "exact product-name match must win regardless of transport"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: " pg27ucdm ",
+            isHDMIOrDisplayPortTransport: false,
+            displayProductNames: ["ExternalDisplay"]
+        ) == 0,
+        "name match must ignore case and surrounding whitespace"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "B",
+            isHDMIOrDisplayPortTransport: false,
+            displayProductNames: ["A", "B"]
+        ) == 1,
+        "name match must pick the right display among several"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "ExternalDisplay",
+            isHDMIOrDisplayPortTransport: true,
+            displayProductNames: ["ExternalDisplay", "ExternalDisplay"]
+        ) == nil,
+        "duplicate product names are ambiguous and must fail closed"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "ASUS ExternalDisplay Audio",
+            isHDMIOrDisplayPortTransport: true,
+            displayProductNames: ["Some Other Name"]
+        ) == 0,
+        "single external display + HDMI/DP transport may match without a name hit"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "MacBook Pro Speakers",
+            isHDMIOrDisplayPortTransport: false,
+            displayProductNames: ["Some Other Name"]
+        ) == nil,
+        "non-HDMI/DP transport must not use the single-display fallback"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "Unknown",
+            isHDMIOrDisplayPortTransport: true,
+            displayProductNames: ["A", "B"]
+        ) == nil,
+        "multiple displays without a name match must fail closed"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: nil,
+            isHDMIOrDisplayPortTransport: true,
+            displayProductNames: ["ExternalDisplay"]
+        ) == 0,
+        "unreadable audio name still allows the single-display HDMI/DP fallback"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: nil,
+            isHDMIOrDisplayPortTransport: false,
+            displayProductNames: ["ExternalDisplay"]
+        ) == nil,
+        "unreadable audio name without HDMI/DP transport must fail closed"
+    )
+    try expect(
+        DDCDisplayMatching.matchIndex(
+            audioDeviceName: "ExternalDisplay",
+            isHDMIOrDisplayPortTransport: true,
+            displayProductNames: []
+        ) == nil,
+        "no external DDC displays must fail closed"
+    )
+}
+
+func checkDDCMuteEmulationPreservesUserVolume() throws {
+    // Display WITHOUT a native mute VCP (0x8D): mute is emulated as
+    // 0x62 = 0. The user-volume layer — what cachedNormalizedVolume /
+    // Router.readDirectStereoVolume report — must keep the user's level,
+    // otherwise a snapshot writes 0 back as route.volume and a later
+    // unmute "restores" silence.
+    let emulatedMute = DDCVolumeLevels.planned(
+        volume: 0.75, muted: true, supportsMuteVCP: false
+    )
+    try expect(
+        emulatedMute.outputLevel == 0,
+        "emulated mute must drive the panel's 0x62 level to 0"
+    )
+    try expect(
+        emulatedMute.userVolume == 0.75,
+        "read after an emulated mute must return the user volume, not 0"
+    )
+    let emulatedUnmute = DDCVolumeLevels.planned(
+        volume: 0.75, muted: false, supportsMuteVCP: false
+    )
+    try expect(
+        emulatedUnmute == DDCVolumeLevels(userVolume: 0.75, outputLevel: 0.75),
+        "unmute after an emulated mute must restore the user volume"
+    )
+
+    // Display WITH a native mute VCP: 0x62 stays at the user level even
+    // while muted, so both layers carry the user volume.
+    let nativeMute = DDCVolumeLevels.planned(
+        volume: 0.6, muted: true, supportsMuteVCP: true
+    )
+    try expect(
+        nativeMute == DDCVolumeLevels(userVolume: 0.6, outputLevel: 0.6),
+        "native mute must keep 0x62 at the user level"
+    )
+
+    // Both layers clamp out-of-range intents.
+    let clamped = DDCVolumeLevels.planned(
+        volume: 1.5, muted: true, supportsMuteVCP: false
+    )
+    try expect(
+        clamped.userVolume == 1.0 && clamped.outputLevel == 0,
+        "out-of-range intents must clamp in the user layer and still mute"
+    )
+    let clampedLow = DDCVolumeLevels.planned(
+        volume: -0.25, muted: false, supportsMuteVCP: true
+    )
+    try expect(
+        clampedLow == DDCVolumeLevels(userVolume: 0, outputLevel: 0),
+        "negative intents must clamp to 0 in both layers"
+    )
+}
+
+func checkDirectStereoVolumeReadbackSourceDecision() throws {
+    // Some HDMI/DP devices expose a READABLE-but-unsettable CoreAudio
+    // VolumeScalar — a stale mirror that never tracks the panel's real
+    // speaker level. Readback must follow the backend that owns WRITES,
+    // so a DDC-classified device reads the DDC user-intent cache and
+    // never that mirror (otherwise a snapshot writes the stale level back
+    // into routing and the next media key re-applies it).
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: false,
+            coreAudioPreviouslyRejected: false,
+            ddcKnownSupported: true
+        ) == .ddc,
+        "readable-but-unsettable CoreAudio with a DDC backend must read the DDC cache"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: true,
+            coreAudioPreviouslyRejected: false,
+            ddcKnownSupported: false
+        ) == .coreAudioHardware,
+        "settable CoreAudio volume must keep the CoreAudio readback"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: true,
+            coreAudioPreviouslyRejected: false,
+            ddcKnownSupported: true
+        ) == .coreAudioHardware,
+        "settable CoreAudio must win over DDC, matching the capability snapshot"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: true,
+            coreAudioPreviouslyRejected: true,
+            ddcKnownSupported: true
+        ) == .ddc,
+        "a CoreAudio write rejection must demote the settability claim to DDC"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: false,
+            coreAudioPreviouslyRejected: false,
+            ddcKnownSupported: false
+        ) == DirectStereoVolumeBackend.none,
+        "no usable backend must read nothing instead of a stale CoreAudio mirror"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: true,
+            coreAudioPreviouslyRejected: true,
+            ddcKnownSupported: false
+        ) == DirectStereoVolumeBackend.none,
+        "rejected CoreAudio without DDC support must fail closed to none"
+    )
+}
+
+func checkDirectStereoCoreAudioMutePreservesVolume() throws {
+    // CoreAudio mirror of the DDC two-layer rule (Codex P1): a device
+    // whose Mute property accepted the write must NOT have VolumeScalar
+    // driven to 0 — the observer's post-suppression echo read that 0,
+    // overwrote route.volume, and unmute "restored" silence.
+    try expect(
+        DirectStereoOutput.plannedCoreAudioVolume(
+            volume: 0.75, muted: true, muteAccepted: true
+        ) == 0.75,
+        "accepted mute write must keep VolumeScalar at the user level"
+    )
+    try expect(
+        DirectStereoOutput.plannedCoreAudioVolume(
+            volume: 0.75, muted: true, muteAccepted: false
+        ) == 0,
+        "unwritable mute must degrade to emulated mute (scalar = 0)"
+    )
+    try expect(
+        DirectStereoOutput.plannedCoreAudioVolume(
+            volume: 0.75, muted: false, muteAccepted: false
+        ) == 0.75,
+        "unmute after an emulated mute must restore the user volume"
+    )
+    try expect(
+        DirectStereoOutput.plannedCoreAudioVolume(
+            volume: 0.6, muted: false, muteAccepted: true
+        ) == 0.6,
+        "unmuted apply must write the user volume unchanged"
+    )
+    try expect(
+        DirectStereoOutput.plannedCoreAudioVolume(
+            volume: 1.5, muted: true, muteAccepted: true
+        ) == 1.0
+            && DirectStereoOutput.plannedCoreAudioVolume(
+                volume: -0.25, muted: false, muteAccepted: true
+            ) == 0,
+        "out-of-range intents must clamp to 0...1 in every mute state"
+    )
+}
+
+func checkDirectStereoVolumeApplyBookkeeping() throws {
+    // A successful DDC fallback must NOT mask a failed CoreAudio level
+    // write (Codex P2): the failure is recorded — demoting the driver's
+    // settability claim — WITHOUT counting a user-visible rejection, and
+    // the follow-on classification must be .ddc, never .coreAudioHardware.
+    // The old single-Bool return skipped all bookkeeping whenever DDC
+    // saved the intent.
+    typealias Outcome = DirectStereoOutput.HardwareVolumeApplyOutcome
+    let ddcSaved = Outcome(
+        attempted: true,
+        coreAudioVolumeAccepted: false,
+        coreAudioMuteAccepted: false,
+        ddcAccepted: true
+    )
+    try expect(
+        ddcSaved.disprovesCoreAudioSettability,
+        "a failed CoreAudio level write must be recorded even when DDC accepts the fallback"
+    )
+    try expect(
+        !ddcSaved.isUserVisibleRejection && ddcSaved.anyBackendAccepted,
+        "a successful DDC fallback must not count as a user-visible rejection"
+    )
+    try expect(
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable: true,
+            coreAudioPreviouslyRejected: ddcSaved.disprovesCoreAudioSettability,
+            ddcKnownSupported: true
+        ) == .ddc,
+        "after a DDC-saved apply the device must classify as ddc, not coreAudioHardware"
+    )
+    let coreAudioOK = Outcome(
+        attempted: true,
+        coreAudioVolumeAccepted: true,
+        coreAudioMuteAccepted: true,
+        ddcAccepted: false
+    )
+    try expect(
+        !coreAudioOK.disprovesCoreAudioSettability
+            && !coreAudioOK.isUserVisibleRejection
+            && coreAudioOK.anyBackendAccepted,
+        "a clean CoreAudio level write must record nothing"
+    )
+    let bothFailed = Outcome(
+        attempted: true,
+        coreAudioVolumeAccepted: false,
+        coreAudioMuteAccepted: false,
+        ddcAccepted: false
+    )
+    try expect(
+        bothFailed.disprovesCoreAudioSettability
+            && bothFailed.isUserVisibleRejection,
+        "both backends failing must demote settability AND count the rejection"
+    )
+    let muteOnly = Outcome(
+        attempted: true,
+        coreAudioVolumeAccepted: false,
+        coreAudioMuteAccepted: true,
+        ddcAccepted: false
+    )
+    try expect(
+        muteOnly.disprovesCoreAudioSettability
+            && !muteOnly.isUserVisibleRejection
+            && muteOnly.anyBackendAccepted,
+        "mute-only CoreAudio success carries the intent but still demotes the level settability claim"
+    )
+    let notAttempted = Outcome(
+        attempted: false,
+        coreAudioVolumeAccepted: false,
+        coreAudioMuteAccepted: false,
+        ddcAccepted: false
+    )
+    try expect(
+        !notAttempted.disprovesCoreAudioSettability
+            && !notAttempted.isUserVisibleRejection
+            && !notAttempted.anyBackendAccepted,
+        "an unattempted intent (raced teardown) must record nothing"
+    )
+}
+
+func checkDDCDroppedPendingIntentReporting() throws {
+    // Codex P2: an intent accepted while the capability probe is in
+    // flight ("probing" optimistic accept) must be REPORTED when the
+    // probe concludes unsupported — previously it vanished silently:
+    // enqueueApply returned true, the Router booked it as carried, and
+    // no rejection diagnostics ever recorded the loss.
+    //
+    // Behavioral check against a real controller instance: a UID that
+    // matches no CoreAudio device fails the fail-closed probe chain at
+    // its first step, so the probe settles on unsupported quickly and
+    // without touching any display.
+    guard DDCDisplayEnumerator.isSupported else {
+        print("  (skipped DDC dropped-intent check — IOAVService unavailable on this host)")
+        return
+    }
+    let controller = DDCDisplayVolumeController()
+    let droppedUIDs = OSAllocatedUnfairLock(initialState: [String]())
+    let dropped = DispatchSemaphore(value: 0)
+    controller.setOnPendingIntentDropped { uid in
+        droppedUIDs.withLock { $0.append(uid) }
+        dropped.signal()
+    }
+    let uid = "syncast-timingcheck-no-such-device"
+    let accepted = controller.enqueueApply(uid: uid, volume: 0.5, muted: false)
+    try expect(
+        accepted,
+        "an intent for an unprobed UID must be optimistically accepted (probe in flight)"
+    )
+    try expect(
+        dropped.wait(timeout: .now() + 5.0) == .success,
+        "the unsupported probe verdict must fire onPendingIntentDropped for the accepted intent"
+    )
+    try expect(
+        droppedUIDs.withLock { $0 } == [uid],
+        "onPendingIntentDropped must carry exactly the dropped intent's UID"
+    )
+    try expect(
+        controller.isKnownUnsupported(uid: uid),
+        "the probe verdict for a nonexistent device must settle on unsupported"
+    )
+    // Fail-closed contract unchanged: once unsupported, further intents
+    // are rejected up front (Router books those itself) and must NOT
+    // re-fire the dropped-intent signal — nothing was ever queued.
+    let rejected = controller.enqueueApply(uid: uid, volume: 0.4, muted: false)
+    try expect(
+        !rejected,
+        "an intent for a known-unsupported UID must still be rejected synchronously"
+    )
+    try expect(
+        dropped.wait(timeout: .now() + 0.5) == .timedOut,
+        "a synchronously rejected intent must not fire onPendingIntentDropped (it was never queued)"
+    )
+}
+
 let checks = [
     checkFullyPreArmCallbackDropsAllFrames,
     checkStraddlingCallbackDropsOnlyPreArmFrames,
@@ -858,6 +1327,14 @@ let checks = [
     checkPassiveBaselineMarkGuard,
     checkPassiveEvidenceIntentClassifiesSyncContext,
     checkPassiveSnapshotRejectsZeroCaptureTicks,
+    checkDDCPacketConstructionAndChecksum,
+    checkDDCVolumeScaleConversion,
+    checkDDCDisplayMatchingDecision,
+    checkDDCMuteEmulationPreservesUserVolume,
+    checkDirectStereoVolumeReadbackSourceDecision,
+    checkDirectStereoCoreAudioMutePreservesVolume,
+    checkDirectStereoVolumeApplyBookkeeping,
+    checkDDCDroppedPendingIntentReporting,
 ]
 
 do {

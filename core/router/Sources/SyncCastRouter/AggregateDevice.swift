@@ -908,6 +908,16 @@ public final class AggregateDevice {
         return index * perSubdeviceChannels
     }
 
+    /// Read-only writability probe for a device UID, used by the Router's
+    /// `directStereoVolumeCapabilities()` snapshot to classify a device as
+    /// CoreAudio-controllable WITHOUT writing anything. Shares (and
+    /// populates) the writable-elements cache, so a later
+    /// `applyHardwareVolume` skips straight to the cached element list.
+    public static func probeHardwareVolumeWritable(uid: String) -> Bool {
+        guard let physicalID = try? deviceIDForUID(uid) else { return false }
+        return !writableElements(physicalID: physicalID).isEmpty
+    }
+
     /// Static so it can be unit-tested in isolation. Tries master
     /// element first; falls back to per-channel iteration. Returns
     /// true if any write succeeded.
@@ -915,17 +925,26 @@ public final class AggregateDevice {
         physicalID: AudioObjectID,
         volume: Float
     ) -> Bool {
-        // Step 0: cache lookup. If we've already probed this device,
-        // skip straight to writing the known-writable elements.
+        writeToCachedElements(
+            physicalID,
+            elements: writableElements(physicalID: physicalID),
+            volume: volume
+        )
+    }
+
+    /// Cached writable-element lookup with lazy probe. Element 0 first,
+    /// then 1..32 with an early bail-out after 4 consecutive misses (most
+    /// DACs expose at most 2 channels, and the per-element probe on HDMI/
+    /// DP outputs is the slow path that motivated this cache). The probe
+    /// itself is read-only (HasProperty + IsSettable).
+    private static func writableElements(
+        physicalID: AudioObjectID
+    ) -> [AudioObjectPropertyElement] {
         let cached: [AudioObjectPropertyElement]? = writableElementsLock
             .withLock { writableElementsCache[physicalID] }
         if let elements = cached {
-            return writeToCachedElements(physicalID, elements: elements, volume: volume)
+            return elements
         }
-        // Step 1: probe writable elements. Element 0 first, then 1..32
-        // with an early bail-out after 4 consecutive misses (most DACs
-        // expose at most 2 channels, and the per-element probe on HDMI/
-        // DP outputs is the slow path that motivated this cache).
         var writable: [AudioObjectPropertyElement] = []
         if isVolumeWritable(physicalID, element: 0) {
             writable.append(0)
@@ -945,7 +964,7 @@ public final class AggregateDevice {
         writableElementsLock.withLock {
             writableElementsCache[physicalID] = frozen
         }
-        return writeToCachedElements(physicalID, elements: frozen, volume: volume)
+        return frozen
     }
 
     /// Write `volume` to every element in `elements`. Tries master

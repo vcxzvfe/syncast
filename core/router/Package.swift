@@ -14,6 +14,10 @@ let package = Package(
             name: "SyncCastPassiveHeadless",
             targets: ["SyncCastPassiveHeadless"]
         ),
+        .executable(
+            name: "SyncCastDDCProbe",
+            targets: ["SyncCastDDCProbe"]
+        ),
     ],
     dependencies: [
         .package(path: "../discovery"),
@@ -36,6 +40,11 @@ let package = Package(
             name: "SyncCastRouterTimingCheck",
             dependencies: ["SyncCastRouter"],
             path: "Sources/SyncCastRouterTimingCheck"
+        ),
+        .executableTarget(
+            name: "SyncCastDDCProbe",
+            dependencies: ["SyncCastRouter"],
+            path: "Sources/SyncCastDDCProbe"
         ),
         .executableTarget(
             name: "SyncCastPassiveHeadless",

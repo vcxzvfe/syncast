@@ -337,6 +337,38 @@ public actor Router {
         capture.onUnexpectedStop = { [weak self] in
             Task { await self?.handleCaptureDied() }
         }
+        // Wire the DDC controller's "accepted intent was dropped" signal
+        // into the actor (same hop pattern as onUnexpectedStop above).
+        // `enqueueApply` optimistically accepts intents while a capability
+        // probe is in flight; if the probe (or a later revalidation /
+        // write-failure demotion) lands on unsupported, the queued intent
+        // is discarded — without this hook that loss never reached the
+        // rejection bookkeeping ("UI moved, hardware didn't, nothing
+        // logged"; Codex P2). The controller is process-wide, so the most
+        // recently constructed Router owns the handler — in production
+        // exactly one Router exists per process.
+        DDCDisplayVolumeController.shared.setOnPendingIntentDropped {
+            [weak self] uid in
+            Task { await self?.recordDroppedDDCVolumeIntent(uid: uid) }
+        }
+    }
+
+    /// Retroactive rejection bookkeeping for a DDC intent that was
+    /// accepted (probe in flight / binding then demoted) and dropped when
+    /// the UID's verdict landed on unsupported. Mirrors exactly what
+    /// `applyDirectStereoHardwareVolume` records for an immediate
+    /// both-backends rejection, so diagnostics can't tell the two apart —
+    /// which is the point: to the user both are "the slider moved, the
+    /// hardware didn't".
+    private func recordDroppedDDCVolumeIntent(uid: String) {
+        aggregateHwVolumeUnsupportedUIDs.insert(uid)
+        aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
+        if !loggedHwVolumeRejectionUIDs.contains(uid) {
+            loggedHwVolumeRejectionUIDs.insert(uid)
+            FileHandle.standardError.write(Data(
+                ("[Router] DDC volume intent for \(uid.prefix(20)) was accepted while probing but dropped — probe concluded unsupported; use the device OSD or hardware controls (further rejections silenced)\n").utf8
+            ))
+        }
     }
 
     /// Called when the capture backend terminates on its own. We
@@ -986,7 +1018,12 @@ public actor Router {
         for (uid, count) in aggregateHwVolumeRejectionCounts {
             hwVolInfo += " hwVolRejected[\(uid.prefix(6))]=\(count)"
         }
-        let directInfo = directStereoOutput.map { " \($0.diagnostic)" } ?? ""
+        // DDC takeover marker: " ddc=N ..." appears once any covered UID is
+        // (or was) volume-controlled over DDC/CI, so field reports can tell
+        // "display slider works via DDC" from "display has no volume path".
+        let directInfo = directStereoOutput.map {
+            " \($0.diagnostic)\(DDCDisplayVolumeController.shared.diagnosticSuffix())"
+        } ?? ""
         let captureInfo: String
         if mode == .stereo,
            let direct = directStereoOutput,
@@ -1024,8 +1061,20 @@ public actor Router {
     /// Direct Stereo has no AUHAL render callback and therefore no software
     /// gain stage. A user-visible volume change can only be reflected on
     /// physical devices whose CoreAudio driver exposes writable output
-    /// volume/mute controls. Unsupported devices (typical HDMI/DP displays)
-    /// are logged once and otherwise left to their own OSD/hardware control.
+    /// volume/mute controls, or — for HDMI/DP monitors that expose none —
+    /// on the display's DDC/CI speaker volume (handled inside
+    /// `DirectStereoOutput.applyHardwareVolume`, applied asynchronously off
+    /// this actor). Devices neither backend can control are logged once and
+    /// otherwise left to their own OSD/hardware control; the rejection
+    /// counters only ever record intents that BOTH backends refused.
+    ///
+    /// Bookkeeping is per backend: an actual CoreAudio LEVEL write failure
+    /// lands in `aggregateHwVolumeUnsupportedUIDs` EVEN when the DDC
+    /// fallback carried the intent. `classifyDirectStereoVolumeBackend`
+    /// keys on that set to distrust the driver's settability probe —
+    /// without the entry, a device whose driver claims "settable" but
+    /// rejects real writes would keep classifying (and reading back) as
+    /// `.coreAudioHardware` instead of using the DDC cache.
     @discardableResult
     public func applyDirectStereoHardwareVolume(
         deviceID: String,
@@ -1040,20 +1089,129 @@ public actor Router {
         else {
             return false
         }
-        let ok = direct.applyHardwareVolume(uid: uid, volume: volume, muted: muted)
-        if ok {
-            return true
+        let outcome = direct.applyHardwareVolume(
+            uid: uid, volume: volume, muted: muted
+        )
+        if outcome.disprovesCoreAudioSettability {
+            aggregateHwVolumeUnsupportedUIDs.insert(uid)
         }
-        aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
-        aggregateHwVolumeUnsupportedUIDs.insert(uid)
-        if !loggedHwVolumeRejectionUIDs.contains(uid) {
-            loggedHwVolumeRejectionUIDs.insert(uid)
-            FileHandle.standardError.write(Data(
-                ("[Router] direct stereo hardware volume unsupported for \(uid.prefix(20)) — system/media-key volume cannot control this device through CoreAudio; use the device OSD or hardware controls\n").utf8
-            ))
+        if outcome.isUserVisibleRejection {
+            aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
+            if !loggedHwVolumeRejectionUIDs.contains(uid) {
+                loggedHwVolumeRejectionUIDs.insert(uid)
+                FileHandle.standardError.write(Data(
+                    ("[Router] direct stereo hardware volume unsupported for \(uid.prefix(20)) — neither CoreAudio nor DDC/CI can control this device; use the device OSD or hardware controls\n").utf8
+                ))
+            }
         }
         _ = deviceID
-        return false
+        return outcome.anyBackendAccepted
+    }
+
+    /// Per-device volume-backend capability snapshot for the active Direct
+    /// Stereo output, keyed by CoreAudio device UID. Consumed by the
+    /// menubar UI to decide which sliders are live.
+    ///
+    /// Classification is conservative: CoreAudio writability comes from a
+    /// read-only settability probe (cached); DDC support from the async
+    /// probe — when a probe is still pending/in-flight this method waits
+    /// (bounded, ~2 s) for the verdict so the first snapshot after Direct
+    /// Stereo starts doesn't misreport a DDC display as uncontrollable.
+    /// On timeout it stays fail closed: unknown reports `.none`.
+    ///
+    /// Reentrancy: the Router actor is free to interleave during the
+    /// bounded wait. No intermediate actor state is held across the
+    /// suspension — mode/output/UIDs are re-read and re-validated after it.
+    public func directStereoVolumeCapabilities() async -> [String: DirectStereoVolumeBackend] {
+        guard let direct = activeDirectStereoOutput(), direct.isActive else {
+            return [:]
+        }
+        // Kick probes for UIDs we haven't classified yet (no-op for
+        // already-probed UIDs), then wait for in-flight verdicts to land.
+        DDCDisplayVolumeController.shared.probeCapabilities(
+            uids: Array(direct.coveredOutputUIDs)
+        )
+        await DDCDisplayVolumeController.shared.waitForSettledCapabilities(
+            uids: Array(direct.coveredOutputUIDs)
+        )
+        // Re-validate after the suspension: Direct Stereo may have been
+        // reconciled away (or rebuilt with different devices) while the
+        // actor interleaved.
+        guard let settled = activeDirectStereoOutput(), settled.isActive else {
+            return [:]
+        }
+        var result: [String: DirectStereoVolumeBackend] = [:]
+        for uid in settled.coveredOutputUIDs {
+            result[uid] = classifyDirectStereoVolumeBackend(uid: uid)
+        }
+        return result
+    }
+
+    /// Best-available 0...1 volume readback for a Direct Stereo device,
+    /// sourced from the backend that owns the device's WRITES (the same
+    /// classification as `directStereoVolumeCapabilities()`):
+    /// `.coreAudioHardware` reads the device's VolumeScalar, `.ddc` reads
+    /// the DDC controller's cached user-intent level (probe-time read,
+    /// updated after each applied write), `.none` reads nothing.
+    ///
+    /// Following the backend matters: some HDMI/DP devices expose a
+    /// READABLE-but-unsettable CoreAudio VolumeScalar — a stale mirror
+    /// that never tracks the panel's real speaker level. A "CoreAudio
+    /// read first" order would return that mirror for `.ddc` devices, the
+    /// snapshot would write it back as route.volume, and the next media
+    /// key / slider step would re-apply the wrong level.
+    ///
+    /// Like the capability snapshot, a pending/in-flight DDC probe is
+    /// awaited (bounded) before classifying, and all actor state is
+    /// re-validated after the suspension.
+    public func readDirectStereoVolume(uid: String) async -> Float? {
+        guard let direct = activeDirectStereoOutput(), direct.covers(uid: uid)
+        else {
+            return nil
+        }
+        DDCDisplayVolumeController.shared.probeCapabilities(uids: [uid])
+        await DDCDisplayVolumeController.shared.waitForSettledCapabilities(
+            uids: [uid]
+        )
+        guard let settled = activeDirectStereoOutput(), settled.covers(uid: uid)
+        else {
+            return nil
+        }
+        switch classifyDirectStereoVolumeBackend(uid: uid) {
+        case .coreAudioHardware:
+            return AggregateDevice.readHardwareVolume(uid: uid)
+        case .ddc:
+            return DDCDisplayVolumeController.shared.cachedNormalizedVolume(
+                uid: uid
+            )
+        case .none:
+            return nil
+        }
+    }
+
+    /// One UID's volume-backend verdict, shared by the capability snapshot
+    /// and the readback path so they can never diverge. The decision
+    /// itself is the pure `DirectStereoVolumeReadback.backend` (covered by
+    /// SyncCastRouterTimingCheck); this wrapper just feeds it live state.
+    private func classifyDirectStereoVolumeBackend(
+        uid: String
+    ) -> DirectStereoVolumeBackend {
+        DirectStereoVolumeReadback.backend(
+            coreAudioVolumeSettable:
+                AggregateDevice.probeHardwareVolumeWritable(uid: uid),
+            coreAudioPreviouslyRejected:
+                aggregateHwVolumeUnsupportedUIDs.contains(uid),
+            ddcKnownSupported:
+                DDCDisplayVolumeController.shared.isKnownSupported(uid: uid)
+        )
+    }
+
+    /// The Direct Stereo output iff the router is currently in
+    /// stereo/direct mode. Helper for the volume snapshot/readback paths,
+    /// which must re-validate this exact condition after every suspension.
+    private func activeDirectStereoOutput() -> DirectStereoOutput? {
+        guard mode == .stereo, stereoOutputPath == .direct else { return nil }
+        return directStereoOutput
     }
 
     /// Force a complete local-driver tear-down + rebuild, bypassing the
@@ -1405,6 +1563,15 @@ public actor Router {
         let direct = directStereoOutput ?? DirectStereoOutput()
         try direct.reconcile(targets: targets)
         directStereoOutput = direct
+        // Warm the DDC capability cache off-actor so the first volume
+        // intent (and the menubar's capability snapshot) doesn't race the
+        // slow I2C probe, and retry previously-unsupported UIDs so display
+        // sleep/replug recovers without a restart. Fail-closed:
+        // unmatched/unsupported devices simply stay on the existing
+        // CoreAudio-or-nothing path.
+        DDCDisplayVolumeController.shared.refreshCapabilities(
+            uids: Array(direct.coveredOutputUIDs)
+        )
         FileHandle.standardError.write(Data(
             "[Router] direct stereo active: \(direct.diagnostic)\n".utf8
         ))

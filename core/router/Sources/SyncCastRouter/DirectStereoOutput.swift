@@ -252,6 +252,89 @@ public final class DirectStereoOutput {
         coveredUIDs.contains(uid)
     }
 
+    /// Snapshot of the physical subdevice UIDs covered by the active
+    /// Direct Stereo output. Empty while inactive.
+    public var coveredOutputUIDs: Set<String> {
+        coveredUIDs
+    }
+
+    /// Per-backend outcome of one `applyHardwareVolume` intent.
+    ///
+    /// The Router needs the CoreAudio LEVEL verdict SEPARATELY from the
+    /// DDC verdict: a successful DDC fallback must not mask a failed
+    /// CoreAudio write. Collapsed into a single Bool, the Router's
+    /// rejection bookkeeping never demoted the driver's (false)
+    /// settability claim, so classification and readback kept trusting
+    /// the stale CoreAudio mirror instead of the DDC cache.
+    ///
+    /// The decision properties are pure and covered by
+    /// SyncCastRouterTimingCheck.
+    public struct HardwareVolumeApplyOutcome: Equatable, Sendable {
+        /// The intent reached the backends (output active + UID covered).
+        public let attempted: Bool
+        /// CoreAudio accepted the LEVEL write.
+        public let coreAudioVolumeAccepted: Bool
+        /// CoreAudio accepted the mute write.
+        public let coreAudioMuteAccepted: Bool
+        /// The DDC/CI fallback accepted (enqueued) the intent.
+        public let ddcAccepted: Bool
+
+        public init(
+            attempted: Bool,
+            coreAudioVolumeAccepted: Bool,
+            coreAudioMuteAccepted: Bool,
+            ddcAccepted: Bool
+        ) {
+            self.attempted = attempted
+            self.coreAudioVolumeAccepted = coreAudioVolumeAccepted
+            self.coreAudioMuteAccepted = coreAudioMuteAccepted
+            self.ddcAccepted = ddcAccepted
+        }
+
+        /// Some backend carried the intent. A DDC enqueue counts; so does
+        /// a mute-only CoreAudio success (some HDMI sinks expose a
+        /// writable Mute but no VolumeScalar).
+        public var anyBackendAccepted: Bool {
+            coreAudioVolumeAccepted || ddcAccepted || coreAudioMuteAccepted
+        }
+
+        /// An actual CoreAudio LEVEL write failed: the driver's
+        /// settability claim is disproven and must be recorded REGARDLESS
+        /// of whether DDC saved the user-visible intent, or later
+        /// classification/readback stay on `.coreAudioHardware`.
+        public var disprovesCoreAudioSettability: Bool {
+            attempted && !coreAudioVolumeAccepted
+        }
+
+        /// User-visible rejection: EVERY backend refused the intent. Only
+        /// these feed the rejection counters and the once-per-UID log — a
+        /// successful DDC fallback is not a rejection.
+        public var isUserVisibleRejection: Bool {
+            attempted && !anyBackendAccepted
+        }
+    }
+
+    /// Pure plan for the VolumeScalar level of one volume/mute intent —
+    /// the CoreAudio mirror of `DDCVolumeLevels.planned`'s two-layer
+    /// semantics (covered by SyncCastRouterTimingCheck).
+    ///
+    /// Devices whose Mute property accepted the write keep VolumeScalar at
+    /// the user's level even while muted: silencing is the Mute property's
+    /// job, and parking the scalar at 0 destroys the saved level — the
+    /// hardware observer's post-suppression echo read 0, overwrote
+    /// `route.volume`, and the next unmute "restored" silence (Codex P1).
+    /// Only devices where the mute write failed/unsupported degrade to
+    /// emulated mute (scalar = 0); their unmute writes the clamped user
+    /// volume again, restoring the level.
+    public static func plannedCoreAudioVolume(
+        volume: Float,
+        muted: Bool,
+        muteAccepted: Bool
+    ) -> Float {
+        let clamped = max(Float(0), min(Float(1), volume))
+        return (muted && !muteAccepted) ? 0 : clamped
+    }
+
     /// Apply an explicit user volume/mute intent to one physical subdevice.
     ///
     /// Direct Stereo intentionally has no render callback: ordinary media apps
@@ -259,19 +342,68 @@ public final class DirectStereoOutput {
     /// ScreenCaptureKit and preserve DRM playback. That means software gain is
     /// impossible here; the only safe volume path is the underlying device's
     /// CoreAudio hardware volume/mute property. HDMI/DP monitors often expose
-    /// neither, so this is best-effort and returns false when the hardware
-    /// refuses control.
+    /// neither — for those we fall back to the display's DDC/CI speaker
+    /// volume (VCP 0x62/0x8D) when the UID conservatively matches an external
+    /// DDC display; the DDC write itself is asynchronous on a dedicated
+    /// serial queue.
+    ///
+    /// Mute ordering/semantics: the Mute write lands first, and the
+    /// VolumeScalar target is then planned from its verdict
+    /// (`plannedCoreAudioVolume`). While muted with a working Mute
+    /// property the scalar intentionally still carries the USER level —
+    /// the write is inaudible (Mute already silences), keeps System
+    /// Settings' slider truthful, and means a mute-only device's level
+    /// write fails for the genuine reason (unsettable VolumeScalar), so
+    /// the Router's `coreAudioVolumeAccepted` bookkeeping needs no
+    /// mute-specific carve-outs.
+    ///
+    /// Returns the per-backend outcome so the Router can record a failed
+    /// CoreAudio level write even when the DDC fallback succeeded (its
+    /// `aggregateHwVolumeUnsupportedUIDs` bookkeeping is what demotes the
+    /// device to the `.ddc` classification on later snapshots/readbacks).
     @discardableResult
     public func applyHardwareVolume(
         uid: String,
         volume: Float,
         muted: Bool
-    ) -> Bool {
-        guard isActive, coveredUIDs.contains(uid) else { return false }
-        let target = muted ? Float(0) : max(Float(0), min(Float(1), volume))
+    ) -> HardwareVolumeApplyOutcome {
+        guard isActive, coveredUIDs.contains(uid) else {
+            return HardwareVolumeApplyOutcome(
+                attempted: false,
+                coreAudioVolumeAccepted: false,
+                coreAudioMuteAccepted: false,
+                ddcAccepted: false
+            )
+        }
         let muteOK = AggregateDevice.applyHardwareMute(uid: uid, muted: muted)
+        let target = Self.plannedCoreAudioVolume(
+            volume: volume, muted: muted, muteAccepted: muteOK
+        )
         let volumeOK = AggregateDevice.applyHardwareVolume(uid: uid, volume: target)
-        return muteOK || volumeOK
+        if volumeOK {
+            return HardwareVolumeApplyOutcome(
+                attempted: true,
+                coreAudioVolumeAccepted: true,
+                coreAudioMuteAccepted: muteOK,
+                ddcAccepted: false
+            )
+        }
+        // CoreAudio rejected the LEVEL write (mute may still have worked —
+        // some HDMI sinks expose a writable Mute but no VolumeScalar). DDC
+        // carries the level so the slider isn't a silent no-op; this also
+        // keeps `directStereoVolumeCapabilities()` (which classifies on
+        // volume writability) consistent with what apply actually does.
+        let ddcAccepted = DDCDisplayVolumeController.shared.enqueueApply(
+            uid: uid,
+            volume: volume,
+            muted: muted
+        )
+        return HardwareVolumeApplyOutcome(
+            attempted: true,
+            coreAudioVolumeAccepted: false,
+            coreAudioMuteAccepted: muteOK,
+            ddcAccepted: ddcAccepted
+        )
     }
 
     private static func deduplicate(_ targets: [Target]) -> [Target] {
