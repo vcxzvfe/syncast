@@ -11,7 +11,11 @@ public enum Transport: String, Codable, Sendable, CaseIterable {
 /// service so the rest of the app can reference devices independently of
 /// transport-level identifiers (CoreAudio object IDs / Bonjour records).
 public struct Device: Identifiable, Hashable, Sendable, Codable {
-    public let id: String              // SyncCast-assigned UUID, stable across restarts where possible
+    /// SyncCast-assigned identifier. NOT stable across restarts: `StableIDMap`
+    /// mints a fresh UUID per key per process. Anything that must survive a
+    /// relaunch has to key off `coreAudioUID` (local devices) or
+    /// `airplayDeviceID` (AirPlay receivers) instead.
+    public let id: String
     public let transport: Transport
     public let name: String
     public let model: String?
@@ -21,6 +25,24 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
     public let isOutputCapable: Bool
     public let supportsHardwareVolume: Bool
     public let nominalSampleRate: Double?
+    /// The AirPlay `deviceid` from the Bonjour TXT record, e.g.
+    /// `02:00:CA:FE:00:01`. nil for CoreAudio devices and for AirPlay
+    /// endpoints whose TXT record omitted it.
+    ///
+    /// This is the only genuinely stable AirPlay identity available, and it
+    /// is the SAME value on all three sides of the system: Bonjour publishes
+    /// it, OwnTone derives its output id from it (`int(hex) == output id`),
+    /// and pyatv reports it as the device identifier. Persist selections and
+    /// pairing credentials against this, never against the display name.
+    public let airplayDeviceID: String?
+    /// True when this AirPlay receiver is THIS Mac's own AirPlay Receiver.
+    ///
+    /// Determined at runtime from the Bonjour browse result: only the local
+    /// machine advertises `_airplay._tcp` on the loopback interface. The test
+    /// is independent of device name, model, hostname, subnet and location,
+    /// which is what makes it safe for a laptop that moves between an office
+    /// and a home network.
+    public let isLocalMachineReceiver: Bool
 
     public init(
         id: String,
@@ -32,7 +54,9 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
         coreAudioUID: String? = nil,
         isOutputCapable: Bool = true,
         supportsHardwareVolume: Bool = true,
-        nominalSampleRate: Double? = nil
+        nominalSampleRate: Double? = nil,
+        airplayDeviceID: String? = nil,
+        isLocalMachineReceiver: Bool = false
     ) {
         self.id = id
         self.transport = transport
@@ -44,6 +68,35 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
         self.isOutputCapable = isOutputCapable
         self.supportsHardwareVolume = supportsHardwareVolume
         self.nominalSampleRate = nominalSampleRate
+        self.airplayDeviceID = airplayDeviceID
+        self.isLocalMachineReceiver = isLocalMachineReceiver
+    }
+
+    /// Key under which a user's selection of this device should be persisted.
+    /// nil when the device exposes no stable identity, in which case the
+    /// caller must NOT persist it rather than inventing one.
+    public var persistenceKey: String? {
+        switch transport {
+        case .coreAudio:
+            return coreAudioUID.map { "ca:\($0)" }
+        case .airplay2:
+            return Device.normalizedAirplayDeviceID(airplayDeviceID).map { "ap:\($0)" }
+        }
+    }
+
+    /// Canonical uppercase colon-free form of an AirPlay `deviceid`, e.g.
+    /// `0200CAFE0001`. OwnTone's output id is this value read as hex.
+    public static func normalizedAirplayDeviceID(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let stripped = raw
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        guard !stripped.isEmpty,
+              stripped.allSatisfy({ $0.isHexDigit })
+        else { return nil }
+        return stripped
     }
 }
 

@@ -87,6 +87,17 @@ sign_bundle "$DST"
 log "Verifying signature"
 codesign --verify --verbose=2 "$DST" 2>&1 | tail -3
 
+# SwiftPM's generated Bundle.module accessor looks for the resource bundle at
+# the app bundle ROOT (Bundle.main.bundleURL), falling back to the absolute
+# .build path of the machine that compiled it. After the repo moved from
+# ~/syncast to ~/Dev/media/syncast (2026-07), that fallback broke and the app
+# crashed at launch. Keep a copy at the bundle root so lookup #1 succeeds.
+# MUST run after signing/verification: root-level files unseal the bundle and
+# would fail codesign. Benign for local ad-hoc installs; proper fix = custom
+# resource accessor + rebuild.
+log "Restoring SwiftPM resource bundle at bundle root (post-sign)"
+cp -R "$DST/Contents/MacOS/SyncCastMenuBar_SyncCastMenuBar.bundle" "$DST/" 2>/dev/null || true
+
 log "Done. Launch with:  open $DST"
 
 cat <<'EOF'

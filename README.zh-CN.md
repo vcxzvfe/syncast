@@ -47,10 +47,10 @@ macOS 自带的音频多路输出方案各有缺陷:
 - **系统音频捕获**:AirPlay/捕获相关路径仍可使用 ScreenCaptureKit; 本地 Stereo 现在默认走 Direct Stereo CoreAudio 输出路径,不需要 ScreenCaptureKit 或屏幕录制权限。
 - **同时输出到本地 + AirPlay**:一次播放,内置扬声器、USB/HDMI 输出、AirPlay 2 接收器(HomePod、小米音箱等)都可以出声; 但本地 + AirPlay 的自动同步仍是实验功能。
 - **两种模式**(互斥切换):
-  - **AirPlay 实验模式**:本地输出 + AirPlay 接收器走 AirPlay/OwnTone 管道。多个 AirPlay 设备之间通常由 AirPlay 自己维护时序,但本地扬声器和 AirPlay 之间仍需要被动校准,且会受中断、切换设备、调音量影响。
+  - **AirPlay 实验模式**:本地输出 + AirPlay 接收器走 AirPlay/OwnTone 管道。多个 AirPlay 设备之间由 AirPlay 自己维护时序;本地扬声器通过环形缓冲水位控制环从属锁到同一个 OwnTone 时钟域,并可对每个输出做毫秒级延迟微调以补偿听音位置差异。
   - **本地模式 (Stereo / Local)**:只用本地 CoreAudio 设备,默认走 Direct Stereo,低延迟,口型对得上视频。这是当前最稳定的模式。
 - **每台设备独立音量**:菜单栏 UI 给每台输出独立音量推子。
-- **无主动校准音的默认策略**:普通启动不会播放高频/超声校准音。当前校准研发路线是使用真实节目音频 + 麦克风做被动测量,并且失败时不写入延迟。
+- **不使用声学测量**:2026-08-09 起,主动探针与被动麦克风两条测量路线均已从代码中删除。SyncCast 不会打开麦克风,也不会播放任何校准音;对齐完全依靠 OwnTone 时钟域。
 - **菜单栏轻量级 UI**:不抢 Dock 位置,后台运行,顶部 icon 一键展开。
 
 ---
@@ -60,7 +60,7 @@ macOS 自带的音频多路输出方案各有缺陷:
 - macOS 14 (Sonoma) 或更高版本
 - Apple Silicon 或 Intel 都支持(目前仅打包当前主机架构)
 - 默认本地 Stereo 路径不需要 **Screen Recording**(屏幕录制)权限; AirPlay / SCK fallback 等捕获路径仍可能需要
-- 麦克风权限只用于你显式运行被动诊断时; 正常播放和 Stereo 模式不会使用麦克风或播放校准音
+- 不需要麦克风权限; 没有任何代码路径会打开麦克风,应用包内也不再包含 `NSMicrophoneUsageDescription`
 - Netflix、Prime Video、Apple TV+ 等 DRM 视频可能会因为 ScreenCaptureKit 路径触发黑屏/拒播; 这是当前 P0 改造方向之一
 - AirPlay 输出需要 macOS 与目标设备处于同一局域网
 
@@ -199,9 +199,8 @@ SyncCast 还在早期阶段,API 和 UI 都可能在不通知的情况下变更�
 - 仅支持当前编译机器的架构(没做 universal2)
 - 未公证(non-notarized),首次启动需手动允许 Gatekeeper
 - 没有自动更新机制
-- 本地 + AirPlay 自动同步还没有达到长期可靠; 当前正在推进被动无探针测量、漂移监控和保守修正门控
+- 本地 + AirPlay 同步现在走 OwnTone 时钟域,只在单一环境下由人耳验证过; 尚未在多种接收端和长时间会话中验证
 - ScreenCaptureKit 捕获会影响部分 DRM 视频播放; 本地 Stereo 已默认绕过 SCK,但 AirPlay / Process Tap 捕获验证仍在推进
-- 主动高频校准探针已从普通运行中关闭,仅保留为显式 lab diagnostic
 - 部分边缘情况下设备掉线后需要手动重连
 
 如果你愿意当 alpha 测试用户、能接受偶尔重启 app、能读 Console 日志反馈 bug,欢迎试用。

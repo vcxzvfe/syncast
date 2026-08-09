@@ -12,53 +12,6 @@ private struct EnabledLocalOutput {
     let name: String
 }
 
-private struct AirplayTauCache: Sendable {
-    let groupTau: Int
-    let groupConfidence: Double
-    let groupUncertaintyMs: Int
-    let probeProfile: String
-    let routeSignature: String
-    let calibratedAt: Date
-}
-
-/// Injects `CalibrationSession.clickPulse` samples into the live capture
-/// ringBuffer so they ride through the existing whole-home audio path.
-/// AirPlay receivers play the click after their PTP latency; local
-/// bridges play it after the broadcaster's delay-line. The mic in
-/// `CalibrationRunner` measures the per-output arrival time so we can
-/// compute the delta needed to align them.
-///
-/// We deliberately race with the capture backend's write thread on this ring
-/// rather than pause capture for calibration — the click is a 10 ms transient
-/// every couple seconds, the worst case is a single chunk of garbled
-/// audio in the user's actual playback (recoverable, barely audible),
-/// vs. interrupting their audio entirely. Acceptable for v1 calibration.
-private struct RingBufferClickEmitter: ClickEmitter {
-    let ringBuffer: RingBuffer
-
-    func emit(samples: [[Float]], at anchorNs: UInt64) async {
-        let nowNs = DispatchTime.now().uptimeNanoseconds
-        if anchorNs > nowNs {
-            try? await Task.sleep(nanoseconds: anchorNs - nowNs)
-        }
-        guard samples.count >= 2,
-              !samples[0].isEmpty,
-              samples[0].count == samples[1].count
-        else { return }
-        let frames = samples[0].count
-        samples[0].withUnsafeBufferPointer { ch0 in
-            samples[1].withUnsafeBufferPointer { ch1 in
-                let ptrArray: [UnsafePointer<Float>] = [
-                    ch0.baseAddress!, ch1.baseAddress!,
-                ]
-                ptrArray.withUnsafeBufferPointer { ptrs in
-                    ringBuffer.write(channels: ptrs.baseAddress!, frames: frames)
-                }
-            }
-        }
-    }
-}
-
 /// The Router is the top-level coordinator: it owns the capture, the ring
 /// buffer, the local outputs, and the IPC client to the sidecar. The view
 /// layer talks to this actor; CoreAudio threads talk to its members directly.
@@ -104,12 +57,6 @@ public actor Router {
         return payload["noop"] as? Bool == true
     }
 
-    private static let activeAcousticCalibrationEnabled: Bool = {
-        ActiveAcousticDiagnosticsGate.isEnabled()
-    }()
-    private static let activeAcousticCalibrationDisabledMessage =
-        ActiveAcousticDiagnosticsGate.disabledMessage
-
     public enum RouterState: String, Sendable {
         case idle
         case starting
@@ -140,6 +87,12 @@ public actor Router {
     public private(set) var state: RouterState = .idle
     public private(set) var lastError: String?
     public private(set) var mode: Mode = .stereo
+
+    /// Per-device AirPlay pairing state pushed up by the sidecar, keyed by the
+    /// device's stable persistence key. Read by the pairing extension
+    /// (`Router+Pairing.swift`).
+    var pairingStatesStorage: [String: PairingState] = [:]
+    var pairingErrorsStorage: [String: String] = [:]
 
     private let capture: any SystemAudioCapture
     private let stereoOutputPath: StereoOutputPathPolicy.Path
@@ -205,7 +158,10 @@ public actor Router {
     /// and go straight to the software-gain fallback. Cleared on
     /// teardown so re-plug or device hot-swap gets a fresh probe.
     private var aggregateHwVolumeUnsupportedUIDs: Set<String> = []
-    private var ipc: IpcClient?
+    /// Shared JSON-RPC channel to the sidecar. Internal (not private) so the
+    /// pairing extension in `Router+Pairing.swift` can issue bounded pairing
+    /// calls on the same connection.
+    var ipc: IpcClient?
     private var audioWriter: AudioSocketWriter?
     /// Per-device connection state, keyed by SyncCast device ID. Updated
     /// in the sidecar-notification handler on every `event.device_state`
@@ -236,21 +192,13 @@ public actor Router {
     /// Cached path returned by `local_fifo.path` IPC — fetched once on
     /// the first whole-home transition and reused for all bridges.
     private var localFifoSocketPath: URL?
+    /// Last delay-line value we successfully pushed to (or read back from)
+    /// the sidecar broadcaster. Used only as the fallback for
+    /// `localFifoCurrentDelayMsForDiagnostics()` when the sidecar's own
+    /// diagnostics are unavailable.
+    private var lastAppliedLocalFifoDelayMs: Int = 0
 
     /// Diagnostic socket server: lets command-line callers
-    /// (`scripts/calibration_test.sh`) trigger a one-shot calibration
-    /// without driving the SwiftUI menubar. Lifecycle: bound when the
-    /// AppModel calls `startCalibrationDiagnosticServer` after entering
-    /// whole-home + running, torn down on every other state. nil when
-    /// idle / in stereo mode.
-    private var calibrationDiagnosticServer: CalibrationDiagnosticServer?
-
-    /// Per-AirPlay-device τ (ms) captured from the most recent SUCCESSFUL
-    /// full calibration (Phase 1 + Phase 2), with the route/volume
-    /// signature it was measured against. Continuous mode refuses to
-    /// apply local-only drift against this cache after AirPlay route,
-    /// volume, connection, or OwnTone timing state changes.
-    private var airplayTauCache: AirplayTauCache?
     private var activeAirplayDeviceIDs: Set<String> = []
     private var registeredAirplayEndpointsByID: [String: String] = [:]
     private var lastAirplayVolumeByID: [String: Float] = [:]
@@ -298,12 +246,6 @@ public actor Router {
             self.capture = SCKCapture(sampleRate: sampleRate, channelCount: channelCount)
         }
         self.scheduler = Scheduler(sampleRate: sampleRate)
-        let probeFrequencies = ActiveCalibrator.fingerprintFrequencies
-            .map { String(Int($0)) }
-            .joined(separator: ",")
-        FileHandle.standardError.write(Data(
-            "[Router] calibration probe profile=\(ActiveCalibrator.fingerprintProbeProfileName) tones=[\(probeFrequencies)] symbols=\(ActiveCalibrator.fingerprintSymbols) duration=\(ActiveCalibrator.fingerprintDurationMs)ms local_amp=\(String(format: "%.3f", ActiveCalibrator.fingerprintLocalAmplitude)) airplay_amp=\(String(format: "%.3f", ActiveCalibrator.fingerprintAirplayAmplitude))\n".utf8
-        ))
         // Reap any private aggregate devices left behind by a prior crash
         // BEFORE we ever try to create one in this run. Header docs say
         // private aggregates auto-clean on process exit, but coreaudiod
@@ -402,9 +344,27 @@ public actor Router {
                     deviceID: deviceID, stateStr: stateStr, reason: reason,
                 ) }
             }
+            // Pairing progresses asynchronously behind a human-scale window
+            // (the user has to read a PIN off the receiver's own screen and
+            // type it back), so the sidecar reports it by notification rather
+            // than as the result of a long-blocking call.
+            if method == "event.pairing_state",
+               let deviceKey = params["device_key"] as? String,
+               let stateStr = params["state"] as? String {
+                let reason = params["last_error"] as? String
+                Task { await self.recordPairingState(
+                    deviceKey: deviceKey, stateStr: stateStr, reason: reason,
+                ) }
+            }
         }
         _ = try await client.call("sidecar.hello", params: ["v": 1, "router_pid": ProcessInfo.processInfo.processIdentifier])
         self.ipc = client
+        // A fresh sidecar process knows nothing about the trims we pushed to
+        // its predecessor, so forget what we think it is carrying. Otherwise
+        // the "unchanged ⇒ don't push" guard would suppress the one push that
+        // re-establishes them, and every AirPlay receiver would silently run
+        // untrimmed for the rest of the session.
+        lastPushedAirplayTrimsMs = [:]
         let writer = AudioSocketWriter(ring: capture.ringBuffer, socketPath: sockets.audio)
         self.audioWriter = writer
     }
@@ -479,10 +439,6 @@ public actor Router {
 
     public func stop() async {
         state = .stopping
-        // 0a. Tear down the diagnostic socket listener. Cheap; safe to
-        //     call even when not bound. Done first so a CLI client
-        //     can't race a request against the rest of the teardown.
-        stopCalibrationDiagnosticServer()
         // 0. Tear down whole-home bridges first (if any). They hold
         //    Unix sockets pointing at the sidecar and AUHALs on
         //    physical devices; both need to release before the rest of
@@ -542,385 +498,15 @@ public actor Router {
         try audioWriter.start()
     }
 
-    // MARK: - Auto-calibration
+    // MARK: - Capture diagnostics
     //
-    // Plays brief click pulses through the live whole-home audio path
-    // (capture ringBuffer → AudioSocketWriter → sidecar → both AirPlay and
-    // local-bridge fan-outs) and listens via the chosen microphone to
-    // measure the relative arrival time at each output. Returns the
-    // ABSOLUTE TARGET (in ms) for `airplayDelayMs` (NOT a delta to add)
-    // — Phase 1 local τ comes from the bridge's direct synthesis path
-    // which bypasses the delay-line. See `CalibrationDelta.deltaMs`.
-    //
-    // Note on click injection: we write directly to `capture.ringBuffer`
-    // from a Task that races with the capture backend's write thread. The ring's
-    // "single-writer" invariant is technically violated, but the click
-    // is a 10 ms burst once every couple seconds — even if it interleaves
-    // with a capture callback, the resulting glitch is at most a single
-    // chunk, recoverable, and irrelevant for cross-correlation peak
-    // detection. Pausing capture for calibration would interrupt user audio,
-    // which is worse UX. Acceptable for v1.
-    public struct CalibrationDelta: Sendable {
-        /// ABSOLUTE TARGET delay-line value in ms (NOT a delta to add).
-        /// Computed as `max(airplay τ) − max(local τ)`; local τ is from
-        /// the bridge's direct synthesis which bypasses the delay-line,
-        /// so this is the delay-line setting to align all outputs.
-        /// Field name kept for ABI stability — was wrongly interpreted
-        /// as an additive delta in earlier versions.
-        public let deltaMs: Int
-        public let confidence: Double         // 0.0–1.0
-        public let perDeviceOffsetMs: [String: Int]
-        public let perDeviceConfidence: [String: Double]
-        public let perDeviceUncertaintyMs: [String: Int]
-    }
-
-    public enum CalibrationFailure: Error {
-        case noEnabledDevices
-        case engineFailed(String)
-    }
-
-    /// Per-device sequential measurement. The previous "all devices at
-    /// once" approach injected one click into the live ring and let it
-    /// fan out to every enabled output simultaneously; the mic captured
-    /// one merged signal, so cross-correlation found ONE peak (dominated
-    /// by the loudest/closest speaker) and per-device offsets were
-    /// indistinguishable. To actually distinguish "Xiaomi is fast vs
-    /// PG27 is slow", we measure each device in isolation by SOLOing it:
-    /// keep every enabled device's data path live (so OwnTone never
-    /// rebuilds its session — disabling a receiver tears it down and
-    /// triggers a multi-second mDNS rediscovery), but zero the AUDIBLE
-    /// output on every device except the one being measured. AirPlay is
-    /// soloed via `device.set_volume` (sidecar → OwnTone REST PUT
-    /// /api/outputs/{id} with volume=0); local CoreAudio in whole-home
-    /// is soloed via `bridge.setVolume(0)`, reached by setting
-    /// `routing[d].muted = true` and letting `replan()` propagate.
-    /// Stereo-mode local outputs follow the same `replan()` path through
-    /// `LocalOutput.setRouting(muted:)`.
-    public func runCalibration(
-        devices: [Device],
-        microphoneDeviceID: AudioDeviceID?,
-        pulseCount: Int = 5,
-        progress: (@Sendable (String) -> Void)? = nil
-    ) async throws -> CalibrationDelta {
-        // v4 calibration — mixed-architecture active signals.
-        //
-        // Pipeline:
-        //   * Phase 1 (local FDM, parallel ~1.5 s): each enabled local
-        //     bridge plays a unique pilot tone (1 kHz, 2 kHz, 3 kHz,
-        //     4 kHz). The mic bandpasses each frequency independently
-        //     and reports per-device onset time. TRUE FDM — measurements
-        //     are fully parallel.
-        //   * Phase 2 (AirPlay TDMA, sequential ~2.5 s/device): for each
-        //     enabled AirPlay device, mute every other AirPlay output
-        //     via `device.set_volume(0)`, inject a unique linear chirp
-        //     into the SCK ring, cross-correlate the captured mic
-        //     against the chirp template. AirPlay 2 multi-room is a
-        //     single-stream architecture so per-device differentiation
-        //     MUST be temporal; FDM in the AirPlay band is structurally
-        //     impossible.
-        //   * Phase 3: delta = max(AirPlay τ) − max(local τ). ABSOLUTE
-        //     TARGET for airplayDelayMs (NOT a delta to add); see
-        //     `CalibrationDelta.deltaMs` doc.
-        //
-        // v3 (MuteDipCalibrator, retained as fallback) modulated the
-        // user's MUSIC volume in TDMA slots and cross-correlated the
-        // envelope. With ambient music as the carrier, run-to-run
-        // variance was ±90 ms — the chosen genre/loudness affected the
-        // per-slot envelope shape too much. v4's active signals are
-        // independent of the user's audio content.
-        //
-        // The legacy `pulseCount` parameter is ignored — Phase 1 and
-        // Phase 2 timings come from `ActiveCalibrator` defaults. Body
-        // delegated to `runCalibrationRaw` (also used by the continuous
-        // loop) so probe-build / routing-restore plumbing is single-
-        // sourced.
-        _ = pulseCount
-
-        let enabled = devices.filter { routing[$0.id]?.enabled == true }
-        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
-        let enabledLocal = enabled.filter { $0.transport == .coreAudio }
-        let enabledAirplay = enabled.filter { $0.transport == .airplay2 }
-        guard !enabledLocal.isEmpty && !enabledAirplay.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "calibration requires at least one local and one AirPlay output"
-            )
-        }
-        let silentAirplay = enabledAirplay.filter { dev in
-            let route = routing[dev.id]
-            return (route?.muted ?? false) || (route?.volume ?? 1.0) <= 0.01
-        }
-        guard silentAirplay.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "calibration requires audible AirPlay receivers; muted/zero-volume ids \(silentAirplay.map { String($0.id.prefix(8)) })"
-            )
-        }
-        let inactiveAirplay = enabledAirplay.filter {
-            !activeAirplayDeviceIDs.contains($0.id)
-        }
-        guard inactiveAirplay.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "calibration requires active AirPlay receivers; inactive ids \(inactiveAirplay.map { String($0.id.prefix(8)) })"
-            )
-        }
-        let disconnectedAirplay = enabledAirplay.filter { dev in
-            let state = connectionStates[dev.id] ?? .unknown
-            return state == .failed || state == .disconnected
-        }
-        guard disconnectedAirplay.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "calibration requires connected AirPlay receivers; disconnected ids \(disconnectedAirplay.map { String($0.id.prefix(8)) })"
-            )
-        }
-        progress?("Calibrating \(enabled.count) device\(enabled.count == 1 ? "" : "s") (active signals)…")
-        let result = try await runCalibrationRaw(
-            devices: devices, microphoneDeviceID: microphoneDeviceID
-        )
-        // Cache Phase-2 AirPlay group tau so the continuous loop (Phase 1
-        // only) can recompute drift without re-doing the disruptive
-        // mute-dip. This is deliberately a group-domain cache keyed by the
-        // whole AirPlay route signature, not a per-receiver tau cache.
-        if let groupTau = result.perDeviceTauMs[ActiveCalibrator.airplayGroupDeviceID],
-           groupTau >= 0 {
-            airplayTauCache = AirplayTauCache(
-                groupTau: groupTau,
-                groupConfidence: result.perDeviceConfidence[
-                    ActiveCalibrator.airplayGroupDeviceID
-                ] ?? result.aggregateConfidence,
-                groupUncertaintyMs: result.perDeviceUncertaintyMs[
-                    ActiveCalibrator.airplayGroupDeviceID
-                ] ?? Int.max,
-                probeProfile: ActiveCalibrator.fingerprintProbeProfileName,
-                routeSignature: airplayRouteSignature(enabled: enabled),
-                calibratedAt: Date()
-            )
-        } else {
-            airplayTauCache = nil
-        }
-        return CalibrationDelta(
-            deltaMs: result.deltaMs,
-            confidence: result.aggregateConfidence,
-            perDeviceOffsetMs: result.perDeviceTauMs,
-            perDeviceConfidence: result.perDeviceConfidence,
-            perDeviceUncertaintyMs: result.perDeviceUncertaintyMs
-        )
-    }
-
-    // MARK: - Frequency-Response Sweep (diagnostic)
-    //
-    // Drives every enabled LOCAL bridge through a frequency sweep so the
-    // operator can pick the highest frequency that still clears a target
-    // SNR on the user's mic + speaker chain. Goal: enable v4+
-    // calibration to choose the highest high-band probe a route can
-    // support. High-band reduces audibility risk, but it is not a silent
-    // guarantee on every speaker/DSP chain.
-    //
-    // AirPlay is intentionally NOT swept — playing different tones on
-    // different AirPlay receivers requires TDMA mute/unmute (~3 s
-    // overhead per device per frequency) and a more complex chirp-injection
-    // path. The summary string surfaces "airplay frequency response =
-    // unknown without per-device path" so the caller knows.
-    public func runFrequencyResponseTest(
-        devices: [Device],
-        microphoneDeviceID: AudioDeviceID? = nil,
-        frequencies: [Double] = [
-            500, 1000, 2000, 4000, 8000, 12000, 14000,
-            15000, 16000, 17000, 18000, 18500, 19000, 19500,
-            20000, 21000, 22000,
-        ],
-        toneAmplitude: Float = 0.1,
-        toneDurationMs: Int = 500
-    ) async throws -> FrequencyResponseResult {
-        guard Self.activeAcousticCalibrationEnabled else {
-            throw CalibrationFailure.engineFailed(
-                Self.activeAcousticCalibrationDisabledMessage
-            )
-        }
-        let enabled = devices.filter { routing[$0.id]?.enabled == true }
-        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
-        let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
-        var probes: [ActiveCalibrator.FrequencyResponseProbe] = []
-        for dev in enabled where dev.transport == .coreAudio {
-            if let bridge = bridgeSnapshot[dev.id] {
-                probes.append(.init(deviceID: dev.id, bridge: bridge))
-            }
-        }
-        guard !probes.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "frequency-response sweep requires whole-home mode with at least one local bridge enabled"
-            )
-        }
-        let calibrator = ActiveCalibrator(microphoneDeviceID: microphoneDeviceID)
-        do {
-            return try await calibrator.runFrequencyResponseSweep(
-                probes: probes,
-                frequencies: frequencies,
-                toneAmplitude: toneAmplitude,
-                toneDurationMs: toneDurationMs
-            )
-        } catch {
-            if error is CancellationError { throw error }
-            throw CalibrationFailure.engineFailed("\(error)")
-        }
-    }
-
-    // MARK: - Calibration diagnostic socket
-    //
-    // Bring up / tear down the Unix-socket listener that lets
-    // `scripts/calibration_test.sh` run a calibration from the CLI.
-    // The provider closure supplies a snapshot (devices + mic id) at the
-    // moment the request lands; we don't cache device lists in the
-    // Router, so the closure is the bridge to AppModel's MainActor state.
-
-    /// Start the diagnostic listener. Idempotent. Caller is the AppModel,
-    /// which fires this after the engine is running in whole-home mode.
-    /// `provider` is invoked once per request to get the live device set;
-    /// returning nil signals "router not ready, reply with error".
-    public func startCalibrationDiagnosticServer(
-        socketPath: URL,
-        provider: @escaping CalibrationDiagnosticServer.Provider,
-        activeProbeMethodsEnabled: Bool = false,
-        delayApplier: CalibrationDiagnosticServer.DelayApplier? = nil,
-        passiveDelayApplier: CalibrationDiagnosticServer.PassiveDelayApplier? = nil,
-        syncContextMarker: CalibrationDiagnosticServer.SyncContextMarker? = nil
-    ) {
-        if let existing = calibrationDiagnosticServer {
-            if FileManager.default.fileExists(atPath: socketPath.path) {
-                return
-            }
-            existing.stop()
-            calibrationDiagnosticServer = nil
-        }
-        let server = CalibrationDiagnosticServer(
-            socketPath: socketPath,
-            provider: provider,
-            passiveStatusProvider: { [weak self] in
-                guard let self else {
-                    return CalibrationDiagnosticServer.PassiveStatus(
-                        captureBackend: "router-gone"
-                    )
-                }
-                return await self.passiveDiagnosticStatus()
-            },
-            activeProbeMethodsEnabled: activeProbeMethodsEnabled,
-            runner: { [weak self] snap in
-                guard let self else {
-                    throw CalibrationFailure.engineFailed("router gone")
-                }
-                let delta = try await self.runCalibration(
-                    devices: snap.devices,
-                    microphoneDeviceID: snap.microphoneDeviceID,
-                    pulseCount: 5,
-                    progress: nil
-                )
-                return (
-                    deltaMs: delta.deltaMs,
-                    confidence: delta.confidence,
-                    perDeviceOffsetMs: delta.perDeviceOffsetMs,
-                    perDeviceConfidence: delta.perDeviceConfidence,
-                    perDeviceUncertaintyMs: delta.perDeviceUncertaintyMs
-                )
-            },
-            freqRunner: { [weak self] snap, frequencies, toneAmplitude in
-                guard let self else {
-                    throw CalibrationFailure.engineFailed("router gone")
-                }
-                // **v7**: forward optional sweep params from the
-                // diagnostic socket. Both nil ⇒ default sweep (the
-                // pre-v7 behavior). Either non-nil overrides only
-                // that parameter — `runFrequencyResponseTest` already
-                // accepts these as defaulted parameters, so the
-                // pattern below avoids duplicating its signature.
-                if let frequencies, let toneAmplitude {
-                    return try await self.runFrequencyResponseTest(
-                        devices: snap.devices,
-                        microphoneDeviceID: snap.microphoneDeviceID,
-                        frequencies: frequencies,
-                        toneAmplitude: Float(toneAmplitude)
-                    )
-                } else if let frequencies {
-                    return try await self.runFrequencyResponseTest(
-                        devices: snap.devices,
-                        microphoneDeviceID: snap.microphoneDeviceID,
-                        frequencies: frequencies
-                    )
-                } else if let toneAmplitude {
-                    return try await self.runFrequencyResponseTest(
-                        devices: snap.devices,
-                        microphoneDeviceID: snap.microphoneDeviceID,
-                        toneAmplitude: Float(toneAmplitude)
-                    )
-                } else {
-                    return try await self.runFrequencyResponseTest(
-                        devices: snap.devices,
-                        microphoneDeviceID: snap.microphoneDeviceID
-                    )
-                }
-            },
-            delayApplier: delayApplier ?? { [weak self] ms in
-                guard let self else {
-                    throw CalibrationFailure.engineFailed("router gone")
-                }
-                return try await self.setLocalFifoDelayMs(ms)
-            },
-            passiveDelayApplier: passiveDelayApplier,
-            passiveCaptureRunner: { [weak self] snap, durationSec, maxDelayMs, outputDirectory in
-                guard let self else {
-                    throw CalibrationFailure.engineFailed("router gone")
-                }
-                let outputURL = outputDirectory.map {
-                    URL(fileURLWithPath: $0)
-                }
-                return try await PassiveCapture.capture(
-                    captureBackend: self.capture,
-                    microphoneDeviceID: snap.microphoneDeviceID,
-                    durationSec: durationSec,
-                    maxDelayMs: maxDelayMs,
-                    outputDirectory: outputURL,
-                    currentDelayMs: snap.currentDelayMs,
-                    contextSignature: snap.contextSignature,
-                    delayLocked: snap.delayLocked,
-                    enabledAirplayCount: snap.enabledAirplayCount,
-                    activeAirplayCount: snap.activeAirplayCount,
-                    airplayTimingEpoch: snap.airplayTimingEpoch,
-                    syncContextState: snap.syncContextState,
-                    syncContextReason: snap.syncContextReason,
-                    syncContextRevision: snap.syncContextRevision,
-                    syncContextUpdatedUnix: snap.syncContextUpdatedUnix,
-                    devices: snap.devices,
-                    airplayConnectionStates: snap.airplayConnectionStates
-                )
-            },
-            syncContextMarker: syncContextMarker
-        )
-        do {
-            try server.start()
-            calibrationDiagnosticServer = server
-            FileHandle.standardError.write(Data(
-                "[Router] calibration diagnostic socket bound at \(socketPath.path)\n".utf8
-            ))
-        } catch {
-            lastError = "calibration diagnostic socket: \(error)"
-        }
-    }
-
-    private func passiveDiagnosticStatus() -> CalibrationDiagnosticServer.PassiveStatus {
-        CalibrationDiagnosticServer.PassiveStatus(
-            captureBackend: capture.backendName,
-            captureDiagnostic: capture.diagnosticReport(),
-            tickCount: capture.tickCount,
-            ringWritePosition: capture.ringBuffer.writePosition,
-            sampleRate: capture.sampleRate,
-            channelCount: capture.channelCount,
-            ringCapacityFrames: capture.ringBuffer.capacityFrames
-        )
-    }
-
-    /// Stop the diagnostic listener. Idempotent. Called on whole-home
-    /// exit and from `Router.stop()`.
-    public func stopCalibrationDiagnosticServer() {
-        calibrationDiagnosticServer?.stop()
-        calibrationDiagnosticServer = nil
-    }
+    // Retired 2026-08-09: this section used to describe an acoustic
+    // auto-calibration scheme that played click pulses through the live path
+    // and measured their arrival with the microphone. It was deleted along
+    // with `ActiveCalibrator` / `MuteDipCalibrator` / the passive drift
+    // observers. Synchronisation now comes entirely from the OwnTone clock
+    // domain plus the Layer-2 ring-level PLL, and NO code path opens the
+    // microphone (README.md states that as a guarantee).
 
     /// Diagnostic: how many capture callbacks have been processed?
     /// Zero after a few seconds with system audio playing means the active
@@ -940,7 +526,6 @@ public actor Router {
     public func noteWholeHomeTimingInstability(reason: String) {
         routeMutationRevision &+= 1
         bumpAirplayTimingEpoch(reason: "whole-home timing instability: \(reason)")
-        invalidateAirplayTauCache(reason: "whole-home timing instability: \(reason)")
     }
 
     public func localBridgeTimingDiagnostics() -> [String: LocalBridgeTimingDiagnostic] {
@@ -975,7 +560,7 @@ public actor Router {
         }
         var awInfo = ""
         if let aw = audioWriter {
-            awInfo = " airplayWriter=pkts:\(aw.packetsSent) underrun:\(aw.underrunPackets) partial:\(aw.partialSends) bytes:\(aw.bytesSent) overlays:\(aw.overlaysScheduled)/\(aw.overlayFramesMixed)/drop\(aw.overlaysDroppedLate) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
+            awInfo = " airplayWriter=pkts:\(aw.packetsSent) underrun:\(aw.underrunPackets) partial:\(aw.partialSends) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
         }
         // Driver mode: most useful in field reports — tells us instantly
         // if the kernel-level synchronized aggregate is engaged or not.
@@ -1191,8 +776,8 @@ public actor Router {
 
     /// One UID's volume-backend verdict, shared by the capability snapshot
     /// and the readback path so they can never diverge. The decision
-    /// itself is the pure `DirectStereoVolumeReadback.backend` (covered by
-    /// SyncCastRouterTimingCheck); this wrapper just feeds it live state.
+    /// itself is the pure `DirectStereoVolumeReadback.backend`; this
+    /// wrapper just feeds it live state.
     private func classifyDirectStereoVolumeBackend(
         uid: String
     ) -> DirectStereoVolumeBackend {
@@ -1340,7 +925,6 @@ public actor Router {
         if newMode != mode {
             routeMutationRevision &+= 1
             bumpAirplayTimingEpoch(reason: "mode changed to \(newMode.rawValue)")
-            invalidateAirplayTauCache(reason: "mode changed to \(newMode.rawValue)")
         }
         do {
             _ = try await ipc.call("mode.set", params: ["mode": newMode.rawValue])
@@ -1356,12 +940,15 @@ public actor Router {
             // Going to stereo: kill every bridge. They're useless
             // without the sidecar broadcaster on the other end, and
             // leaving them running while the SCK→aggregate path is
-            // about to come up would double-play. Also drop the
-            // calibration diagnostic socket — calibration is a
-            // whole-home feature and the socket file would be stale.
-            stopCalibrationDiagnosticServer()
-            for (_, b) in localBridges { b.stop() }
+            // about to come up would double-play.
+                for (_, b) in localBridges { b.stop() }
             localBridges.removeAll()
+            // Layer 3: the sidecar zeroes the AirPlay offsets on its own
+            // `mode.set("stereo")` (it owns the OwnTone REST session and the
+            // persisted `speakers.offset_ms` rows). Forget our cached value
+            // so the next whole-home session re-pushes rather than being
+            // silenced by the deadband against a figure no longer in force.
+            lastPushedAirplayOffsetMs = nil
         case .wholeHome:
             // Going to whole_home: tear down the SCK→aggregate path.
             // Otherwise reconcileEngineAsync's running-true→wholeHome
@@ -1512,6 +1099,25 @@ public actor Router {
             } catch {
                 lastError = "bridge \(t.name) start failed: \(error)"
             }
+        }
+        // Seed every bridge (including ones just created) with the user's
+        // trim before it has rendered enough blocks to matter. The AirPlay
+        // half needs IPC and is pushed by the caller via
+        // `applyDeviceDelayTrims()`.
+        applyLocalDelayTrims(normalizedDelayTrims())
+        scheduleMeasuredAirPlayOffsetPush()
+    }
+
+    /// Measure `L_local` once the bridges have settled and push it as the
+    /// AirPlay offset (Layer 3). Detached because `localPipelineLatencyMs`
+    /// is nil until the first AUHAL render, and because the caller must not
+    /// block bridge bring-up on a REST round trip. The deadband inside
+    /// `pushMeasuredAirPlayOffset` makes repeat calls — one per
+    /// `startWholeHome`, which the reconciler fires often — cheap.
+    private func scheduleMeasuredAirPlayOffsetPush() {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.airplayOffsetSettleNanos)
+            await self?.pushMeasuredAirPlayOffset()
         }
     }
 
@@ -1813,9 +1419,6 @@ public actor Router {
                 reason: "connection state for \(deviceID.prefix(8)) changed "
                     + transition
             )
-            invalidateAirplayTauCache(
-                reason: "connection state for \(deviceID.prefix(8)) changed \(transition)"
-            )
         }
         if state == .failed, let reason = reason {
             connectionFailureReasons[deviceID] = reason
@@ -1848,19 +1451,8 @@ public actor Router {
             bumpAirplayTimingEpoch(
                 reason: "sidecar measured latency changed \(previous)ms -> \(measuredMs)ms"
             )
-            invalidateAirplayTauCache(
-                reason: "sidecar measured latency changed to \(measuredMs)ms"
-            )
             replan()
         }
-    }
-
-    private func invalidateAirplayTauCache(reason: String) {
-        guard airplayTauCache != nil else { return }
-        airplayTauCache = nil
-        FileHandle.standardError.write(Data(
-            "[Router] airplay calibration cache invalidated: \(reason)\n".utf8
-        ))
     }
 
     private func bumpAirplayTimingEpoch(reason: String) {
@@ -1888,7 +1480,13 @@ public actor Router {
     /// Tell the sidecar about an AirPlay 2 device. Idempotent — re-adding
     /// the same device is a no-op on the sidecar side (returns
     /// `device_id already exists`, which we swallow).
-    public func registerAirplayDevice(id: String, name: String, host: String, port: Int) async {
+    public func registerAirplayDevice(
+        id: String,
+        name: String,
+        host: String,
+        port: Int,
+        airplayDeviceID: String? = nil
+    ) async {
         guard let ipc else {
             lastError = "ipc not attached, cannot register \(name)"
             return
@@ -1899,19 +1497,23 @@ public actor Router {
             bumpAirplayTimingEpoch(
                 reason: "AirPlay endpoint changed for \(id.prefix(8))"
             )
-            invalidateAirplayTauCache(
-                reason: "AirPlay receiver registered/updated \(id.prefix(8))"
-            )
             registeredAirplayEndpointsByID[id] = endpoint
         }
         do {
-            _ = try await ipc.call("device.add", params: [
+            var params: [String: Any] = [
                 "device_id": id,
                 "transport": "airplay2",
                 "host": host,
                 "port": port,
                 "name": name,
-            ])
+            ]
+            // The stable Bonjour `deviceid` lets the sidecar match this
+            // receiver to its OwnTone output arithmetically instead of by
+            // display name. Names collide in practice — the live OwnTone
+            // database already holds two different machines sharing one — and
+            // a collision silently routes audio to someone else's speaker.
+            if let airplayDeviceID { params["airplay_device_id"] = airplayDeviceID }
+            _ = try await ipc.call("device.add", params: params)
         } catch let IpcClient.IpcError.rpcError(code, message) {
             // -32602 INVALID_PARAMS / "device_id already exists" is benign
             if code != -32602 {
@@ -1945,9 +1547,6 @@ public actor Router {
                     + "\(String(format: "%.2f", old)) -> "
                     + "\(String(format: "%.2f", clamped))"
             )
-            invalidateAirplayTauCache(
-                reason: "AirPlay volume changed for \(id.prefix(8)) \(String(format: "%.2f", old)) -> \(String(format: "%.2f", clamped))"
-            )
         }
         lastAirplayVolumeByID[id] = clamped
         guard let ipc else { return }
@@ -1976,9 +1575,6 @@ public actor Router {
                 reason: "AirPlay active set changed "
                     + "\(activeAirplayDeviceIDs.map { String($0.prefix(8)) }) -> "
                     + "\(requestedIDs.map { String($0.prefix(8)) })"
-            )
-            invalidateAirplayTauCache(
-                reason: "AirPlay active set changed \(activeAirplayDeviceIDs.map { String($0.prefix(8)) }) -> \(requestedIDs.map { String($0.prefix(8)) })"
             )
             activeAirplayDeviceIDs = requestedIDs
         }
@@ -2014,9 +1610,6 @@ public actor Router {
                     bumpAirplayTimingEpoch(
                         reason: "AirPlay stream restarted for unchanged active set []"
                     )
-                    invalidateAirplayTauCache(
-                        reason: "AirPlay stream restarted for unchanged active set"
-                    )
                 }
                 do {
                     try audioWriter?.start()
@@ -2050,9 +1643,6 @@ public actor Router {
                 reason: "AirPlay stream restarted for unchanged active set "
                     + "\(requestedIDs.map { String($0.prefix(8)) })"
             )
-            invalidateAirplayTauCache(
-                reason: "AirPlay stream restarted for unchanged active set"
-            )
         }
         do {
             try audioWriter?.start()
@@ -2069,9 +1659,16 @@ public actor Router {
         for (id, r) in routing where r.enabled && localOutputs[id] == nil {
             latencies.append(.init(deviceID: id, transport: .airplay2, measuredMs: measuredAirplayLatencyMs))
         }
-        let trims = Dictionary(uniqueKeysWithValues: routing.compactMapValues { $0.manualDelayMs }
-            .map { ($0.key, $0.value) })
-        let plans = scheduler.plan(latencies: latencies, manualTrimMs: trims)
+        // `manualTrimMs` is deliberately EMPTY here. `DeviceRouting.manualDelayMs`
+        // is now the user's per-output listening-position trim, and it is
+        // applied in whole-home mode only — on the local leg via
+        // `LocalAirPlayBridge.setTrimMs` and on the AirPlay leg via OwnTone's
+        // per-output `offset_ms`. Feeding it to the Scheduler as well would
+        // ALSO move `readBackoffFrames` for stereo-mode `localOutputs`, which
+        // is a different code path with a different clock domain and is
+        // explicitly out of scope. The Scheduler keeps the parameter (and its
+        // tests) so the capability is not lost, but this caller never uses it.
+        let plans = scheduler.plan(latencies: latencies, manualTrimMs: [:])
         for plan in plans {
             guard let out = localOutputs[plan.deviceID] else { continue }
             let r = routing[plan.deviceID] ?? DeviceRouting(deviceID: plan.deviceID)
@@ -2129,6 +1726,141 @@ public actor Router {
             let r = routing[devID] ?? DeviceRouting(deviceID: devID)
             let target = r.muted ? Float(0) : r.volume
             bridge.setVolume(target)
+        }
+
+        // Per-device delay trim, local leg. Cheap and idempotent — a bridge
+        // already holding the value takes the no-op path in render() — so it
+        // rides along with every replan rather than needing its own trigger.
+        // The AirPlay leg needs IPC and therefore an async context; see
+        // `applyDeviceDelayTrims()`.
+        applyLocalDelayTrims(normalizedDelayTrims())
+    }
+
+    // MARK: - Per-device delay trim
+    //
+    // One user-settable millisecond bias per enabled output, compensating the
+    // listener's distance to each speaker (1 ms ≈ 34 cm) plus residual
+    // systematic skew. Stored signed in `DeviceRouting.manualDelayMs`,
+    // normalised to non-negative per-leg values here, and applied downstream
+    // of everything the Layer-1/2/3 sync stack does.
+
+    /// Sidecar JSON-RPC method that carries the AirPlay leg's trims.
+    private static let deviceTrimSetMethod = "sync.set_output_trims_ms"
+
+    /// Smallest trim magnitude worth putting on the wire. Values below it are
+    /// PRUNED from the pushed map, which under `sync.set_output_trims_ms`'s
+    /// full-replacement contract is how an output gets reset to zero.
+    ///
+    /// This is NOT the repeat-push suppressor — that is the
+    /// `lastPushedAirplayTrimsMs` comparison below, which is what actually
+    /// keeps a replan from buying the user a relatch dropout. Equal to the UI
+    /// step, and since trims are whole milliseconds the two together mean
+    /// exactly "drop the zeros". Raising `DeviceDelayTrim.stepMs` without
+    /// revisiting this would start pruning trims the user really set, and
+    /// pruning means reset-to-zero, not leave-alone.
+    private static let minPushableTrimMs = DeviceDelayTrim.stepMs
+
+    /// Non-zero AirPlay trims last pushed to the sidecar, so a replan that
+    /// changes nothing emits no IPC at all.
+    private var lastPushedAirplayTrimsMs: [String: Int] = [:]
+
+    /// The outputs a trim can currently reach: local bridges plus AirPlay
+    /// receivers the sidecar has been told are active. Anything else (a
+    /// disabled row, a receiver that has not been registered yet) is excluded
+    /// from BOTH the normalisation minimum and the result — see
+    /// `DelayTrimNormalizer`.
+    private func trimmableOutputIDs() -> Set<String> {
+        guard mode == .wholeHome else { return [] }
+        var ids = Set(localBridges.keys)
+        for id in activeAirplayDeviceIDs where routing[id]?.enabled ?? false {
+            ids.insert(id)
+        }
+        return ids.filter { routing[$0]?.enabled ?? false }
+    }
+
+    /// Signed user intent turned into the non-negative delays the legs can
+    /// actually apply. Empty outside whole-home mode: stereo runs a different
+    /// output path (`localOutputs`, not `localBridges`) whose timing is
+    /// deliberately left untouched.
+    private func normalizedDelayTrims() -> [String: Int] {
+        let enabled = trimmableOutputIDs()
+        guard !enabled.isEmpty else { return [:] }
+        return DelayTrimNormalizer.normalize(
+            raw: routing.mapValues { $0.manualDelayMs },
+            enabled: enabled
+        )
+    }
+
+    /// Push the local half of a normalised trim map. Bridges absent from the
+    /// map are reset to 0 rather than left holding a stale bias — a device
+    /// that just got disabled must not keep delaying itself.
+    private func applyLocalDelayTrims(_ normalized: [String: Int]) {
+        for (devID, bridge) in localBridges {
+            bridge.setTrimMs(normalized[devID] ?? 0)
+        }
+    }
+
+    /// Recompute the per-output trims and fan them out to both legs.
+    ///
+    /// Both legs are driven from ONE normalisation of ONE routing snapshot,
+    /// which is why this lives on the Router: it is the only place that holds
+    /// `routing`, `localBridges` and the sidecar IPC handle at the same time.
+    /// The sidecar cannot do it (local CoreAudio devices are invisible to it,
+    /// so it can never compute the global minimum) and a single bridge cannot
+    /// (no global view).
+    ///
+    /// The AirPlay push is skipped entirely when the non-zero trim set is
+    /// unchanged. That matters more than it looks: OwnTone latches
+    /// `offset_ms` when it builds an output session and refuses to change a
+    /// live one, so applying an AirPlay trim costs a disable → 0.4 s →
+    /// enable dropout on that receiver.
+    ///
+    /// - Returns: `.applied` when the AirPlay leg now carries what the user
+    ///   asked for (including the "nothing changed" and "nothing to send"
+    ///   cases), `.failed` when it does not and the caller must retry. The
+    ///   distinction exists because a dropped push is invisible: the local
+    ///   leg has already moved, so a silent failure leaves the two legs
+    ///   disagreeing by exactly the trim the user just dialled in.
+    @discardableResult
+    public func applyDeviceDelayTrims() async -> DeviceTrimPushResult {
+        // Stereo runs a different output path whose timing is deliberately
+        // untouched, and the sidecar independently returns 0 for every
+        // AirPlay offset outside whole-home. Reporting `.applied` (rather
+        // than falling through to a "no sidecar attached" failure) keeps a
+        // stereo-mode re-seed from driving the caller's retry loop and
+        // surfacing an error for work that was never meant to happen.
+        guard mode == .wholeHome else { return .applied }
+        let normalized = normalizedDelayTrims()
+        applyLocalDelayTrims(normalized)
+
+        let airplayIDs = activeAirplayDeviceIDs.filter {
+            localBridges[$0] == nil && (routing[$0]?.enabled ?? false)
+        }
+        var airplayTrims: [String: Int] = [:]
+        for id in airplayIDs {
+            let value = normalized[id] ?? 0
+            if abs(value) >= Self.minPushableTrimMs { airplayTrims[id] = value }
+        }
+        guard airplayTrims != lastPushedAirplayTrimsMs else { return .applied }
+        guard let ipc else {
+            // No sidecar attached: remember nothing, so the push is retried
+            // once IPC comes back rather than being suppressed by a
+            // record that never actually landed. Reported as a failure for
+            // the same reason — outside whole-home there is nothing to push
+            // in the first place, so `normalizedDelayTrims()` is empty and
+            // we never reach here.
+            return .failed
+        }
+        do {
+            _ = try await ipc.call(
+                Self.deviceTrimSetMethod,
+                params: ["trims_ms": airplayTrims]
+            )
+            lastPushedAirplayTrimsMs = airplayTrims
+            return .applied
+        } catch {
+            lastError = "device trim push failed: \(error)"
+            return .failed
         }
     }
 
@@ -2211,13 +1943,182 @@ public actor Router {
             "local_fifo.set_delay_ms", params: ["delay_ms": ms]
         )
         if let dict = result as? [String: Any], let applied = dict["delay_ms"] as? Int {
-            continuousActiveCurrentDelayMs = max(0, min(5000, applied))
-            continuousActiveCalibrator?.noteExternalDelayChange()
+            lastAppliedLocalFifoDelayMs = max(0, min(5000, applied))
             return applied
         }
-        continuousActiveCurrentDelayMs = max(0, min(5000, ms))
-        continuousActiveCalibrator?.noteExternalDelayChange()
+        lastAppliedLocalFifoDelayMs = max(0, min(5000, ms))
         return ms
+    }
+
+    // MARK: - Layer 3: residual AirPlay offset
+    //
+    // Layer 1 (broadcaster delay 0) and Layer 2 (the PLL in
+    // `LocalAirPlayBridge` that slaves the local device clock to OwnTone's
+    // fifo write rate) leave both legs departing OwnTone together and never
+    // drifting apart. The residual is the LOCAL leg's own pipeline latency
+    // `L_local` — ring fill + render quantum + packet quantisation + the
+    // CoreAudio device's presentation latency. The local leg cannot be
+    // advanced, so the AirPlay leg is delayed by `L_local` instead, using
+    // OwnTone's per-output `offset_ms` (positive = delay, verified against
+    // outputs/airplay.c:2180 and docs/json-api.md).
+
+    /// Sidecar JSON-RPC method that sets the AirPlay-side offset.
+    private static let airplayOffsetSetMethod = "sync.set_airplay_offset_ms"
+    /// Sidecar JSON-RPC method that reads the offset state back.
+    private static let airplayOffsetGetMethod = "sync.airplay_offset"
+    /// `source` label the sidecar records when the value came from this
+    /// measurement path rather than from a human moving a slider.
+    public static let airplayOffsetMeasuredSource = "router_measured"
+    /// `source` label the sidecar records for a hand-tuned value. A manual
+    /// offset is never overwritten by the measurement path.
+    public static let airplayOffsetManualSource = "manual"
+    /// Don't churn the offset for sub-audible changes. Re-applying it costs a
+    /// disable/enable cycle on every AirPlay receiver (OwnTone latches the
+    /// offset at session construction), so a 1-2 ms wobble in the measured
+    /// value must not buy the user a dropout. 5 ms is well under the ~10 ms
+    /// threshold where two sources start to read as separate.
+    private static let airplayOffsetDeadbandMs = 5
+    /// How long to let a freshly-started bridge run before measuring. The
+    /// render quantum is only known after the first AUHAL callback, and
+    /// `localPipelineLatencyMs` deliberately returns nil until then rather
+    /// than guessing.
+    private static let airplayOffsetSettleNanos: UInt64 = 1_500_000_000
+
+    /// Last offset (ms) successfully pushed to the sidecar, so
+    /// `pushMeasuredAirPlayOffset` can honour the deadband. nil until the
+    /// first push of this session.
+    private var lastPushedAirplayOffsetMs: Int?
+
+    /// Measured `L_local` across the running local bridges, or nil when no
+    /// bridge has rendered yet.
+    ///
+    /// With several local devices their latencies differ (built-in speakers
+    /// are a few ms, a DisplayPort monitor tens), and one AirPlay offset
+    /// cannot satisfy all of them. We take the MAXIMUM, which puts the AirPlay
+    /// leg level with the slowest local device; the faster ones then lead it
+    /// by their own shortfall instead of the whole budget. Taking the minimum
+    /// would leave every local device late by up to the same spread, which is
+    /// the more noticeable failure because the local speaker is the one the
+    /// user is standing next to.
+    public func measuredLocalPipelineLatencyMs() -> Double? {
+        localBridges.values.compactMap { $0.localPipelineLatencyMs }.max()
+    }
+
+    /// Push a specific AirPlay offset (ms) to the sidecar. Positive delays
+    /// the AirPlay leg; 0 retires the correction. Returns the value the
+    /// sidecar actually applied (it clamps to OwnTone's ±2000 ms range).
+    ///
+    /// `relatch` cycles already-playing outputs so the new value takes effect
+    /// now instead of at their next enable — OwnTone copies the offset into
+    /// an output session when it builds it and will not change a live one.
+    ///
+    /// `source` defaults to `manual`, matching the sidecar's own default,
+    /// because everything except `pushMeasuredAirPlayOffset` is by definition
+    /// a human asking for a specific value. Labelling a hand-tuned offset
+    /// `router_measured` would let the next measurement overwrite it — the
+    /// exact outcome the "a manual value outranks our measurement" rule in
+    /// `pushMeasuredAirPlayOffset` exists to prevent.
+    @discardableResult
+    public func setAirPlayOffsetMs(
+        _ ms: Int,
+        source: String = Router.airplayOffsetManualSource,
+        relatch: Bool = true
+    ) async throws -> Int {
+        guard let ipc else {
+            throw NSError(domain: "SyncCastRouter", code: 101, userInfo: [
+                NSLocalizedDescriptionKey: "sidecar not attached"
+            ])
+        }
+        let result = try await ipc.call(
+            Self.airplayOffsetSetMethod,
+            params: [
+                "offset_ms": ms,
+                "source": source,
+                "relatch": relatch,
+            ]
+        )
+        let applied = (result as? [String: Any])?["offset_ms"] as? Int ?? ms
+        lastPushedAirplayOffsetMs = applied
+        return applied
+    }
+
+    /// Current sidecar-side offset state, or nil when IPC is unavailable.
+    public func airPlayOffsetState() async -> [String: Any]? {
+        guard let ipc else { return nil }
+        let result = try? await ipc.call(Self.airplayOffsetGetMethod, params: [:])
+        return result as? [String: Any]
+    }
+
+    /// Measure `L_local` from the running bridges and push it as the AirPlay
+    /// offset. No-op when nothing has been measured yet or when the change is
+    /// inside the deadband. Failures land in `lastError` rather than
+    /// propagating: a whole-home session that is merely a few ms out of
+    /// alignment must not be torn down over it.
+    public func pushMeasuredAirPlayOffset() async {
+        guard let measured = measuredLocalPipelineLatencyMs() else { return }
+        let target = Int(measured.rounded())
+        let state = await airPlayOffsetState()
+        // A value the user dialled in by hand outranks our measurement. The
+        // measurement is a model of the pipeline; the human was listening to
+        // it. Silently overwriting a field-tuned offset is the worst outcome
+        // here, because it looks like the tuning simply did not stick.
+        if (state?["source"] as? String) == Self.airplayOffsetManualSource {
+            return
+        }
+        if lastPushedAirplayOffsetMs == nil {
+            // First push of the session: seed the deadband from what the
+            // outputs are actually CARRYING, so a measurement that merely
+            // confirms what is already latched does not buy the user a
+            // relatch dropout on every whole-home start.
+            //
+            // Deliberately not `effective_offset_ms`: that is the sidecar's
+            // INTENT, and the two diverge precisely where it matters. Any
+            // receiver that was already selected in OwnTone when whole-home
+            // began kept the offset its live session latched (OwnTone will
+            // not change a playing one), while the sidecar still reports its
+            // intended value — so seeding from intent suppressed the one push
+            // that would have re-latched it, and that receiver ran ~L_local
+            // ahead of the local leg for the entire session with nothing in
+            // the log. Seeding from the per-output truth leaves the seed nil
+            // in exactly that case, and nil forces the push through.
+            lastPushedAirplayOffsetMs = Self.latchedOffsetMs(from: state)
+        }
+        if let previous = lastPushedAirplayOffsetMs,
+           abs(previous - target) < Self.airplayOffsetDeadbandMs {
+            return
+        }
+        do {
+            let applied = try await setAirPlayOffsetMs(
+                target, source: Self.airplayOffsetMeasuredSource
+            )
+            FileHandle.standardError.write(Data(
+                "[Router] airplay offset: L_local measured \(target) ms, applied \(applied) ms\n".utf8
+            ))
+        } catch {
+            lastError = "airplay offset push failed: \(error)"
+        }
+    }
+
+    /// The offset the AirPlay outputs are known to be CARRYING, from the
+    /// sidecar's per-output `latched` map. nil means "not knowable", which
+    /// every caller must read as "push, do not assume it is already right".
+    ///
+    /// nil in three cases, all of which genuinely need a push: no state at
+    /// all (IPC down), an empty map (nothing latched yet this session, or an
+    /// output that was already live when we wrote its offset and therefore
+    /// never latched ours), and any output whose offset write failed (its
+    /// value is whatever a previous session persisted).
+    ///
+    /// When several outputs are latched at different values, the MINIMUM is
+    /// the honest summary: the deadband must only suppress a push when EVERY
+    /// output is already close enough, and the furthest-away one decides that.
+    static func latchedOffsetMs(from state: [String: Any]?) -> Int? {
+        guard let state else { return nil }
+        if let failures = state["write_failures"] as? [Any], !failures.isEmpty {
+            return nil
+        }
+        guard let latched = state["latched"] as? [String: Any] else { return nil }
+        return latched.values.compactMap { intDiagnosticValue($0) }.min()
     }
 
     /// Broadcaster diagnostics (running flag, actual_delivery_lag_ms, etc.)
@@ -2230,11 +2131,11 @@ public actor Router {
 
     public func localFifoCurrentDelayMsForDiagnostics() async -> Int? {
         guard let diagnostics = await localFifoDiagnostics() else {
-            return continuousActiveCurrentDelayMs
+            return lastAppliedLocalFifoDelayMs
         }
         return Self.intDiagnosticValue(diagnostics["current_delay_ms"])
             ?? Self.intDiagnosticValue(diagnostics["delay_ms"])
-            ?? continuousActiveCurrentDelayMs
+            ?? lastAppliedLocalFifoDelayMs
     }
 
     private static func intDiagnosticValue(_ value: Any?) -> Int? {
@@ -2242,435 +2143,6 @@ public actor Router {
         if let value = value as? Double, value.isFinite { return Int(value.rounded()) }
         if let value = value as? NSNumber { return value.intValue }
         return nil
-    }
-
-    // MARK: - Continuous v4 active calibration
-    //
-    // Wraps `ActiveCalibrator` in a periodic background loop. Each
-    // cycle re-uses `runCalibrationRaw` (same plumbing as the manual
-    // one-shot button) and pushes the corrected delay through the
-    // existing `setLocalFifoDelayMs` IPC. Replaces the GCC-PHAT
-    // passive engine, which couldn't distinguish per-device taus.
-    public private(set) var continuousActiveCalibrator: ContinuousActiveCalibrator?
-    public private(set) var lastContinuousActiveSample: ContinuousActiveCalibrator.Sample?
-    /// Cached most-recent delay-line value. Read by the loop's
-    /// `initialDelayMs` callback so each cycle's delta is computed
-    /// against the freshest value rather than the original seed.
-    private var continuousActiveCurrentDelayMs: Int = 1750
-    public typealias ContinuousActiveDeviceProvider =
-        @Sendable () async -> [Device]
-
-    /// Begin continuous v4 active calibration. Idempotent. `runner`
-    /// re-enters `runCalibrationRaw` so routing / volume / restore is
-    /// single-sourced.
-    public func startContinuousActiveCalibration(
-        intervalSeconds: Int,
-        microphoneDeviceID: AudioDeviceID?,
-        initialDelayMs: Int,
-        deviceProvider: @escaping ContinuousActiveDeviceProvider,
-        onSample: @escaping @Sendable (ContinuousActiveCalibrator.Sample) -> Void
-    ) async throws {
-        guard Self.activeAcousticCalibrationEnabled else {
-            throw CalibrationFailure.engineFailed(
-                Self.activeAcousticCalibrationDisabledMessage
-            )
-        }
-        if continuousActiveCalibrator != nil { return }
-        continuousActiveCurrentDelayMs = max(0, min(5000, initialDelayMs))
-        let calibrator = ContinuousActiveCalibrator(
-            runner: { [weak self] in
-                guard let self else { throw CalibrationFailure.engineFailed("router gone") }
-                let devs = await deviceProvider()
-                // Phase-1-only — see runCalibrationLocalOnly. AirPlay τ
-                // is inherited from the most recent full calibration so
-                // continuous mode never silences AirPlay devices.
-                return try await self.runCalibrationLocalOnly(
-                    devices: devs, microphoneDeviceID: microphoneDeviceID
-                )
-            },
-            applyDelayMs: { [weak self] ms in
-                await self?.applyContinuousActiveDelay(ms)
-            },
-            initialDelayMs: { [weak self] in
-                return await self?.continuousActiveDelaySnapshot() ?? 0
-            },
-            onSample: { [weak self] (sample: ContinuousActiveCalibrator.Sample) in
-                guard let self else { return }
-                Task { await self.recordContinuousActiveSample(sample) }
-                onSample(sample)
-            }
-        )
-        calibrator.measurementIntervalSeconds = Double(intervalSeconds)
-        do {
-            try await calibrator.start()
-        } catch {
-            lastError = "continuous active calibration start failed: \(error)"
-            throw error
-        }
-        continuousActiveCalibrator = calibrator
-    }
-
-    /// Stop the continuous loop. Idempotent.
-    public func stopContinuousActiveCalibration() {
-        continuousActiveCalibrator?.stop()
-        continuousActiveCalibrator = nil
-        lastContinuousActiveSample = nil
-    }
-
-    fileprivate func continuousActiveDelaySnapshot() -> Int {
-        return continuousActiveCurrentDelayMs
-    }
-
-    /// Cache + push to broadcaster. Failures surface in `lastError`
-    /// but don't propagate — the next cycle retries.
-    private func applyContinuousActiveDelay(_ ms: Int) async {
-        let clamped = max(0, min(10_000, ms))
-        continuousActiveCurrentDelayMs = max(0, min(5000, ms))
-        do {
-            _ = try await setLocalFifoDelayMs(clamped)
-        } catch {
-            lastError = "continuous active set_delay_ms failed: \(error)"
-        }
-    }
-
-    private func recordContinuousActiveSample(
-        _ sample: ContinuousActiveCalibrator.Sample
-    ) {
-        lastContinuousActiveSample = sample
-    }
-
-    /// Phase-1-only variant for the continuous calibration loop. Drives
-    /// `ActiveCalibrator.run` with `airplayProbes: []` so Phase 2 (the
-    /// disruptive AirPlay TDMA mute-dip — ~24 s of silenced devices for
-    /// a typical 2-receiver setup) is skipped entirely. The only on-air
-    /// activity per cycle is one local high-band coded probe from the
-    /// active `ActiveCalibrator` profile.
-    ///
-    /// AirPlay group τ is inherited from `airplayTauCache` (populated
-    /// by the most recent successful full `runCalibration`). The
-    /// returned `Result.perDeviceTauMs` MERGES the freshly-measured
-    /// local taus with the cached `airplay-group` tau, and `deltaMs` is
-    /// recomputed as `max(0, cachedAirplayGroup − median(freshLocal)
-    /// − broadcasterOverheadMs)` so the continuous loop's drift policy
-    /// still operates against an AirPlay-vs-local delta.
-    ///
-    /// If the user has enabled AirPlay devices but never run a full
-    /// Auto-calibrate (cache empty), throws `CalibrationFailure.engineFailed`
-    /// — the continuous loop's existing failure handling logs once and
-    /// keeps trying without disturbing the user.
-    public func runCalibrationLocalOnly(
-        devices: [Device],
-        microphoneDeviceID: AudioDeviceID?
-    ) async throws -> ActiveCalibrator.Result {
-        let enabled = devices.filter { routing[$0.id]?.enabled == true }
-        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
-        let enabledLocalIDs = Set(
-            enabled.filter { $0.transport == .coreAudio }.map { $0.id }
-        )
-        let enabledAirplayIDs = Set(
-            enabled.filter { $0.transport == .airplay2 }.map { $0.id }
-        )
-        guard !enabledLocalIDs.isEmpty, !enabledAirplayIDs.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "continuous active calibration requires enabled local and AirPlay outputs"
-            )
-        }
-        guard let cache = airplayTauCache else {
-            throw CalibrationFailure.engineFailed(
-                "no full calibration cached; run Auto-calibrate once before enabling continuous mode"
-            )
-        }
-        let age = Date().timeIntervalSince(cache.calibratedAt)
-        guard age <= airplayTauCacheTTLSeconds else {
-            throw CalibrationFailure.engineFailed(
-                "stale AirPlay calibration cache (age \(Int(age))s); run Auto-calibrate again"
-            )
-        }
-        let probeProfile = ActiveCalibrator.fingerprintProbeProfileName
-        guard cache.probeProfile == probeProfile else {
-            throw CalibrationFailure.engineFailed(
-                "stale AirPlay calibration cache; probe profile changed from \(cache.probeProfile) to \(probeProfile)"
-            )
-        }
-        let signature = airplayRouteSignature(enabled: enabled)
-        guard signature == cache.routeSignature else {
-            throw CalibrationFailure.engineFailed(
-                "stale AirPlay calibration cache; route or volume changed"
-            )
-        }
-        let raw = try await runCalibrationRaw(
-            devices: devices,
-            microphoneDeviceID: microphoneDeviceID,
-            skipAirplayPhase: true
-        )
-        // Merge fresh local τ with cached AirPlay group τ. Route signature
-        // validation above makes the group tau specific to the exact
-        // enabled AirPlay set/volume/mute context without pretending it is
-        // independent per-receiver data.
-        var merged = raw.perDeviceTauMs
-        merged[ActiveCalibrator.airplayGroupDeviceID] = cache.groupTau
-        var mergedConfidence = raw.perDeviceConfidence
-        mergedConfidence[ActiveCalibrator.airplayGroupDeviceID] =
-            cache.groupConfidence
-        var mergedUncertainty = raw.perDeviceUncertaintyMs
-        mergedUncertainty[ActiveCalibrator.airplayGroupDeviceID] =
-            cache.groupUncertaintyMs
-        // Recompute delta = cached AirPlay group τ − median(fresh local τ)
-        // − broadcasterOverheadMs. ABSOLUTE TARGET delay-line value (the
-        // continuous loop SETs, not adds) — same semantics + same bug fix as
-        // the manual-calibrate path in `ActiveCalibrator.run`. Median is
-        // robust to per-device cycle drift; broadcaster-overhead corrects
-        // for Phase 1's tone bypassing the SCK→writer→sidecar→broadcaster
-        // chain that real music traverses.
-        let airplayCached: [Int] = [cache.groupTau].filter { $0 >= 0 }
-        let localFresh: [Int] = enabled
-            .filter { $0.transport == .coreAudio }
-            .compactMap { raw.perDeviceTauMs[$0.id] }
-            .filter { $0 >= 0 }
-        guard !airplayCached.isEmpty, !localFresh.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "continuous active calibration cannot merge local drift without cached AirPlay and fresh local taus"
-            )
-        }
-        let airMed = airplayCached.max() ?? 0
-        let locMed = ActiveCalibrator.medianInt(localFresh)
-        let overheadMs = ActiveCalibrator.resolvedBroadcasterOverheadMs()
-        // Defensive clamp: never recommend a negative delay-line.
-        let mergedDelta = max(0, airMed - locMed - overheadMs)
-        return ActiveCalibrator.Result(
-            perDeviceTauMs: merged,
-            perDeviceConfidence: mergedConfidence,
-            perDeviceUncertaintyMs: mergedUncertainty,
-            aggregateConfidence: min(raw.aggregateConfidence, cache.groupConfidence),
-            deltaMs: mergedDelta
-        )
-    }
-
-    /// Variant of `runCalibration` that returns the raw
-    /// `ActiveCalibrator.Result` instead of the squashed
-    /// `CalibrationDelta`. The continuous loop needs the full result
-    /// (per-device taus, aggregate confidence) so it can run its own
-    /// drift / confidence policies; the manual one-shot caller only
-    /// needs the squashed delta + summary so the existing API is left
-    /// alone.
-    ///
-    /// `skipAirplayPhase` (true → Phase-1-only) is set by the
-    /// continuous loop via `runCalibrationLocalOnly`; the manual
-    /// Auto-calibrate path leaves it false to run the full Phase 1 +
-    /// Phase 2 sequence.
-    fileprivate func runCalibrationRaw(
-        devices: [Device],
-        microphoneDeviceID: AudioDeviceID?,
-        skipAirplayPhase: Bool = false
-    ) async throws -> ActiveCalibrator.Result {
-        guard Self.activeAcousticCalibrationEnabled else {
-            throw CalibrationFailure.engineFailed(
-                Self.activeAcousticCalibrationDisabledMessage
-            )
-        }
-        let enabled = devices.filter { routing[$0.id]?.enabled == true }
-        guard !enabled.isEmpty else { throw CalibrationFailure.noEnabledDevices }
-        let calibrationRouteRevision = routeMutationRevision
-
-        let originalRouting: [String: DeviceRouting] = Dictionary(
-            uniqueKeysWithValues: enabled.compactMap { dev -> (String, DeviceRouting)? in
-                guard let r = routing[dev.id] else { return nil }
-                return (dev.id, r)
-            }
-        )
-
-        let bridgeSnapshot: [String: LocalAirPlayBridge] = localBridges
-        var localProbes: [ActiveCalibrator.LocalProbe] = []
-        var airplayProbes: [ActiveCalibrator.AirPlayProbe] = []
-        for dev in enabled {
-            switch dev.transport {
-            case .coreAudio:
-                if let bridge = bridgeSnapshot[dev.id] {
-                    localProbes.append(.init(deviceID: dev.id, bridge: bridge))
-                }
-            case .airplay2:
-                if !skipAirplayPhase {
-                    let origVol = originalRouting[dev.id]?.volume ?? 1.0
-                    airplayProbes.append(.init(deviceID: dev.id, originalVolume: origVol))
-                }
-            }
-        }
-        // Phase-1-only with no local bridges enabled is a no-op; surface
-        // it as a typed failure so the continuous loop's recordFailure()
-        // path treats it as a skipped cycle.
-        if skipAirplayPhase && localProbes.isEmpty {
-            throw CalibrationFailure.engineFailed(
-                "phase-1-only calibration requires at least one enabled local bridge"
-            )
-        }
-
-        let writer = audioWriter
-        let injectChirpToRing: @Sendable (
-            _ samples: [[Float]], _ atNs: UInt64
-        ) async -> Void = { samples, atNs in
-            guard samples.count >= 2,
-                  !samples[0].isEmpty,
-                  samples[0].count == samples[1].count
-            else { return }
-            if writer?.scheduleStereoOverlay(samples: samples, atNs: atNs) != true {
-                FileHandle.standardError.write(Data(
-                    "[Router] calibration probe overlay schedule failed atNs=\(atNs)\n".utf8
-                ))
-            }
-        }
-
-        let airplaySetter: ActiveCalibrator.AsyncAirplayVolumeSetter = {
-            [weak self] devID, vol in
-            await self?.setAirplayVolume(
-                id: devID,
-                volume: vol,
-                invalidatesTiming: false
-            )
-        }
-
-        let muteAirplayBeforeLocal: ActiveCalibrator.AsyncSideEffect?
-        let restoreAirplayAfterLocal: ActiveCalibrator.AsyncSideEffect?
-        if airplayProbes.isEmpty {
-            muteAirplayBeforeLocal = nil
-            restoreAirplayAfterLocal = nil
-        } else {
-            muteAirplayBeforeLocal = { [weak self, airplayProbes] in
-                guard let self else { return }
-                for probe in airplayProbes {
-                    await self.setAirplayVolume(
-                        id: probe.deviceID,
-                        volume: 0,
-                        invalidatesTiming: false
-                    )
-                }
-                try? await Task.sleep(nanoseconds: 900_000_000)
-            }
-            restoreAirplayAfterLocal = { [weak self, airplayProbes] in
-                guard let self else { return }
-                for probe in airplayProbes {
-                    await self.setAirplayVolume(
-                        id: probe.deviceID,
-                        volume: probe.originalVolume,
-                        invalidatesTiming: false
-                    )
-                }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
-        }
-
-        let calibrator = ActiveCalibrator(
-            microphoneDeviceID: microphoneDeviceID,
-            muteAirplayBeforeLocalPhase: muteAirplayBeforeLocal,
-            restoreAirplayAfterLocalPhase: restoreAirplayAfterLocal
-        )
-        let requiredBridgeIDs = Set(localProbes.map(\.deviceID))
-        let transportBefore = calibrationTransportSnapshot(
-            bridgeIDs: requiredBridgeIDs
-        )
-
-        var didRestore = false
-        func restoreOriginalRouting() async {
-            if didRestore { return }
-            didRestore = true
-            guard routeMutationRevision == calibrationRouteRevision else {
-                FileHandle.standardError.write(Data(
-                    "[Router] calibration routing restore skipped because route revision changed \(calibrationRouteRevision) -> \(routeMutationRevision)\n".utf8
-                ))
-                return
-            }
-            for (id, r) in originalRouting {
-                routing[id] = r
-            }
-            replan()
-            for dev in enabled where dev.transport == .airplay2 {
-                let v = originalRouting[dev.id]?.volume ?? 1.0
-                await setAirplayVolume(
-                    id: dev.id,
-                    volume: v,
-                    invalidatesTiming: false
-                )
-            }
-        }
-
-        do {
-            try Task.checkCancellation()
-            let result = try await calibrator.run(
-                localProbes: localProbes,
-                airplayProbes: airplayProbes,
-                setAirplayVolume: airplaySetter,
-                injectChirpToRing: injectChirpToRing,
-                sckRingSampleRate: capture.sampleRate
-            )
-            let transportAfter = calibrationTransportSnapshot(
-                bridgeIDs: requiredBridgeIDs
-            )
-            await restoreOriginalRouting()
-            guard routeMutationRevision == calibrationRouteRevision else {
-                throw CalibrationFailure.engineFailed(
-                    "calibration route context changed during measurement"
-                )
-            }
-            try validateCalibrationTransport(
-                before: transportBefore,
-                after: transportAfter,
-                requiresWriter: !airplayProbes.isEmpty,
-                requiredBridgeIDs: requiredBridgeIDs
-            )
-            return result
-        } catch {
-            await restoreOriginalRouting()
-            if error is CancellationError { throw error }
-            throw CalibrationFailure.engineFailed("\(error)")
-        }
-    }
-
-    private func calibrationTransportSnapshot(
-        bridgeIDs: Set<String>
-    ) -> CalibrationTransportSnapshot {
-        let writerSnapshot = audioWriter.map {
-            CalibrationTransportSnapshot.Writer(
-                packetsSent: $0.packetsSent,
-                underrunPackets: $0.underrunPackets,
-                partialSends: $0.partialSends,
-                lastError: $0.lastSendError,
-                overlaysScheduled: $0.overlaysScheduled,
-                overlayFramesScheduled: $0.overlayFramesScheduled,
-                overlayFramesMixed: $0.overlayFramesMixed,
-                overlaysDroppedLate: $0.overlaysDroppedLate
-            )
-        }
-        var bridgeSnapshots: [String: CalibrationTransportSnapshot.Bridge] = [:]
-        for id in bridgeIDs {
-            guard let bridge = localBridges[id] else { continue }
-            bridgeSnapshots[id] = .init(
-                packetsReceived: bridge.packetsReceived,
-                renderTickCount: bridge.renderTickCount,
-                driftResyncCount: bridge.driftResyncCount,
-                driftResyncReason: bridge.lastDriftResyncReason,
-                driftResyncFrameDelta: bridge.lastDriftResyncFrameDelta,
-                lastError: bridge.lastError
-            )
-        }
-        return .init(writer: writerSnapshot, bridges: bridgeSnapshots)
-    }
-
-    private func validateCalibrationTransport(
-        before: CalibrationTransportSnapshot,
-        after: CalibrationTransportSnapshot,
-        requiresWriter: Bool,
-        requiredBridgeIDs: Set<String>
-    ) throws {
-        let failures = CalibrationTransportHealth.failures(
-            before: before,
-            after: after,
-            requiresWriter: requiresWriter,
-            requiredBridgeIDs: requiredBridgeIDs
-        )
-        guard failures.isEmpty else {
-            throw CalibrationFailure.engineFailed(
-                "calibration transport unhealthy: " + failures.joined(separator: "; ")
-            )
-        }
     }
 
 }

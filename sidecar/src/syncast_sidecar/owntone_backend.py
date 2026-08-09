@@ -16,7 +16,11 @@ The REST API surface we use:
 
   GET  /api/outputs                            list known outputs
   PUT  /api/outputs/{id}                       enable/disable
-  PUT  /api/outputs/{id}/volume                set 0..100
+  PUT  /api/outputs/{id}  {"volume": N}        set 0..100
+  PUT  /api/outputs/{id}  {"pin": "1234"}      submit an AirPlay pairing PIN
+  PUT  /api/outputs/{id}  {"offset_ms": N}     per-output playback offset
+                                               (positive = delay; see
+                                               `set_output_offset_ms`)
   GET  /api/queue, POST /api/queue/clear       (used to flush state)
 
 This module deliberately keeps the OwnTone surface small. If we need
@@ -30,6 +34,7 @@ import contextlib
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -41,9 +46,103 @@ from . import log
 
 logger = log.get("sidecar.owntone")
 
+# Default ceiling for a loopback REST round trip to our own OwnTone. Every
+# ordinary endpoint answers in milliseconds; anything slower is a fault.
+REST_TIMEOUT_S = 2.0
+# PUT /api/outputs/{id} with a PIN is the one exception. OwnTone handles it
+# SYNCHRONOUSLY: `player_speaker_authorize` blocks on `commands_exec_sync`
+# while `airplay_device_authorize` runs a full AirPlay pair-setup (SRP plus
+# three RTSP round trips), and OwnTone's own RTSP layer budgets 10 s to
+# connect and 15 s per exchange. Holding this call to the ordinary 2 s cap
+# aborts pairings that are proceeding normally — and the client then reports
+# a correct PIN as rejected while the receiver may in fact have paired.
+PAIRING_REST_TIMEOUT_S = 30.0
+
+# OwnTone's output buffer duration (the `start_buffer_ms` default in
+# owntone-server/src/conffile.c:79). This is the single most important
+# timing anchor for whole-home sync: every output rides it. An AirPlay-2
+# receiver (e.g. the Xiaomi Sound) plays each sample at
+# `pts + OWNTONE_OUTPUT_BUFFER_DURATION_MS`, PTP-locked to the player
+# clock; the fifo output module releases the SAME byte to the pipe at
+# `pts + OWNTONE_OUTPUT_BUFFER_DURATION_MS + fifo_offset_ms`
+# (outputs/fifo.c:262 `delay = outputs_buffer_duration_ms_get() +
+# device->offset_ms`, verified against source). So with a zero broadcaster
+# delay the local leg trails the AirPlay leg only by the local pipeline
+# latency `L_local`; a NEGATIVE fifo offset advances it to close that gap.
+OWNTONE_OUTPUT_BUFFER_DURATION_MS = 2250
+
+# Local pipeline latency estimate `L_local`: the delay from the fifo pipe
+# releasing a byte to that audio leaving the local speaker. It is the
+# steady ring fill the Layer-2 PLL holds (backoff ≈ 109 ms) plus the AUHAL
+# output presentation latency (device `kAudioDevicePropertyLatency` +
+# buffer frames + safety offset, tens of ms). Determinate in origin, but
+# device-dependent in exact value — TUNE against a cross-correlation of the
+# two speakers' arrivals on real hardware (see the FinalGate checklist).
+#
+# SUPERSEDED as a control value. The residual is now cancelled by DELAYING
+# the AirPlay leg through OwnTone's per-output `offset_ms` REST channel
+# (`set_output_offset_ms` below, driven by
+# `device_manager.AIRPLAY_SYNC_OFFSET_DEFAULT_MS` and by the router's own
+# measurement). This constant survives as the historical estimate and as
+# the basis for `LOCAL_FIFO_OFFSET_MS`.
+LOCAL_PIPELINE_LATENCY_MS = 120
+
+# Per-output fifo timing offset. NEGATIVE would advance the pipe release
+# earlier so the local leg's mean offset lands near the AirPlay leg instead
+# of `+L_local` behind it.
+#
+# NOT EMITTED ANYWHERE, and must not be: writing `offset_ms` into the
+# `fifo {}` config block kills OwnTone outright on an unpatched build (see
+# the warning in `_write_config`), and the shipped binary IS unpatched. The
+# equivalent effect is available without that risk through the REST channel
+# (`PUT /api/outputs/{fifo_id} {"offset_ms": -N}`), which any build honours.
+# We nonetheless correct the residual on the AIRPLAY side instead: one
+# receiver-independent value, no exposure to the unsigned-wraparound bug in
+# `outputs/fifo.c:263`, and it leaves the local leg's timing untouched.
+LOCAL_FIFO_OFFSET_MS = -LOCAL_PIPELINE_LATENCY_MS
+
+# Hard range OwnTone's player enforces on a per-speaker playback offset.
+# `speaker_offset_ms_set` (owntone-server/src/player.c:2930) rejects anything
+# outside -2000..2000 outright, which the REST layer turns into an opaque
+# HTTP 400. We clamp on this side so a tuning knob can never produce one.
+OWNTONE_OFFSET_LIMIT_MS = 2000
+
+# Floor for a NEGATIVE offset, tightened below the player's own limit for the
+# fifo output's sake. `outputs/fifo.c:262-266` computes
+# `uint64_t delay_ms = outputs_buffer_duration_ms_get(); delay_ms +=
+# device->offset_ms;` — the guard on line 263 (`delay_ms + device->offset_ms
+# < 0`) is DEAD CODE, because C promotes the signed `offset_ms` to uint64_t
+# before the comparison. An offset more negative than the buffer duration
+# therefore wraps to ~1.8e19 ms of delay and the local leg goes silent
+# forever with nothing in the log. `min()` here means the player's ±2000
+# limit is what actually binds today; the fifo term is kept explicit so the
+# invariant survives a future change to either constant.
+OWNTONE_OFFSET_MIN_MS = -min(
+    OWNTONE_OFFSET_LIMIT_MS, OWNTONE_OUTPUT_BUFFER_DURATION_MS - 1,
+)
+OWNTONE_OFFSET_MAX_MS = OWNTONE_OFFSET_LIMIT_MS
+
+
+def clamp_output_offset_ms(offset_ms: int) -> int:
+    """Clamp a per-output offset into the range OwnTone will actually accept.
+
+    Single source of truth for the bound, so the REST client, the device
+    manager and the JSON-RPC layer cannot drift apart on it.
+    """
+    return max(OWNTONE_OFFSET_MIN_MS, min(OWNTONE_OFFSET_MAX_MS, int(offset_ms)))
+
 
 class OwnToneError(RuntimeError):
-    pass
+    """A REST call to OwnTone failed.
+
+    `code` carries the HTTP status when there was one, so callers can tell a
+    genuine 4xx rejection apart from "the helper is not reachable" without
+    parsing the message — and without importing this module.
+    """
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class OwnToneBackend:
@@ -90,6 +189,13 @@ class OwnToneBackend:
         uid = os.geteuid()
         self.output_fifo_path = Path(f"/tmp/syncast-{uid}.output.fifo")
         self.config_path = self.state_dir / "owntone.conf"
+        # OwnTone's own database. It owns `speakers.auth_key`, which is where
+        # a successful AirPlay pairing credential lives — and, as things
+        # stand, the ONLY place it lives. Moving it would mean patching
+        # OwnTone's C source, so instead the directory is kept owner-only
+        # (see `_harden_state_dir`) rather than pretending a second copy
+        # exists somewhere safer.
+        self.db_path = self.state_dir / "songs.db"
         self.config_template = config_template
         self.rest_port = rest_port
         self._proc: subprocess.Popen[bytes] | None = None
@@ -103,6 +209,7 @@ class OwnToneBackend:
                 "owntone binary not found in PATH; run scripts/bootstrap.sh"
             )
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._harden_state_dir()
         # CRITICAL: an OwnTone left over from a previous session (e.g. the
         # menubar was force-killed without running its shutdown handler,
         # or install-app.sh missed it) holds an exclusive SQLite lock on
@@ -122,6 +229,10 @@ class OwnToneBackend:
             close_fds=True,
         )
         await self._wait_for_rest(timeout_s=10.0)
+        # Again, now that OwnTone has created `songs.db`. The first call could
+        # only tighten what already existed, and on a first run the database
+        # holding the pairing credentials is born 0644.
+        self._harden_state_dir()
         # Open FIFO for write only AFTER OwnTone has it open for read,
         # otherwise we block. OwnTone opens its pipe input lazily on first
         # play; we open O_NONBLOCK and accept short writes initially.
@@ -179,6 +290,18 @@ class OwnToneBackend:
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+
+    @property
+    def pid(self) -> int | None:
+        """pid of the OwnTone child, or None when it is not running.
+
+        Needed by the unified-clock-domain path: the capture tap must exclude
+        every process in the SyncCast tree, not just the menubar app.
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return None
+        return proc.pid
 
     def is_alive(self) -> bool:
         """True if the OwnTone child process is still running. Cheap; uses
@@ -250,12 +373,114 @@ class OwnToneBackend:
     def set_output_enabled(self, output_id: str, enabled: bool) -> None:
         self._put(f"/api/outputs/{output_id}", {"selected": enabled})
 
+    def set_output_pin(self, output_id: str, pin: str) -> None:
+        """Hand a pairing PIN to OwnTone for one output.
+
+        Endpoint: PUT /api/outputs/{id} with body {"pin": "...."}. OwnTone
+        routes that straight into ``player_speaker_authorize`` ->
+        ``airplay_device_authorize``, which starts an AirPlay pair-setup
+        sequence and, on success, persists the resulting credential in its
+        own ``speakers.auth_key`` column.
+
+        The PIN goes in the request BODY, never in the URL: OwnTone logs
+        request paths at its default log level and that log file is
+        world-readable inside Application Support.
+
+        This call blocks for the whole pair-setup exchange, so it gets its
+        own generous timeout rather than the ordinary REST ceiling.
+        """
+        self._put(
+            f"/api/outputs/{output_id}",
+            {"pin": pin},
+            timeout_s=PAIRING_REST_TIMEOUT_S,
+        )
+
+    def _harden_state_dir(self) -> None:
+        """Make the OwnTone state directory and database owner-only.
+
+        `songs.db` holds long-lived AirPlay pairing credentials in cleartext,
+        and OwnTone creates it 0644 inside a 0755 directory. Nothing else
+        protects it, so tighten it on every start rather than relying on the
+        enclosing `~/Library` being private.
+        """
+        for path, mode in ((self.state_dir, 0o700), (self.db_path, 0o600)):
+            try:
+                if path.exists():
+                    path.chmod(mode)
+            except OSError as e:
+                logger.warning(
+                    "state_dir_chmod_failed",
+                    extra={"path": str(path), "error_kind": type(e).__name__},
+                )
+
+    def read_speaker_auth_key(self, output_id: str) -> str | None:
+        """Read the stored AirPlay credential for one speaker.
+
+        Returns None when there is none, when the database has not been
+        created yet, or when it cannot be read. Callers must treat the value
+        as a secret: it must never be logged, echoed in an error, or put on
+        the wire in cleartext beyond the local 0600 control socket.
+        """
+        if not self.db_path.exists():
+            return None
+        try:
+            with contextlib.closing(sqlite3.connect(str(self.db_path))) as conn:
+                row = conn.execute(
+                    "SELECT auth_key FROM speakers WHERE id = ?", (output_id,),
+                ).fetchone()
+        except sqlite3.Error as e:
+            logger.warning(
+                "speaker_auth_key_read_failed",
+                extra={"error_kind": type(e).__name__},
+            )
+            return None
+        if not row or not row[0]:
+            return None
+        return str(row[0])
+
     def set_output_volume(self, output_id: str, volume: float) -> None:
         # OwnTone uses 0..100; we accept 0.0..1.0.
         # Endpoint: PUT /api/outputs/{id} with body {volume: N}.
         # (Not /api/outputs/{id}/volume — that path returns HTTP 400.)
         v = max(0, min(100, int(round(volume * 100))))
         self._put(f"/api/outputs/{output_id}", {"volume": v})
+
+    def set_output_offset_ms(self, output_id: str, offset_ms: int) -> int:
+        """Set one output's playback offset. Returns the value actually sent.
+
+        Endpoint: ``PUT /api/outputs/{id}`` with body ``{"offset_ms": N}``
+        (httpd_jsonapi.c:1753-1757 → `player_speaker_offset_ms_set`; 204 on
+        success, 400 on rejection). The JSON gate is `json_type_int`, so the
+        value must be a real int — a float is silently ignored.
+
+        SIGN — read off the source, not assumed:
+          * docs/json-api.md: "positive value means delay", range -2000..2000.
+          * fifo leg, outputs/fifo.c:262-266: `delay_ms =
+            outputs_buffer_duration_ms_get(); delay_ms += device->offset_ms;`
+            the pipe hands each byte over that much LATER.
+          * AirPlay leg, outputs/airplay.c:1598 `session->offset_samples =
+            device->offset_ms * rate / 1000` and outputs/airplay.c:2180
+            `cur_stamp.pos -= session->offset_samples` inside
+            `packets_sync_send`. The sync packet declares "RTP position `pos`
+            happens at wall clock `ts`"; lowering `pos` while holding `ts`
+            maps every sample to a LATER instant on the receiver.
+        So POSITIVE delays an output and NEGATIVE advances it, consistently
+        across output modules.
+
+        LATCH TIMING: both modules copy `device->offset_ms` once, when their
+        session is constructed, and player.c:2937-2944 explicitly declines to
+        change a session that is already playing. Callers must therefore send
+        the offset BEFORE the `selected: true` that starts the output;
+        changing it afterwards requires a disable/enable cycle.
+
+        PERSISTENCE: the value lands in the `speakers.offset_ms` column
+        (db_init.c:157) on a graceful OwnTone shutdown (player.c:3924-3927),
+        so it survives restarts. Never assume the stored value — always write
+        the one you want, and write 0 to retire it.
+        """
+        applied = clamp_output_offset_ms(offset_ms)
+        self._put(f"/api/outputs/{output_id}", {"offset_ms": applied})
+        return applied
 
     def play_pipe(self) -> None:
         # OwnTone scans the FIFO into its library as a track when it
@@ -382,6 +607,18 @@ library {{
 # in owntone-server/src/outputs/fifo.c:64 to 44.1 kHz s16le 2ch — Swift
 # bridges decode that and let CoreAudio handle SRC up to the device's
 # nominal rate.
+# NOTE: do NOT emit `offset_ms` here. OwnTone's `sec_fifo` option set
+# (owntone-server/src/conffile.c) has no such key, and libconfuse treats an
+# unknown option as FATAL, not as something to ignore:
+#     config: [fifo:125] no such option 'offset_ms'
+#     FATAL  config: Parse error in config file
+#     FATAL  main: Config file errors; please fix your config
+# OwnTone then exits before it even opens its logfile, so BOTH legs go
+# silent (local and AirPlay) with no trace in owntone.log. Emitting this
+# key is only valid against a patched OwnTone build that adds the option
+# to sec_fifo and wires it into fifo_init; until such a build ships, the
+# residual local-pipeline offset stays uncorrected (see
+# LOCAL_FIFO_OFFSET_MS) and drift is handled by the Swift Layer-2 PLL.
 fifo {{
   nickname = "SyncCast Local Bridge"
   path = "{self.output_fifo_path}"
@@ -437,10 +674,14 @@ fifo {{
     def _post(self, path: str, body: Any) -> dict[str, Any]:
         return self._request("POST", path, body)
 
-    def _put(self, path: str, body: Any) -> dict[str, Any]:
-        return self._request("PUT", path, body)
+    def _put(
+        self, path: str, body: Any, timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request("PUT", path, body, timeout_s=timeout_s)
 
-    def _request(self, method: str, path: str, body: Any) -> dict[str, Any]:
+    def _request(
+        self, method: str, path: str, body: Any, timeout_s: float | None = None,
+    ) -> dict[str, Any]:
         import json
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urlrequest.Request(
@@ -450,13 +691,23 @@ fifo {{
             headers={"Content-Type": "application/json"} if data else {},
         )
         try:
-            with urlrequest.urlopen(req, timeout=2.0) as resp:  # noqa: S310
+            with urlrequest.urlopen(  # noqa: S310
+                req, timeout=timeout_s or REST_TIMEOUT_S,
+            ) as resp:
                 raw = resp.read()
                 if not raw:
                     return {}
                 return json.loads(raw)
+        except urlerror.HTTPError as e:
+            raise OwnToneError(f"owntone {method} {path}: {e}", code=e.code) from e
         except urlerror.URLError as e:
             raise OwnToneError(f"owntone {method} {path}: {e}") from e
+        except TimeoutError as e:
+            # urllib raises the read timeout from `getresponse()`, which sits
+            # OUTSIDE its own OSError -> URLError conversion, so without this
+            # clause a slow OwnTone escapes as a bare socket timeout that no
+            # caller is written to expect.
+            raise OwnToneError(f"owntone {method} {path}: timed out") from e
 
     def _request_no_body(self, method: str, path: str) -> dict[str, Any]:
         """Like _request but explicitly sends NO body and no JSON

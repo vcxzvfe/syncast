@@ -197,6 +197,11 @@ public final class LocalOutput {
     ///   device-level latency + safety offset + max stream latency.
     /// Called once per LocalOutput at start time; values are stable for
     /// the lifetime of an AUHAL binding.
+    ///
+    /// Also the measured hardware term of the whole-home `L_local` budget —
+    /// `LocalAirPlayBridge` reads it through `outputLatencyFrames(deviceID:)`
+    /// so both playback paths agree on what a device's presentation latency
+    /// is, rather than each carrying its own probe.
     private static func queryOutputLatencyFrames(deviceID: AudioObjectID) -> Int64 {
         let dev = readUInt32Property(deviceID, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeOutput)
         let safety = readUInt32Property(deviceID, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeOutput)
@@ -221,6 +226,14 @@ public final class LocalOutput {
             if l > maxStreamLat { maxStreamLat = l }
         }
         return Int64(dev + safety + maxStreamLat)
+    }
+
+    /// Public reader for the same probe, so callers outside `LocalOutput`
+    /// (notably `LocalAirPlayBridge`, which needs the hardware term of
+    /// `L_local`) do not reimplement the property walk. Pure query — it
+    /// opens nothing and mutates nothing.
+    public static func outputLatencyFrames(deviceID: AudioObjectID) -> Int64 {
+        queryOutputLatencyFrames(deviceID: deviceID)
     }
 
     private static func readUInt32Property(

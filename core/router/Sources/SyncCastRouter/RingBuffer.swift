@@ -81,6 +81,19 @@ public final class RingBuffer: @unchecked Sendable {
     /// Consumer: read `frames` starting at the absolute frame `at`.
     /// Out-of-window frames are zero-filled. Returns the number of frames
     /// genuinely backed by ring data.
+    ///
+    /// `at` may be NEGATIVE and may sit arbitrarily far outside the valid
+    /// window in either direction; the whole block is then zero-filled.
+    /// `LocalAirPlayBridge.render()` produces exactly such a tap during cold
+    /// start, where the read cursor is still ~0 while the per-device delay
+    /// trim already asks for its full normalised value — silence is the
+    /// correct output there, because the frames that trim asks for predate
+    /// the stream.
+    ///
+    /// INVARIANT: this function writes EXACTLY `frames` values per channel,
+    /// never more. It runs on the CoreAudio real-time thread writing straight
+    /// into the AUHAL's `mData`, so an unbounded zero-fill is an
+    /// out-of-bounds write into someone else's buffer, not a glitch.
     @discardableResult
     public func read(
         at startFrame: Int64,
@@ -95,9 +108,15 @@ public final class RingBuffer: @unchecked Sendable {
         // with [lowerValid, upperValid).
         let validStart = max(startFrame, lowerValid)
         let validEnd = min(startFrame &+ Int64(frames), upperValid)
-        let validFrames = max(0, Int(validEnd - validStart))
-        let leadingZeros = Int(max(0, validStart - startFrame))
-        let trailingZeros = frames - leadingZeros - validFrames
+        // Every span below is clamped into [0, frames]. `validStart -
+        // startFrame` is unbounded on its own: a caller whose `at` lags the
+        // window by more than one block (cold start with a large delay trim)
+        // makes it far larger than `frames`, and an unclamped `leadingZeros`
+        // would then zero-fill straight past the caller's buffer.
+        let leadingZeros = min(frames, Int(max(0, validStart - startFrame)))
+        let validFrames = min(max(0, Int(validEnd - validStart)),
+                              frames - leadingZeros)
+        let trailingZeros = max(0, frames - leadingZeros - validFrames)
 
         // Zero-fill leading.
         if leadingZeros > 0 {

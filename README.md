@@ -35,9 +35,9 @@ Neither gives you a dependable Local + AirPlay mix with per-device control. Sync
   - Local CoreAudio outputs (built-in speakers, USB / HDMI / Thunderbolt DACs)
   - AirPlay 2 receivers (HomePod, Apple TV, Xiaomi Sound, third-party speakers, other Macs running AirPlay Receiver)
 - Two mutually-exclusive modes, swapped in one click:
-  - **AirPlay experimental mode** — local + AirPlay routing through the OwnTone-backed AirPlay pipeline. Multiple AirPlay receivers are generally handled by AirPlay's own timing domain, but Local + AirPlay delay still needs robust passive calibration and can drift after AirPlay interruptions, volume changes, or route changes.
+  - **AirPlay experimental mode** — local + AirPlay routing through the OwnTone-backed AirPlay pipeline. Multiple AirPlay receivers are handled by AirPlay's own timing domain; the local leg is slaved to that same clock domain by a ring-level control loop, with a per-output millisecond trim for listening-position differences.
   - **Stereo mode** — local CoreAudio outputs only, defaulting to Direct Stereo. This is the currently stable path and is suitable for video.
-- Active acoustic calibration tones are disabled in normal builds. The current calibration R&D path is passive no-probe measurement from real program audio plus a microphone, with fail-closed confidence gates.
+- Acoustic (microphone) measurement was retired on 2026-08-09. SyncCast never opens the microphone and never plays calibration tones; alignment comes from the OwnTone clock domain instead.
 - Lives quietly in the menubar. Pure user-space Swift + a small Python sidecar.
 
 ## Architecture
@@ -83,7 +83,7 @@ Sub-components:
 
 - **macOS 14 (Sonoma) or later** — required for the current alpha.
 - **Screen Recording permission** — not required for the default local Stereo path. It is still required for ScreenCaptureKit fallback/capture-dependent paths such as AirPlay unless Process Tap is selected.
-- **Microphone permission** — optional and only for explicit passive diagnostics. Normal playback and Stereo mode do not use the microphone or play calibration tones.
+- **Microphone permission** — never requested. No code path opens the microphone, and the app bundle carries no `NSMicrophoneUsageDescription`.
 - **Xcode 15+** and **Python 3.11+** — only if you're building from source.
 - An AirPlay 2 receiver and/or a CoreAudio output device — preferably both, that's the point.
 
@@ -136,7 +136,7 @@ Development installs use ad-hoc signing by default. That is fine for the default
 1. **Launch SyncCast.** Look for the icon in the macOS menubar.
 2. **Grant Screen Recording** only if you use an SCK capture path and macOS prompts for it, then quit and reopen once.
 3. **Pick a mode** in the popover:
-   - *AirPlay experimental* — AirPlay receivers plus selected local outputs. Expect latency and calibration limitations.
+   - *AirPlay experimental* — AirPlay receivers plus selected local outputs. Expect added latency; per-output delay trims are available for fine alignment.
    - *Stereo* — local outputs only, low-latency aggregate device, suitable for video.
 4. **Tick the devices you want.** Discovery runs continuously; new AirPlay receivers and audio devices appear within a few seconds.
 5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the Direct Stereo output; capture-dependent modes use the selected capture backend.
@@ -154,9 +154,8 @@ What works:
 - Local `.app` bundling with self-signed codesigning
 
 What's still rough:
-- Local + AirPlay automatic alignment is not production-reliable yet. Passive no-probe measurement and conservative correction gates are under active development.
+- Local + AirPlay alignment now rides the OwnTone clock domain and has been verified by ear on one setup only; it has not been validated across a range of receivers or long sessions.
 - ScreenCaptureKit can trigger DRM playback blocks; Local Stereo now defaults to Direct Stereo, while Process Tap / AirPlay capture validation remains in progress.
-- Active acoustic probe calibration is lab-only and disabled by default because high-band tones were audible on real hardware.
 - Not notarized — Gatekeeper warnings are normal on first launch.
 - No first-run wizard yet; `bootstrap.sh` is the on-ramp.
 - AirPlay device pairing flow is minimal (relies on `pyatv`).
@@ -169,7 +168,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's next.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — full system design.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased plan and current status.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records (one per cross-cutting choice).
-- [`docs/round11_manual_first_design.md`](docs/round11_manual_first_design.md) — design notes for the current iteration.
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) — current state and open threads.
 - [`proto/`](proto/) — IPC schemas between the Swift router and the Python sidecar.
 - [`sidecar/README.md`](sidecar/README.md) — sidecar internals and protocol.
 

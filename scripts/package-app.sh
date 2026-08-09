@@ -89,13 +89,6 @@ cp "$SWIFT_BIN" "$MACOS_DIR/SyncCastMenuBar"
 cp "$REPO_ROOT/apps/menubar/Resources/Info.plist" "$CONTENTS/Info.plist"
 mkdir -p "$RES_DIR"
 cp -f "$REPO_ROOT/apps/menubar/Resources/AppIcon.icns" "$RES_DIR/AppIcon.icns"
-PASSIVE_TOOLS_DIR="$RES_DIR/passive-tools"
-mkdir -p "$PASSIVE_TOOLS_DIR/scripts"
-cp "$REPO_ROOT/scripts/passive_"*.py "$PASSIVE_TOOLS_DIR/scripts/"
-cp "$REPO_ROOT/scripts/passive_drift_session.sh" "$PASSIVE_TOOLS_DIR/scripts/"
-cp "$REPO_ROOT/scripts/coreaudio_default_output_guard.sh" "$PASSIVE_TOOLS_DIR/scripts/"
-cp "$REPO_ROOT/scripts/coreaudio_default_output.c" "$PASSIVE_TOOLS_DIR/scripts/"
-chmod +x "$PASSIVE_TOOLS_DIR/scripts/passive_drift_session.sh"
 # SwiftPM resource bundle (Assets.xcassets — menubar template image)
 # Bundle.module loads from <binary-dir>/<Target>_<Target>.bundle. We add a
 # minimal Info.plist at root so codesign accepts the bundle as shallow.

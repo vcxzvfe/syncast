@@ -1,4 +1,3 @@
-import CoreAudio
 import SwiftUI
 import SyncCastDiscovery
 import SyncCastRouter
@@ -28,6 +27,11 @@ struct MainPopover: View {
             footer
         }
         .padding(.vertical, 8)
+        // Pairing is deliberately NOT presented here. A sheet attached to the
+        // MenuBarExtra(.window) panel can never receive keyboard input — the
+        // panel is non-activating, and the click that tried to focus the PIN
+        // field made the panel resign key, which tore the sheet down with it.
+        // `PairingWindowController` owns a real, key-capable window instead.
         .onAppear {
             // Re-check Accessibility on every popover open: if the user
             // just granted it in System Settings, the media-key event
@@ -57,14 +61,12 @@ struct MainPopover: View {
         .padding(.vertical, 4)
     }
 
-    // MARK: - Sync section (manual-first)
+    // MARK: - Sync section (manual)
     //
-    // Manual-first calibration: a slider the user drags until music sounds
-    // aligned, a Lock button that pins the chosen value, and an A/B test
-    // (Stevens method bracketing) for users who can't tell which side of
-    // the sweet spot they're on. Auto-calibrate and continuous calibration
-    // are demoted into an Advanced disclosure — they remain available but
-    // are no longer the headline action.
+    // A slider the user drags until music sounds aligned, plus a Lock
+    // button that pins the chosen value. Long-term alignment is handled
+    // by the clock-following control loop in the router, not by this
+    // fixed value.
     private var syncSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Header: title + lock pill + reset
@@ -92,7 +94,7 @@ struct MainPopover: View {
                     .frame(width: 70, alignment: .trailing)
             }
 
-            // Action row: Lock + A/B test
+            // Action row: Lock
             HStack(spacing: 6) {
                 Button(action: {
                     if case .locked = model.delayLockState {
@@ -107,60 +109,7 @@ struct MainPopover: View {
                 .controlSize(.small)
                 .accessibilityIdentifier("lockDelayButton")
 
-                Button(action: {
-                    if case .idle = model.auditionState {
-                        model.startAudition()
-                    } else {
-                        model.stopAudition()
-                    }
-                }) {
-                    Label(auditionButtonLabel,
-                          systemImage: "waveform.path.ecg")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Stevens method bracketing: alternates ±150ms every 1.2s for 4 rounds")
-                .accessibilityIdentifier("auditionButton")
-
-                if model.activeAcousticDiagnosticsEnabled {
-                    Button(action: {
-                        Task { await model.runAutoCalibrate() }
-                    }) {
-                        Label(autoCalibrateLabel, systemImage: "tuningfork")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(autoCalibrateDisabled)
-                    .help(autoCalibrateHelp)
-                    .accessibilityIdentifier("primaryAutoCalibrateButton")
-                }
-
                 Spacer()
-            }
-
-            passiveAutosyncRow
-
-            // A/B running prompt
-            if case .running(let round, _) = model.auditionState {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Round \(round)/4 — which sounds aligned?")
-                        .font(.caption2)
-                    HStack {
-                        Button("← A sounds better") { model.chooseAuditionA() }
-                            .keyboardShortcut(.leftArrow, modifiers: [])
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .accessibilityIdentifier("auditionChooseAButton")
-                        Button("B sounds better →") { model.chooseAuditionB() }
-                            .keyboardShortcut(.rightArrow, modifiers: [])
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .accessibilityIdentifier("auditionChooseBButton")
-                    }
-                }
-                .padding(6)
-                .background(Color.yellow.opacity(0.1))
-                .cornerRadius(6)
             }
 
             // Coaching hint
@@ -168,8 +117,9 @@ struct MainPopover: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            // Diagnostics disclosure: active tone tools are lab-gated.
-            // Hybrid Tracking UI is intentionally removed here.
+            perSpeakerTrimHint
+
+            // Diagnostics disclosure: read-only pipeline readouts.
             DisclosureGroup("Diagnostics") {
                 advancedSection
             }
@@ -179,192 +129,59 @@ struct MainPopover: View {
         .padding(.vertical, 6)
         .focusable()
         .onKeyPress(.leftArrow) {
-            if case .idle = model.auditionState {
-                let step = NSEvent.modifierFlags.contains(.shift) ? -100 : -10
-                model.nudgeAirplayDelay(by: step)
-                return .handled
-            }
-            return .ignored
+            let step = NSEvent.modifierFlags.contains(.shift) ? -100 : -10
+            model.nudgeAirplayDelay(by: step)
+            return .handled
         }
         .onKeyPress(.rightArrow) {
-            if case .idle = model.auditionState {
-                let step = NSEvent.modifierFlags.contains(.shift) ? 100 : 10
-                model.nudgeAirplayDelay(by: step)
-                return .handled
-            }
-            return .ignored
+            let step = NSEvent.modifierFlags.contains(.shift) ? 100 : 10
+            model.nudgeAirplayDelay(by: step)
+            return .handled
         }
     }
 
+    /// Explains the per-speaker trim controls that live on the device rows,
+    /// and offers the one global escape hatch.
+    ///
+    /// The sign convention has to be stated somewhere the user will read it:
+    /// nothing can play EARLY, so the values are relative and the earliest
+    /// speaker is always the reference. Without that sentence, "I set -5 and
+    /// nothing moved on that speaker" looks like a bug rather than the
+    /// normalisation working correctly.
     @ViewBuilder
-    private var passiveAutosyncRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Button(action: {
-                    model.runPassiveAutosyncOnce()
-                }) {
-                    Label(passiveAutosyncButtonLabel,
-                          systemImage: "waveform.path.ecg")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!model.canRunPassiveAutosync)
-                .accessibilityIdentifier("passiveAutosyncButton")
-
-                if model.passiveAutosyncRunning {
-                    Button(action: {
-                        model.cancelPassiveAutosync()
-                    }) {
-                        Label("Stop", systemImage: "xmark.circle")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .accessibilityIdentifier("passiveAutosyncStopButton")
-                }
-
-                Spacer()
-            }
-
-            if let status = model.passiveAutosyncStatusText {
-                Text(status)
-                    .font(.caption2)
-                    .foregroundStyle(model.passiveAutosyncStatusIsError ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("passiveAutosyncStatus")
+    private var perSpeakerTrimHint: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(
+                "Per-speaker delay is on each device row. Relative only: "
+                + "the earliest speaker is the reference. Plus holds a "
+                + "speaker back, so one that sits FURTHER away needs a "
+                + "MINUS value. "
+                + "1 ms ≈ \(Int((DeviceDelayTrim.speedOfSoundMPerS / 10).rounded())) cm."
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if model.hasAnyDeviceTrim {
+                Button("Reset trims") { model.resetAllDeviceTrims() }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10))
+                    .accessibilityIdentifier("resetAllDeviceTrimsButton")
             }
         }
     }
 
-    // MARK: - Diagnostics (lab-gated active calibration)
+    // MARK: - Diagnostics
     //
-    // Manual tuning remains the headline flow, but the automatic acoustic
-    // measurement needs to be discoverable and truthfully named.
+    // Read-only pipeline readouts. The acoustic (microphone) measurement
+    // tools that used to live here were retired: alignment is handled by
+    // the OwnTone clock domain plus the ring-level control loop, so no
+    // acoustic measurement is needed.
     @ViewBuilder
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if !model.activeAcousticDiagnosticsEnabled {
-                Text("Active tone diagnostics are disabled. Passive no-probe measurement is the default path.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-            // Diagnostic Calibrate row: button + mic picker + status indicator.
-            HStack(spacing: 8) {
-                Button(action: {
-                    Task { await model.runAutoCalibrate() }
-                }) {
-                    HStack(spacing: 4) {
-                        if case .running = model.calibrationStatus {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .controlSize(.mini)
-                        } else if case .requestingPermission = model.calibrationStatus {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .controlSize(.mini)
-                        } else {
-                            Image(systemName: "mic.fill")
-                                .font(.system(size: 10))
-                        }
-                        Text(autoCalibrateLabel)
-                            .font(.system(size: 10))
-                    }
-                }
-                .buttonStyle(.borderless)
-                .disabled(autoCalibrateDisabled)
-                .accessibilityIdentifier("autoCalibrateButton")
-                Spacer()
-                if !model.availableInputDevices.isEmpty {
-                    Picker("Mic", selection: micPickerBinding) {
-                        ForEach(model.availableInputDevices, id: \.id) { dev in
-                            Text("\(dev.name) (\(dev.transportType))")
-                                .tag(Optional(dev.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .controlSize(.mini)
-                    .frame(maxWidth: 140)
-                    .accessibilityIdentifier("calibrationMicPicker")
-                }
-            }
-            // Live progress while sequential per-device sweep is running:
-            // "Calibrating <Device> (n/total)…". Sequential sweep takes
-            // ≈30s for 4 devices, so per-device feedback matters.
-            if case .running = model.calibrationStatus,
-               let progress = model.calibrationProgress {
-                Text(progress)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            // Per-status caption (result or error). Tap to dismiss.
-            if case let .completed(delta, confidence, applied) = model.calibrationStatus {
-                let score = String(format: "%.1f", confidence)
-                let prefix = applied ? "Set delay to" : "Measured target"
-                let suffix = applied ? "" : " — not applied"
-                Text("\(prefix) \(delta) ms (confidence score \(score))\(suffix) — tap to dismiss")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .onTapGesture { model.dismissCalibrationStatus() }
-            } else if case let .failed(msg) = model.calibrationStatus {
-                Text(msg)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-                    .onTapGesture { model.dismissCalibrationStatus() }
-            }
-
-            // Continuous (background) calibration: toggle, optional
-            // stepper, status caption. Hybrid mutual-exclusion logic
-            // is removed because Hybrid Tracking is gone from this UI.
-            HStack(spacing: 8) {
-                Toggle(isOn: Binding(
-                    get: { model.backgroundCalibrationEnabled },
-                    set: { newValue in
-                        model.backgroundCalibrationEnabled = newValue
-                        if newValue {
-                            Task { await model.ensureMicPermissionForBackgroundCalibration() }
-                        }
-                    }
-                )) {
-                    Text("Continuous").font(.system(size: 10))
-                }
-                .toggleStyle(.switch).controlSize(.mini)
-                .accessibilityIdentifier("continuousCalibrationToggle")
-                .help("Lab diagnostic: may play active test tones after route or AirPlay events.")
-                if model.backgroundCalibrationEnabled {
-                    Stepper(value: Binding(
-                        get: { model.backgroundCalibrationIntervalS },
-                        set: { model.backgroundCalibrationIntervalS = $0 }
-                    ), in: AppModel.bgIntervalRange, step: 10) {
-                        Text("\(model.backgroundCalibrationIntervalS)s")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .frame(minWidth: 32, alignment: .trailing)
-                    }
-                    .controlSize(.mini)
-                    .accessibilityIdentifier("continuousCalibrationStepper")
-                }
-                Spacer()
-            }
-            if model.backgroundCalibrationEnabled,
-               let status = continuousStatusText {
-                Text(status)
-                    .font(.caption2)
-                    .foregroundStyle(model.backgroundCalibrationMicDenied ? AnyShapeStyle(Color.red) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-                    .lineLimit(2)
-            }
-            if model.backgroundCalibrationActive {
-                liveStatusBlock
-                    .accessibilityIdentifier("continuousCalibrationLiveStatus")
-            }
-            }
-
-            // Measured-lag readout (was inline in v1 syncSection).
             HStack(spacing: 6) {
-                Text("Measured lag: \(model.measuredLagMs.map { "\($0)" } ?? "—") ms")
+                Text("Measured lag: \(model.measuredLagMs.map { "\($0)" } ?? "\u{2014}") ms")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -389,243 +206,17 @@ struct MainPopover: View {
         return "lock.fill"
     }
 
-    private var auditionButtonLabel: String {
-        if case .idle = model.auditionState {
-            return "A/B test"
-        }
-        return "Stop A/B"
-    }
-
-    private var passiveAutosyncButtonLabel: String {
-        if model.passiveAutosyncRequestingPermission {
-            return "Waiting..."
-        }
-        if model.passiveAutosyncCanceling {
-            return "Stopping..."
-        }
-        if model.passiveAutosyncRunning {
-            return "Checking..."
-        }
-        if model.passiveAutosyncNeedsMicrophoneGrant {
-            return "Grant Mic"
-        }
-        return "Passive Check"
-    }
-
     private var coachingHint: String {
-        if case .running = model.auditionState {
-            return "Listening — pick the side that sounds in sync"
-        }
         if case .locked(let v) = model.delayLockState {
             return "Locked at \(v) ms"
         }
         return "Drag until music sounds aligned, then press Lock"
     }
 
-    // MARK: - Live continuous-calibration status block
-    //
-    // Three rows: per-device τ strip, trend timeline, cycle info.
-    // Reads `model.lastCalibrationSample` + `calibrationSampleHistory`;
-    // @Observable invalidates on mutation. The "Xs ago" string updates
-    // each second because `syncSection` already re-renders on the
-    // existing `measuredLagMs` 1 Hz poller.
-    @ViewBuilder
-    private var liveStatusBlock: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            perDeviceLatencyStrip
-            trendTimelineRow
-            cycleInfoRow
-        }
-        .padding(.top, 2)
-    }
-
-    /// One row per entry in `lastCalibrationSample?.perDeviceTauMs`.
-    /// Empty until the integrator swaps in `ContinuousActiveCalibrator.Sample`.
-    @ViewBuilder
-    private var perDeviceLatencyStrip: some View {
-        let entries = sortedPerDeviceEntries
-        if entries.isEmpty {
-            Text("Per-device τ: awaiting first cycle")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-        } else {
-            // Bar scale: τ_d / τ_max so the 15 ms locals render as
-            // pips next to ~2400 ms AirPlay, matching the spec mock.
-            let tauMax = max(1, entries.map(\.1).max() ?? 1)
-            VStack(alignment: .leading, spacing: 1) {
-                ForEach(entries, id: \.0) { entry in
-                    perDeviceRow(name: entry.0, tau: entry.1, tauMax: tauMax)
-                }
-            }
-        }
-    }
-
-    /// Stable display order: largest τ first, so AirPlay receivers
-    /// (the dominant latency contributors) sit at the top.
-    private var sortedPerDeviceEntries: [(String, Int)] {
-        guard let sample = model.lastCalibrationSample else { return [] }
-        return sample.perDeviceTauMs
-            .map { ($0.key, $0.value) }
-            .sorted { $0.1 > $1.1 }
-    }
-
-    /// One device row: name, τ, proportional bar, drift indicator.
-    @ViewBuilder
-    private func perDeviceRow(name: String, tau: Int, tauMax: Int) -> some View {
-        let frac = max(0, min(1.0, Double(tau) / Double(tauMax)))
-        HStack(spacing: 6) {
-            Text(truncate(name, max: 10))
-                .frame(width: 70, alignment: .leading)
-            Text("\(tau) ms")
-                .frame(width: 56, alignment: .trailing)
-            ZStack(alignment: .leading) {
-                Rectangle().fill(Color.secondary.opacity(0.12))
-                    .frame(width: 60, height: 6)
-                Rectangle().fill(Color.accentColor.opacity(0.55))
-                    .frame(width: max(2, CGFloat(frac) * 60), height: 6)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 1))
-            Text(driftLabel(for: name, tau: tau))
-                .foregroundStyle(driftColor(for: name, tau: tau))
-                .frame(width: 64, alignment: .leading)
-        }
-        .font(.system(size: 10, design: .monospaced))
-        .foregroundStyle(.secondary)
-    }
-
-    /// "steady" / "+Xms drift" / "−Xms drift" against the same
-    /// device's τ in the previous sample. "—" on first cycle.
-    private func driftLabel(for device: String, tau: Int) -> String {
-        guard let prev = previousTau(for: device) else { return "—" }
-        let delta = tau - prev
-        if abs(delta) <= 2 { return "steady" }
-        return "\(delta > 0 ? "+" : "−")\(abs(delta))ms drift"
-    }
-
-    private func driftColor(for device: String, tau: Int) -> Color {
-        guard let prev = previousTau(for: device) else { return .secondary }
-        let d = abs(tau - prev)
-        return d <= 2 ? .secondary : (d <= 10 ? .yellow : .orange)
-    }
-
-    /// Previous-sample τ for `device`, or nil if no comparison frame.
-    private func previousTau(for device: String) -> Int? {
-        let h = model.calibrationSampleHistory
-        return h.count >= 2 ? h[h.count - 2].perDeviceTauMs[device] : nil
-    }
-
-    /// Trend timeline — last 10 sliding samples' appliedDelayMs,
-    /// comma-joined. Truncates on overflow.
-    @ViewBuilder
-    private var trendTimelineRow: some View {
-        let recent = Array(model.calibrationSampleHistory.suffix(10))
-        if !recent.isEmpty {
-            let parts = recent.map { String($0.appliedDelayMs) }
-            let spanS = model.backgroundCalibrationIntervalS * max(1, recent.count - 1)
-            let span = spanS >= 60 ? "\(spanS / 60)m" : "\(spanS)s"
-            HStack(spacing: 4) {
-                Text("Recent:")
-                Text(parts.joined(separator: ", "))
-                    .lineLimit(1).truncationMode(.tail)
-                Text("(\(span) sliding)")
-                    .foregroundStyle(.tertiary)
-            }
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.secondary)
-        }
-    }
-
-    /// Cycle info: age, confidence, last applied delta. The threshold
-    /// figure shown in the spec mock is engine-side (CalibrationRunner.
-    /// deltaApplyThresholdMs); if the integrator exposes it on the new
-    /// Sample, surface it here.
-    @ViewBuilder
-    private var cycleInfoRow: some View {
-        if let sample = model.lastCalibrationSample {
-            let age = max(0, Int(Date().timeIntervalSince(sample.timestamp)))
-            let conf = String(format: "%.1f", sample.confidence * 100)
-            let lastDelta = model.lastAppliedDelta
-                .map { $0 >= 0 ? "+\($0) ms" : "\($0) ms" } ?? "0 ms"
-            HStack(spacing: 6) {
-                Text("Last: \(age)s ago")
-                Text("•")
-                Text("Conf: \(conf)")
-                Text("•")
-                Text("Δ: \(lastDelta)")
-                Spacer(minLength: 0)
-            }
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.secondary)
-        }
-    }
-
-    /// Truncate `s` to `n` characters with an ellipsis on overflow.
-    private func truncate(_ s: String, max n: Int) -> String {
-        s.count <= n ? s : String(s.prefix(max(1, n - 1))) + "…"
-    }
-
-    /// One of: mic-denied / inactive / waiting / active-with-sample.
-    private var continuousStatusText: String? {
-        if model.backgroundCalibrationMicDenied {
-            return "Microphone access denied — open System Settings"
-        }
-        if !model.backgroundCalibrationActive {
-            return "Inactive — enable AirPlay first"
-        }
-        guard let sample = model.lastCalibrationSample else {
-            return "Active — waiting for sample"
-        }
-        let age = max(0, Int(Date().timeIntervalSince(sample.timestamp)))
-        // ActiveCalibrator's aggregate confidence is an SNR (≥ 3 ⇒
-        // detection threshold, higher ⇒ better). Map to a 0–100%
-        // display by saturating at 20 — empirically a "very clean"
-        // measurement runs 10–30, and treating 20+ as "100% confident"
-        // keeps the popover caption readable.
-        let pct = min(100, Int((sample.confidence / 20.0 * 100).rounded()))
-        return "Active — last drift \(sample.measuredDeltaMs) ms (applied \(sample.appliedDelayMs) ms, \(pct)% confidence) \(age)s ago"
-    }
-
-    private var autoCalibrateLabel: String {
-        if !model.activeAcousticDiagnosticsEnabled {
-            return "Diagnostics Off"
-        }
-        switch model.calibrationStatus {
-        case .idle:                  return "Diagnostic Calibrate"
-        case .requestingPermission:  return "Asking…"
-        case .running:               return "Calibrating…"
-        case .completed(_, _, _):    return "Diagnostic Calibrate"
-        case .failed(_):             return "Diagnostic Calibrate"
-        }
-    }
-
-    private var autoCalibrateDisabled: Bool {
-        if !model.activeAcousticDiagnosticsEnabled {
-            return true
-        }
-        switch model.calibrationStatus {
-        case .running, .requestingPermission: return true
-        default: return false
-        }
-    }
-
-    private var autoCalibrateHelp: String {
-        if model.activeAcousticDiagnosticsEnabled {
-            return "Lab diagnostic: may play audible active test tones."
-        }
-        return "Active test tones are disabled; use passive no-probe diagnostics."
-    }
-
     private var airplayDelaySliderRange: ClosedRange<Double> {
         let lower = Double(AppModel.airplayDelayMsRange.lowerBound)
         let upper = Double(AppModel.airplayDelayMsRange.upperBound)
         return lower...upper
-    }
-
-    private var micPickerBinding: Binding<AudioDeviceID?> {
-        Binding(
-            get: { model.selectedMicID },
-            set: { model.setSelectedMic($0) }
-        )
     }
 
     /// Single-line live debug strip — visible to the user, lets us diagnose
@@ -742,9 +333,14 @@ struct MainPopover: View {
                         DeviceRow(deviceID: dev.id)
                     }
                 }
-                if !model.airPlayDevices.isEmpty {
+                // Only genuinely remote AirPlay receivers are targets. This
+                // Mac's own AirPlay Receiver is never listed: under direction
+                // B the local speakers are an OwnTone output (the "Local"
+                // section above), not an AirPlay target, so self-targeting —
+                // and its full-screen-PIN deadlock — cannot arise.
+                if !model.remoteAirPlayDevices.isEmpty {
                     sectionHeader("AirPlay")
-                    ForEach(model.airPlayDevices) { dev in
+                    ForEach(model.remoteAirPlayDevices) { dev in
                         DeviceRow(deviceID: dev.id)
                     }
                 }
@@ -766,20 +362,6 @@ struct MainPopover: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            if model.activeAcousticDiagnosticsEnabled {
-                Button(action: {
-                    Task { await model.runAutoCalibrate() }
-                }) {
-                    Label("Diagnostics", systemImage: "tuningfork")
-                }
-                .disabled(model.mode != .wholeHome || autoCalibrateDisabled)
-                .accessibilityIdentifier("footerAutoCalibrateButton")
-                .accessibilityLabel("Diagnostics")
-                .accessibilityHint(autoCalibrateHelp)
-                .help(model.mode == .wholeHome
-                      ? autoCalibrateHelp
-                      : "Switch to Whole-home mode to open diagnostics")
-            }
             Spacer()
             Button("Quit") {
                 NSApp.terminate(nil)
@@ -848,6 +430,51 @@ private struct DeviceRow: View {
         }
     }
 
+    /// Pairing affordance for AirPlay receivers that demand authentication.
+    ///
+    /// Rendered only when there is something to say. A receiver that needs no
+    /// pairing, or is already paired, gets no extra chrome — the row stays as
+    /// quiet as it has always been.
+    @ViewBuilder
+    private func pairingRow(for device: Device) -> some View {
+        let state = model.pairingState(for: device)
+        switch state {
+        case .notRequired, .paired:
+            EmptyView()
+        case .awaitingPIN, .verifying:
+            // Cancel has to be reachable from here. An attempt in this state
+            // holds the receiver's display hostage with a full-screen PIN for
+            // the sidecar's whole four-minute window, and a row with no
+            // button at all left the user nothing to do but wait it out.
+            HStack(spacing: 6) {
+                Label("Pairing…", systemImage: "hourglass")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Button("Cancel") {
+                    model.cancelPairing(for: device)
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                Spacer(minLength: 0)
+            }
+        case .required, .failed, .cancelled, .timedOut:
+            HStack(spacing: 6) {
+                Image(systemName: "lock")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                Text(state == .required ? "Needs pairing" : "Pairing did not finish")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Button(state == .required ? "Pair" : "Try again") {
+                    model.startPairing(for: device)
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
     @ViewBuilder
     private func rowBody(for device: Device) -> some View {
         HStack(spacing: 10) {
@@ -895,6 +522,23 @@ private struct DeviceRow: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
+                    // Per-speaker delay trim. Whole-home only: in stereo the
+                    // bridges do not run and the Scheduler is deliberately
+                    // given an empty trim map, so a visible control would be
+                    // inert and therefore misleading. Rendering nothing (as
+                    // opposed to a disabled control) also keeps the row
+                    // height identical between modes.
+                    //
+                    // ENABLED only, for the same reason:
+                    // `Router.trimmableOutputIDs()` excludes disabled outputs
+                    // from both the normalisation minimum and the result, so
+                    // a disabled row's stepper moves nothing anywhere. The
+                    // value is keyed by `Device.persistenceKey` and re-seeded
+                    // by `applyPersistedDeviceTrims()`, so hiding the row
+                    // never loses a trim set while the device was on.
+                    if model.mode == .wholeHome && routing.enabled {
+                        delayTrimRow(for: device)
+                    }
                 }
                 // One-line failure breadcrumb. Only shown when the
                 // sidecar has reported `failed` for this device, so a
@@ -911,6 +555,7 @@ private struct DeviceRow: View {
                         .foregroundStyle(.red)
                         .lineLimit(1)
                 }
+                pairingRow(for: device)
             }
         }
         .padding(.horizontal, 14)
@@ -919,8 +564,101 @@ private struct DeviceRow: View {
         .contentShape(Rectangle())
         .onTapGesture { model.toggleDevice(deviceID) }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text("\(device.name), \(routing.enabled ? "enabled" : "disabled"), \(syncLabel)"))
+        .accessibilityLabel(Text(accessibilityRowLabel(for: device)))
         .accessibilityHint(Text("Double-tap to \(routing.enabled ? "disable" : "enable")"))
+    }
+
+    private func accessibilityRowLabel(for device: Device) -> String {
+        var parts = [
+            device.name,
+            routing.enabled ? "enabled" : "disabled",
+            syncLabel,
+        ]
+        let trim = model.deviceTrimMs(for: deviceID)
+        if model.mode == .wholeHome && routing.enabled && trim != 0 {
+            parts.append("delay \(trim > 0 ? "+" : "")\(trim) milliseconds")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Millisecond delay trim for one speaker.
+    ///
+    /// A stepper rather than a slider, deliberately: the useful range is a
+    /// handful of milliseconds, one press IS one step, and — unlike a drag —
+    /// it produces discrete commit events. That matters because every AirPlay
+    /// commit costs that receiver a ~0.4 s relatch dropout, so a drag stream
+    /// would be a stutter stream.
+    ///
+    /// Sign convention is stated in the section hint, not just in code:
+    /// positive = later. Only the relative pattern is meaningful, so dialling
+    /// the far speaker negative and the near one positive are the same edit.
+    @ViewBuilder
+    private func delayTrimRow(for device: Device) -> some View {
+        let trim = model.deviceTrimMs(for: deviceID)
+        HStack(spacing: 6) {
+            Image(systemName: "timer")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Stepper(
+                "",
+                onIncrement: {
+                    model.nudgeDeviceTrim(DeviceDelayTrim.stepMs, for: deviceID)
+                },
+                onDecrement: {
+                    model.nudgeDeviceTrim(-DeviceDelayTrim.stepMs, for: deviceID)
+                }
+            )
+            .labelsHidden()
+            .controlSize(.mini)
+            .accessibilityIdentifier("deviceTrimStepper-\(deviceID)")
+            .accessibilityValue(Text("\(trim) milliseconds"))
+            Text(model.deviceTrimDistanceHint(for: deviceID))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(trim == 0 ? AnyShapeStyle(HierarchicalShapeStyle.secondary)
+                                           : AnyShapeStyle(.primary))
+                .lineLimit(1)
+            // Per-row reset appears only when there is something to reset, so
+            // an untouched row gains no chrome and no layout shift.
+            if trim != 0 {
+                Button {
+                    model.resetDeviceTrim(for: deviceID)
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 9))
+                .help("Reset this speaker's delay to 0 ms")
+                .accessibilityIdentifier("deviceTrimResetButton-\(deviceID)")
+            }
+            // A device with no stable identity (no CoreAudio UID, no Bonjour
+            // `deviceid`) cannot be keyed in the defaults plist, so its trim
+            // lives for this session only. Silently accepting an edit that
+            // cannot survive a relaunch is the one behaviour that misleads —
+            // on the next launch the speaker reverts to 0 while every
+            // neighbour is restored, which reads as the feature regressing.
+            if trim != 0 && device.persistenceKey == nil {
+                Image(systemName: "clock.badge.exclamationmark")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .help("This output has no stable identity, so its delay "
+                          + "is kept for this session only.")
+                    .accessibilityLabel(Text("Not remembered after quitting"))
+            }
+            // An AirPlay commit disables and re-enables the receiver, which
+            // is an audible ~0.4 s gap. Say so, or it reads as a bug.
+            if device.transport == .airplay2 && model.deviceTrimCommitInFlight {
+                Text("applying…")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        // Swallow taps that land in this sub-row. The whole device row
+        // carries `.onTapGesture { model.toggleDevice(deviceID) }`, and
+        // missing the stepper by a few points must not switch the speaker
+        // off in the middle of tuning it.
+        .contentShape(Rectangle())
+        .onTapGesture { }
     }
 
     private func iconName(for device: Device) -> String {

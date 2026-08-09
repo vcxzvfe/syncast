@@ -49,8 +49,94 @@ from .audio_socket import (
     AudioSocketReader,
     LocalFifoBroadcaster,
 )
+from .owntone_backend import (
+    OWNTONE_OFFSET_MAX_MS,
+    OWNTONE_OFFSET_MIN_MS,
+    OWNTONE_OUTPUT_BUFFER_DURATION_MS,
+    clamp_output_offset_ms,
+)
 
 logger = log.get("sidecar.devices")
+
+# Playout latency reported back to the menubar for a freshly-added AirPlay
+# output. Derived from OwnTone's real output buffer duration (the anchor an
+# AirPlay-2 receiver is PTP-locked to), NOT the former hardcoded 1800 ms
+# guess. Purely informational today — no Swift consumer seeds a delay from
+# it — but keeping it truthful and named avoids re-introducing a magic
+# number the sync math might later be built on.
+DEVICE_REPORTED_LATENCY_MS = OWNTONE_OUTPUT_BUFFER_DURATION_MS
+
+# ---------------------------------------------------------------------------
+# Whole-home residual offset (Layer 3)
+# ---------------------------------------------------------------------------
+# Layer 1 (broadcaster delay = 0) and Layer 2 (the Swift PLL that slaves the
+# local device clock to OwnTone's fifo write rate) leave both legs departing
+# OwnTone at the same instant and never drifting apart. What is left is a
+# FIXED residual: the local leg's own pipeline latency `L_local`, the delay
+# between a byte leaving OwnTone's output fifo and that audio leaving the
+# local speaker.
+#
+#     L_local = PLL steady-state ring fill
+#                 (LocalAirPlayBridge.baselineBackoffMs = 109 ms)
+#             + one AUHAL render quantum (512 frames ≈ 11 ms at 48 kHz)
+#             + broadcaster packet quantisation (352-frame packets, ~4 ms mean)
+#             + the CoreAudio device's presentation latency
+#                 (kAudioDevicePropertyLatency + safety offset + stream
+#                  latency: single-digit ms built-in, tens of ms over DP/HDMI)
+#
+# The local leg cannot be advanced — the pipe cannot surrender a byte before
+# OwnTone releases it — so the AirPlay leg is DELAYED by the same amount
+# instead, using OwnTone's per-output `offset_ms` (positive = delay; see
+# `OwnToneBackend.set_output_offset_ms` for the source citations).
+#
+# This constant is only the FALLBACK: 109 + 11 + 4 + ~6 ms of built-in device
+# latency. The router measures the real thing per output device and pushes it
+# via `sync.set_airplay_offset_ms`, which is what should normally be in force.
+AIRPLAY_SYNC_OFFSET_DEFAULT_MS = 130
+
+# Bounds for the offset knob. Identical to OwnTone's own accepted range so a
+# field-tuning slider can use the full span without ever eliciting a 400.
+AIRPLAY_SYNC_OFFSET_MIN_MS = OWNTONE_OFFSET_MIN_MS
+AIRPLAY_SYNC_OFFSET_MAX_MS = OWNTONE_OFFSET_MAX_MS
+
+# Per-output USER trim: how much the listener wants this one receiver held
+# back relative to the others, to compensate its distance from where they sit
+# (1 ms of air ~= 34 cm). Distinct from AIRPLAY_SYNC_OFFSET_DEFAULT_MS above,
+# which is a SYSTEM correction cancelling the local leg's pipeline latency.
+# The two ADD: an output carries `_airplay_offset_ms + trim`, and only the sum
+# is clamped against OwnTone's own range, so a user trim can never push the
+# composite outside what the REST layer accepts.
+#
+# The bound is on the NORMALISED value that crosses the wire, which is not
+# the same number as the signed user range. `DeviceDelayTrim.rangeMs` on the
+# Swift side is +-200 ms of signed intent; `DelayTrimNormalizer` slides the
+# set up until the earliest speaker sits at 0, so the whole span can land on
+# ONE output (-200 there, +200 here => 400 here). Bounding at 200 would have
+# silently truncated exactly that case, moving a receiver 200 ms off what the
+# user asked for with nothing logged — while the local leg, whose ring is
+# sized for the full span (`LocalAirPlayBridge.defaultRingCapacityFrames`),
+# honoured it.
+#
+# So: SPAN, not range. Still an ergonomic bound, not a safety bound —
+# `clamp_output_offset_ms` remains the safety bound on the composite.
+OUTPUT_TRIM_LIMIT_MS = 400
+
+# Trim assumed for an output the user has never touched. Explicit so an
+# unknown output id can never inherit a neighbour's value.
+OUTPUT_TRIM_DEFAULT_MS = 0
+
+# Offsets are latched when an output's session is constructed and OwnTone
+# refuses to change a live one (player.c:2937-2944), so re-tuning mid-stream
+# means disable → pause → enable. This is how long we wait between the two
+# REST calls, long enough for OwnTone to tear the session down and short
+# enough to stay an unremarkable dropout.
+AIRPLAY_OFFSET_RELATCH_PAUSE_S = 0.4
+
+# Where the in-force offset value came from, for diagnostics/UI. Not a
+# free-form string: the menubar keys off these.
+OFFSET_SOURCE_DEFAULT = "default"
+OFFSET_SOURCE_MEASURED = "router_measured"
+OFFSET_SOURCE_MANUAL = "manual"
 
 
 def default_local_fifo_socket_path() -> Path:
@@ -69,6 +155,40 @@ def default_local_fifo_socket_path() -> Path:
 NotifyFn = Callable[[str, dict[str, Any]], None]
 
 
+def _normalize_airplay_device_id(raw: Any) -> str | None:
+    """Canonicalise a Bonjour `deviceid` into colon-free uppercase hex.
+
+    Mirrors `Device.normalizedAirplayDeviceID` on the Swift side so both ends
+    agree on the key. Returns None for anything that is not hex.
+    """
+    if not raw:
+        return None
+    text = str(raw).replace(":", "").replace("-", "").strip().upper()
+    if not text:
+        return None
+    try:
+        int(text, 16)
+    except ValueError:
+        return None
+    return text
+
+
+def _owntone_output_id_for(airplay_device_id: str | None) -> str | None:
+    """OwnTone's output id for a receiver, derived from its `deviceid`.
+
+    OwnTone parses the Bonjour `deviceid` MAC into a uint64 and uses it
+    verbatim as the output id and as the `speakers` table primary key, so this
+    conversion is exact rather than heuristic:
+    ``int("0200CAFE0001", 16) == 2202428899329``.
+    """
+    if not airplay_device_id:
+        return None
+    try:
+        return str(int(airplay_device_id, 16))
+    except ValueError:
+        return None
+
+
 @dataclass
 class Device:
     id: str
@@ -79,7 +199,21 @@ class Device:
     state: str = "added"
     volume: float = 1.0
     owntone_output_id: str | None = None     # populated on first OwnTone match
+    # Stable AirPlay identity from the Bonjour TXT `deviceid` record, in
+    # canonical hex form (e.g. "0200CAFE0001"). OwnTone derives its own
+    # output id from exactly this value (`int(hex, 16)`), which makes it the
+    # only reliable way to match a device to an OwnTone output. Display names
+    # are NOT reliable: the live OwnTone database already contains two
+    # different machines sharing one name.
+    airplay_device_id: str | None = None
     last_state_emit: float = field(default_factory=time.monotonic)
+
+    @property
+    def pairing_key(self) -> str:
+        """Key the menubar and the pairing coordinator agree on."""
+        if self.airplay_device_id:
+            return f"ap:{self.airplay_device_id}"
+        return f"name:{self.name}"
 
 
 class DeviceManager:
@@ -117,6 +251,43 @@ class DeviceManager:
         # newly-constructed LocalFifoBroadcaster, and re-applied via
         # `set_local_fifo_delay_ms` if the menubar tweaks it at runtime.
         self._local_fifo_delay_ms = max(0, int(local_fifo_delay_ms))
+        # Layer 3 (residual offset): how far the AirPlay leg is delayed so it
+        # lands together with the local leg, which trails by `L_local`. Only
+        # meaningful in whole-home mode — see AIRPLAY_SYNC_OFFSET_DEFAULT_MS.
+        self._airplay_offset_ms: int = clamp_output_offset_ms(
+            AIRPLAY_SYNC_OFFSET_DEFAULT_MS,
+        )
+        self._airplay_offset_source: str = OFFSET_SOURCE_DEFAULT
+        # SyncCast device id -> user delay trim (ms), added to
+        # `_airplay_offset_ms` for that one output. Keyed by device id (the
+        # same id `device.add` / `device.set_volume` use) rather than by
+        # OwnTone output id, because the router knows devices and the
+        # device->output mapping is ours to make. Non-negative by
+        # construction: the Swift side normalises the signed user intent
+        # before it reaches the wire.
+        self._output_trim_ms: dict[str, int] = {}
+        # OwnTone output id → offset we last wrote to it. OwnTone persists
+        # `speakers.offset_ms` across restarts, so this is a record of what WE
+        # put there, used to zero exactly those rows again on the way out. It
+        # is never treated as authoritative for what OwnTone currently holds.
+        self._applied_output_offsets: dict[str, int] = {}
+        # OwnTone output id → offset we know a LIVE session is carrying.
+        #
+        # Distinct from `_applied_output_offsets` on purpose. That one records
+        # what we wrote into OwnTone's database; this one records what an
+        # output's playing session actually latched, which is only knowable
+        # when we ourselves caused the session to be built — a genuine
+        # off→on transition, or a relatch. An output that was ALREADY selected
+        # when we wrote its offset keeps whatever its session latched earlier
+        # (outputs/airplay.c:1598 copies the value at session construction and
+        # player.c:2937-2944 refuses to touch a live one), so it deliberately
+        # does NOT appear here. Absence means "unknown", which every consumer
+        # must treat as "must be re-latched", never as "already correct".
+        self._latched_output_offsets: dict[str, int] = {}
+        # OwnTone output ids whose offset write FAILED. Their persisted value
+        # is whatever a previous session left behind, so they still have to be
+        # visited by the rollback sweep even though nothing of ours landed.
+        self._offset_write_failures: set[str] = set()
         self._owntone_binary = owntone_binary
         self._owntone_config_template = owntone_config_template
         self._state_dir = state_dir
@@ -126,6 +297,16 @@ class DeviceManager:
         # Stored as Optional and lazily created — keeps __init__ free
         # of asyncio primitives that must live inside the running loop.
         self._deferred_reconcile_task: asyncio.Task[None] | None = None
+        # Watch set + deadline SHARED with the running loop (one task at a
+        # time). A new schedule UNIONS into this set rather than cancelling and
+        # replacing the task with only its own ids — otherwise a just-paired
+        # device's retry would evict a slower second receiver the loop is still
+        # waiting on. See `_schedule_deferred_reconcile`.
+        self._deferred_reconcile_targets: set[str] = set()
+        self._deferred_reconcile_deadline: float = 0.0
+        # Optional PairingCoordinator, injected by the server after both
+        # objects exist. None in tests and in any build without pairing.
+        self._pairing: Any = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -135,6 +316,11 @@ class DeviceManager:
     async def shutdown(self) -> None:
         async with self._get_lock():
             await self._stop_streaming_unlocked()
+            # Retire any Layer-3 offset while OwnTone is still answering
+            # REST. It lives in `speakers.offset_ms` and outlives the
+            # process, so leaving it set would silently skew the next
+            # session (including a plain stereo one).
+            self._clear_airplay_offsets_unlocked()
             self._devices.clear()
             # Tear the broadcaster down BEFORE OwnTone — otherwise the
             # broadcaster's read on the (now unreffed) fifo would have
@@ -185,6 +371,9 @@ class DeviceManager:
         host = params["host"]
         port = int(params.get("port", 7000))
         name = params.get("name", device_id)
+        airplay_device_id = _normalize_airplay_device_id(
+            params.get("airplay_device_id"),
+        )
         async with self._get_lock():
             existing = self._devices.get(device_id)
             if existing is not None:
@@ -198,6 +387,8 @@ class DeviceManager:
                 existing.host = host
                 existing.port = port
                 existing.name = name
+                if airplay_device_id:
+                    existing.airplay_device_id = airplay_device_id
                 # Diagnostic: prove that re-add is hitting the upsert
                 # branch with the expected name. The Xiaomi-stuck-off
                 # bug only surfaces when `_reconcile_outputs` runs with
@@ -213,7 +404,10 @@ class DeviceManager:
                     "device_add_idempotent",
                     extra={"device_id": device_id, "device_name": name},
                 )
-                return {"connected": True, "reported_latency_ms": 1800}
+                return {
+                    "connected": True,
+                    "reported_latency_ms": DEVICE_REPORTED_LATENCY_MS,
+                }
             dev = Device(
                 id=device_id,
                 transport=transport,
@@ -221,6 +415,7 @@ class DeviceManager:
                 port=port,
                 name=name,
                 state="added",
+                airplay_device_id=airplay_device_id,
             )
             self._devices[device_id] = dev
             # Diagnostic: first-time registration, the canonical signal
@@ -238,9 +433,13 @@ class DeviceManager:
                        "device_count": len(self._devices)},
             )
             self._notify("event.device_state", {
-                "device_id": device_id, "state": "added", "buffer_ms": 1800,
+                "device_id": device_id, "state": "added",
+                "buffer_ms": DEVICE_REPORTED_LATENCY_MS,
             })
-            return {"connected": True, "reported_latency_ms": 1800}
+            return {
+                "connected": True,
+                "reported_latency_ms": DEVICE_REPORTED_LATENCY_MS,
+            }
 
     async def remove(self, device_id: str) -> dict[str, Any]:
         async with self._get_lock():
@@ -392,22 +591,18 @@ class DeviceManager:
                         self._owntone.play_pipe()
                     except Exception:  # noqa: BLE001
                         logger.exception("play_pipe_priming_failed")
-                # Wire the broadcaster tee. AudioSocketReader (which
-                # already exists for AirPlay PCM forwarding to OwnTone)
-                # will now also call broadcaster.feed(packet) for every
-                # chunk it writes. Bridge clients receive Swift's
-                # native 48 kHz s16le 2ch packets directly.
-                if self._audio_reader is not None and self._broadcaster is not None:
-                    self._audio_reader.set_broadcaster_tee(
-                        self._broadcaster.feed
-                    )
+                # Direction B: the broadcaster reads OwnTone's OUTPUT fifo
+                # itself (`LocalFifoBroadcaster._run_broadcaster`), so there is
+                # no pre-OwnTone tee to wire. The local leg therefore rides
+                # OwnTone's single player clock, in lockstep with the AirPlay
+                # outputs.
             else:  # stereo
-                # Detach the tee BEFORE stopping the broadcaster — the
-                # AudioSocketReader thread might still be in a recv()
-                # holding the GIL and would call .feed() on a
-                # half-stopped broadcaster otherwise.
-                if self._audio_reader is not None:
-                    self._audio_reader.set_broadcaster_tee(None)
+                # Layer 3 rollback. The local leg leaves the fifo→bridge
+                # chain here, so its `L_local` no longer exists and any
+                # AirPlay delay compensating for it becomes pure error.
+                # OwnTone persists the value, so it has to be retired
+                # explicitly rather than left to expire with the session.
+                self._clear_airplay_offsets_unlocked()
                 if self._broadcaster is not None:
                     try:
                         self._broadcaster.stop()
@@ -518,6 +713,345 @@ class DeviceManager:
         )
         return {"delay_ms": applied}
 
+    # ---------- Layer 3: residual AirPlay offset ----------
+
+    @staticmethod
+    def _resolved_output_id(dev: Device) -> str | None:
+        """The OwnTone output id a device is known to map to, or None.
+
+        Two sources, in order of authority:
+
+        1. `dev.owntone_output_id`, stamped by `_reconcile_outputs` from the
+           output it ACTUALLY matched. That path falls back to name matching
+           for receivers whose Bonjour record carried no `deviceid`
+           (`_match_output`), so this is the only source that covers them.
+        2. The `int(deviceid_hex, 16)` derivation, for a device that has a
+           `deviceid` but has not been through a reconcile yet.
+
+        Using (2) alone is what made a name-matched receiver's trim
+        unreachable: it resolved to None, never equalled any output id, and
+        the trim silently read back as 0 while every diagnostic reported it
+        as in force.
+        """
+        if dev.owntone_output_id:
+            return str(dev.owntone_output_id)
+        return _owntone_output_id_for(dev.airplay_device_id)
+
+    def _trim_ms_for_output(self, output_id: str) -> int:
+        """The user's delay trim for the device behind an OwnTone output id.
+
+        Returns ``OUTPUT_TRIM_DEFAULT_MS`` when no device claims the output,
+        which is the honest answer for the fifo output and for anything
+        discovered outside SyncCast. A trim that belongs to a device we cannot
+        map to ANY output is a silent 0, so it is logged once per call site
+        rather than swallowed.
+        """
+        unresolved: list[str] = []
+        for dev_id, dev in self._devices.items():
+            trim = self._output_trim_ms.get(dev_id)
+            if trim is None:
+                continue
+            resolved = self._resolved_output_id(dev)
+            if resolved is None:
+                unresolved.append(dev_id)
+                continue
+            if resolved == output_id:
+                return trim
+        if unresolved:
+            logger.warning(
+                "output_trim_unresolved_device",
+                extra={"device_ids": unresolved, "owntone_output_id": output_id},
+            )
+        return OUTPUT_TRIM_DEFAULT_MS
+
+    def _target_airplay_offset_ms(self, output_id: str | None = None) -> int:
+        """The offset an AirPlay output should be carrying right now.
+
+        Only whole-home mode routes local audio through the fifo → broadcaster
+        → bridge chain, so only whole-home mode has an `L_local` to cancel. In
+        stereo mode the correct value is 0: delaying AirPlay there would skew
+        an otherwise-fine AirPlay-only stream against nothing.
+
+        With `output_id` given, the user's per-output trim is ADDED to the
+        system correction and the SUM is clamped, so the composite always
+        stays inside the range OwnTone's REST layer accepts. Without it the
+        base correction alone is returned — that is the "what is the system
+        asking for" number `airplay_offset_state` reports, and the reason the
+        parameter is optional rather than required.
+        """
+        if self._mode != "whole_home":
+            return 0
+        if output_id is None:
+            return self._airplay_offset_ms
+        return clamp_output_offset_ms(
+            self._airplay_offset_ms + self._trim_ms_for_output(output_id),
+        )
+
+    def _push_output_offset(self, output_id: str, offset_ms: int) -> bool:
+        """Write one output's offset, recording what we wrote.
+
+        Unconditional by design. The value is persisted in OwnTone's
+        `speakers` table and survives a graceful restart, so we never infer it
+        from a previous session — every enable rewrites it and every disable
+        zeroes it. That makes the whole feature idempotent and self-cleaning.
+
+        Returns True when the write landed. Failures are logged and reported,
+        not raised: an output playing a few ms off is a far better outcome
+        than an output that never gets enabled. A failed write is REMEMBERED
+        (`_offset_write_failures`) rather than forgotten, because that output
+        is precisely the one that may still be carrying a stale persisted
+        offset — dropping it here would exclude it from the rollback sweep and
+        leave that stale row behind forever.
+        """
+        if self._owntone is None:
+            return False
+        try:
+            applied = self._owntone.set_output_offset_ms(output_id, offset_ms)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "airplay_offset_set_failed",
+                extra={"owntone_output_id": output_id, "offset_ms": offset_ms},
+            )
+            self._offset_write_failures.add(output_id)
+            self._applied_output_offsets.pop(output_id, None)
+            # The session's value is now unknowable, so it must not be
+            # reported as latched — see `_latched_output_offsets`.
+            self._latched_output_offsets.pop(output_id, None)
+            return False
+        self._offset_write_failures.discard(output_id)
+        if applied:
+            self._applied_output_offsets[output_id] = applied
+        else:
+            self._applied_output_offsets.pop(output_id, None)
+        logger.info(
+            "airplay_offset_set",
+            extra={
+                "owntone_output_id": output_id,
+                "offset_ms": applied,
+                "source": self._airplay_offset_source,
+                "mode": self._mode,
+            },
+        )
+        return True
+
+    def _clear_airplay_offsets_unlocked(self) -> None:
+        """Zero every offset this process wrote. Caller holds the lock.
+
+        The rollback path. Called on the way out of whole-home mode and on
+        shutdown so a value computed for one session can never linger in
+        OwnTone's database and silently skew the next one.
+
+        Outputs whose write FAILED are swept too. They were never recorded as
+        applied, but a failure is not evidence that the row is clean — it is
+        evidence that we do not know what is in it.
+        """
+        for output_id in sorted(
+            set(self._applied_output_offsets) | self._offset_write_failures
+        ):
+            self._push_output_offset(output_id, 0)
+        self._applied_output_offsets.clear()
+        self._offset_write_failures.clear()
+        # Zeroing the database row does not rebuild a live session, so nothing
+        # is known to be latched any more.
+        self._latched_output_offsets.clear()
+
+    def airplay_offset_state(self) -> dict[str, Any]:
+        """Current Layer-3 offset state, for diagnostics and the UI."""
+        return {
+            "offset_ms": self._airplay_offset_ms,
+            "effective_offset_ms": self._target_airplay_offset_ms(),
+            "source": self._airplay_offset_source,
+            "mode": self._mode,
+            "min_offset_ms": AIRPLAY_SYNC_OFFSET_MIN_MS,
+            "max_offset_ms": AIRPLAY_SYNC_OFFSET_MAX_MS,
+            "default_offset_ms": AIRPLAY_SYNC_OFFSET_DEFAULT_MS,
+            # Per-output USER trim (device id -> ms) and the composite it
+            # produces (OwnTone output id -> ms). Both are diagnostics: the
+            # first is what the human asked for, the second is what each
+            # output should be carrying once the system correction is added.
+            "output_trims_ms": dict(self._output_trim_ms),
+            "effective_offset_by_output_ms": {
+                output_id: self._target_airplay_offset_ms(output_id)
+                for output_id in sorted(
+                    set(self._applied_output_offsets)
+                    | set(self._latched_output_offsets)
+                )
+            },
+            "max_output_trim_ms": OUTPUT_TRIM_LIMIT_MS,
+            "applied": dict(self._applied_output_offsets),
+            # Per-output truth: what a LIVE session is known to carry. The
+            # router seeds its "has anything changed?" deadband from this and
+            # NOT from `effective_offset_ms`, which is only our intent — an
+            # output that was already selected before we wrote its offset is
+            # absent here, and that absence is what forces the re-latch.
+            "latched": dict(self._latched_output_offsets),
+            "write_failures": sorted(self._offset_write_failures),
+        }
+
+    async def set_airplay_offset_ms(
+        self,
+        offset_ms: int,
+        source: str = OFFSET_SOURCE_MANUAL,
+        relatch: bool = True,
+    ) -> dict[str, Any]:
+        """Set how far the AirPlay leg is delayed, and re-latch live outputs.
+
+        `offset_ms` is `L_local`: how far the LOCAL leg trails, hence how far
+        AirPlay must be held back to meet it. Positive delays AirPlay.
+
+        OwnTone latches the offset when an output's session is built and
+        refuses to change a playing one, so `relatch=True` cycles each
+        currently-selected output (disable, brief pause, enable) to make the
+        new value take. That costs a short dropout on the AirPlay receivers,
+        which is why the caller can turn it off when it is about to enable the
+        outputs anyway.
+
+        Idempotent in effect as well as in value: an output already known to
+        be carrying `target` in its live session is NOT cycled, because the
+        relatch is an audible dropout on every receiver and re-sending the
+        current value (a retried RPC, a UI refresh) must not cost one. An
+        output we have no latched record for is cycled — absence means the
+        session's value is unknown, not that it is already right.
+
+        Call with 0 to retire the correction entirely.
+        """
+        applied = clamp_output_offset_ms(offset_ms)
+        async with self._get_lock():
+            self._airplay_offset_ms = applied
+            self._airplay_offset_source = source
+            relatched, unchanged = await self._reapply_output_offsets_unlocked(
+                relatch=relatch,
+            )
+            state = self.airplay_offset_state()
+        state["relatched"] = relatched
+        state["unchanged"] = unchanged
+        return state
+
+    async def set_output_trims_ms(
+        self,
+        trims_ms: dict[str, int],
+        relatch: bool = True,
+    ) -> dict[str, Any]:
+        """Replace the per-output user delay trims and re-latch what changed.
+
+        `trims_ms` maps SyncCast device id -> milliseconds of extra delay for
+        that one receiver. It is a FULL REPLACEMENT, not a patch: an id the
+        caller omits goes back to `OUTPUT_TRIM_DEFAULT_MS`. That is what makes
+        "reset all trims" a single call and makes the feature self-cleaning —
+        there is no way to leave a forgotten trim behind by dropping a key.
+
+        Values are non-negative by contract (the Swift side normalises signed
+        user intent so the earliest speaker sits at 0 and nothing has to play
+        early); a negative value is still accepted and clamped here rather
+        than trusted, and the composite with `_airplay_offset_ms` is clamped
+        again against OwnTone's own range.
+
+        Idempotent: an output whose composite is unchanged is not cycled, so
+        re-sending the current map costs nobody a dropout. Changing one costs
+        that receiver a ~`AIRPLAY_OFFSET_RELATCH_PAUSE_S` gap, which is
+        inherent to OwnTone latching the offset at session construction.
+        """
+        cleaned: dict[str, int] = {}
+        for dev_id, raw in trims_ms.items():
+            value = max(-OUTPUT_TRIM_LIMIT_MS, min(int(raw), OUTPUT_TRIM_LIMIT_MS))
+            if value != OUTPUT_TRIM_DEFAULT_MS:
+                cleaned[str(dev_id)] = value
+        async with self._get_lock():
+            self._output_trim_ms = cleaned
+            relatched, unchanged = await self._reapply_output_offsets_unlocked(
+                relatch=relatch,
+            )
+            state = self.airplay_offset_state()
+        state["relatched"] = relatched
+        state["unchanged"] = unchanged
+        return state
+
+    async def _reapply_output_offsets_unlocked(
+        self, relatch: bool,
+    ) -> tuple[list[str], list[str]]:
+        """Write every selected AirPlay output's composite offset.
+
+        Caller holds the lock. Returns (relatched, unchanged) output ids.
+
+        The composite is recomputed PER OUTPUT because the user trim is
+        per-output; the system correction it is added to is global. Writing is
+        unconditional (see `_push_output_offset` — the database row is ours to
+        own), but CYCLING is not: only an output whose live session is known
+        to be carrying something other than the new composite is disturbed. An
+        output with no latched record is cycled, because absence means "we do
+        not know", never "already correct".
+        """
+        relatched: list[str] = []
+        unchanged: list[str] = []
+        if self._owntone is None:
+            return relatched, unchanged
+        for output_id in self._selected_airplay_output_ids_unlocked():
+            target = self._target_airplay_offset_ms(output_id)
+            latched = self._latched_output_offsets.get(output_id)
+            self._push_output_offset(output_id, target)
+            if not relatch:
+                continue
+            if latched == target:
+                unchanged.append(output_id)
+                continue
+            await self._relatch_output_unlocked(output_id, target)
+            relatched.append(output_id)
+        return relatched, unchanged
+
+    def _selected_airplay_output_ids_unlocked(self) -> list[str]:
+        """OwnTone ids of the currently-selected non-fifo outputs.
+
+        The fifo output is excluded on purpose: it is the LOCAL leg, and this
+        knob only ever moves the AirPlay leg. Returns an empty list when the
+        output list cannot be read — the caller then simply changes nothing.
+        """
+        if self._owntone is None:
+            return []
+        try:
+            outputs = self._owntone.list_outputs()
+        except Exception:  # noqa: BLE001
+            logger.exception("airplay_offset_list_outputs_failed")
+            return []
+        ids: list[str] = []
+        for o in outputs:
+            if o.get("type") == "fifo":
+                continue
+            if not o.get("selected"):
+                continue
+            output_id = str(o.get("id", ""))
+            if output_id:
+                ids.append(output_id)
+        return ids
+
+    async def _relatch_output_unlocked(
+        self, output_id: str, offset_ms: int,
+    ) -> None:
+        """Stop and restart one output so a new offset takes effect.
+
+        Necessary because `player.c:2937-2944` will not apply a new offset to
+        a session that is already playing; only a fresh session reads it
+        (outputs/airplay.c:1598). Caller holds the lock.
+
+        `offset_ms` is what the rebuilt session will latch, recorded on
+        success. On failure the record is dropped instead of guessed at: a
+        half-completed cycle leaves the session in a state we cannot name, and
+        the next push must re-latch rather than skip.
+        """
+        if self._owntone is None:
+            return
+        try:
+            self._owntone.set_output_enabled(output_id, False)
+            await asyncio.sleep(AIRPLAY_OFFSET_RELATCH_PAUSE_S)
+            self._owntone.set_output_enabled(output_id, True)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "airplay_offset_relatch_failed",
+                extra={"owntone_output_id": output_id},
+            )
+            self._latched_output_offsets.pop(output_id, None)
+            return
+        self._latched_output_offsets[output_id] = offset_ms
+
     async def flush(self) -> dict[str, Any]:
         if self._broadcaster is not None:
             self._broadcaster.reset()
@@ -540,7 +1074,6 @@ class DeviceManager:
         if self._owntone is not None and not self._owntone.is_alive():
             logger.warning("owntone_dead_will_respawn")
             if self._audio_reader is not None:
-                self._audio_reader.set_broadcaster_tee(None)
                 self._audio_reader.stop()
                 self._audio_reader = None
             if self._broadcaster is not None:
@@ -641,16 +1174,6 @@ class DeviceManager:
 
     async def _ensure_audio_reader(self, audio_socket: Path) -> None:
         if self._audio_reader is not None:
-            # Already running. If we're in whole-home mode and the
-            # broadcaster came up after the reader, attach the tee now
-            # so feed() starts firing.
-            if (
-                self._mode == "whole_home"
-                and self._broadcaster is not None
-            ):
-                self._audio_reader.set_broadcaster_tee(
-                    self._broadcaster.feed
-                )
             return
         if self._owntone is None:
             return
@@ -661,12 +1184,8 @@ class DeviceManager:
         )
         reader.start()
         self._audio_reader = reader
-        # Tee wiring: in whole-home mode, the audio reader's PCM also
-        # needs to fan out to bridge clients. Set this here (vs in
-        # set_mode) so the tee is correct regardless of which order
-        # set_mode and stream.start arrive.
-        if self._mode == "whole_home" and self._broadcaster is not None:
-            reader.set_broadcaster_tee(self._broadcaster.feed)
+        # Direction B: no tee. The broadcaster reads OwnTone's OUTPUT fifo
+        # directly, so the reader only ever feeds OwnTone's input.
 
     async def _reconcile_outputs(self, enabled_ids: list[str]) -> None:
         """Tell OwnTone which of its known outputs to send to.
@@ -755,8 +1274,9 @@ class DeviceManager:
             },
         )
 
+        by_id = self._index_outputs_by_owntone_id(outputs)
         for dev_id, dev in self._devices.items():
-            match = by_name.get(dev.name.lower())
+            match = self._match_output(dev, by_id, by_name)
             if match is None:
                 # Diagnostic: this is the most likely failure mode for
                 # Xiaomi-never-selected. Logging WHICH device missed
@@ -802,8 +1322,117 @@ class DeviceManager:
 
         Extracted from `_reconcile_outputs` so retry loops and the
         deferred-reconcile task share the same matching semantics.
+
+        NOTE: names collide. The live OwnTone database on the development
+        machine already holds two different speakers sharing one name, and a
+        dict comprehension silently keeps whichever it saw last. Prefer
+        `_index_outputs_by_owntone_id`; this remains as the fallback for
+        endpoints whose Bonjour record carried no `deviceid`.
         """
         return {str(o.get("name", "")).lower(): o for o in outputs}
+
+    def _index_outputs_by_owntone_id(
+        self, outputs: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Build an OwnTone-output-id → output dict.
+
+        Contrary to the older comment in `_ensure_owntone`, AirPlay output ids
+        are NOT reassigned on each OwnTone launch: OwnTone derives them from
+        the receiver's `deviceid` MAC and stores them as the `speakers` table
+        primary key, so they are stable across restarts. (The fifo output is
+        the exception — its id is a local counter.)
+        """
+        return {str(o.get("id", "")): o for o in outputs}
+
+    def _match_output(
+        self,
+        dev: Device,
+        by_id: dict[str, dict[str, Any]],
+        by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Resolve a device to its OwnTone output, id first, name second."""
+        owntone_id = _owntone_output_id_for(dev.airplay_device_id)
+        if owntone_id is not None:
+            match = by_id.get(owntone_id)
+            if match is not None:
+                return match
+        return by_name.get(dev.name.lower())
+
+    def resolve_pairing_output(self, device_key: str) -> tuple[str, bool] | None:
+        """Map a pairing key to (owntone_output_id, needs_authorization).
+
+        Returns None when the receiver is not currently visible to OwnTone,
+        which the coordinator reports as a plain "not visible right now"
+        rather than as a pairing failure.
+        """
+        dev = next(
+            (d for d in self._devices.values() if d.pairing_key == device_key), None,
+        )
+        if dev is None or self._owntone is None:
+            return None
+        try:
+            outputs = self._owntone.list_outputs()
+        except Exception:
+            logger.warning("pairing_resolve_list_failed")
+            return None
+        match = self._match_output(
+            dev,
+            self._index_outputs_by_owntone_id(outputs),
+            self._index_outputs_by_name(outputs),
+        )
+        if match is None:
+            return None
+        return str(match.get("id", "")), bool(match.get("needs_auth_key", False))
+
+    def schedule_pairing_retry(self, device_key: str) -> None:
+        """Re-apply the output state for a receiver that just finished pairing.
+
+        The original enable was refused because `needs_auth_key` was set, and
+        that refusal returns before the device is added to any watch set — so
+        neither the deferred-reconcile loop nor anything on the Swift side
+        ever comes back to it. This is the only path that does.
+        """
+        dev_entry = next(
+            (
+                (dev_id, dev)
+                for dev_id, dev in self._devices.items()
+                if dev.pairing_key == device_key
+            ),
+            None,
+        )
+        if dev_entry is None:
+            logger.info("pairing_retry_unknown_device", extra={"device_key": device_key})
+            return
+        dev_id, _dev = dev_entry
+        # Reuse the existing deferred-reconcile machinery rather than issuing
+        # REST calls from the pairing task: it already takes the manager lock,
+        # re-lists OwnTone's outputs (needed, because `needs_auth_key` has
+        # just changed) and gives up after a bounded wait.
+        self._schedule_deferred_reconcile({dev_id})
+
+    def set_pairing_coordinator(self, coordinator: Any) -> None:
+        """Inject the pairing coordinator so reconcile can report that a
+        receiver needs pairing. Optional: the manager works without it."""
+        self._pairing = coordinator
+
+    def _notify_pairing_required(self, dev: Device) -> None:
+        coordinator = getattr(self, "_pairing", None)
+        if coordinator is None:
+            return
+        coordinator.note_authorization_required(dev.pairing_key, True)
+
+    @property
+    def owntone_backend(self) -> Any:
+        """The running OwnTone backend, or None when it has not started."""
+        return self._owntone
+
+    @property
+    def owntone_pid(self) -> int | None:
+        """pid of the OwnTone child process, if one is running."""
+        if self._owntone is None:
+            return None
+        pid = getattr(self._owntone, "pid", None)
+        return int(pid) if pid else None
 
     async def _apply_output_state(
         self,
@@ -832,10 +1461,45 @@ class DeviceManager:
             `disconnected` because the user opted out.
         """
         output_id = str(output.get("id", ""))
+        # OwnTone already tells us whether a receiver demands a credential we
+        # do not hold (`needs_auth_key = requires_auth AND auth_key IS NULL`).
+        # Enabling anyway makes OwnTone return HTTP 400, which used to surface
+        # as an opaque "connection failed". Report it as what it is so the UI
+        # can offer the pairing flow.
+        if should_enable and bool(output.get("needs_auth_key", False)):
+            self._notify_pairing_required(dev)
+            self._notify_conn_state(
+                dev_id, "failed", reason="this receiver needs to be paired first",
+            )
+            return
         try:
             if should_enable:
                 self._notify_conn_state(dev_id, "connecting")
+            # Layer 3: the offset MUST precede the enable. OwnTone copies
+            # `device->offset_ms` into the session when it builds it
+            # (outputs/airplay.c:1598) and refuses to change a live one
+            # (player.c:2937-2944), so writing it afterwards would take
+            # effect only on the NEXT enable. On the disable path we write 0
+            # so a receiver the user turned off never keeps a correction it
+            # is no longer part of — the value is persisted by OwnTone.
+            target_offset_ms = (
+                self._target_airplay_offset_ms(output_id) if should_enable else 0
+            )
+            was_selected = bool(output.get("selected", False))
+            offset_written = self._push_output_offset(output_id, target_offset_ms)
             self._owntone.set_output_enabled(output_id, should_enable)
+            # Only a genuine off→on transition builds a fresh session, and only
+            # a fresh session reads the offset we just wrote. Enabling an
+            # already-selected output is a no-op inside OwnTone, so its session
+            # keeps whatever it latched earlier — record nothing, and the next
+            # `set_airplay_offset_ms` will cycle it instead of assuming it is
+            # already right. This is the case that used to leave a receiver
+            # that was live before whole-home started ~L_local ahead of the
+            # local leg for the whole session.
+            if should_enable and offset_written and not was_selected:
+                self._latched_output_offsets[output_id] = target_offset_ms
+            else:
+                self._latched_output_offsets.pop(output_id, None)
             if should_enable:
                 self._owntone.set_output_volume(output_id, dev.volume)
             logger.info(
@@ -928,28 +1592,37 @@ class DeviceManager:
         stream stops. Self-terminates when every target has either
         succeeded or been disabled by the user.
         """
-        # Cancel any prior task. start_stream calls _reconcile_outputs
-        # whenever the user toggles a device, so multiple stacked tasks
-        # would all fight for the lock and re-emit duplicate events.
+        # MERGE into the shared watch set rather than cancel+replace. An
+        # in-flight loop reads `_deferred_reconcile_targets` in place, so
+        # unioning here means a pairing retry (or a second toggle) ADDS its
+        # device without evicting the ones already being watched. Previously
+        # this cancelled the task and replaced its set with only the new ids,
+        # so enabling Mac mini + Xiaomi together and finishing the mini's PIN
+        # first silently dropped the slower Xiaomi's discovery retry.
+        self._deferred_reconcile_targets |= set(target_ids)
+        # (Re)extend the discovery window so late-added targets get a full
+        # deadline rather than inheriting an almost-expired one.
+        self._deferred_reconcile_deadline = time.monotonic() + 30.0
         prior = getattr(self, "_deferred_reconcile_task", None)
         if prior is not None and not prior.done():
-            prior.cancel()
-        task = asyncio.create_task(
-            self._deferred_reconcile_loop(set(target_ids)),
-        )
+            # The running loop will pick up the enlarged set on its next poll.
+            return
+        task = asyncio.create_task(self._deferred_reconcile_loop())
         self._deferred_reconcile_task = task
 
-    async def _deferred_reconcile_loop(self, targets: set[str]) -> None:
+    async def _deferred_reconcile_loop(self) -> None:
         """Loop body for the background reconcile.
 
-        Polls OwnTone's outputs every ~1.5s for up to 30 seconds. When a
-        target's output finally appears, takes the device-manager lock
-        briefly, applies the enable, and removes the target from the
-        watch set. Stops once the watch set is empty.
+        Polls OwnTone's outputs every ~1.5s until the shared deadline. When a
+        target's output finally appears, takes the device-manager lock briefly,
+        applies the enable, and removes the target from the shared watch set
+        (`_deferred_reconcile_targets`). Stops once the watch set is empty. The
+        set and deadline are shared with `_schedule_deferred_reconcile` so a
+        concurrent schedule can extend both without cancelling this task.
         """
-        deadline = time.monotonic() + 30.0
+        targets = self._deferred_reconcile_targets
         try:
-            while targets and time.monotonic() < deadline:
+            while targets and time.monotonic() < self._deferred_reconcile_deadline:
                 await asyncio.sleep(1.5)
                 if self._owntone is None:
                     logger.info("deferred_reconcile_owntone_gone")
@@ -998,11 +1671,14 @@ class DeviceManager:
                     "deferred_reconcile_timeout",
                     extra={"remaining": list(targets)},
                 )
-                for dev_id in targets:
+                for dev_id in list(targets):
                     self._notify_conn_state(
                         dev_id, "failed",
                         reason="OwnTone never discovered receiver",
                     )
+                # Clear the timed-out ids from the shared set so a later
+                # schedule starts from a clean slate rather than reviving them.
+                targets.clear()
         except asyncio.CancelledError:
             # Expected on shutdown / re-schedule.
             raise
@@ -1020,8 +1696,10 @@ class DeviceManager:
         if prior is not None and not prior.done():
             prior.cancel()
         self._deferred_reconcile_task = None
+        # Drop the shared watch set so a fresh stream doesn't inherit ids from
+        # the stopped session.
+        self._deferred_reconcile_targets.clear()
         if self._audio_reader is not None:
-            self._audio_reader.set_broadcaster_tee(None)
             self._audio_reader.stop()
             self._audio_reader = None
         if self._broadcaster is not None:

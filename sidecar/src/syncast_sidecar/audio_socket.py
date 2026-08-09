@@ -31,6 +31,7 @@ from __future__ import annotations
 import collections
 import errno
 import os
+import select
 import socket
 import threading
 import time
@@ -51,19 +52,48 @@ PACKET_BYTES = 480 * 2 * 2
 # every broadcast send corresponds to exactly one OwnTone packet boundary.
 LOCAL_FIFO_CHUNK_BYTES = 352 * 2 * 2  # 1408
 
-# Per-client SO_SNDBUF target. Sized for ~50 ms of 44.1 kHz s16le stereo
-# (~8800 bytes), rounded up to a kernel-friendly boundary. Smaller buffers
-# make us notice slow clients faster (drop chunks rather than building a
-# multi-second backlog the receiver would still try to play); larger
-# buffers tolerate occasional render-thread hiccups but mask real problems.
-LOCAL_FIFO_CLIENT_SNDBUF = 16 * 1024
+# Per-client SO_SNDBUF target. Sized for ~360 ms of 44.1 kHz s16le stereo,
+# a middle ground: large enough to ride out the startup catch-up burst (a
+# freshly-connected bridge draining the delay-line backlog) and brief
+# render-thread hiccups without EAGAIN-dropping, small enough that a
+# chronically slow reader still surfaces as a backlog rather than hiding
+# behind a multi-second queue. The old 16 KB (~90 ms) dropped so eagerly
+# that a single reader stall starved the ring; the real slow-reader bug it
+# was guarding against (per-packet file I/O in the bridge reader) is fixed
+# at the source, so this buffer only needs to absorb transients now.
+LOCAL_FIFO_CLIENT_SNDBUF = 64 * 1024
 
-# Default broadcast-side delay for whole-home mode. AirPlay receivers
-# play ~1800 ms behind capture (PTP-anchored playout); local CoreAudio
-# bridges play ~50 ms behind. We hold each PCM packet inside the
-# broadcaster for `default_delay_ms - bridge_latency` so both paths emit
-# the SAME audio at the SAME wall-clock instant. Tuned empirically.
-DEFAULT_LOCAL_FIFO_DELAY_MS = 1750
+# Default broadcast-side delay for whole-home mode.
+#
+# CORRECTED (Direction B). The old value (1750 ms) assumed the broadcaster
+# had to *add* ~1.8 s to align the local leg with the AirPlay leg. That was
+# a pre-tee mental model where the bridge tapped raw capture. In Direction B
+# the broadcaster reads OwnTone's OUTPUT fifo, and OwnTone's fifo module
+# already holds each byte until `pts + buffer_duration (2250 ms) +
+# offset_ms` — the SAME instant its AirPlay-2 outputs play it (both ride the
+# one player clock). So the pipe release is already time-aligned with the
+# AirPlay leg; ANY positive broadcaster delay here would push the local leg
+# LATER (behind the AirPlay receivers), the opposite of what we want.
+#
+# The correct coarse alignment is therefore delay = 0.
+#
+# The residual `L_local` (local pipeline latency, ~120 ms) is then cancelled
+# by DELAYING THE AIRPLAY LEG, not by advancing this one: the broadcaster
+# cannot release a byte before the pipe hands it over, so it cannot advance
+# the local leg at all. That correction is
+# `device_manager.AIRPLAY_SYNC_OFFSET_DEFAULT_MS`, written per receiver via
+# `OwnToneBackend.set_output_offset_ms`.
+#
+# Do NOT reach for `owntone_backend.LOCAL_FIFO_OFFSET_MS` instead — it is a
+# documented trap, kept only as the historical estimate. Its own docstring
+# explains why it is never emitted: in the config block it kills an
+# unpatched OwnTone at parse time, and through REST it hits the unsigned
+# promotion in `outputs/fifo.c:263` that turns a negative offset into a
+# ~1.8e19 ms hold, i.e. a permanently silent local leg with nothing logged.
+#
+# Long-term drift is handled entirely by the Swift Layer-2 clock-following
+# PLL (LocalAirPlayBridge), not by any fixed delay here.
+DEFAULT_LOCAL_FIFO_DELAY_MS = 0
 
 # Hard upper bound. Caller-supplied values larger than this are clamped
 # down. This protects the bounded-queue overflow check from losing
@@ -107,6 +137,17 @@ LOCAL_FIFO_DELAY_RAMP_S = 0.030
 # system's per-process limit.
 MAX_BROADCASTER_CLIENTS = 16
 
+# Direction B: how long the reader waits for data on OwnTone's output fifo
+# before looping back to check `_stop_event`. Keeps `stop()` responsive
+# (sub-`SELECT` seconds) without busy-waiting on an idle pipe.
+LOCAL_FIFO_READ_SELECT_TIMEOUT_S = 0.2
+
+# Back-off between reopen attempts when OwnTone's output fifo is not yet
+# available (OwnTone still booting) or its writer went away (mode change /
+# flush). Short enough that local audio resumes promptly, long enough not to
+# spin. Bounded, and always interruptible by `_stop_event`.
+LOCAL_FIFO_REOPEN_BACKOFF_S = 0.2
+
 
 class AudioSocketReader:
     """Reads PCM packets from a SOCK_SEQPACKET socket on a worker thread."""
@@ -120,10 +161,6 @@ class AudioSocketReader:
         self._path = socket_path
         self._sink = sink
         self._packet_bytes = packet_bytes
-        # Optional tee callback the device manager can install when
-        # whole-home mode is active; receives every PCM chunk just
-        # after the OwnTone fifo write. None in stereo mode.
-        self._broadcaster_tee: Callable[[bytes], None] | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._listen_sock: socket.socket | None = None
@@ -137,20 +174,6 @@ class AudioSocketReader:
             target=self._run, name="syncast-audio-socket", daemon=True,
         )
         self._thread.start()
-
-    def set_broadcaster_tee(
-        self, tee: Callable[[bytes], None] | None
-    ) -> None:
-        """Install or remove the whole-home broadcaster tee callback.
-
-        Called by `device_manager.set_mode("whole_home")` after
-        constructing a `LocalFifoBroadcaster`, with `tee=broadcaster.feed`.
-        On switch back to stereo, called with `tee=None` to remove the
-        link cleanly. The reader thread reads `_broadcaster_tee` once
-        per recv and invokes it (if non-None); race-free because Python
-        attribute writes are atomic w.r.t. the GIL.
-        """
-        self._broadcaster_tee = tee
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -238,19 +261,11 @@ class AudioSocketReader:
                         extra={"received": len(packet), "written": written},
                     )
                     continue
-                # Tee the exact same complete PCM frame to the
-                # whole-home broadcaster (if any). We tee only after
-                # OwnTone accepted the frame so AirPlay and local never
-                # intentionally diverge by one side receiving bytes the
-                # other side missed.
-                tee = self._broadcaster_tee
-                if tee is not None:
-                    try:
-                        tee(packet)
-                    except Exception:  # noqa: BLE001
-                        # Never let a broadcaster failure kill the OwnTone
-                        # pipe writer — that would silence AirPlay too.
-                        logger.exception("broadcaster_tee_failed")
+                # Direction B: the reader's ONLY job is to hand Swift's PCM to
+                # OwnTone's input fifo. The local leg no longer tees pre-OwnTone
+                # input — it is fanned out from OwnTone's OUTPUT fifo by
+                # `LocalFifoBroadcaster._run_broadcaster`, so local and AirPlay
+                # share OwnTone's one player clock instead of two clock domains.
 
 
 class _BroadcastClient:
@@ -284,8 +299,8 @@ class LocalFifoBroadcaster:
 
           - ``listener``: blocking ``accept(2)`` loop; appends new
             ``_BroadcastClient`` instances to the registry.
-          - ``broadcaster``: legacy placeholder thread (post-tee
-            architecture; see ``_run_broadcaster`` for the long story).
+          - ``broadcaster``: reads OwnTone's OUTPUT fifo and hands each
+            packet to ``feed()`` (see ``_run_broadcaster``).
           - ``delay-pump``: pops items from the delay queue when
             their wall-clock due-time arrives and calls
             ``_broadcast(packet)``. Always spawned so a runtime
@@ -333,6 +348,11 @@ class LocalFifoBroadcaster:
         self._fifo_path = fifo_path
         self._listen_sock: socket.socket | None = None
         self._fifo_fd: int | None = None
+        # Guards `_fifo_fd`. Two threads race for that descriptor — `stop()`
+        # closes it to unblock the reader, and the reader closes it when its
+        # own pump returns — so the handover has to be indivisible rather than
+        # a check-then-act. See `_take_fifo_fd`.
+        self._fifo_lock = threading.Lock()
         self._listener_thread: threading.Thread | None = None
         self._broadcast_thread: threading.Thread | None = None
         self._delay_pump_thread: threading.Thread | None = None
@@ -606,8 +626,7 @@ class LocalFifoBroadcaster:
                 pass
         # Closing the fifo fd unblocks a blocking read in the broadcaster
         # thread (read returns 0, treated as EOF, loop exits).
-        fd = self._fifo_fd
-        self._fifo_fd = None
+        fd = self._take_fifo_fd()
         if fd is not None:
             try:
                 os.close(fd)
@@ -650,6 +669,32 @@ class LocalFifoBroadcaster:
 
     # ---------- internals ----------
 
+    def _take_fifo_fd(self, expected: int | None = None) -> int | None:
+        """Atomically claim the fifo fd, so exactly one caller closes it.
+
+        Testing ``self._fifo_fd == fd`` and then closing ``fd`` is not enough:
+        ``stop()`` can run in the gap between the two, clear the field, and
+        close the descriptor first. The loser of that race then calls
+        ``os.close`` on a number the process has already released — and once
+        the listener thread's ``accept()`` (or a later ``_open_listener``) has
+        been handed the same number, it is an unrelated live socket that gets
+        closed, which kills the broadcast listener or a connected bridge with
+        no error anywhere. Transferring ownership under the lock removes the
+        gap entirely.
+
+        ``expected`` restricts the claim to one particular descriptor (the
+        broadcaster thread only owns the one it opened); ``None`` claims
+        whatever is currently there.
+        """
+        with self._fifo_lock:
+            fd = self._fifo_fd
+            if fd is None:
+                return None
+            if expected is not None and fd != expected:
+                return None
+            self._fifo_fd = None
+            return fd
+
     def _open_listener(self) -> None:
         if self._socket_path.exists():
             try:
@@ -674,26 +719,32 @@ class LocalFifoBroadcaster:
         self._listen_sock = s
 
     def _open_fifo_blocking(self) -> None:
-        """Open OwnTone's output fifo for reading.
+        """Open OwnTone's output fifo for reading (non-blocking).
 
         We use a brief retry: OwnTone creates the fifo at startup, but
         if the broadcaster is asked to start before OwnTone has finished
         booting, the path may not yet exist as a fifo. The
         ``OwnToneBackend`` already pre-creates it during its own
         ``_ensure_fifo`` so this is just defence-in-depth.
+
+        The open is ``O_RDONLY | O_NONBLOCK``. A plain blocking ``O_RDONLY``
+        open of a fifo waits for a writer, which would hang the reader
+        thread whenever OwnTone's writer is briefly absent (mode change,
+        flush, reopen after EOF) — and there is no clean way to interrupt a
+        blocking ``os.open``. Non-blocking open returns a usable fd
+        immediately even with no writer; the read side then uses ``select``
+        so the reader stays responsive to ``_stop_event`` without busy
+        waiting. The name is kept for call-site compatibility.
         """
         deadline = time.monotonic() + 5.0
         last_err: Exception | None = None
         while time.monotonic() < deadline and not self._stop_event.is_set():
             try:
-                # O_RDONLY (blocking). On macOS opening a fifo for read
-                # blocks until at least one writer has it open — that's
-                # OwnTone, and it always opens its end at startup, so
-                # this returns near-immediately. If OwnTone has crashed,
-                # the open hangs and `stop()`'s socket close is what
-                # ultimately bails us out. A 5s deadline is the safety net.
-                fd = os.open(str(self._fifo_path), os.O_RDONLY)
-                self._fifo_fd = fd
+                fd = os.open(
+                    str(self._fifo_path), os.O_RDONLY | os.O_NONBLOCK
+                )
+                with self._fifo_lock:
+                    self._fifo_fd = fd
                 return
             except OSError as e:
                 last_err = e
@@ -761,12 +812,15 @@ class LocalFifoBroadcaster:
         """Push one PCM chunk into the delay queue (or directly to
         bridge clients if ``delay_ms == 0``).
 
-        Called by `AudioSocketReader` immediately after writing the
-        chunk to OwnTone's input fifo (the AirPlay-bound copy). This
-        is the post-b0543d5 architecture: bridges receive Swift's
-        native PCM directly, NOT via OwnTone's fifo OUTPUT module
-        (which had unfixable multi-reader semantics — see fifo.c
-        patch in build/owntone-server/src/outputs/fifo.c).
+        On the direction-B audio path: ``_pump_fifo_to_clients`` reads OwnTone's
+        OUTPUT fifo and hands each packet here. Both the local bridges and the
+        AirPlay receivers ride OwnTone's single player clock (one clock domain),
+        but the AirPlay legs play ~1.8 s later at their PTP-anchored playout,
+        while a bridge would render immediately — so this delay line holds each
+        packet for the configured ``delay_ms`` to align the two legs at the same
+        wall-clock instant. ``set_delay_ms`` (the Sync slider) tunes it live,
+        and the feed→broadcast timing here is what populates
+        ``actual_delivery_lag_ms``.
 
         Delay path (``delay_seconds > 0``):
           enqueue (due_time, enqueued_time, packet) and signal the
@@ -842,22 +896,94 @@ class LocalFifoBroadcaster:
             self._actual_delivery_lag_ms = lag
 
     def _run_broadcaster(self) -> None:
-        """Idle thread placeholder.
+        """Read OwnTone's OUTPUT fifo and fan the bytes to bridge clients.
 
-        Pre-tee architecture: this thread opened OwnTone's output fifo
-        and read packets in a loop. Post-tee (b0543d5+1): bridges
-        receive Swift's PCM directly via `feed()` from
-        AudioSocketReader; the OwnTone fifo OUTPUT module is no longer
-        consulted (its multi-reader / self-flushing semantics made it
-        unusable for our broadcast use case).
+        Direction B. The local speakers are an OwnTone ``fifo {}`` output, so
+        every byte on this pipe has already been released by OwnTone's player
+        presentation clock — the SAME clock that gates the RAOP/AirPlay
+        outputs (see ``build/owntone-server/src/outputs/fifo.c``: writes are
+        held until ``pts < player_clock − outputs_buffer_duration``).
+        Forwarding them straight to the Swift ``LocalAirPlayBridge`` clients
+        puts the local leg on OwnTone's single timeline. That is the whole
+        point of direction B: no self-target, no second clock domain, and
+        therefore no full-screen-PIN deadlock. Each packet is handed to
+        ``feed()`` (not broadcast directly) so the broadcast delay line can hold
+        it until the AirPlay legs' later PTP playout instant — same clock, offset
+        only by the fixed playout gap.
 
-        We keep the thread spawned so `start()` / `stop()` ordering and
-        `_fifo_ready` semantics are preserved for callers; it just
-        sleeps until stop. A future cleanup can drop the thread entirely.
+        The O_RDONLY open MUST precede OwnTone's O_WRONLY open, which
+        ``device_manager._ensure_broadcaster`` guarantees by waiting on
+        ``_fifo_ready`` before it enables the fifo output over REST.
+
+        Failure is bounded and self-healing: a failed open, an EOF (OwnTone
+        closed its write end on a mode change / flush / shutdown), or a read
+        error drops the local leg to silence and retries the open, rather
+        than corrupting the stream or wedging the thread. If the reader is
+        down, the Swift bridge simply underruns to silence — the user never
+        loses their AirPlay legs, and switching back to stereo is unaffected.
         """
-        self._fifo_ready.set()
         while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=1.0)
+            self._open_fifo_blocking()
+            # Signal the handshake regardless of outcome so
+            # `device_manager`'s bounded wait never hangs. A failed open just
+            # means no local audio this cycle; we back off and retry below.
+            self._fifo_ready.set()
+            fd = self._fifo_fd
+            if fd is None:
+                self._stop_event.wait(timeout=LOCAL_FIFO_REOPEN_BACKOFF_S)
+                continue
+            try:
+                self._pump_fifo_to_clients(fd)
+            finally:
+                # Claim the fd before closing it: `stop()` may already have
+                # taken it, and closing a descriptor we no longer own can hit
+                # an unrelated socket that inherited the number.
+                owned = self._take_fifo_fd(expected=fd)
+                if owned is not None:
+                    try:
+                        os.close(owned)
+                    except OSError:
+                        pass
+            # Prepare a fresh handshake for the next reopen cycle.
+            self._fifo_ready.clear()
+            if not self._stop_event.is_set():
+                self._stop_event.wait(timeout=LOCAL_FIFO_REOPEN_BACKOFF_S)
+
+    def _pump_fifo_to_clients(self, fd: int) -> None:
+        """Inner read loop for one open fifo fd. Returns on EOF, read error,
+        or stop, letting the caller decide whether to reopen."""
+        while not self._stop_event.is_set():
+            try:
+                readable, _, _ = select.select(
+                    [fd], [], [], LOCAL_FIFO_READ_SELECT_TIMEOUT_S
+                )
+            except (OSError, ValueError):
+                # fd was closed by stop() (EBADF), or is otherwise invalid.
+                return
+            if not readable:
+                continue  # timeout: loop back to check _stop_event
+            try:
+                chunk = os.read(fd, LOCAL_FIFO_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return
+            if not chunk:
+                # EOF: OwnTone closed its write end. Drop to silence and let
+                # the outer loop reopen and resync — never treat this as
+                # stream corruption.
+                return
+            # Hand the packet to `feed()`, NOT straight to `_broadcast`. OwnTone
+            # releases the fifo byte on its player clock (~real time), but the
+            # AirPlay legs play ~1.8 s later at their PTP-anchored playout time,
+            # so a bridge that renders the byte immediately runs ~1.75 s AHEAD
+            # of the AirPlay receivers — audible echo across the room. `feed()`
+            # holds each packet for the broadcast delay (default
+            # DEFAULT_LOCAL_FIFO_DELAY_MS, live-tunable via set_delay_ms) so both
+            # legs emit the same audio at the same wall-clock instant, and it is
+            # what keeps `actual_delivery_lag_ms` truthful. `feed()` handles its
+            # own exceptions internally.
+            self.feed(chunk)
 
     def _run_delay_pump(self) -> None:
         """Drain the delay queue, releasing packets to ``_broadcast``

@@ -1,6 +1,6 @@
 # SyncCast Goal Loop
 
-> Last updated: 2026-05-16
+> Last updated: 2026-08-09
 > Purpose: keep future Codex/agent sessions aligned on the real product goal, not only the latest implementation thread.
 
 ## Product Goal
@@ -11,11 +11,12 @@ Reliability means the user can leave it running during normal Mac use, sleep/wak
 
 ## Current Truth
 
+- **2026-08-09 acoustic measurement retired (supersedes every calibration/passive entry below):** all microphone-based measurement has been deleted from the codebase — active probe calibration, the passive no-probe chain, the A/B audition state machine, the `ActiveAcousticDiagnosticsGate` env switches, and `NSMicrophoneUsageDescription`. SyncCast no longer opens the microphone under any code path. Local/AirPlay alignment now comes from the OwnTone clock domain: Layer 1 keeps the broadcaster delay at 0, Layer 2 runs a ring-water-level PI loop in `LocalAirPlayBridge` (with `FractionalTrimResampler`) that slaves the local device clock to OwnTone's fifo write rate, and Layer 3 absorbs the residual local pipeline latency via OwnTone per-output `offset_ms`. Whole-home sync has been verified by ear by the user with this stack. The dated 2026-05-xx entries below are retained as a record of what was tried and rejected; they no longer describe the code.
 - **Stable product core:** Stereo mode with local CoreAudio outputs is user-verified as very stable.
 - **Resolved by user verification:** Stereo screen-sleep / wake recovery now resumes playback normally after screen sleep.
-- **Immediate AirPlay issue:** Whole-home / AirPlay now gets sound on all selected devices, and the Local + AirPlay delay slider can be hand-tuned. The old active-probe microphone calibration has an opt-in event-driven apply path, but it is lab-only because the probe can be audible; the current product path is passive no-probe evidence, and AirPlay still must remain experimental until repeated long-session runs and listening tests pass.
-- **User correction:** asking the user to report a fixed "best delay" is not meaningful because AirPlay group latency can vary between sessions/tests. SyncCast must measure the current route state and apply only after automated repeat agreement, not rely on a human-selected magic number.
-- **Still experimental:** Broader AirPlay long-session reliability remains unproven and must be measured before it is described as solved. A bad calibration must fail closed instead of changing a known-good manual delay.
+- **Immediate AirPlay issue:** Whole-home / AirPlay gets sound on all selected devices and is aligned by the clock-domain stack described in the 2026-08-09 entry above. It still must remain experimental until repeated long-session runs and listening tests pass.
+- **User correction:** asking the user to report a fixed "best delay" is not meaningful because AirPlay group latency can vary between sessions/tests. This is why alignment is now closed-loop against OwnTone's own clock rather than a human-selected magic number.
+- **Still experimental:** Broader AirPlay long-session reliability remains unproven and must be measured before it is described as solved.
 - **AirPlay sync model:** AirPlay receiver-to-receiver sync should be treated as the AirPlay timing domain's responsibility. SyncCast's near-term problem is aligning local Mac/display/CoreAudio speakers to the already-buffered AirPlay group.
 - **Blocking for always-on media use:** ScreenCaptureKit triggers Screen Recording semantics and blocks or degrades DRM playback in Netflix, Apple TV+, Disney+, and similar apps.
 - **2026-05-12 Tap reality check:** Process Tap is viable for non-SCK capture when non-SyncCast audio is actually playing, but Tap-backed AirPlay calibration is not yet a drop-in SCK replacement. A live Tap calibration attempt produced zero Tap callbacks without external program audio, and a system-sound helper was audible to the user. Tap smoke/calibration harnesses now keep auxiliary audio probes disabled by default.
@@ -49,7 +50,7 @@ Acceptance:
 Replace ScreenCaptureKit for always-on media playback with two non-SCK paths:
 
 - **Direct Stereo Output:** create/manage a public CoreAudio aggregate or multi-output device and make it the system default output for local Stereo. This avoids screen capture and system-audio capture entirely for the DRM-critical local mode.
-- **Core Audio Process Tap:** continue the `SystemAudioCapture -> RingBuffer` architecture for capture-dependent paths such as AirPlay, calibration, and future routing.
+- **Core Audio Process Tap:** continue the `SystemAudioCapture -> RingBuffer` architecture for capture-dependent paths such as AirPlay and future routing.
 
 Acceptance:
 - Direct Stereo Output can drive two local outputs without requesting Screen Recording or System Audio Recording.

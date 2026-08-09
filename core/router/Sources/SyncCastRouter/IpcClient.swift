@@ -7,12 +7,26 @@ import Foundation
 /// This client deliberately stays small. No reconnection logic, no audio
 /// socket — both live in `SidecarManager` so the boundary is testable.
 public actor IpcClient {
-    public enum IpcError: Error {
+    public enum IpcError: Error, CustomStringConvertible {
         case socketCreationFailed(Int32)
         case socketConnectFailed(Int32)
         case writeFailed(Int32)
         case responseParseFailed
         case rpcError(code: Int, message: String)
+        /// The connection went away while this call was in flight.
+        case connectionClosed
+
+        public var description: String {
+            switch self {
+            case .socketCreationFailed(let e): return "socket() failed errno=\(e)"
+            case .socketConnectFailed(let e): return "connect() failed errno=\(e)"
+            case .writeFailed(let e): return "write() failed errno=\(e)"
+            case .responseParseFailed: return "could not parse the helper's answer"
+            case .rpcError(let code, let message): return "rpc error \(code): \(message)"
+            case .connectionClosed:
+                return "the audio helper closed the connection"
+            }
+        }
     }
 
     private let socketPath: URL
@@ -69,6 +83,14 @@ public actor IpcClient {
                 guard let self else { return }
                 Task { await self.dispatchLine(line) }
             }
+            // EOF (or a hard read error) means no response will ever arrive
+            // for anything still in flight. Without this every pending
+            // continuation would stay suspended forever, wedging its caller
+            // — including callers that wrapped themselves in a timeout, since
+            // a timeout cannot complete a task group whose other child never
+            // finishes.
+            guard let self else { return }
+            Task { await self.failAllPending(with: IpcError.connectionClosed) }
         }
         thread.name = "syncast.ipc.reader"
         thread.qualityOfService = .utility
@@ -79,6 +101,22 @@ public actor IpcClient {
     public func close() {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
         readerThread = nil
+        failAllPending(with: IpcError.connectionClosed)
+    }
+
+    /// Resume every in-flight call with `error`. Called on socket EOF and on
+    /// explicit close, so no caller is left suspended on a socket that can
+    /// never answer.
+    private func failAllPending(with error: Error) {
+        guard !pending.isEmpty else { return }
+        let waiters = pending
+        pending.removeAll()
+        for (_, cont) in waiters { cont.resume(throwing: error) }
+    }
+
+    private func cancelPending(id: Int) {
+        guard let cont = pending.removeValue(forKey: id) else { return }
+        cont.resume(throwing: CancellationError())
     }
 
     @discardableResult
@@ -92,20 +130,37 @@ public actor IpcClient {
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         var line = Data(); line.append(data); line.append(0x0a)
-        // Register the continuation FIRST, then write. If we wrote first
-        // and the sidecar replied before we got back to register the
-        // continuation, dispatchLine would see pending[id] empty and
-        // drop the response — leaving call() hung forever. This is a
-        // real race we hit on local Unix sockets where round-trip is
-        // sub-millisecond.
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any, Error>) in
-            self.pending[id] = cont
-            do {
-                try self.writeAll(line)
-            } catch {
-                self.pending.removeValue(forKey: id)
-                cont.resume(throwing: error)
+        // Cancellation support is load-bearing, not a nicety. Callers bound
+        // this call by racing it against a sleeping task in a task group, and
+        // a task group must await ALL of its children before it can return —
+        // so a continuation that ignores cancellation turns "5 second
+        // timeout" into "hang forever". The cancel handler pulls the id out
+        // of `pending` and resumes it, which is what lets the group finish.
+        return try await withTaskCancellationHandler {
+            // Register the continuation FIRST, then write. If we wrote first
+            // and the sidecar replied before we got back to register the
+            // continuation, dispatchLine would see pending[id] empty and
+            // drop the response — leaving call() hung forever. This is a
+            // real race we hit on local Unix sockets where round-trip is
+            // sub-millisecond.
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any, Error>) in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                self.pending[id] = cont
+                do {
+                    try self.writeAll(line)
+                } catch {
+                    self.pending.removeValue(forKey: id)
+                    cont.resume(throwing: error)
+                }
             }
+        } onCancel: {
+            // Runs outside actor isolation, so hop back on. Racing with a
+            // real response is safe: whichever gets to `removeValue` first
+            // wins and the other sees nil.
+            Task { await self.cancelPending(id: id) }
         }
     }
 

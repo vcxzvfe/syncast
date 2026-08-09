@@ -8,7 +8,7 @@
 - **Resolved:** Stereo screen-sleep / wake recovery now resumes playback normally per user verification.
 - **Blocking:** ScreenCaptureKit capture triggers Screen Recording semantics and breaks DRM playback. Local Stereo now defaults to Direct Stereo, but real DRM playback checks are still pending.
 - **Experimental:** Whole-home / AirPlay devices can all output sound, but SyncCast has not proven reliable Local CoreAudio vs AirPlay-group alignment over long sessions. AirPlay receiver-to-receiver timing is treated as the AirPlay/OwnTone timing domain unless future evidence says otherwise.
-- **Active measurement path:** passive no-probe capture/monitor is the preferred AirPlay reliability path after audible probe reports. It now uses dual waveform/envelope agreement and drift-slope evidence, but no successful live Logitech passive corpus has been promoted to automatic apply.
+- **Measurement path (2026-08-09):** acoustic measurement is retired. Both active-probe and passive microphone measurement have been deleted; SyncCast no longer opens the microphone at all. Local/AirPlay alignment is handled by the OwnTone clock domain plus the ring-water-level control loop in `LocalAirPlayBridge` (see `docs/ARCHITECTURE.md`).
 - **Local-only VCS state:** current Goal work is installed locally but not pushed to GitHub/origin.
 
 ## Milestone 1: Freeze Stereo Stability
@@ -37,7 +37,7 @@
 - [x] Add installed-app smoke harness for Process Tap path (`scripts/tap_capture_smoke_test.sh`).
 - [x] Fail closed when Tap is explicitly requested on an unsupported macOS instead of falling back to SCK.
 - [ ] Runtime-harden `TapCapture.swift`: startup timeout, aggregate input validation, format/SRC handling, RT-safe callback state, and death callbacks.
-- [ ] Validate Tap mode for capture-dependent paths: AirPlay, calibration, and future routing.
+- [ ] Validate Tap mode for capture-dependent paths: AirPlay and future routing.
 - [ ] Keep SCK as fallback for unsupported OS versions or Tap startup failure.
 
 ## Milestone 4: AirPlay Truth And Measurement
@@ -48,12 +48,9 @@
 - [ ] Add a group start barrier and explicit late-join / resync behavior.
 - [ ] Use OwnTone `offset_ms` only for measured stable per-device bias.
 - [x] Disable automatic delay writes for multi-AirPlay group measurements until per-receiver evidence exists.
-- [x] Add passive no-probe estimator/capture/monitor scaffolding with fail-closed context gates.
-- [x] Add dual waveform/envelope estimator agreement and drift-slope evidence.
-- [ ] Collect a live passive Logitech corpus for Local + AirPlay with ordinary program audio.
-- [ ] Keep passive apply in dry-run until two independent same-context sessions pass audit/finalize/correction gates.
+- [x] Retire acoustic (microphone) measurement entirely in favour of the OwnTone clock domain + ring-level control loop.
 - [ ] Build a long-session AirPlay test protocol: 2+ receivers, 2+ hours, skew/drift logs.
-- [ ] Rerun long Local + AirPlay drift after the 2026-05-07 retry/threshold/mic host-time changes; the last `display,xiaomi 900 6 60` run failed health gates despite several stable-looking cycles.
+- [ ] Rerun long Local + AirPlay drift on the current OwnTone clock-domain stack. (The 2026-05-07 mic-host-time item this replaced is obsolete: its harness `scripts/drift_test.sh` and the acoustic measurement it drove were deleted on 2026-08-09, so a new no-mic drift protocol is needed.)
 - [ ] Capture recovery behavior for sleep/wake, receiver restart, network drop, sidecar restart, and OwnTone restart.
 - [ ] Add diagnostics for sidecar/OwnTone buffer health, receiver state, packet timing, and local bridge lag.
 - [x] Add drift health gates for applied error, confidence, uncertainty/MAD, malformed JSON, and transport-counter failures.

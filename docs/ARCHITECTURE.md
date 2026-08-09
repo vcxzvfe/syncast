@@ -6,7 +6,7 @@
 
 ### Goals (in priority order)
 1. **Preserve the stable local Stereo path**: local CoreAudio outputs must stay low-latency and reliable.
-2. **Improve Local + AirPlay sync quality**: target ≤30 ms perceived offset at steady state, but treat it as unresolved until passive real-room evidence proves it.
+2. **Improve Local + AirPlay sync quality**: target ≤30 ms perceived offset at steady state. Since 2026-08-09 the only acceptance evidence is listening verification plus the ring-level drift logs — there is no acoustic measurement in the codebase.
 3. **Per-device volume**: independent linear gain 0.0–1.0, plus mute, persisted across launches.
 4. **Pluggable transports**: adding a new device class (Snapcast, generic RTP, Chromecast) should be a new module under `core/router/Transports/`, not a rewrite.
 5. **Reliability**: a misbehaving AirPlay receiver must not stall the local outputs.
@@ -70,7 +70,7 @@
 | Module | Language | Responsibility |
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, IPC client to sidecar, passive diagnostic capture. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
@@ -90,15 +90,13 @@ See [research/sync-brief.md](research/sync-brief.md) for the full discussion. He
 
 - **Master clock**: `mach_absolute_time()` on the host. Wall-clock is not used — we are NTP-discipline-agnostic.
 - **AirPlay receiver group**: multiple AirPlay receivers are delegated to the AirPlay/OwnTone timing domain. SyncCast should not invent per-receiver truth unless the evidence can distinguish them.
-- **Local + AirPlay strategy**: pad the fast local path until it matches AirPlay's late delivery. Manual delay can align a room; automatic correction is not product-ready.
-- **Timing evidence**: active acoustic probes are lab-only and disabled by default because high-band probes were audible on real hardware. The current safe path is passive no-probe measurement: compare the captured reference ring with a microphone recording of real program audio, reject weak/mismatched evidence, and avoid writes unless repeated sessions agree.
-- **Route mutations**: AirPlay connection, route, delay, and volume changes bump an AirPlay timing epoch. Passive baselines must not cross epochs.
-
-Passive control pipeline:
-
-`passive_status -> passive_capture -> passive_capture_estimate -> passive_drift_monitor -> passive_delay_decision -> passive_session_audit/finalize -> passive_correction_gate -> passive_apply_candidate`
-
-Safety invariants: passive capture emits no probes; the microphone opens only after a no-mic readiness preflight; monitor evidence is scoped to route context, current delay, delay-lock state, enabled AirPlay count, AirPlay timing epoch, and capture backend; and delay writes are forbidden until repeat-confirmed candidates pass the app-side guard. The estimator defaults to dual waveform/envelope agreement and exposes drift fields (`slope_ms_per_min`, `drift_ppm`, `fitted_drift_span_ms`) as evidence, not as proof of product reliability by themselves.
+- **Local + AirPlay strategy**: both legs are driven from the same OwnTone clock domain (see below), so the local path follows AirPlay's playout rate rather than being padded to guess at it.
+- **Timing evidence (2026-08-09)**: acoustic measurement has been retired. Both the active-probe path and the passive no-probe microphone path are removed from the codebase; SyncCast never opens the microphone. Alignment comes from the OwnTone clock domain instead:
+  - **Layer 1** — the broadcaster adds no delay (`DEFAULT_LOCAL_FIFO_DELAY_MS = 0`); OwnTone's fifo output already releases each byte at `pts + outputs_buffer_duration_ms + offset_ms`.
+  - **Layer 2** — `LocalAirPlayBridge` runs a PI control loop whose phase detector is the ring water level (`writePos - readCursor`), micro-resampling through `FractionalTrimResampler` so the local device clock follows OwnTone's fifo write rate.
+  - **Layer 3** — the residual local pipeline latency is absorbed by delaying the AirPlay leg via OwnTone's per-output `offset_ms`.
+  - **User trim (2026-08-09)** — on top of those three, each enabled output carries a user-settable millisecond trim compensating its distance from the listening position (1 ms ≈ 34 cm). It is a steady-state bias, deliberately NOT an input to Layer 2: the local leg applies it as a ring read-tap offset (`startFrame - trimFrames`) while `readCursor` keeps advancing untrimmed, so the PI loop's error signal is identical to a zero-trim run. Signed intent is normalised by `DelayTrimNormalizer` (the earliest speaker becomes the 0 reference) because neither leg can play early. The AirPlay half ADDS to the Layer-3 offset via `sync.set_output_trims_ms`; the sum, not the trim, is what gets clamped to OwnTone's range.
+- **Route mutations**: AirPlay connection, route, delay, and volume changes bump an AirPlay timing epoch.
 
 ## 6. Concurrency model
 
@@ -126,11 +124,11 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 
 | Data | Location | Why |
 |---|---|---|
-| Per-device routing (`enabled`, `volume`, `mute`, `manualDelayMs`) | `~/Library/Application Support/SyncCast/devices.json` | Survives launches |
-| Stable device IDs | same file | Map from CoreAudio UID / AirPlay device key → SyncCast UUID |
-| Last passive baseline / diagnostic artifacts | session output directories, future persisted store | Used only after fail-closed audit; stale route/timing epochs are rejected |
+| Whole-home local member selection | `UserDefaults` key `syncast.wholeHome.localMemberUIDs` | Keyed by CoreAudio UID so it survives replug |
+| Global local-fifo delay + lock | `UserDefaults` keys `syncast.airplayDelayMs`, `syncast.airplayDelayLockedAt` | Survives launches |
+| Per-speaker delay trim | `UserDefaults` key `syncast.deviceDelayTrimMs`, a `[persistenceKey: rawMs]` map | Keyed by `Device.persistenceKey` (`ca:<UID>` / `ap:<hex deviceid>`), never by `Device.id`, which is re-minted every process. Stores RAW signed intent, never the normalised output — normalisation depends on which devices are present, so persisting it would drift each session. A device that is absent keeps its entry, same rule as the member store. |
 
-Atomic writes via temp-file + `rename`. No SQLite — overkill at this scale.
+Note: earlier revisions of this document described a `~/Library/Application Support/SyncCast/devices.json` routing store. No such file exists or has ever been written; per-device routing is rebuilt from discovery on each launch, and only the keys above are persisted.
 
 ## 9. Build & distribution
 

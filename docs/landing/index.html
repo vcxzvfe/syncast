@@ -246,7 +246,7 @@
   <header class="hero">
     <span class="pill"><span class="dot"></span>Open source · macOS</span>
     <h1>One audio source.<br><span class="accent">Local Stereo</span> first.</h1>
-    <p class="lede">SyncCast is a macOS menubar app for stable local multi-output playback through a Direct Stereo path, with an experimental Local + AirPlay mode under active calibration and DRM-capture work.</p>
+    <p class="lede">SyncCast is a macOS menubar app for stable local multi-output playback through a Direct Stereo path, with an experimental Local + AirPlay mode that slaves every local output to the OwnTone clock domain and adds per-speaker millisecond delay trims.</p>
     <div class="cta-row">
       <a class="btn primary" href="https://github.com/vcxzvfe/syncast" target="_blank" rel="noopener">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.6v-2c-3.2.7-3.8-1.5-3.8-1.5-.5-1.3-1.3-1.6-1.3-1.6-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.2-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.5-1.5 7.8-5.8 7.8-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
@@ -269,7 +269,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 18 0"/><path d="M6 12a6 6 0 0 1 12 0"/><circle cx="12" cy="12" r="2"/></svg>
         </div>
         <h3>AirPlay experimental mode</h3>
-        <p>Send audio to AirPlay 2 receivers through the OwnTone-backed sidecar while the project develops safer passive Local + AirPlay delay control.</p>
+        <p>Send audio to AirPlay 2 receivers through the OwnTone-backed sidecar, with local speakers riding the same player clock. Per-speaker delay trims (1 ms &asymp; 34 cm) let you compensate how far each speaker sits from where you listen.</p>
       </article>
 
       <article class="feature">

@@ -7,14 +7,6 @@ let package = Package(
     products: [
         .library(name: "SyncCastRouter", targets: ["SyncCastRouter"]),
         .executable(
-            name: "SyncCastRouterTimingCheck",
-            targets: ["SyncCastRouterTimingCheck"]
-        ),
-        .executable(
-            name: "SyncCastPassiveHeadless",
-            targets: ["SyncCastPassiveHeadless"]
-        ),
-        .executable(
             name: "SyncCastDDCProbe",
             targets: ["SyncCastDDCProbe"]
         ),
@@ -37,22 +29,9 @@ let package = Package(
             path: "Sources/SyncCastRouter"
         ),
         .executableTarget(
-            name: "SyncCastRouterTimingCheck",
-            dependencies: ["SyncCastRouter"],
-            path: "Sources/SyncCastRouterTimingCheck"
-        ),
-        .executableTarget(
             name: "SyncCastDDCProbe",
             dependencies: ["SyncCastRouter"],
             path: "Sources/SyncCastDDCProbe"
-        ),
-        .executableTarget(
-            name: "SyncCastPassiveHeadless",
-            dependencies: [
-                "SyncCastRouter",
-                .product(name: "SyncCastDiscovery", package: "discovery"),
-            ],
-            path: "Sources/SyncCastPassiveHeadless"
         ),
         .testTarget(
             name: "SyncCastRouterTests",

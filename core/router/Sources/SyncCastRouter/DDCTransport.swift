@@ -35,8 +35,11 @@ public enum DDCAudioVCP {
 
 // MARK: - Pure packet construction / parsing (unit-checkable)
 
-/// Pure DDC/CI packet helpers. No IO — checked by SyncCastRouterTimingCheck
-/// against byte vectors captured from real hardware (ASUS ExternalDisplay).
+/// Pure DDC/CI packet helpers. No IO — the byte layouts here were derived
+/// from vectors captured on real hardware (ASUS ExternalDisplay). The standalone
+/// verifier that exercised them (`SyncCastRouterTimingCheck`) was retired
+/// with the acoustic-measurement removal on 2026-08-09; these helpers are
+/// currently unit-checkable but uncovered.
 public enum DDCPacket {
     /// 7-bit I2C address of the DDC/CI peripheral on the display.
     public static let chipAddress: UInt32 = 0x37

@@ -55,18 +55,6 @@ public final class AudioSocketWriter: @unchecked Sendable {
     /// second concurrent writer — the same 2.2× over-rate bug feb56ca
     /// originally fixed.
     private var writerGeneration: UInt64 = 0
-    private struct ScheduledOverlay {
-        let startNs: UInt64
-        let samples: [[Float]]
-        let frames: Int
-        var mixedFrames: Int = 0
-    }
-    private var scheduledOverlays: [ScheduledOverlay] = []
-    public private(set) var overlaysScheduled: UInt64 = 0
-    public private(set) var overlayFramesScheduled: UInt64 = 0
-    public private(set) var overlayFramesMixed: UInt64 = 0
-    public private(set) var overlaysDroppedLate: UInt64 = 0
-
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
         self.socketPath = socketPath
@@ -118,38 +106,10 @@ public final class AudioSocketWriter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if fd >= 0 { Darwin.close(fd); fd = -1 }
         writerActive = false
-        scheduledOverlays.removeAll()
         // Invalidate any in-flight Task cleanup from a previous
         // generation so a stop()+start() cycle's stale Task exit
         // cannot clobber the new generation's `writerActive`.
         writerGeneration &+= 1
-    }
-
-    /// Schedule a short stereo probe to be mixed into the outgoing
-    /// AirPlay-bound PCM at a wall-clock time. This is used by
-    /// `ActiveCalibrator` instead of writing probes into `RingBuffer`:
-    /// writing into the ring advances its write cursor and permanently
-    /// adds backlog, which made repeated 100 ms chirps appear about
-    /// 100 ms later on every cycle. Overlay mixing preserves the capture
-    /// queue's timeline while still sending the probe through OwnTone.
-    @discardableResult
-    public func scheduleStereoOverlay(samples: [[Float]], atNs: UInt64) -> Bool {
-        guard samples.count >= channelCount,
-              !samples[0].isEmpty,
-              samples[0].count == samples[1].count
-        else { return false }
-        let frames = samples[0].count
-        return lock.withLock {
-            guard writerActive, fd >= 0 else { return false }
-            scheduledOverlays.append(.init(
-                startNs: atNs,
-                samples: Array(samples.prefix(channelCount)),
-                frames: frames
-            ))
-            overlaysScheduled &+= 1
-            overlayFramesScheduled &+= UInt64(frames)
-            return true
-        }
     }
 
     private func connect() throws {
@@ -269,10 +229,6 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 nextRead &+= Int64(frameCount)
             }
 
-            mixScheduledOverlays(
-                into: &planar, packetStartNs: packetStartNs,
-                packetIntervalNs: packetIntervalNs
-            )
             for f in 0..<frameCount {
                 for ch in 0..<channelCount {
                     let v = planar[ch][f]
@@ -333,78 +289,6 @@ public final class AudioSocketWriter: @unchecked Sendable {
         }
     }
 
-    private func mixScheduledOverlays(
-        into planar: inout [[Float]],
-        packetStartNs: UInt64,
-        packetIntervalNs: UInt64
-    ) {
-        let packetEndNs = packetStartNs &+ packetIntervalNs
-        lock.withLock {
-            var droppedLate = 0
-            scheduledOverlays.removeAll { overlay in
-                let durationNs = UInt64(
-                    Double(overlay.frames) / sampleRate * 1_000_000_000.0
-                )
-                let expired = overlay.startNs &+ durationNs <= packetStartNs
-                if expired, overlay.mixedFrames < overlay.frames {
-                    droppedLate += 1
-                }
-                return expired
-            }
-            if droppedLate > 0 {
-                overlaysDroppedLate &+= UInt64(droppedLate)
-            }
-            for index in scheduledOverlays.indices {
-                let overlay = scheduledOverlays[index]
-                let durationNs = UInt64(
-                    Double(overlay.frames) / sampleRate * 1_000_000_000.0
-                )
-                let overlayEndNs = overlay.startNs &+ durationNs
-                if overlay.startNs >= packetEndNs || overlayEndNs <= packetStartNs {
-                    continue
-                }
-
-                let packetFrameStart: Int
-                let overlayFrameStart: Int
-                if overlay.startNs > packetStartNs {
-                    packetFrameStart = min(
-                        frameCount,
-                        Int(ceil(
-                            Double(overlay.startNs - packetStartNs)
-                                / 1_000_000_000.0 * sampleRate
-                        ))
-                    )
-                    overlayFrameStart = 0
-                } else {
-                    packetFrameStart = 0
-                    overlayFrameStart = min(
-                        overlay.frames,
-                        Int(floor(
-                            Double(packetStartNs - overlay.startNs)
-                                / 1_000_000_000.0 * sampleRate
-                        ))
-                    )
-                }
-
-                var mixedFramesThisPacket = 0
-                for f in packetFrameStart..<frameCount {
-                    let overlayIndex = overlayFrameStart + f - packetFrameStart
-                    if overlayIndex >= overlay.frames { break }
-                    for ch in 0..<min(channelCount, overlay.samples.count) {
-                        planar[ch][f] += overlay.samples[ch][overlayIndex]
-                    }
-                    mixedFramesThisPacket += 1
-                }
-                if mixedFramesThisPacket > 0 {
-                    scheduledOverlays[index].mixedFrames = min(
-                        overlay.frames,
-                        scheduledOverlays[index].mixedFrames + mixedFramesThisPacket
-                    )
-                    overlayFramesMixed &+= UInt64(mixedFramesThisPacket)
-                }
-            }
-        }
-    }
 }
 
 private extension NSLock {

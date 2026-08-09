@@ -1,7 +1,5 @@
 import AppKit
-import AVFoundation
 import CoreAudio
-import Darwin
 import Foundation
 import Observation
 import SyncCastDiscovery
@@ -9,51 +7,10 @@ import SyncCastRouter
 
 /// Lock state for the whole-home AirPlay delay slider. `.unlocked` is the
 /// default (free-running); `.locked(at:)` carries the millisecond target
-/// the user has pinned. Calibrators consult this before applying any
-/// automated correction.
+/// the user has pinned.
 public enum DelayLockState: Equatable {
     case unlocked
     case locked(at: Int)  // ms
-}
-
-/// Product-level state for the Local + AirPlay synchronization context.
-/// This is intentionally separate from the old active calibration status:
-/// route and AirPlay events can make a previously acceptable delay
-/// "suspect" even when no probe or microphone task is running.
-public enum SyncContextState: String, Equatable, Sendable {
-    case valid
-    case suspect
-    case measuring
-    case readyToDryRun
-    case dryRunReady
-    case applied
-    case locked
-}
-
-/// App-owned passive no-probe controller state. This is separate from the
-/// lab-gated active calibration status because it must be safe for normal
-/// playback: no emitted probes and no direct delay write.
-public enum PassiveAutosyncState: Equatable, Sendable {
-    case idle
-    case requestingPermission(startedAt: Date)
-    case running(startedAt: Date, output: String)
-    case canceling(startedAt: Date, output: String?)
-    case completed(verdict: String, detail: String)
-    case failed(verdict: String, detail: String)
-}
-
-/// A/B side identifier for the audition state machine. The audition flips
-/// the broadcast delay between baseline-150 ms (A) and baseline+150 ms (B)
-/// every 1.2 s within a single round.
-public enum AuditionSide: String, Equatable { case A, B }
-
-/// Audition state machine. Idle by default. `.running(round:side:)` carries
-/// the current round (1...4) and the side currently being played. Round 5
-/// auto-stops, restoring `airplayDelayMs` to the baseline that was active
-/// when `startAudition()` was first called.
-public enum AuditionState: Equatable {
-    case idle
-    case running(round: Int, side: AuditionSide)  // round 1...4
 }
 
 /// Top-level UI view-model. Owns the `DiscoveryService` and a `Router`,
@@ -76,24 +33,6 @@ final class AppModel {
         .environment["SYNCAST_INITIAL_MODE"]?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
-
-    private static let activeAcousticCalibrationEnabled: Bool = {
-        ActiveAcousticDiagnosticsGate.isEnabled()
-    }()
-    private static let activeAcousticCalibrationDisabledMessage =
-        ActiveAcousticDiagnosticsGate.disabledMessage
-
-    private static let passiveAutosyncAllowsAcceptedDelayApply: Bool = {
-        let raw = ProcessInfo.processInfo
-            .environment["SYNCAST_PASSIVE_AUTOSYNC_ALLOW_DELAY_APPLY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return raw == "1" || raw == "true" || raw == "yes" || raw == "accepted"
-    }()
-
-    var activeAcousticDiagnosticsEnabled: Bool {
-        Self.activeAcousticCalibrationEnabled
-    }
 
     private static var startsInWholeHome: Bool {
         requestedInitialMode == "wholehome" || requestedInitialMode == "whole_home"
@@ -121,6 +60,32 @@ final class AppModel {
     /// Per-device "last_error" string from the most recent failed
     /// event. Surfaced as a one-line message under failed device rows.
     var connectionFailureReasons: [String: String] = [:]
+
+    // MARK: - Whole-home local output selection (direction B)
+
+    /// CoreAudio UIDs of the local outputs the user picked for whole-home, in
+    /// their chosen order. Stored as UIDs (never names, never indices) so the
+    /// selection survives moving between an office display and a home display.
+    /// Under direction B these are plain OwnTone outputs, not AirPlay targets:
+    /// no pairing, no PIN.
+    var wholeHomeLocalMemberUIDs: [String] = []
+    /// AirPlay pairing state per stable device key.
+    var pairingStates: [String: PairingState] = [:]
+    var pairingErrors: [String: String] = [:]
+    /// Drives the two-stage pairing sheet. nil when no attempt is running.
+    var pairingSheet: PairingSheetState?
+    /// Owns the window that hosts the pairing flow. Created on first pairing
+    /// attempt, then reused. Not observed: it is UI plumbing, not state, and
+    /// tracking it would make every view that reads the model depend on it.
+    @ObservationIgnored var pairingWindowController: PairingWindowController?
+    /// Enabled-device memory per mode, keyed by the device's STABLE key
+    /// rather than by its per-launch id.
+    ///
+    /// Switching modes disables devices the new mode cannot drive. Without
+    /// this, switching to stereo and back silently cleared every AirPlay
+    /// selection — and once selections became persistent, a mode round trip
+    /// would have eaten the persisted value too.
+    var rememberedEnabledKeysByMode: [Mode: Set<String>] = [:]
     /// The fundamental architectural choice: which audio path is active.
     /// These are mutually exclusive. Switching requires a full pipeline
     /// teardown + rebuild (a few hundred ms of silence on transition,
@@ -143,72 +108,8 @@ final class AppModel {
         }
     }
     var lastError: String?
-    /// Screen Recording TCC permission state. We replaced the old
-    /// "BlackHole microphone" gate with this.
+    /// Screen Recording TCC permission state.
     var screenRecordingGranted: Bool = false
-
-    // MARK: - Calibration mic plumbing
-    //
-    // The active diagnostic calibration flow plays test tones through each
-    // configured output and listens with a microphone to measure the
-    // round-trip latency. The user picks WHICH input to listen with via
-    // the picker driven by these fields. The actual capture / DSP
-    // pipeline lives in `Calibration.swift` and `CalibrationRunner.swift`
-    // — this view-model only surfaces the available devices, the user's
-    // choice, and the TCC permission status.
-
-    /// Live list of input-capable CoreAudio devices, refreshed on hot-plug.
-    /// Populated by `refreshInputDevices()`; the first refresh runs at
-    /// bootstrap and a `kAudioHardwarePropertyDevices` listener keeps it
-    /// current. Sort order: system default first, then alphabetical.
-    var availableInputDevices: [InputDeviceInfo] = []
-
-    /// User-selected calibration mic. `nil` means "use system default
-    /// input" — that is the bootstrap value if `userDefaultsMicUID` is
-    /// unset OR if the persisted UID no longer maps to an attached
-    /// device (e.g. user unplugged that USB mic). The resolution is
-    /// done by `effectiveMicID`, which falls back to the system default
-    /// when this is nil or unresolvable.
-    ///
-    /// Persisted via `UserDefaults` key `"syncast.calibrationMicID"` —
-    /// stored as the device UID (a stable string set by the kernel),
-    /// NOT the live `AudioDeviceID` (a UInt32 that changes on replug).
-    /// `selectedMicID` itself is the LIVE id, resolved at refresh time.
-    var selectedMicID: AudioDeviceID? {
-        didSet {
-            persistSelectedMic()
-        }
-    }
-
-    /// Effective mic id used by the calibration runner: either
-    /// `selectedMicID` if set + still attached, or the current system
-    /// default input. Returns `nil` only on a system with no input
-    /// device at all (vanishingly rare).
-    var effectiveMicID: AudioDeviceID? {
-        if let chosen = selectedMicID,
-           availableInputDevices.contains(where: { $0.id == chosen }) {
-            return chosen
-        }
-        return InputDeviceEnumerator.defaultInputDeviceID()
-    }
-
-    /// Synchronous read of `AVCaptureDevice.authorizationStatus(for:.audio)`.
-    /// Cheap; safe to call from view body. Drives the "Auto-calibrate"
-    /// button's enabled / "Grant access…" affordance.
-    var hasMicrophonePermission: Bool {
-        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-    }
-
-    /// UserDefaults key for the persisted calibration-mic preference.
-    /// Stored as the device UID string, not the live AudioDeviceID.
-    private static let micUIDDefaultsKey = "syncast.calibrationMicID"
-
-    /// CoreAudio HAL listener that fires on `kAudioHardwarePropertyDevices`
-    /// changes (device hot-plug). Held strongly here so it survives until
-    /// the AppModel itself is torn down. Calls back to `refreshInputDevices`
-    /// on the main queue so re-resolution of `selectedMicID` and
-    /// `availableInputDevices` happens on `@MainActor`.
-    private var inputDeviceListener: InputDeviceListener?
 
     // MARK: - Whole-home delay-line tuning
     //
@@ -216,8 +117,6 @@ final class AppModel {
     // AirPlay 2's PTP-anchored playout (~1.8 s). The slider in the
     // popover writes into `airplayDelayMs`; a debounced setter pushes
     // the change to the sidecar via JSON-RPC `local_fifo.set_delay_ms`.
-    // The auto-calibration flow above writes here too with its
-    // `recommendedDelayMs` result.
 
     /// User-tunable broadcast-side delay (ms) for the whole-home FIFO,
     /// aligning local bridges with AirPlay 2's ~1.8 s PTP playout.
@@ -226,106 +125,23 @@ final class AppModel {
     /// Last sidecar `actual_delivery_lag_ms` reading; nil before first
     /// sample or outside whole-home. Drives the slider's caption.
     var measuredLagMs: Int? = nil
-    /// Current trust state for Local + AirPlay delay evidence. A route,
-    /// AirPlay timing-domain, volume, wake, or manual-delay change moves
-    /// this to `.suspect` until passive evidence can establish a new
-    /// baseline or repeat-confirmed correction. Stereo mode uses `.valid`
-    /// because there is no Local + AirPlay context to guard.
-    var syncContextState: SyncContextState = .valid
-    var syncContextReason: String = "stereo path; no Local+AirPlay baseline active"
-    var syncContextUpdatedAt: Date = Date()
-    var syncContextRevision: UInt64 = 0
-    var syncContextDelayMs: Int = AppModel.loadPersistedDelayMs()
-
-    var passiveAutosyncState: PassiveAutosyncState = .idle
-    var passiveAutosyncArtifactPath: String?
-    var passiveAutosyncSessionRoot: String?
-
-    var passiveAutosyncRunning: Bool {
-        if case .running = passiveAutosyncState { return true }
-        return false
-    }
-
-    var passiveAutosyncRequestingPermission: Bool {
-        if case .requestingPermission = passiveAutosyncState { return true }
-        return false
-    }
-
-    var passiveAutosyncCanceling: Bool {
-        if case .canceling = passiveAutosyncState { return true }
-        return false
-    }
-
-    var passiveAutosyncNeedsMicrophoneGrant: Bool {
-        AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined
-    }
-
-    private var passiveAutosyncBusy: Bool {
-        switch passiveAutosyncState {
-        case .requestingPermission, .running, .canceling:
-            return true
-        case .idle, .completed, .failed:
-            return false
-        }
-    }
-
-    private var canRequestOrUseMicrophoneForPassiveAutosync: Bool {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized, .notDetermined:
-            return true
-        case .denied, .restricted:
-            return false
-        @unknown default:
-            return false
-        }
-    }
-
-    var canRunPassiveAutosync: Bool {
-        guard mode == .wholeHome,
-              streamingState == .running,
-              hasEnabledLocalAndAirPlayOutputs,
-              hasEnabledAirPlayOutputNotKnownDisconnected,
-              canRequestOrUseMicrophoneForPassiveAutosync,
-              !passiveAutosyncBusy
-        else { return false }
-        guard case .unlocked = delayLockState else { return false }
-        return true
-    }
-
-    var passiveAutosyncStatusText: String? {
-        switch passiveAutosyncState {
-        case .idle:
-            return nil
-        case .requestingPermission:
-            return "Passive check waiting for microphone permission"
-        case .running(let startedAt, _):
-            let elapsed = max(0, Int(Date().timeIntervalSince(startedAt)))
-            return "Passive check running (\(elapsed)s)"
-        case .canceling:
-            return "Passive check stopping"
-        case .completed(let verdict, let detail):
-            return detail.isEmpty ? "Passive check: \(verdict)" : "\(verdict): \(detail)"
-        case .failed(let verdict, let detail):
-            return detail.isEmpty ? "Passive check failed: \(verdict)" : "\(verdict): \(detail)"
-        }
-    }
-
-    var passiveAutosyncStatusIsError: Bool {
-        if case .failed = passiveAutosyncState { return true }
-        return false
-    }
-
     static let airplayDelayMsKey = "syncast.airplayDelayMs"
-    static let defaultAirplayDelayMs: Int = 1750
-    /// UI cap. Bumped from 3000 to 5000 ms because empirical AirPlay
-    /// measurements (v4 ActiveCalibrator) found total command-to-mic
-    /// latencies of 2300–2700 ms. With local at ~10 ms, the recommended
-    /// delay-line value is in that 2300–2700 ms range, plus headroom
-    /// for slower AirPlay receivers (some HomePod variants buffer
-    /// 3–4 s). Sidecar still clamps to [0, 10000] for an absolute
+    /// Fresh-install broadcast-delay default. CORRECTED to 0 to match the
+    /// Direction-B timing model (sidecar `DEFAULT_LOCAL_FIFO_DELAY_MS`):
+    /// OwnTone's fifo pipe already releases each byte at the AirPlay-2
+    /// playout instant, so no positive broadcaster delay is needed — the
+    /// residual local pipeline latency is trimmed EARLIER via the OwnTone
+    /// fifo `offset_ms`, and long-term drift is handled by the Swift
+    /// Layer-2 clock-following PLL, not this fixed value. (A user who
+    /// previously pinned a large delay under the old 1750 model still has
+    /// that value persisted; resetting the Sync slider re-derives from 0.)
+    static let defaultAirplayDelayMs: Int = 0
+    /// UI cap for the global local-fifo delay slider. 5000 ms leaves
+    /// headroom for slow AirPlay receivers (some HomePod variants buffer
+    /// 3–4 s). The sidecar still clamps to [0, 10000] as an absolute
     /// safety bound.
-    static let airplayDelayMsRange: ClosedRange<Int> =
-        CalibrationDiagnosticServer.autoApplyDelayRange
+    static let localFifoDelayMsRange: ClosedRange<Int> = 0...5000
+    static let airplayDelayMsRange: ClosedRange<Int> = localFifoDelayMsRange
 
     private static func loadPersistedDelayMs() -> Int {
         // If the user previously locked the delay, prefer the locked value.
@@ -351,200 +167,34 @@ final class AppModel {
                    airplayDelayMsRange.upperBound)
     }
 
-    // MARK: - Background continuous v4 active calibration
-    // Replaces the previous PassiveCalibrator-based engine, which used
-    // GCC-PHAT against shared music — that approach can't distinguish
-    // per-device latencies and produced ±100 ms run-to-run noise plus
-    // bad absolute values. The new path drives `ActiveCalibrator`
-    // (per-device unique probes, FDM for locals + TDMA mute-dip for
-    // AirPlay) on a fixed cadence and applies the corrected delay
-    // when measured drift exceeds 30 ms with sufficient confidence.
-    // Automatic apply is intentionally conservative: the user's field
-    // feedback showed that a single bad mic run can overwrite a usable
-    // hand-tuned Local + AirPlay delay.
-    var backgroundCalibrationEnabled: Bool = AppModel.loadPersistedBgEnabled() {
-        didSet {
-            if backgroundCalibrationEnabled &&
-                !AppModel.activeAcousticCalibrationEnabled {
-                backgroundCalibrationEnabled = false
-                UserDefaults.standard.set(false, forKey: AppModel.bgEnabledKey)
-                eventDrivenCalibrationTask?.cancel()
-                postApplyValidationTask?.cancel()
-                pendingEventDrivenCalibrationReason = nil
-                SyncCastLog.log(
-                    "bgCalib: active acoustic diagnostics disabled; ignoring Continuous"
-                )
-                return
-            }
-            UserDefaults.standard.set(backgroundCalibrationEnabled, forKey: AppModel.bgEnabledKey)
-            if !backgroundCalibrationEnabled {
-                eventDrivenCalibrationTask?.cancel()
-                postApplyValidationTask?.cancel()
-                pendingEventDrivenCalibrationReason = nil
-            }
-            reconcileBackgroundCalibration()
-            if backgroundCalibrationEnabled {
-                scheduleEventDrivenCalibration(reason: "continuous enabled")
-            }
+    /// UserDefaults keys written by features that have since been removed
+    /// (legacy hybrid tracker, microphone-based acoustic calibration).
+    /// Leaving them behind would clutter the user's defaults plist forever.
+    private static let retiredDefaultsKeys = [
+        "syncast.hybridTrackingEnabled",
+        "syncast.bgCalibrationEnabled",
+        "syncast.bgCalibrationIntervalS",
+        "syncast.calibrationMicID",
+    ]
+
+    /// One-shot cleanup of `retiredDefaultsKeys`. Idempotent: removing an
+    /// absent key is a no-op, so this can run on every launch.
+    private static func removeRetiredDefaults() {
+        for key in retiredDefaultsKeys {
+            UserDefaults.standard.removeObject(forKey: key)
         }
     }
-    /// Sample interval (seconds, clamped to `bgIntervalRange`). Live
-    /// changes restart the engine.
-    var backgroundCalibrationIntervalS: Int = AppModel.loadPersistedBgInterval() {
-        didSet {
-            let r = AppModel.bgIntervalRange
-            let v = min(max(backgroundCalibrationIntervalS, r.lowerBound), r.upperBound)
-            if v != backgroundCalibrationIntervalS { backgroundCalibrationIntervalS = v; return }
-            UserDefaults.standard.set(v, forKey: AppModel.bgIntervalKey)
-            restartBackgroundCalibrationIfActive()
-        }
-    }
-    /// Most recent Sample emitted by the continuous loop. The popover
-    /// renders this in the "Continuous" status caption.
-    var lastCalibrationSample: ContinuousActiveCalibrator.Sample? = nil
-    /// Sliding-window history of the last `calibrationHistoryCapacity`
-    /// samples emitted by the continuous calibrator. Drives the trend
-    /// timeline + drift indicators in `MainPopover.liveStatusBlock`.
-    /// Append-and-trim happens in `handleBackgroundCalibrationSample`;
-    /// cleared whenever the engine stops so a fresh start doesn't show
-    /// stale post-restart drift.
-    var calibrationSampleHistory: [ContinuousActiveCalibrator.Sample] = []
-    static let calibrationHistoryCapacity: Int = 20
-    /// Most recent non-zero delta the continuous calibrator pushed into
-    /// `airplayDelayMs`. Computed as the signed difference of the two
-    /// latest samples' `appliedDelayMs`. `nil` until at least two
-    /// samples have arrived OR when the latest delta was zero (steady
-    /// state).
-    var lastAppliedDelta: Int? {
-        guard calibrationSampleHistory.count >= 2 else { return nil }
-        let n = calibrationSampleHistory.count
-        let delta = calibrationSampleHistory[n - 1].appliedDelayMs
-                  - calibrationSampleHistory[n - 2].appliedDelayMs
-        return delta == 0 ? nil : delta
-    }
-    /// True iff the engine is running (toggle on + bad preconditions → false).
-    var backgroundCalibrationActive: Bool = false
-    /// Toggle on but mic permission denied/restricted.
-    var backgroundCalibrationMicDenied: Bool = false
-    /// Pause while a one-shot manual run is in flight, so the click
-    /// pulses don't pollute the continuous correlator.
-    private var continuousPausedForManual: Bool = false
 
-    private struct PendingAutoCalibrationApply {
-        let targetMs: Int
-        let timestamp: Date
-        let contextSignature: String
-    }
-
-    private struct PendingPassiveDryRunCandidate {
-        let targetDelayMs: Int
-        let currentDelayMs: Int
-        let contextSignature: String
-        let captureBackend: String
-        let enabledAirplayCount: Int
-        let activeAirplayCount: Int
-        let airplayTimingEpoch: UInt64
-        let acceptedFromSyncContextState: String
-        let acceptedFromSyncContextRevision: UInt64
-        let acceptedSyncContextRevision: UInt64
-        let sessionRoot: String?
-        let controlReport: String?
-        let acceptedUnix: Double
-    }
-
-    private var pendingAutoCalibrationApply: PendingAutoCalibrationApply?
-    private var pendingPassiveDryRunCandidate: PendingPassiveDryRunCandidate?
-    private var passiveDryRunExpiryTask: Task<Void, Never>?
-    private var eventDrivenCalibrationTask: Task<Void, Never>?
-    private var postApplyValidationTask: Task<Void, Never>?
-    private var pendingEventDrivenCalibrationReason: String?
-    private var lastEventDrivenCalibrationAt: Date?
-    private var eventDrivenCalibrationRetryCount: Int = 0
-    private var eventDrivenRetryScheduledForCurrentAttempt: Bool = false
     private var userDelayRevision: UInt64 = 0
-    private var lastLocalFifoRunning: Bool?
-    private var lastLocalFifoClientCount: Int?
-    private var lastLocalFifoOverflowDrops: Int?
-    private var lastLocalFifoPerClientDrops: Int?
-    private var lastLocalFifoDelayMs: Int?
+    /// Last-seen drift-resync counter per local bridge. The only fifo/bridge
+    /// diagnostic the app still consumes: an increase means that device had
+    /// to snap its read cursor, which `refreshLocalFifoLag` reports to the
+    /// router as whole-home timing instability.
     private var lastLocalBridgeResyncCounts: [String: UInt64] = [:]
-    private var passiveAutosyncTask: Task<Void, Never>?
-    private var passiveAutosyncProcess: Process?
-    private var passiveAutosyncRunID: UUID?
-    private var passiveAutosyncEventTask: Task<Void, Never>?
-    private var pendingPassiveAutosyncReason: String?
-    private var lastPassiveAutosyncFinishedAt: Date?
-    private var lastPassiveAutosyncFinishedRevision: UInt64?
-
-    private struct PassiveAutosyncLaunchContext: Sendable {
-        let syncContextState: SyncContextState
-        let syncContextRevision: UInt64
-        let routeSignature: String
-    }
-
-    // ActiveCalibrator already fails closed below 3.0 and requires stable
-    // repeated cycles. A 4.0 UI gate rejected real field-stable runs whose
-    // local direct-path confidence was 3.1-3.4 despite AirPlay group MAD
-    // being only a few milliseconds. Single-run writes are now capped at
-    // a tiny direct correction and must have low uncertainty; anything
-    // bigger needs repeat agreement in the same route/mic/volume context.
-    static let autoApplyConfidenceFloor: Double =
-        CalibrationDiagnosticServer.autoApplyConfidenceFloor
-    static let autoApplyMaxSingleJumpMs: Int =
-        CalibrationDiagnosticServer.autoApplyMaxSingleJumpMs
-    static let autoApplyRepeatAgreementMs: Int =
-        CalibrationDiagnosticServer.autoApplyRepeatAgreementMs
-    static let autoApplyMaxUncertaintyMs: Int =
-        CalibrationDiagnosticServer.autoApplyMaxUncertaintyMs
-    static let autoApplyMaxAirplayReceivers: Int =
-        CalibrationDiagnosticServer.autoApplyMaxAirplayReceivers
-    static let autoApplyRepeatWindowS: TimeInterval = 180
-    static let eventDrivenCalibrationSettleS: TimeInterval = 10
-    static let eventDrivenCalibrationCooldownS: TimeInterval = 90
-    static let eventDrivenCalibrationRetrySettleS: TimeInterval = 25
-    static let postApplyValidationSettleS: TimeInterval = 45
-    static let maxEventDrivenCalibrationRetries: Int = 1
-
-    static let bgEnabledKey = "syncast.bgCalibrationEnabled"
-    static let bgIntervalKey = "syncast.bgCalibrationIntervalS"
-    /// 1200 s (20 min). Continuous mode is lab-gated because even
-    /// high-band Phase-1 probes were audible on user hardware. The disruptive
-    /// Phase-2 AirPlay TDMA mute-dip is reserved for the manual
-    /// Auto-calibrate button, so we no longer need to probe every 30 s
-    /// to keep up with drift; thermal/network drift in AirPlay shows
-    /// up only on the manual cadence anyway.
-    static let defaultBgIntervalS: Int = 1200
-    /// 60 s … 3600 s (1 min … 60 min). Floor raised from 10 s because
-    /// even lab-only Phase-1 probes should not run more than once a
-    /// minute; ceiling raised from 300 s because long-idle setups can
-    /// happily wait 1 h between drift checks.
-    static let bgIntervalRange: ClosedRange<Int> = 60...3600
-
-    private static func loadPersistedBgEnabled() -> Bool {
-        guard activeAcousticCalibrationEnabled else { return false }
-        return UserDefaults.standard.bool(forKey: bgEnabledKey)
-    }
-    private static func loadPersistedBgInterval() -> Int {
-        guard let raw = UserDefaults.standard.object(forKey: bgIntervalKey) as? Int
-        else { return defaultBgIntervalS }
-        // Persisted values from the old 10…300 range are clamped into
-        // the new 60…3600 floor/ceiling on first load.
-        return min(max(raw, bgIntervalRange.lowerBound), bgIntervalRange.upperBound)
-    }
-
-    // MARK: - Manual delay lock + audition state machine
+    // MARK: - Manual delay lock
     //
-    // The whole-home delay slider has two ergonomic problems we solve here:
-    //   1. Background calibrators (continuous v4) and prior closed-loop
-    //      drivers occasionally jitter the delay value while the user is
-    //      happy with what they hear. The lock pins the broadcast-side
-    //      delay to a user-chosen value; calibrators can still RUN, but
-    //      external code can check `delayLockState` before applying any
-    //      automated correction.
-    //   2. Picking the "right" delay by feel is hard. The audition state
-    //      machine A/B-tests ±150 ms around a baseline, then narrows the
-    //      baseline by 75 ms on each user choice for 4 rounds. Total
-    //      ~10 s of A/B with deterministic convergence.
+    // The lock pins the broadcast-side delay to a user-chosen value so
+    // nothing else can move it out from under the user.
 
     /// Persistence key for the manual lock target. Stored in milliseconds.
     /// 0 means "no lock" — chosen because the slider's lower bound is 0
@@ -562,22 +212,6 @@ final class AppModel {
     /// (Swift 5.9 macros), which auto-observes all `var` mutations and
     /// is incompatible with Combine's `@Published` property wrapper.
     public private(set) var delayLockState: DelayLockState = .unlocked
-
-    /// Audition state machine. Idle until `startAudition()`; transitions
-    /// through 4 rounds of A/B side switching at 1.2 s cadence. Each
-    /// `chooseAuditionA` / `chooseAuditionB` narrows the baseline by
-    /// 75 ms before kicking off the next round.
-    public private(set) var auditionState: AuditionState = .idle
-
-    /// Snapshot of `airplayDelayMs` taken at `startAudition()` and
-    /// adjusted by the chooser methods. Restored on `stopAudition()`
-    /// (or when round 5 auto-stops). Private to keep the contract
-    /// surface small.
-    private var auditionBaselineMs: Int = 0
-
-    /// In-flight side-switching Task. Cancelled by stopAudition / chooseX
-    /// before launching a fresh per-round Task.
-    private var auditionSideSwitchTask: Task<Void, Never>?
 
     enum Mode: String, Sendable, CaseIterable, Identifiable {
         /// Local CoreAudio outputs only, ~50 ms latency, video sync OK.
@@ -618,13 +252,12 @@ final class AppModel {
     /// SwiftPM resource bundle; SF Symbol fallbacks are prefixed with `sf:`
     /// so the view layer can route to `Image(systemName:)`.
     var statusIconName: String {
-        switch streamingState {
-        case .idle:     return "MenubarIcon"
-        case .starting: return "MenubarIcon"
-        case .running:  return "MenubarIcon"
-        case .stopping: return "MenubarIcon"
-        case .error:    return "sf:speaker.slash"
-        }
+        // Always the branded icon, including in `.error`. A mute-slash system
+        // symbol reads as "SyncCast turned your audio off", which is both
+        // alarming and wrong — the fault is surfaced in words via `lastError`
+        // in the popover, not by mutating the menu-bar identity. Users find
+        // the app by its icon; changing it on every transient error loses them.
+        "MenubarIcon"
     }
 
     /// Is at least one local-output device enabled? Used to decide whether
@@ -634,7 +267,7 @@ final class AppModel {
     }
 
     private let discovery: DiscoveryService
-    private let router: Router
+    let router: Router
     private let sidecarLauncher = SidecarLauncher()
     var sidecarRunning: Bool = false
     private var systemVolumeKeyController: SystemVolumeKeyController?
@@ -742,17 +375,8 @@ final class AppModel {
         let lockedAt = AppModel.loadPersistedLockedAt()
         if lockedAt > 0 {
             self.delayLockState = .locked(at: lockedAt)
-            self.syncContextState = .locked
-            self.syncContextReason = "persisted delay lock"
-            self.syncContextDelayMs = lockedAt
         }
-        // One-shot cleanup of the legacy hybrid-tracker pref. The
-        // toggle/engine has been removed; leaving the key behind would
-        // simply clutter the user's defaults plist forever.
-        UserDefaults.standard.removeObject(forKey: "syncast.hybridTrackingEnabled")
-        if !Self.activeAcousticCalibrationEnabled {
-            UserDefaults.standard.set(false, forKey: Self.bgEnabledKey)
-        }
+        AppModel.removeRetiredDefaults()
         let volumeController = SystemVolumeKeyController(
             onAction: { [weak self] action in
                 // Called from the tap thread (or an NSEvent monitor) —
@@ -775,10 +399,6 @@ final class AppModel {
 
     private func bootstrap() async {
         SyncCastLog.log("bootstrap start")
-        SyncCastLog.log(
-            "active acoustic diagnostics: "
-            + ActiveAcousticDiagnosticsGate.startupLogState()
-        )
         // Check Screen Recording permission state only when the launch path
         // can use ScreenCaptureKit. Direct Stereo and Process Tap validation
         // must not be polluted by Screen Recording prompts or scary logs.
@@ -789,11 +409,6 @@ final class AppModel {
             screenRecordingGranted = true
             SyncCastLog.log("screen-recording status: not required for initial path capture=\(AppModel.requestedCaptureBackend) stereoPath=\(AppModel.selectedStereoOutputPath.rawValue)")
         }
-        // Populate the calibration-mic picker. We do NOT prompt for TCC
-        // here — enumeration is read-only HAL property work and does not
-        // require microphone access; the actual TCC prompt is deferred
-        // until the user explicitly taps "Auto-calibrate".
-        startInputDeviceWatch()
         // Auto-recover the local audio driver after display sleep / system
         // wake. Display DPMS sleep yanks HDMI/DP audio sub-devices from
         // CoreAudio entirely; on wake the device reappears with the same
@@ -868,6 +483,12 @@ final class AppModel {
             SyncCastLog.log("[SyncCast] sidecar attach gave up: \(error)".replacingOccurrences(of: "[SyncCast] ", with: ""))
             lastError = "sidecar: \(error.localizedDescription)"
         }
+        // 1b. Restore the remembered whole-home local-output selection before
+        //     the first engine reconcile, so the very first whole-home start
+        //     already knows which local outputs the user picked. It is applied
+        //     to the routing table once discovery has reported the devices
+        //     that are actually connected (see `applyEvent`).
+        loadWholeHomeLocalOutputSelection()
         // 2. Start discovery (CoreAudio + Bonjour).
         SyncCastLog.log("[SyncCast] starting discovery".replacingOccurrences(of: "[SyncCast] ", with: ""))
         await discovery.start()
@@ -891,6 +512,7 @@ final class AppModel {
                 guard let self else { return }
                 await self.refreshConnectionStates()
                 await self.refreshLocalFifoLag()
+                await self.refreshPairingStates()
             }
         }
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
@@ -1041,6 +663,21 @@ final class AppModel {
 
     private func applyEvent(_ event: DiscoveryEvent) async {
         await MainActor.run {
+            // Re-seed per-device delay trims from the persisted store after
+            // EVERY event, including the ones that `return` early from the
+            // migration paths below — hence `defer` rather than a trailing
+            // call. A device that just appeared, or was just re-keyed under a
+            // fresh `Device.id`, has to pick its remembered trim back up here
+            // or the user's tuning silently reverts to zero.
+            defer {
+                if applyPersistedDeviceTrims() {
+                    // Re-seeding moved the normalisation baseline; both legs
+                    // have to be re-driven or only the local one moves. Goes
+                    // through the same debounce as a stepper press, so a
+                    // burst of discovery events costs one commit.
+                    scheduleDeviceTrimCommitTask()
+                }
+            }
             switch event {
             case .appeared(let dev):
                 SyncCastLog.log("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))".replacingOccurrences(of: "[SyncCast] ", with: ""))
@@ -1072,14 +709,7 @@ final class AppModel {
                         devices.sort { $0.name < $1.name }
                         detectBlackHole(in: dev)
                         if wasEnabled {
-                            markSyncContextSuspect(
-                                reason: "device reconnected \(dev.name)"
-                            )
                             reconcileEngine()
-                            reconcileBackgroundCalibration()
-                            scheduleEventDrivenCalibration(
-                                reason: "device reconnected \(dev.name)"
-                            )
                         }
                         return
                     }
@@ -1092,6 +722,22 @@ final class AppModel {
                     routing[dev.id] = DeviceRouting(deviceID: dev.id, enabled: false)
                 }
                 detectBlackHole(in: dev)
+                // Direction B: a local output the user previously picked for
+                // whole-home has just (re)appeared — the office display came
+                // back, or the app relaunched and discovery caught up. Re-enable
+                // it so the remembered selection is honoured. Only enables; a
+                // device the user disabled is removed from the remembered set at
+                // that moment (see `persistWholeHomeLocalOutputSelection`), so
+                // this never resurrects a deliberate off.
+                if mode == .wholeHome,
+                   dev.transport == .coreAudio,
+                   let uid = dev.coreAudioUID,
+                   wholeHomeLocalMemberUIDs.contains(uid),
+                   isSelectableInMode(dev, mode: .wholeHome),
+                   routing[dev.id]?.enabled == false {
+                    routing[dev.id]?.enabled = true
+                    reconcileEngine()
+                }
             case .updated(let dev):
                 if let idx = devices.firstIndex(where: { $0.id == dev.id }) {
                     let previous = devices[idx]
@@ -1105,14 +751,7 @@ final class AppModel {
                            || previous.port != dev.port
                            || previous.name != dev.name
                        ) {
-                        markSyncContextSuspect(
-                            reason: "AirPlay endpoint updated \(dev.name)"
-                        )
                         reconcileEngine()
-                        reconcileBackgroundCalibration()
-                        scheduleEventDrivenCalibration(
-                            reason: "AirPlay endpoint updated \(dev.name)"
-                        )
                     }
                 } else if let idx = devices.firstIndex(where: { sameLogicalDevice($0, dev) }) {
                     // Same physical device, new SyncCast id. Migrate the
@@ -1126,14 +765,7 @@ final class AppModel {
                         routing[dev.id] = oldR
                     }
                     if wasEnabled {
-                        markSyncContextSuspect(
-                            reason: "device updated/reconnected \(dev.name)"
-                        )
                         reconcileEngine()
-                        reconcileBackgroundCalibration()
-                        scheduleEventDrivenCalibration(
-                            reason: "device updated/reconnected \(dev.name)"
-                        )
                     }
                 }
                 detectBlackHole(in: dev)
@@ -1145,7 +777,6 @@ final class AppModel {
                 // shadow set, wake handler sees an empty enabled list and
                 // silently no-ops in the canonical bug scenario.
                 let goneDevice = devices.first(where: { $0.id == id })
-                let goneName = goneDevice?.name ?? String(id.prefix(8))
                 let wasEnabled = routing[id]?.enabled ?? false
                 if let goneDev = goneDevice,
                    let goneUID = goneDev.coreAudioUID,
@@ -1174,14 +805,7 @@ final class AppModel {
                     // takes the (.running, false) → stop arm. Reviewer-
                     // flagged ship-blocker.
                     if wasEnabled {
-                        stopPassiveAutosyncForRouteChange(
-                            reason: "enabled device disappeared \(goneName)"
-                        )
-                        markSyncContextSuspect(
-                            reason: "enabled device disappeared \(goneName)"
-                        )
                         reconcileEngine()
-                        reconcileBackgroundCalibration()
                     }
                 }
             case .error(let msg):
@@ -1197,36 +821,8 @@ final class AppModel {
     private func refreshConnectionStates() async {
         let snap = await router.connectionStatesSnapshot()
         await MainActor.run {
-            let prior = self.connectionStates
             self.connectionStates = snap.states
             self.connectionFailureReasons = snap.reasons
-            guard self.mode == .wholeHome else { return }
-            let enabledAirPlayIDs = self.devices
-                .filter {
-                    $0.transport == .airplay2
-                        && (self.routing[$0.id]?.enabled ?? false)
-                }
-                .map(\.id)
-            for id in enabledAirPlayIDs {
-                let old = prior[id] ?? .unknown
-                let new = snap.states[id] ?? .unknown
-                if old != .connected, new == .connected {
-                    self.scheduleEventDrivenCalibration(
-                        reason: "AirPlay receiver connected \(id.prefix(8))"
-                    )
-                    break
-                }
-            }
-            if let changedID = enabledAirPlayIDs.first(where: {
-                (prior[$0] ?? .unknown) != (snap.states[$0] ?? .unknown)
-            }) {
-                let old = prior[changedID] ?? .unknown
-                let new = snap.states[changedID] ?? .unknown
-                self.markSyncContextSuspect(
-                    reason: "AirPlay connection state changed \(changedID.prefix(8)) \(old.rawValue)->\(new.rawValue)"
-                )
-                self.reconcileBackgroundCalibration()
-            }
         }
     }
 
@@ -1238,13 +834,6 @@ final class AppModel {
               let diag = await router.localFifoDiagnostics(),
               (diag["running"] as? Bool) == true else {
             if measuredLagMs != nil { measuredLagMs = nil }
-            if mode == .wholeHome, lastLocalFifoRunning == true {
-                markSyncContextSuspect(
-                    reason: "local FIFO broadcaster stopped or diagnostics disappeared"
-                )
-                reconcileBackgroundCalibration()
-            }
-            lastLocalFifoRunning = false
             lastLocalBridgeResyncCounts.removeAll()
             return
         }
@@ -1254,87 +843,24 @@ final class AppModel {
         } else if let lagInt = diag["actual_delivery_lag_ms"] as? Int {
             measuredLagMs = lagInt  // JSON sometimes ships int when float is exact
         }
-        let running = (diag["running"] as? Bool) == true
-        let clients = Self.diagnosticInt(diag["clients_connected"])
-        let overflowDrops = Self.diagnosticInt(
-            diag["chunks_dropped_due_to_overflow"]
-        )
-        let perClientDrops = Self.localFifoPerClientDropCount(diag)
-        let currentDelay = Self.diagnosticInt(diag["current_delay_ms"])
-            ?? Self.diagnosticInt(diag["delay_ms"])
-        if mode == .wholeHome {
-            if lastLocalFifoRunning == false, running {
-                markSyncContextSuspect(
-                    reason: "local FIFO broadcaster restarted"
-                )
-            }
-            if let last = lastLocalFifoClientCount,
-               let clients,
-               last != clients {
-                markSyncContextSuspect(
-                    reason: "local FIFO bridge client count changed \(last)->\(clients)"
-                )
-            }
-            if let last = lastLocalFifoOverflowDrops,
-               let overflowDrops,
-               overflowDrops > last {
-                markSyncContextSuspect(
-                    reason: "local FIFO overflow drops increased \(last)->\(overflowDrops)"
-                )
-            }
-            if let last = lastLocalFifoPerClientDrops,
-               let perClientDrops,
-               perClientDrops > last {
-                markSyncContextSuspect(
-                    reason: "local FIFO per-client drops increased \(last)->\(perClientDrops)"
-                )
-            }
-            if let last = lastLocalFifoDelayMs,
-               let currentDelay,
-               abs(last - currentDelay) > 20,
-               currentDelay != airplayDelayMs {
-                markSyncContextSuspect(
-                    reason: "local FIFO reported delay changed \(last)->\(currentDelay)"
-                )
-            }
-            for (id, timing) in bridgeTiming {
-                guard let last = lastLocalBridgeResyncCounts[id],
-                      timing.driftResyncCount > last else { continue }
-                let reason = (
-                    "local bridge resynced \(id.prefix(8)) "
-                    + "\(last)->\(timing.driftResyncCount) "
-                    + "reason=\(timing.driftResyncReason) "
-                    + "frames=\(timing.driftResyncFrameDelta)"
-                )
-                markSyncContextSuspect(reason: reason)
-                await router.noteWholeHomeTimingInstability(reason: reason)
-            }
+        // A local bridge that had to snap its read cursor lost waveform
+        // continuity on that device, which is exactly the whole-home timing
+        // instability the router wants to hear about. The other fifo
+        // counters (client count, overflow drops, delay) are reported by the
+        // sidecar's own diagnostics and have no consumer here.
+        for (id, timing) in bridgeTiming {
+            guard let last = lastLocalBridgeResyncCounts[id],
+                  timing.driftResyncCount > last else { continue }
+            let reason = (
+                "local bridge resynced \(id.prefix(8)) "
+                + "\(last)->\(timing.driftResyncCount) "
+                + "reason=\(timing.driftResyncReason) "
+                + "frames=\(timing.driftResyncFrameDelta)"
+            )
+            await router.noteWholeHomeTimingInstability(reason: reason)
         }
-        lastLocalFifoRunning = running
-        lastLocalFifoClientCount = clients
-        lastLocalFifoOverflowDrops = overflowDrops
-        lastLocalFifoPerClientDrops = perClientDrops
-        lastLocalFifoDelayMs = currentDelay
         lastLocalBridgeResyncCounts = bridgeTiming.mapValues {
             $0.driftResyncCount
-        }
-    }
-
-    private static func diagnosticInt(_ value: Any?) -> Int? {
-        if let value = value as? Int { return value }
-        if let value = value as? Double, value.isFinite {
-            return Int(value.rounded())
-        }
-        if let value = value as? NSNumber { return value.intValue }
-        return nil
-    }
-
-    private static func localFifoPerClientDropCount(_ diag: [String: Any]) -> Int? {
-        guard let clients = diag["per_client"] as? [[String: Any]] else {
-            return nil
-        }
-        return clients.reduce(0) { total, row in
-            total + (diagnosticInt(row["chunks_dropped"]) ?? 0)
         }
     }
 
@@ -1367,7 +893,7 @@ final class AppModel {
     /// When the set of enabled devices changes (or whole-house mode flips),
     /// reconcile the audio engine: start it if we have BlackHole + at least
     /// one enabled output, stop it otherwise.
-    private func reconcileEngine() {
+    func reconcileEngine() {
         // Coalesce rapid-fire callers (toggleDevice / setVolume / toggleMute /
         // permission watcher). 30 ms is short enough that single-tap toggles
         // feel instant but still absorbs the 4-5 redundant calls that one
@@ -1430,42 +956,6 @@ final class AppModel {
             }
             let state = connectionStates[device.id] ?? .unknown
             return state != .failed && state != .disconnected
-        }
-    }
-
-    private func passiveAutosyncRouteSignature() -> String {
-        devices.compactMap { device -> String? in
-            guard let route = routing[device.id], route.enabled else { return nil }
-            let transport = device.transport.rawValue
-            let stableID = device.coreAudioUID ?? device.id
-            let volume = Int((route.volume * 1000).rounded())
-            let muted = route.muted ? "m" : "u"
-            let state = connectionStates[device.id]?.rawValue ?? "unknown"
-            return "\(transport):\(stableID):v\(volume):\(muted):\(state)"
-        }
-        .sorted()
-        .joined(separator: "|")
-    }
-
-    private func passiveAutosyncLaunchContextStillCurrent(
-        _ context: PassiveAutosyncLaunchContext
-    ) -> Bool {
-        guard mode == .wholeHome,
-              streamingState == .running,
-              hasEnabledLocalAndAirPlayOutputs,
-              hasEnabledAirPlayOutputNotKnownDisconnected,
-              passiveAutosyncRouteSignature() == context.routeSignature
-        else { return false }
-        guard case .unlocked = delayLockState else { return false }
-        if syncContextRevision == context.syncContextRevision,
-           syncContextState == context.syncContextState {
-            return true
-        }
-        switch (context.syncContextState, syncContextState) {
-        case (.suspect, .valid), (.suspect, .applied), (.valid, .applied):
-            return true
-        default:
-            return false
         }
     }
 
@@ -1536,327 +1026,6 @@ final class AppModel {
         }
     }
 
-    private func setSyncContext(
-        _ state: SyncContextState,
-        reason: String,
-        delayMs: Int? = nil
-    ) {
-        let effectiveDelayMs = delayMs ?? airplayDelayMs
-        let changed = syncContextState != state
-            || syncContextReason != reason
-            || syncContextDelayMs != effectiveDelayMs
-        if state != .dryRunReady {
-            passiveDryRunExpiryTask?.cancel()
-            passiveDryRunExpiryTask = nil
-            pendingPassiveDryRunCandidate = nil
-        }
-        syncContextState = state
-        syncContextReason = reason
-        syncContextUpdatedAt = Date()
-        syncContextDelayMs = effectiveDelayMs
-        if changed {
-            syncContextRevision &+= 1
-            SyncCastLog.log(
-                "syncContext: state=\(state.rawValue) rev=\(syncContextRevision) delay=\(effectiveDelayMs)ms reason=\(reason)"
-            )
-        }
-    }
-
-    private func expirePassiveDryRunCandidateIfNeeded(
-        now: Date = Date(),
-        source: String
-    ) {
-        guard syncContextState == .dryRunReady,
-              let candidate = pendingPassiveDryRunCandidate
-        else { return }
-        let nowUnix = now.timeIntervalSince1970
-        let age = nowUnix - candidate.acceptedUnix
-        let maxAge = PassiveApplyGuard.acceptedDryRunMaxAgeSeconds
-        let futureSkew = PassiveApplyGuard.acceptedDryRunFutureSkewSeconds
-        guard nowUnix.isFinite,
-              candidate.acceptedUnix.isFinite,
-              age >= -futureSkew,
-              age <= maxAge
-        else {
-            let reason: String
-            if !candidate.acceptedUnix.isFinite || !nowUnix.isFinite {
-                reason = "passive dry-run candidate timestamp invalid; remeasure Local+AirPlay latency"
-            } else if age < -futureSkew {
-                reason = "passive dry-run candidate timestamp is in the future; remeasure Local+AirPlay latency"
-            } else {
-                reason = "passive dry-run candidate expired after \(Int(age.rounded()))s; remeasure Local+AirPlay latency"
-            }
-            SyncCastLog.log(
-                "passiveAutosync: \(reason) source=\(source)"
-            )
-            setSyncContext(.suspect, reason: reason, delayMs: candidate.currentDelayMs)
-            schedulePassiveAutosync(reason: reason)
-            return
-        }
-    }
-
-    private func schedulePassiveDryRunCandidateExpiryCheck(
-        acceptedUnix: Double,
-        syncContextRevision revision: UInt64
-    ) {
-        passiveDryRunExpiryTask?.cancel()
-        let remaining = max(
-            0,
-            PassiveApplyGuard.acceptedDryRunMaxAgeSeconds
-                - (Date().timeIntervalSince1970 - acceptedUnix)
-                + 0.25
-        )
-        let nanoseconds = UInt64((remaining * 1_000_000_000).rounded())
-        passiveDryRunExpiryTask = Task { [weak self] in
-            do {
-                if nanoseconds > 0 {
-                    try await Task.sleep(nanoseconds: nanoseconds)
-                }
-            } catch {
-                return
-            }
-            await MainActor.run { [weak self] in
-                guard let self,
-                      self.syncContextState == .dryRunReady,
-                      self.syncContextRevision == revision,
-                      let candidate = self.pendingPassiveDryRunCandidate,
-                      abs(candidate.acceptedUnix - acceptedUnix) <= 0.001
-                else { return }
-                self.expirePassiveDryRunCandidateIfNeeded(source: "expiry timer")
-            }
-        }
-    }
-
-    private func markSyncContextSuspect(
-        reason: String,
-        cancelPendingApply: Bool = true
-    ) {
-        if cancelPendingApply {
-            pendingAutoCalibrationApply = nil
-        }
-        guard mode == .wholeHome else { return }
-        if case .locked = delayLockState {
-            setSyncContext(.locked, reason: "delay locked; \(reason)")
-        } else {
-            setSyncContext(.suspect, reason: reason)
-            schedulePassiveAutosync(reason: reason)
-        }
-    }
-
-    private func markSyncContextApplied(reason: String, delayMs: Int) {
-        guard mode == .wholeHome else { return }
-        if case .locked = delayLockState {
-            setSyncContext(.locked, reason: "delay locked after apply; \(reason)", delayMs: delayMs)
-        } else {
-            setSyncContext(.applied, reason: reason, delayMs: delayMs)
-        }
-    }
-
-    private func markPassiveBaselineValidFromDiagnostic(
-        reason: String,
-        request: PassiveBaselineMarkRequest
-    ) async throws -> CalibrationDiagnosticServer.SyncContextMarkResult {
-        guard mode == .wholeHome else {
-            throw Router.CalibrationFailure.engineFailed("router not in whole-home mode")
-        }
-        guard case .unlocked = delayLockState else {
-            throw Router.CalibrationFailure.engineFailed("delay is locked")
-        }
-        guard request.syncContextState == syncContextState.rawValue else {
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context state changed before baseline mark"
-            )
-        }
-        guard request.syncContextRevision == syncContextRevision else {
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context revision changed before baseline mark"
-            )
-        }
-        let currentDelay = await router.localFifoCurrentDelayMsForDiagnostics()
-            ?? airplayDelayMs
-        guard request.currentDelayMs == currentDelay else {
-            throw Router.CalibrationFailure.engineFailed(
-                "current delay changed before baseline mark"
-            )
-        }
-        guard request.contextSignature == autoCalibrationContextSignature() else {
-            throw Router.CalibrationFailure.engineFailed(
-                "route context changed before baseline mark"
-            )
-        }
-        switch syncContextState {
-        case .locked, .measuring, .readyToDryRun, .dryRunReady:
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context cannot be marked valid from state \(syncContextState.rawValue)"
-            )
-        case .valid, .suspect, .applied:
-            break
-        }
-        pendingAutoCalibrationApply = nil
-        setSyncContext(.valid, reason: reason)
-        return CalibrationDiagnosticServer.SyncContextMarkResult(
-            state: syncContextState.rawValue,
-            reason: syncContextReason,
-            revision: syncContextRevision,
-            updatedUnix: syncContextUpdatedAt.timeIntervalSince1970
-        )
-    }
-
-    private func scheduleEventDrivenCalibration(
-        reason: String,
-        isRetry: Bool = false,
-        settleDelayS: TimeInterval? = nil
-    ) {
-        guard AppModel.activeAcousticCalibrationEnabled else {
-            SyncCastLog.log(
-                "autoCalib event skipped: active acoustic diagnostics disabled reason=\(reason)"
-            )
-            return
-        }
-        let effectiveSettleDelayS =
-            settleDelayS ?? AppModel.eventDrivenCalibrationSettleS
-        guard mode == .wholeHome else { return }
-        guard backgroundCalibrationEnabled else {
-            SyncCastLog.log(
-                "autoCalib event skipped: Continuous disabled reason=\(reason)"
-            )
-            return
-        }
-        guard hasEnabledLocalAndAirPlayOutputs else {
-            SyncCastLog.log(
-                "autoCalib event skipped: needs local+AirPlay reason=\(reason)"
-            )
-            return
-        }
-        guard hasEnabledAirPlayOutputNotKnownDisconnected else {
-            SyncCastLog.log(
-                "autoCalib event skipped: AirPlay receiver failed/disconnected reason=\(reason)"
-            )
-            return
-        }
-        let eligibleAirPlayCount =
-            enabledAirPlayOutputNotKnownDisconnectedCount
-        guard eligibleAirPlayCount <= AppModel.autoApplyMaxAirplayReceivers else {
-            SyncCastLog.log(
-                "autoCalib event skipped: \(eligibleAirPlayCount) AirPlay receivers need manual diagnostics; group auto-apply is disabled reason=\(reason)"
-            )
-            return
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "autoCalib event skipped: delay locked reason=\(reason)"
-            )
-            return
-        }
-        guard hasMicrophonePermission else {
-            SyncCastLog.log(
-                "autoCalib event skipped: microphone permission missing reason=\(reason)"
-            )
-            return
-        }
-        switch calibrationStatus {
-        case .running, .requestingPermission:
-            // Do not cancel the task that is already inside
-            // runAutoCalibrate. Route/volume churn during measurement
-            // must be observed by Router's route-revision guard so stale
-            // measurements fail closed instead of surfacing as a generic
-            // CancellationError.
-            pendingEventDrivenCalibrationReason = reason
-            SyncCastLog.log(
-                "autoCalib event deferred: calibration already running reason=\(reason)"
-            )
-            return
-        default:
-            break
-        }
-        if !isRetry {
-            eventDrivenCalibrationRetryCount = 0
-        }
-        eventDrivenCalibrationTask?.cancel()
-        SyncCastLog.log(
-            "autoCalib event scheduled in \(Int(effectiveSettleDelayS))s reason=\(reason)"
-        )
-        eventDrivenCalibrationTask = Task { [weak self] in
-            let delayNs = UInt64(
-                effectiveSettleDelayS * 1_000_000_000
-            )
-            do {
-                try await Task.sleep(nanoseconds: delayNs)
-            } catch {
-                return
-            }
-            guard let self else { return }
-            await self.runEventDrivenCalibrationIfStillValid(reason: reason)
-        }
-    }
-
-    private func runEventDrivenCalibrationIfStillValid(reason: String) async {
-        if Task.isCancelled { return }
-        guard mode == .wholeHome,
-              streamingState == .running,
-              backgroundCalibrationEnabled,
-              hasEnabledLocalAndAirPlayOutputs,
-              hasEnabledAirPlayOutputNotKnownDisconnected,
-              enabledAirPlayOutputNotKnownDisconnectedCount <=
-                AppModel.autoApplyMaxAirplayReceivers,
-              hasMicrophonePermission
-        else {
-            SyncCastLog.log(
-                "autoCalib event aborted: preconditions changed reason=\(reason)"
-            )
-            return
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "autoCalib event aborted: delay locked reason=\(reason)"
-            )
-            return
-        }
-        switch calibrationStatus {
-        case .running, .requestingPermission:
-            // Coalesce route/volume/connect churn while a full
-            // calibration is already in flight. We only need the latest
-            // reason for logging; after the current run finishes, the
-            // route snapshot is re-read before a follow-up is scheduled.
-            pendingEventDrivenCalibrationReason = reason
-            SyncCastLog.log(
-                "autoCalib event deferred: calibration already running reason=\(reason)"
-            )
-            return
-        default:
-            break
-        }
-        if let last = lastEventDrivenCalibrationAt,
-           Date().timeIntervalSince(last) <
-                AppModel.eventDrivenCalibrationCooldownS {
-            let elapsed = Date().timeIntervalSince(last)
-            let remaining = max(
-                5,
-                AppModel.eventDrivenCalibrationCooldownS - elapsed
-            )
-            SyncCastLog.log(
-                "autoCalib event deferred \(Int(remaining))s: cooldown active reason=\(reason)"
-            )
-            eventDrivenCalibrationTask = Task { [weak self] in
-                let delayNs = UInt64(remaining * 1_000_000_000)
-                do {
-                    try await Task.sleep(nanoseconds: delayNs)
-                } catch {
-                    return
-                }
-                guard let self else { return }
-                await self.runEventDrivenCalibrationIfStillValid(reason: reason)
-            }
-            return
-        }
-        let delayRevision = userDelayRevision
-        SyncCastLog.log("autoCalib event running reason=\(reason)")
-        await runAutoCalibrate(
-            requiresContinuousOptIn: true,
-            requiredUserDelayRevision: delayRevision
-        )
-    }
-
     private func reconcileEngineAsync() async {
         SyncCastLog.log("reconcile: scrRec=\(screenRecordingGranted) state=\(streamingState.rawValue) hasEnabled=\(hasEnabledOutputs) mode=\(mode.rawValue) path=\(runtimeAudioPathLabel)")
         // We DON'T gate on screenRecordingGranted any more.
@@ -1912,10 +1081,6 @@ final class AppModel {
                     await reapplyWholeHomeDelayLine(
                         reason: "whole-home route started"
                     )
-                    await installCalibrationDiagnosticSocket()
-                    markSyncContextSuspect(
-                        reason: "whole-home route started; passive baseline required"
-                    )
                 }
 
                 // Log capture health after startup. If callbacks stay at 0,
@@ -1936,29 +1101,19 @@ final class AppModel {
                 await pushAirplayState()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
-                reconcileBackgroundCalibration()
-                scheduleEventDrivenCalibration(
-                    reason: "router started with whole-home AirPlay route"
-                )
                 if mode == .wholeHome {
-                    schedulePassiveAutosync(
-                        reason: "router started with whole-home AirPlay route"
-                    )
+                    await pushDeviceDelayTrims(reason: "engine started")
                 }
             } catch {
                 SyncCastLog.log("reconcile: router.start FAILED: \(error)")
                 lastError = "engine: \(error.localizedDescription)"
                 streamingState = .error
-                reconcileBackgroundCalibration()
             }
         case (.running, false):
             SyncCastLog.log("reconcile: stopping (no enabled outputs)")
-            stopPassiveAutosyncForRouteChange(reason: "routing stopped")
             await router.setActiveAirplayDevices([])
             await router.stop()
             streamingState = .idle
-            setSyncContext(.valid, reason: "no enabled Local+AirPlay route")
-            reconcileBackgroundCalibration()
         case (.running, true):
             // ORDER MATTERS. Router holds its own copy of `routing`
             // (Router.routing) which `syncLocalOutputs` reads to decide
@@ -2010,15 +1165,11 @@ final class AppModel {
                 await reapplyWholeHomeDelayLine(
                     reason: "whole-home route reconciled"
                 )
-                // Re-install calibration diagnostic socket. The Router's
-                // installer is idempotent (returns early if a server is
-                // already bound), so this is safe on every reconcile and
-                // also self-healing if some prior transition tore the
-                // socket down without an immediate reinstall.
-                await installCalibrationDiagnosticSocket()
             }
             await pushAirplayState()
-            reconcileBackgroundCalibration()
+            if mode == .wholeHome {
+                await pushDeviceDelayTrims(reason: "enabled outputs changed")
+            }
         default:
             SyncCastLog.log("reconcile: no-op (state=\(streamingState.rawValue) shouldRun=\(shouldRun))")
             break
@@ -2027,7 +1178,6 @@ final class AppModel {
 
     func shutdownForTermination() async -> Bool {
         SyncCastLog.log("AppModel: termination cleanup requested")
-        await stopPassiveAutosyncForTermination()
         await router.stop()
         let routerState = await router.state
         if routerState == .error {
@@ -2040,58 +1190,22 @@ final class AppModel {
         return true
     }
 
-    private func stopPassiveAutosyncForTermination() async {
-        passiveAutosyncEventTask?.cancel()
-        passiveAutosyncEventTask = nil
-        pendingPassiveAutosyncReason = nil
-        passiveAutosyncTask?.cancel()
-        passiveAutosyncTask = nil
-        guard let process = passiveAutosyncProcess else {
-            passiveAutosyncRunID = nil
-            if case .requestingPermission = passiveAutosyncState {
-                passiveAutosyncState = .failed(
-                    verdict: "terminated",
-                    detail: "passive check stopped during app quit"
-                )
-            }
-            return
-        }
-        let pid = process.processIdentifier
-        SyncCastLog.log(
-            "passiveAutosync: terminating controller during app quit pid=\(pid)"
-        )
-        process.terminate()
-        let exited = await Task.detached(priority: .utility) { () -> Bool in
-            for _ in 0..<20 {
-                if !process.isRunning { return true }
-                usleep(50_000)
-            }
-            return !process.isRunning
-        }.value
-        if !exited && process.isRunning {
-            SyncCastLog.log(
-                "passiveAutosync: force killing controller during app quit pid=\(pid)"
-            )
-            _ = Darwin.kill(pid, SIGKILL)
-        }
-        passiveAutosyncProcess = nil
-        passiveAutosyncRunID = nil
-        passiveAutosyncState = .failed(
-            verdict: "terminated",
-            detail: "passive check stopped during app quit"
-        )
-    }
-
-    /// Sync the enabled AirPlay devices over to the sidecar / OwnTone.
     private func pushAirplayState() async {
         let enabledAirplay = devices.filter {
-            $0.transport == .airplay2 && (routing[$0.id]?.enabled ?? false)
-        }
-        let beforeTimingEpoch: UInt64
-        if mode == .wholeHome {
-            beforeTimingEpoch = await router.airplayTimingEpochForDiagnostics()
-        } else {
-            beforeTimingEpoch = 0
+            $0.transport == .airplay2
+                && (routing[$0.id]?.enabled ?? false)
+                // Direction B backstop — independent of `isSelectableInMode`.
+                // This is the ACTUAL choke point that registers an AirPlay
+                // receiver with OwnTone (below), which is what starts AirPlay
+                // pair-setup. Registering this Mac's own Receiver would make
+                // macOS throw a full-screen PIN over SyncCast: the v3 self-pair
+                // deadlock. Refusing it here means the UI selectability gate and
+                // this registration gate are two separate enforcement points, so
+                // one regressing does not resurrect self-targeting. (Both still
+                // rest on `isLocalMachineReceiver`; if that flag itself were ever
+                // wrong, neither gate catches it — see AirPlayDiscovery for how
+                // the loopback-interface signal is derived.)
+                && !$0.isLocalMachineReceiver
         }
         SyncCastLog.log("pushAirplayState: enabledAirplay=\(enabledAirplay.map { $0.name })")
         for dev in enabledAirplay {
@@ -2100,7 +1214,8 @@ final class AppModel {
                 id: dev.id,
                 name: dev.name,
                 host: dev.host ?? "",
-                port: dev.port ?? 7000
+                port: dev.port ?? 7000,
+                airplayDeviceID: dev.airplayDeviceID
             )
             if let r = routing[dev.id] {
                 await router.setAirplayVolume(
@@ -2111,15 +1226,6 @@ final class AppModel {
         }
         SyncCastLog.log("setActiveAirplayDevices: ids=\(enabledAirplay.map { $0.id.prefix(8) })")
         await router.setActiveAirplayDevices(enabledAirplay.map { $0.id })
-        if mode == .wholeHome, !enabledAirplay.isEmpty {
-            let afterTimingEpoch = await router.airplayTimingEpochForDiagnostics()
-            if afterTimingEpoch != beforeTimingEpoch {
-                markSyncContextSuspect(
-                    reason: "AirPlay timing epoch changed \(beforeTimingEpoch)->\(afterTimingEpoch)"
-                )
-                reconcileBackgroundCalibration()
-            }
-        }
     }
 
     // MARK: - Intents
@@ -2151,28 +1257,39 @@ final class AppModel {
             return
         }
         SyncCastLog.log("setMode: \(mode.rawValue) → \(newMode.rawValue)")
+        let oldMode = mode
         mode = newMode
-        if newMode == .wholeHome {
-            markSyncContextSuspect(reason: "mode switched to whole-home")
-        } else {
-            stopPassiveAutosyncForRouteChange(reason: "mode switched out of whole-home")
-            setSyncContext(.valid, reason: "stereo path; no Local+AirPlay baseline active")
-            lastLocalFifoRunning = nil
-            lastLocalFifoClientCount = nil
-            lastLocalFifoOverflowDrops = nil
-            lastLocalFifoPerClientDrops = nil
-            lastLocalFifoDelayMs = nil
+        if newMode != .wholeHome {
+            // Leaving whole-home tears the bridges down, so their resync
+            // counters restart from zero next time. Keeping the old values
+            // would make the first sample after re-entry look like a huge
+            // resync burst.
             lastLocalBridgeResyncCounts.removeAll()
         }
         refreshScreenRecordingStatusForRuntimePath(reason: "mode changed")
-        pendingAutoCalibrationApply = nil
-        // Disable any device that the new mode can't drive.
+        // Remember what was on in the mode we are LEAVING, then disable
+        // anything the new mode cannot drive, then restore whatever was on
+        // last time we were in the new mode.
+        //
+        // "Disable what the new mode can't drive" on its own used to destroy
+        // the user's selection: switch to stereo and back and every AirPlay
+        // receiver was off again. Remembering by stable key rather than by
+        // the per-launch device id is what makes it survive.
+        rememberedEnabledKeysByMode[oldMode] = enabledStableKeys()
         for dev in devices {
             if !isSelectableInMode(dev, mode: newMode),
                var r = routing[dev.id], r.enabled {
                 r.enabled = false
                 routing[dev.id] = r
             }
+        }
+        restoreRememberedSelection(for: newMode)
+        // Direction B: the per-mode key map above is in-memory only and empty
+        // on a fresh launch, so it cannot restore the local-output choice the
+        // user made in a previous session. Apply the UID-keyed persisted set
+        // here so entering whole-home honours it whatever is connected now.
+        if newMode == .wholeHome {
+            applyRememberedWholeHomeLocalOutputs()
         }
         // Force a full pipeline restart by stopping the engine, then
         // reconciling. The two modes have different audio paths
@@ -2200,20 +1317,12 @@ final class AppModel {
                     self.streamingState = .idle
                     self.modeTransitioning = false
                     self.reconcileEngine()
-                    self.reconcileBackgroundCalibration()
                 }
             }
         } else {
             // No engine to stop — the new mode just needs reconciliation.
             // No async work, so no need to flip the transition flag here.
             reconcileEngine()
-            reconcileBackgroundCalibration()
-        }
-        if newMode == .wholeHome {
-            scheduleEventDrivenCalibration(reason: "mode switched to whole-home")
-        } else {
-            eventDrivenCalibrationTask?.cancel()
-            postApplyValidationTask?.cancel()
         }
     }
 
@@ -2223,6 +1332,18 @@ final class AppModel {
     }
 
     func setDeviceEnabled(_ enabled: Bool, for id: String) {
+        // Never let a device be switched on in a mode that cannot drive it.
+        // For this Mac's own AirPlay Receiver that is not a tidiness rule:
+        // it is never a legal whole-home target under direction B, so enabling
+        // it is refused here as well as being unlisted in the UI.
+        if enabled,
+           let device = devices.first(where: { $0.id == id }),
+           !isSelectableInMode(device, mode: mode) {
+            SyncCastLog.log(
+                "setDeviceEnabled: refusing to enable \(device.name) — not selectable in \(mode.rawValue)"
+            )
+            return
+        }
         var r = routing[id] ?? DeviceRouting(deviceID: id)
         let oldEnabled = r.enabled
         if oldEnabled == enabled {
@@ -2232,16 +1353,20 @@ final class AppModel {
         }
         r.enabled = enabled
         routing[id] = r
-        pendingAutoCalibrationApply = nil
         let name = devices.first(where: { $0.id == id })?.name ?? id
         // Emit BOTH the toggled id and the post-toggle full routing so
         // we can prove or disprove the user-reported "click X but Y
         // toggled" symptom from the log alone (no Console.app needed).
         SyncCastLog.log("toggleDevice: \(name) [id=\(id.prefix(8))] \(oldEnabled ? "ON" : "off") → \(r.enabled ? "ON" : "off"). routing: { \(routingSummary()) }")
-        markSyncContextSuspect(reason: "device toggled \(name)")
+        // Direction B: in whole-home the enabled local CoreAudio outputs ARE
+        // the remembered selection. Persist it by UID whenever it changes so a
+        // relaunch (or a change of location) restores exactly what was on.
+        if mode == .wholeHome,
+           let device = devices.first(where: { $0.id == id }),
+           device.transport == .coreAudio {
+            persistWholeHomeLocalOutputSelection()
+        }
         reconcileEngine()
-        reconcileBackgroundCalibration()
-        scheduleEventDrivenCalibration(reason: "device toggled \(name)")
     }
 
     private struct DirectVolumeTarget {
@@ -2336,13 +1461,10 @@ final class AppModel {
     /// balance on the first key press, and synchronously read CoreAudio
     /// on the main thread per press.
     ///
-    /// Deliberately does NOT call reconcileEngine() /
-    /// reconcileBackgroundCalibration():
+    /// Deliberately does NOT call reconcileEngine():
     ///   - a volume key cannot change the covered device set (enabled
     ///     flags are untouched), so reconcile's syncLocalOutputs pass is
     ///     a guaranteed no-op for the direct path;
-    ///   - background calibration is gated on mode == .wholeHome and
-    ///     cannot apply here;
     ///   - a held key repeats every ~33 ms and each reconcile pass logs
     ///     multiple lines, which flooded launch.log without changing any
     ///     engine state.
@@ -2371,7 +1493,6 @@ final class AppModel {
             }
         }
         guard !changedSummaries.isEmpty else { return }
-        pendingAutoCalibrationApply = nil
         SyncCastLog.log(
             "systemVolumeKey: direct stereo \(reason) → \(changedSummaries.joined(separator: ", "))"
         )
@@ -2716,23 +1837,10 @@ final class AppModel {
 
     func setVolume(_ value: Float, for id: String) {
         var r = routing[id] ?? DeviceRouting(deviceID: id)
-        let old = r.volume
         r.volume = max(0, min(1, value))
         routing[id] = r
-        let crossedAudibleGate = (old > 0.01) != (r.volume > 0.01)
-        let changedEnoughForResync =
-            abs(old - r.volume) > 0.03 || crossedAudibleGate
-        if changedEnoughForResync {
-            pendingAutoCalibrationApply = nil
-        }
         applyDirectStereoHardwareVolumeIfNeeded(for: id)
         reconcileEngine()
-        reconcileBackgroundCalibration()
-        if changedEnoughForResync {
-            let name = devices.first(where: { $0.id == id })?.name ?? id
-            markSyncContextSuspect(reason: "volume changed \(name)")
-            scheduleEventDrivenCalibration(reason: "volume changed \(name)")
-        }
     }
 
     func toggleMute(_ id: String) {
@@ -2750,14 +1858,305 @@ final class AppModel {
         }
         r.muted = muted
         routing[id] = r
-        pendingAutoCalibrationApply = nil
         applyDirectStereoHardwareVolumeIfNeeded(for: id)
         reconcileEngine()
-        reconcileBackgroundCalibration()
         let name = devices.first(where: { $0.id == id })?.name ?? id
         SyncCastLog.log("setMute: \(name) [id=\(id.prefix(8))] \(oldMuted ? "muted" : "unmuted") → \(muted ? "muted" : "unmuted")")
-        markSyncContextSuspect(reason: "mute changed \(name)")
-        scheduleEventDrivenCalibration(reason: "mute changed \(name)")
+    }
+
+    // MARK: - Per-device delay trim
+    //
+    // One millisecond bias per enabled output, compensating how far each
+    // speaker sits from where the user actually listens (1 ms ≈ 34 cm) plus
+    // whatever residual systematic skew Layers 1-3 leave behind. This model
+    // owns the RAW SIGNED intent; `Router` normalises it to the non-negative
+    // values the two legs can actually apply.
+
+    /// Persistence key. Stores `[persistenceKey: rawTrimMs]` — RAW intent,
+    /// never the normalised output. Normalised values depend on which devices
+    /// happen to be present, so persisting them would make the stored numbers
+    /// drift a little further every session.
+    static let deviceTrimDefaultsKey = "syncast.deviceDelayTrimMs"
+
+    /// Debounce before a trim change reaches either leg. Mirrors
+    /// `setAirplayDelay`'s 200 ms, and earns it twice over here: each AirPlay
+    /// commit costs that receiver a ~0.4 s relatch dropout (OwnTone latches
+    /// `offset_ms` at session construction) and each local commit costs a
+    /// ~10 ms cross-fade.
+    static let deviceTrimCommitDebounceNanos: UInt64 = 200_000_000
+
+    /// Backoff before re-driving a trim commit whose AirPlay half failed
+    /// (sidecar restarting OwnTone, IPC not answering). Deliberately longer
+    /// than the debounce: the failure mode it covers is a busy sidecar, and
+    /// hammering it makes that worse.
+    static let deviceTrimRetryDelayNanos: UInt64 = 2_000_000_000
+
+    /// How many times a failed trim commit is re-driven before it is left to
+    /// the next natural trigger (a reconcile, or the user touching a
+    /// stepper). Bounded so a sidecar that is down for good does not leave a
+    /// task looping for the life of the process.
+    static let deviceTrimMaxRetries: Int = 3
+
+    /// Raw user intent keyed by `Device.persistenceKey` (`ca:<UID>` /
+    /// `ap:<hex>`), NOT by `Device.id` — `Device.id` is regenerated per
+    /// process, so keying off it would lose every trim on relaunch. Devices
+    /// with no stable key are held in `routing` only and never written.
+    ///
+    /// A remembered device that is absent right now keeps its entry, exactly
+    /// as `WholeHomeMemberStore` keeps an absent UID: the office display
+    /// comes back when the user does.
+    private var persistedDeviceTrims: [String: Int] = AppModel.loadPersistedDeviceTrims()
+    private var deviceTrimCommitTask: Task<Void, Never>?
+    /// Internal rather than private so the unit tests can observe that a
+    /// re-seed or a failed commit actually left work queued.
+    private(set) var pendingTrimDeviceIDs: Set<String> = []
+    /// Consecutive failed commits, reset on the first success. Bounds the
+    /// retry loop against `deviceTrimMaxRetries`.
+    private var deviceTrimRetryCount: Int = 0
+
+    /// True while a debounced trim commit is in flight. The UI uses it to say
+    /// "applying…" on AirPlay rows — a 0.4 s silence with no explanation
+    /// reads as a bug rather than as the relatch it is.
+    private(set) var deviceTrimCommitInFlight: Bool = false
+
+    private static func loadPersistedDeviceTrims() -> [String: Int] {
+        guard let raw = UserDefaults.standard.dictionary(forKey: deviceTrimDefaultsKey)
+        else { return [:] }
+        var out: [String: Int] = [:]
+        for (key, value) in raw {
+            guard let ms = value as? Int else { continue }
+            out[key] = DeviceDelayTrim.clamp(ms)
+        }
+        return out
+    }
+
+    private func persistDeviceTrims() {
+        UserDefaults.standard.set(
+            persistedDeviceTrims, forKey: AppModel.deviceTrimDefaultsKey
+        )
+    }
+
+    private func persistenceKey(for deviceID: String) -> String? {
+        devices.first { $0.id == deviceID }?.persistenceKey
+    }
+
+    /// Re-seed `routing[*].manualDelayMs` from the persisted store.
+    ///
+    /// Called after every discovery event, because `Device.id` is minted per
+    /// process and per appearance: the stable identity lives in
+    /// `persistenceKey`, and this is the one place that maps it back onto the
+    /// transient id `routing` is keyed by.
+    /// Internal rather than private so the unit tests can drive the
+    /// stable-key → transient-id re-seeding directly; it is not part of the
+    /// UI surface.
+    ///
+    /// A re-seed is a real trim change and is QUEUED like one. Without that,
+    /// a receiver that flapped on Bonjour and came back under a fresh
+    /// `Device.id` gets its value restored into `routing` — where it joins
+    /// the local leg's normalisation minimum — while the sidecar's own map is
+    /// still keyed by the old id and resolves to nothing. The local speakers
+    /// then shift for a trim the AirPlay receiver never receives.
+    ///
+    /// - Returns: whether anything changed, so the caller can decide whether
+    ///   to spend a debounced commit. Callers that only want the in-memory
+    ///   state (the tests) can ignore it.
+    @discardableResult
+    func applyPersistedDeviceTrims() -> Bool {
+        var changed = false
+        for dev in devices {
+            guard let key = dev.persistenceKey else { continue }
+            let stored = persistedDeviceTrims[key] ?? 0
+            // A device with no routing entry yet has nothing to re-seed INTO:
+            // writing through the optional chain would silently no-op while
+            // still reporting a change, which would queue a commit on every
+            // single discovery event forever.
+            guard var r = routing[dev.id], r.manualDelayMs != stored else {
+                continue
+            }
+            r.manualDelayMs = stored
+            routing[dev.id] = r
+            pendingTrimDeviceIDs.insert(dev.id)
+            changed = true
+        }
+        return changed
+    }
+
+    /// True when at least one output carries a non-zero trim. Gates the
+    /// "Reset trims" affordance so it only exists when it would do something.
+    var hasAnyDeviceTrim: Bool {
+        routing.values.contains { $0.manualDelayMs != 0 }
+    }
+
+    /// The trim currently dialled in for a device, in milliseconds. Signed:
+    /// positive means "hold this speaker back".
+    func deviceTrimMs(for deviceID: String) -> Int {
+        routing[deviceID]?.manualDelayMs ?? 0
+    }
+
+    /// Human-readable hint beside the stepper. Sound covers ~34 cm per
+    /// millisecond, which is the whole reason this feature has a physical
+    /// interpretation at all.
+    ///
+    /// Phrased as the CORRECTION the value applies, never as the speaker's
+    /// distance. The two read opposite: on an AV receiver you type how far
+    /// away a speaker is, and the box works out that a distant speaker must
+    /// fire EARLIER. Here positive means "hold this one back"
+    /// (`DeviceDelayTrim`'s stated convention), so a speaker that is further
+    /// away wants a NEGATIVE trim. Labelling `+3 ms` as "further" taught the
+    /// user to press the wrong button and doubled the skew they were trying
+    /// to remove.
+    func deviceTrimDistanceHint(for deviceID: String) -> String {
+        let ms = deviceTrimMs(for: deviceID)
+        if ms == 0 { return "0 ms" }
+        let metres = DeviceDelayTrim.distanceMeters(forMs: ms)
+        let sign = ms > 0 ? "+" : "−"
+        let sense = ms > 0 ? "held back" : "brought forward"
+        return String(
+            format: "%@%d ms, %@ ≈ %.1f m", sign, abs(ms), sense, metres
+        )
+    }
+
+    /// Set one output's trim. In-memory + persisted immediately (so the value
+    /// survives a crash mid-tuning); the push to the audio legs is debounced.
+    func setDeviceTrim(_ ms: Int, for deviceID: String) {
+        let clamped = DeviceDelayTrim.clamp(ms)
+        var r = routing[deviceID] ?? DeviceRouting(deviceID: deviceID)
+        guard r.manualDelayMs != clamped else { return }
+        r.manualDelayMs = clamped
+        routing[deviceID] = r
+        if let key = persistenceKey(for: deviceID) {
+            // Zero is the default, so drop the key rather than storing it —
+            // an untouched speaker leaves no trace in the defaults plist.
+            if clamped == 0 {
+                persistedDeviceTrims.removeValue(forKey: key)
+            } else {
+                persistedDeviceTrims[key] = clamped
+            }
+            persistDeviceTrims()
+        }
+        scheduleDeviceTrimCommit(for: deviceID)
+    }
+
+    /// Nudge one output's trim by a signed delta (the stepper's `-` / `+`).
+    func nudgeDeviceTrim(_ deltaMs: Int, for deviceID: String) {
+        setDeviceTrim(deviceTrimMs(for: deviceID) + deltaMs, for: deviceID)
+    }
+
+    func resetDeviceTrim(for deviceID: String) {
+        setDeviceTrim(0, for: deviceID)
+    }
+
+    /// Clear every trim in one commit.
+    ///
+    /// Deliberately routed through the same debounced path as a single edit,
+    /// so a system that was already at zero produces no IPC at all and
+    /// therefore relatches no AirPlay receiver.
+    func resetAllDeviceTrims() {
+        var changed = false
+        for (id, r) in routing where r.manualDelayMs != 0 {
+            routing[id]?.manualDelayMs = 0
+            pendingTrimDeviceIDs.insert(id)
+            changed = true
+        }
+        if !persistedDeviceTrims.isEmpty {
+            persistedDeviceTrims.removeAll()
+            persistDeviceTrims()
+            changed = true
+        }
+        guard changed else { return }
+        scheduleDeviceTrimCommitTask()
+        SyncCastLog.log("deviceTrim: reset all")
+    }
+
+    private func scheduleDeviceTrimCommit(for deviceID: String) {
+        pendingTrimDeviceIDs.insert(deviceID)
+        scheduleDeviceTrimCommitTask()
+    }
+
+    /// `after` nil means the normal debounce. Spelled as an optional rather
+    /// than a default of `AppModel.deviceTrimCommitDebounceNanos` because a
+    /// MainActor-isolated static cannot be evaluated in a default-argument
+    /// (nonisolated) context under Swift 6.
+    private func scheduleDeviceTrimCommitTask(after delayNanos: UInt64? = nil) {
+        let delay = delayNanos ?? AppModel.deviceTrimCommitDebounceNanos
+        deviceTrimCommitInFlight = true
+        deviceTrimCommitTask?.cancel()
+        deviceTrimCommitTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            if Task.isCancelled { return }
+            await self?.commitDeviceTrims()
+        }
+    }
+
+    /// Push the accumulated trim edits.
+    ///
+    /// Routing goes first so the Router's own copy carries the new
+    /// `manualDelayMs` before it normalises; `applyDeviceDelayTrims` then
+    /// drives BOTH legs from one snapshot. Outside whole-home this is a
+    /// no-op inside the Router (stereo runs a different output path whose
+    /// timing is deliberately untouched), but the routing push still happens
+    /// so a later switch into whole-home starts from the right values.
+    private func commitDeviceTrims() async {
+        let ids = pendingTrimDeviceIDs
+        pendingTrimDeviceIDs.removeAll()
+        for id in ids {
+            guard let r = routing[id] else { continue }
+            await router.setRouting(r)
+        }
+        let result = await router.applyDeviceDelayTrims()
+        guard result == .applied else {
+            // The local leg already moved (applyDeviceDelayTrims applies it
+            // before the IPC), so dropping the AirPlay half here would leave
+            // the two legs disagreeing by exactly what the user just dialled
+            // in — while the UI reports the edit as landed. Re-queue and stay
+            // "in flight" so the row keeps saying "applying…".
+            deviceTrimRetryCount += 1
+            guard deviceTrimRetryCount <= AppModel.deviceTrimMaxRetries else {
+                deviceTrimCommitInFlight = false
+                deviceTrimRetryCount = 0
+                lastError = "Speaker delay trim could not be applied."
+                SyncCastLog.log("deviceTrim: giving up after "
+                                + "\(AppModel.deviceTrimMaxRetries) retries")
+                return
+            }
+            pendingTrimDeviceIDs.formUnion(ids)
+            SyncCastLog.log(
+                "deviceTrim: push failed, retry "
+                + "\(deviceTrimRetryCount)/\(AppModel.deviceTrimMaxRetries)"
+            )
+            scheduleDeviceTrimCommitTask(
+                after: AppModel.deviceTrimRetryDelayNanos
+            )
+            return
+        }
+        deviceTrimRetryCount = 0
+        deviceTrimCommitInFlight = false
+        if !ids.isEmpty {
+            let summary = ids
+                .map { "\($0.prefix(8))=\(routing[$0]?.manualDelayMs ?? 0)ms" }
+                .sorted()
+                .joined(separator: ", ")
+            SyncCastLog.log("deviceTrim applied: \(summary)")
+        }
+    }
+
+    /// Drive both trim legs from a reconcile point rather than from a user
+    /// edit, and re-queue on failure through the same path as an edit.
+    ///
+    /// Needed because enabling or disabling ANY output changes the set the
+    /// normalisation minimum is taken over, so every enabled speaker's
+    /// effective delay moves. `startWholeHome` / `replan` re-apply the LOCAL
+    /// leg on their own; only this drives the AirPlay one.
+    private func pushDeviceDelayTrims(reason: String) async {
+        let result = await router.applyDeviceDelayTrims()
+        guard result == .applied else {
+            SyncCastLog.log("deviceTrim: push failed (\(reason)), queued for retry")
+            scheduleDeviceTrimCommitTask(
+                after: AppModel.deviceTrimRetryDelayNanos
+            )
+            return
+        }
+        deviceTrimRetryCount = 0
     }
 
     /// Live-tune the whole-home FIFO delay. In-memory update is immediate
@@ -2768,10 +2167,6 @@ final class AppModel {
                           AppModel.airplayDelayMsRange.upperBound)
         if clamped != airplayDelayMs {
             userDelayRevision &+= 1
-            pendingAutoCalibrationApply = nil
-            eventDrivenCalibrationTask?.cancel()
-            postApplyValidationTask?.cancel()
-            markSyncContextSuspect(reason: "manual delay changed")
             if case .locked = delayLockState {
                 delayLockState = .locked(at: clamped)
                 UserDefaults.standard.set(
@@ -2849,2070 +2244,9 @@ final class AppModel {
         setAirplayDelay(AppModel.defaultAirplayDelayMs)
     }
 
-    // MARK: - Auto-calibration UI flow
-    //
-    // Pipeline: ensure mic permission → call Router.runCalibration →
-    // apply returned delta to airplayDelayMs (which already pushes via
-    // the debounced setter, including persistence). We surface progress
-    // and completion via the `calibrationStatus` enum so the popover
-    // can show a spinner / result text.
-
-    enum CalibrationStatus: Equatable, Sendable {
-        case idle
-        case requestingPermission
-        case running
-        case completed(deltaMs: Int, confidence: Double, applied: Bool)
-        case failed(String)
-    }
-
-    var calibrationStatus: CalibrationStatus = .idle
-    /// Live "Calibrating <Device> (n/total)…" progress string emitted by
-    /// Router.runCalibration's per-device sequential loop. nil unless the
-    /// runner is mid-sweep. The MainPopover renders this as a sub-caption
-    /// under the spinner so the user sees which device is being measured
-    /// (sequential calibration takes ≈30s for 4 devices, vs the previous
-    /// ≈15s simultaneous run that produced unusable output).
-    var calibrationProgress: String? = nil
-
-    /// Kick off auto-calibration. Safe to call from the main actor on a
-    /// button tap. Uses `effectiveMicID` (W3) as the input device.
-    func runAutoCalibrate(
-        requiresContinuousOptIn: Bool = false,
-        requiredUserDelayRevision: UInt64? = nil,
-        isPostApplyValidation: Bool = false
-    ) async {
-        eventDrivenRetryScheduledForCurrentAttempt = false
-        var pausedContinuousForThisRun = false
-        defer {
-            if pausedContinuousForThisRun && continuousPausedForManual {
-                continuousPausedForManual = false
-                reconcileBackgroundCalibration()
-            }
-        }
-        switch calibrationStatus {
-        case .running, .requestingPermission:
-            SyncCastLog.log("autoCalib: ignored duplicate start request")
-            return
-        default:
-            break
-        }
-        guard AppModel.activeAcousticCalibrationEnabled else {
-            SyncCastLog.log("autoCalib: blocked because active acoustic diagnostics are disabled")
-            calibrationStatus = .failed(
-                AppModel.activeAcousticCalibrationDisabledMessage
-            )
-            return
-        }
-        defer { finishAutoCalibrateAttempt() }
-        defer { calibrationProgress = nil }
-        guard mode == .wholeHome else {
-            calibrationStatus = .failed("Switch to whole-home mode first")
-            return
-        }
-        guard streamingState == .running else {
-            calibrationStatus = .failed("Audio capture isn't running")
-            return
-        }
-        let enabledForCalibration = devices.filter {
-            routing[$0.id]?.enabled == true
-        }
-        let enabledAirplayCount = enabledForCalibration.filter {
-            $0.transport == .airplay2
-        }.count
-        guard enabledForCalibration.contains(where: { $0.transport == .coreAudio }),
-              enabledForCalibration.contains(where: { $0.transport == .airplay2 }) else {
-            calibrationStatus = .failed(
-                "Auto-calibration needs at least one local speaker and one AirPlay speaker"
-            )
-            return
-        }
-        // Permission gate. AVCaptureDevice never re-prompts after a deny,
-        // so on .denied we tell the user to open System Settings.
-        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
-        switch auth {
-        case .denied, .restricted:
-            calibrationStatus = .failed(
-                "Microphone access denied — open System Settings → Privacy → Microphone"
-            )
-            return
-        case .notDetermined:
-            calibrationStatus = .requestingPermission
-            let granted = await requestMicrophonePermission()
-            if !granted {
-                calibrationStatus = .failed("Microphone access not granted")
-                return
-            }
-        case .authorized:
-            break
-        @unknown default:
-            calibrationStatus = .failed("Unexpected microphone permission state")
-            return
-        }
-
-        // Pause continuous calibration while the manual run plays click
-        // pulses; resume after (success OR failure).
-        if backgroundCalibrationActive || backgroundCalibrationEnabled {
-            continuousPausedForManual = true
-            pausedContinuousForThisRun = true
-            reconcileBackgroundCalibration()
-        }
-
-        calibrationStatus = .running
-        setSyncContext(.measuring, reason: "active diagnostic calibration running")
-        calibrationProgress = "Preparing…"
-        let snapshot = devices  // immutable Sendable copy
-        let micID = effectiveMicID
-        do {
-            let delta = try await router.runCalibration(
-                devices: snapshot,
-                microphoneDeviceID: micID,
-                pulseCount: 5,
-                progress: { [weak self] msg in
-                    Task { @MainActor [weak self] in
-                        self?.calibrationProgress = msg
-                    }
-                }
-            )
-            // `deltaMs` is the ABSOLUTE TARGET delay-line value
-            // (= max(airplay τ) − max(local τ_bridge_bypass)), NOT a
-            // delta to add. SET the slider directly. The previous
-            // `+= delta` was wrong: Phase 1 measures local τ via the
-            // bridge's direct calibration-tone synthesis which bypasses
-            // the broadcaster delay-line, so re-runs would double up
-            // until clamped. See `Router.CalibrationDelta.deltaMs`.
-            let next = max(
-                AppModel.airplayDelayMsRange.lowerBound,
-                min(AppModel.airplayDelayMsRange.upperBound, delta.deltaMs)
-            )
-            if requiresContinuousOptIn &&
-                !eventDrivenCalibrationCanStillApply(
-                    stage: "apply",
-                    requiredUserDelayRevision: requiredUserDelayRevision
-                ) {
-                pendingAutoCalibrationApply = nil
-                calibrationStatus = .failed("Event calibration canceled")
-                return
-            }
-            var finalDeltaMs = delta.deltaMs
-            var finalConfidence = delta.confidence
-            let allowPostApplyValidation =
-                requiresContinuousOptIn && !isPostApplyValidation
-            var applied = await applyAutoCalibrationTargetIfTrusted(
-                next, confidence: delta.confidence,
-                perDeviceUncertaintyMs: delta.perDeviceUncertaintyMs,
-                enabledAirplayCount: enabledAirplayCount,
-                requiresContinuousOptIn: requiresContinuousOptIn,
-                requiredUserDelayRevision: requiredUserDelayRevision,
-                allowPostApplyValidation: allowPostApplyValidation
-            )
-            if !applied,
-               shouldAutoVerifyHeldCalibrationTarget(
-                   next, confidence: delta.confidence,
-                   perDeviceUncertaintyMs: delta.perDeviceUncertaintyMs
-               ) {
-                if requiresContinuousOptIn &&
-                    !eventDrivenCalibrationCanStillApply(
-                        stage: "verify",
-                        requiredUserDelayRevision: requiredUserDelayRevision
-                    ) {
-                    pendingAutoCalibrationApply = nil
-                    calibrationStatus = .failed("Event calibration canceled")
-                    return
-                }
-                let verifyContext = autoCalibrationContextSignature()
-                calibrationProgress = "Verifying stable AirPlay delay..."
-                let verifyDelta = try await router.runCalibration(
-                    devices: snapshot,
-                    microphoneDeviceID: micID,
-                    pulseCount: 5,
-                    progress: { [weak self] msg in
-                        Task { @MainActor [weak self] in
-                            self?.calibrationProgress = "Verify: \(msg)"
-                        }
-                    }
-                )
-                let verifyNext = max(
-                    AppModel.airplayDelayMsRange.lowerBound,
-                    min(AppModel.airplayDelayMsRange.upperBound,
-                        verifyDelta.deltaMs)
-                )
-                finalDeltaMs = verifyDelta.deltaMs
-                finalConfidence = min(delta.confidence, verifyDelta.confidence)
-                if autoCalibrationContextSignature() == verifyContext {
-                    applied = await applyAutoCalibrationTargetIfTrusted(
-                        verifyNext, confidence: verifyDelta.confidence,
-                        perDeviceUncertaintyMs: verifyDelta.perDeviceUncertaintyMs,
-                        enabledAirplayCount: enabledAirplayCount,
-                        requiresContinuousOptIn: requiresContinuousOptIn,
-                        requiredUserDelayRevision: requiredUserDelayRevision,
-                        allowPostApplyValidation: allowPostApplyValidation
-                    )
-                } else {
-                    pendingAutoCalibrationApply = nil
-                    applied = false
-                    SyncCastLog.log(
-                        "autoCalib: verify result ignored because route context changed"
-                    )
-                }
-            }
-            if !applied {
-                markSyncContextSuspect(
-                    reason: "active diagnostic measurement did not apply; passive evidence still required",
-                    cancelPendingApply: false
-                )
-            }
-            calibrationStatus = .completed(
-                deltaMs: finalDeltaMs,
-                confidence: finalConfidence,
-                applied: applied,
-            )
-        } catch {
-            SyncCastLog.log("autoCalib: failed \(error)")
-            markSyncContextSuspect(
-                reason: "active diagnostic calibration failed: \(error)",
-                cancelPendingApply: false
-            )
-            calibrationStatus = .failed("\(error)")
-            if requiresContinuousOptIn {
-                scheduleEventDrivenCalibrationRetryIfUseful(
-                    error,
-                    requiredUserDelayRevision: requiredUserDelayRevision
-                )
-            }
-        }
-        calibrationProgress = nil
-
-    }
-
-    private func scheduleEventDrivenCalibrationRetryIfUseful(
-        _ error: Error,
-        requiredUserDelayRevision: UInt64?
-    ) {
-        guard eventDrivenCalibrationCanStillApply(
-                stage: "retry",
-                requiredUserDelayRevision: requiredUserDelayRevision
-              ),
-              eventDrivenCalibrationRetryCount <
-                AppModel.maxEventDrivenCalibrationRetries,
-              shouldRetryEventDrivenCalibration(after: error)
-        else { return }
-        eventDrivenCalibrationRetryCount += 1
-        eventDrivenRetryScheduledForCurrentAttempt = true
-        let reason = "retry \(eventDrivenCalibrationRetryCount) after insufficient confidence"
-        SyncCastLog.log("autoCalib event retry scheduled: \(reason)")
-        scheduleEventDrivenCalibration(
-            reason: reason,
-            isRetry: true,
-            settleDelayS: AppModel.eventDrivenCalibrationRetrySettleS
-        )
-    }
-
-    private func shouldRetryEventDrivenCalibration(after error: Error) -> Bool {
-        String(describing: error).contains("insufficientConfidence")
-    }
-
-    private func schedulePostApplySettleValidation(
-        appliedMs: Int,
-        requiredUserDelayRevision: UInt64?
-    ) {
-        guard eventDrivenCalibrationCanStillApply(
-            stage: "post-apply schedule",
-            requiredUserDelayRevision: requiredUserDelayRevision
-        ) else { return }
-        postApplyValidationTask?.cancel()
-        let settle = AppModel.postApplyValidationSettleS
-        SyncCastLog.log(
-            "autoCalib post-apply validation scheduled in \(Int(settle))s after applying \(appliedMs)ms"
-        )
-        postApplyValidationTask = Task { [weak self] in
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(settle * 1_000_000_000)
-                )
-            } catch {
-                return
-            }
-            guard let self else { return }
-            guard self.eventDrivenCalibrationCanStillApply(
-                stage: "post-apply validation",
-                requiredUserDelayRevision: requiredUserDelayRevision
-            ) else { return }
-            await self.runPostApplySettleValidation(
-                appliedMs: appliedMs,
-                requiredUserDelayRevision: requiredUserDelayRevision
-            )
-        }
-    }
-
-    private func runPostApplySettleValidation(
-        appliedMs: Int,
-        requiredUserDelayRevision: UInt64?
-    ) async {
-        postApplyValidationTask = nil
-        SyncCastLog.log(
-            "autoCalib post-apply validation running after applying \(appliedMs)ms"
-        )
-        await runAutoCalibrate(
-            requiresContinuousOptIn: true,
-            requiredUserDelayRevision: requiredUserDelayRevision,
-            isPostApplyValidation: true
-        )
-        SyncCastLog.log(
-            "autoCalib post-apply validation finished after applying \(appliedMs)ms; current=\(airplayDelayMs)ms"
-        )
-    }
-
-    private func eventDrivenCalibrationCanStillApply(
-        stage: String,
-        requiredUserDelayRevision: UInt64? = nil
-    ) -> Bool {
-        if Task.isCancelled {
-            SyncCastLog.log("autoCalib event \(stage) aborted: task cancelled")
-            return false
-        }
-        if let requiredUserDelayRevision,
-           userDelayRevision != requiredUserDelayRevision {
-            SyncCastLog.log(
-                "autoCalib event \(stage) aborted: user changed delay during calibration"
-            )
-            return false
-        }
-        guard mode == .wholeHome,
-              streamingState == .running,
-              backgroundCalibrationEnabled,
-              hasEnabledLocalAndAirPlayOutputs,
-              hasEnabledAirPlayOutputNotKnownDisconnected,
-              enabledAirPlayOutputNotKnownDisconnectedCount <=
-                AppModel.autoApplyMaxAirplayReceivers,
-              hasMicrophonePermission
-        else {
-            SyncCastLog.log(
-                "autoCalib event \(stage) aborted: preconditions changed"
-            )
-            return false
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log("autoCalib event \(stage) aborted: delay locked")
-            return false
-        }
-        return true
-    }
-
-    private func finishAutoCalibrateAttempt() {
-        if case .completed = calibrationStatus {
-            lastEventDrivenCalibrationAt = Date()
-            eventDrivenCalibrationRetryCount = 0
-        }
-        if let reason = pendingEventDrivenCalibrationReason {
-            guard !eventDrivenRetryScheduledForCurrentAttempt else {
-                SyncCastLog.log(
-                    "autoCalib event pending reason held until retry completes: \(reason)"
-                )
-                return
-            }
-            pendingEventDrivenCalibrationReason = nil
-            scheduleEventDrivenCalibration(
-                reason: "pending after calibration: \(reason)"
-            )
-        }
-    }
-
-    /// Clear a non-idle status. Bound to the popover's "Dismiss" button
-    /// on completed/failed states.
-    func dismissCalibrationStatus() {
-        calibrationStatus = .idle
-    }
-
-    private func applyAutoCalibrationTargetIfTrusted(
-        _ targetMs: Int,
-        confidence: Double,
-        perDeviceUncertaintyMs: [String: Int],
-        enabledAirplayCount: Int,
-        requiresContinuousOptIn: Bool = false,
-        requiredUserDelayRevision: UInt64? = nil,
-        allowPostApplyValidation: Bool = false
-    ) async -> Bool {
-        if requiresContinuousOptIn &&
-            !eventDrivenCalibrationCanStillApply(
-                stage: "apply",
-                requiredUserDelayRevision: requiredUserDelayRevision
-            ) {
-            pendingAutoCalibrationApply = nil
-            return false
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "autoCalib: recommended \(targetMs)ms conf=\(String(format: "%.2f", confidence)) but delay is locked"
-            )
-            pendingAutoCalibrationApply = nil
-            return false
-        }
-        guard confidence >= AppModel.autoApplyConfidenceFloor else {
-            SyncCastLog.log(
-                "autoCalib: recommended \(targetMs)ms rejected: low confidence \(String(format: "%.2f", confidence))"
-            )
-            pendingAutoCalibrationApply = nil
-            return false
-        }
-        guard enabledAirplayCount <= AppModel.autoApplyMaxAirplayReceivers else {
-            SyncCastLog.log(
-                "autoCalib: recommended \(targetMs)ms held: AirPlay group has \(enabledAirplayCount) receivers and group mic measurement cannot prove every receiver contributed"
-            )
-            pendingAutoCalibrationApply = nil
-            return false
-        }
-        guard autoCalibrationUncertaintyIsAcceptable(perDeviceUncertaintyMs) else {
-            let reason = autoCalibrationMaxUncertainty(perDeviceUncertaintyMs)
-                .map { "high uncertainty \($0)ms" } ?? "missing uncertainty"
-            SyncCastLog.log(
-                "autoCalib: recommended \(targetMs)ms rejected: \(reason)"
-            )
-            pendingAutoCalibrationApply = nil
-            return false
-        }
-
-        let current = airplayDelayMs
-        let jump = abs(targetMs - current)
-        if jump <= AppModel.autoApplyMaxSingleJumpMs {
-            pendingAutoCalibrationApply = nil
-            airplayDelayCommitTask?.cancel()
-            let applied = await commitAirplayDelay(
-                targetMs,
-                shouldStillApply: requiresContinuousOptIn
-                    ? { [weak self] in
-                        self?.eventDrivenCalibrationCanStillApply(
-                            stage: "commit",
-                            requiredUserDelayRevision: requiredUserDelayRevision
-                        ) ?? false
-                    }
-                    : nil
-            )
-            guard applied else {
-                return false
-            }
-            SyncCastLog.log(
-                "autoCalib: applied \(targetMs)ms conf=\(String(format: "%.2f", confidence)) jump=\(jump)ms"
-            )
-            markSyncContextApplied(
-                reason: "active diagnostic applied small correction",
-                delayMs: targetMs
-            )
-            if allowPostApplyValidation {
-                schedulePostApplySettleValidation(
-                    appliedMs: targetMs,
-                    requiredUserDelayRevision: requiredUserDelayRevision
-                )
-            }
-            return true
-        }
-
-        let now = Date()
-        let context = autoCalibrationContextSignature()
-        if let pending = pendingAutoCalibrationApply,
-           pending.contextSignature == context,
-           now.timeIntervalSince(pending.timestamp) <= AppModel.autoApplyRepeatWindowS,
-           abs(pending.targetMs - targetMs) <= AppModel.autoApplyRepeatAgreementMs {
-            pendingAutoCalibrationApply = nil
-            airplayDelayCommitTask?.cancel()
-            let applied = await commitAirplayDelay(
-                targetMs,
-                shouldStillApply: requiresContinuousOptIn
-                    ? { [weak self] in
-                        self?.eventDrivenCalibrationCanStillApply(
-                            stage: "commit",
-                            requiredUserDelayRevision: requiredUserDelayRevision
-                        ) ?? false
-                    }
-                    : nil
-            )
-            guard applied else {
-                return false
-            }
-            SyncCastLog.log(
-                "autoCalib: applied repeated large correction \(targetMs)ms conf=\(String(format: "%.2f", confidence)) prior=\(pending.targetMs)ms jump=\(jump)ms"
-            )
-            markSyncContextApplied(
-                reason: "active diagnostic applied repeat-confirmed correction",
-                delayMs: targetMs
-            )
-            if allowPostApplyValidation {
-                schedulePostApplySettleValidation(
-                    appliedMs: targetMs,
-                    requiredUserDelayRevision: requiredUserDelayRevision
-                )
-            }
-            return true
-        }
-
-        pendingAutoCalibrationApply = PendingAutoCalibrationApply(
-            targetMs: targetMs, timestamp: now,
-            contextSignature: context
-        )
-        SyncCastLog.log(
-            "autoCalib: recommended \(targetMs)ms held for repeat confirmation; current=\(current)ms jump=\(jump)ms conf=\(String(format: "%.2f", confidence))"
-        )
-        return false
-    }
-
-    private func shouldAutoVerifyHeldCalibrationTarget(
-        _ targetMs: Int,
-        confidence: Double,
-        perDeviceUncertaintyMs: [String: Int]
-    ) -> Bool {
-        guard case .unlocked = delayLockState else { return false }
-        guard confidence >= AppModel.autoApplyConfidenceFloor else {
-            return false
-        }
-        guard autoCalibrationUncertaintyIsAcceptable(perDeviceUncertaintyMs) else {
-            return false
-        }
-        guard abs(targetMs - airplayDelayMs) >
-            AppModel.autoApplyMaxSingleJumpMs else {
-            return false
-        }
-        guard let pending = pendingAutoCalibrationApply else {
-            return false
-        }
-        guard pending.contextSignature == autoCalibrationContextSignature() else {
-            return false
-        }
-        return abs(pending.targetMs - targetMs) <=
-            AppModel.autoApplyRepeatAgreementMs
-    }
-
-    private func autoCalibrationMaxUncertainty(_ values: [String: Int]) -> Int? {
-        values.values.filter { $0 >= 0 }.max()
-    }
-
-    private func autoCalibrationUncertaintyIsAcceptable(_ values: [String: Int]) -> Bool {
-        guard let max = autoCalibrationMaxUncertainty(values) else {
-            return false
-        }
-        return max <= AppModel.autoApplyMaxUncertaintyMs
-    }
-
-    private func autoCalibrationContextSignature() -> String {
-        let enabled = devices.compactMap { dev -> String? in
-            guard let route = routing[dev.id], route.enabled else {
-                return nil
-            }
-            let volumeBucket = Int((route.volume * 100).rounded())
-            return [
-                dev.id,
-                dev.transport.rawValue,
-                dev.host ?? "",
-                "\(dev.port ?? 0)",
-                "v\(volumeBucket)",
-                route.muted ? "muted" : "unmuted",
-                "d\(route.manualDelayMs)",
-            ].joined(separator: ":")
-        }
-        .sorted()
-        .joined(separator: ";")
-        return [
-            "mode=\(mode.rawValue)",
-            "mic=\(effectiveMicID.map(String.init) ?? "default")",
-            "enabled=\(enabled)",
-        ].joined(separator: "|")
-    }
-
-    /// Install the calibration diagnostic socket. Used by
-    /// `scripts/calibration_test.sh` to drive a one-shot calibration
-    /// from the CLI without touching the menubar UI. Whole-home only;
-    /// the Router tears the socket down on stop / mode-leave.
-    ///
-    /// Path is `/tmp/syncast-<uid>.calibration.sock` to mirror the
-    /// existing sidecar control-socket convention.
-    private func installCalibrationDiagnosticSocket() async {
-        let path = AppModel.calibrationDiagnosticSocketURL
-        // Provider closure: hops to the MainActor to snapshot the live
-        // device list + selected mic. Returning nil tells the server
-        // to reply with an error (router not ready).
-        await router.startCalibrationDiagnosticServer(
-            socketPath: path,
-            provider: { [weak self] in
-                guard let self else { return nil }
-                let routerStates = await self.router.connectionStatesSnapshot()
-                let appliedDelayMs = await self.router
-                    .localFifoCurrentDelayMsForDiagnostics()
-                let airplayTimingEpoch = await self.router
-                    .airplayTimingEpochForDiagnostics()
-                return await MainActor.run { [weak self] () -> CalibrationDiagnosticServer.Snapshot? in
-                    guard let self else { return nil }
-                    guard self.mode == .wholeHome,
-                          self.streamingState == .running else { return nil }
-                    self.expirePassiveDryRunCandidateIfNeeded(
-                        source: "diagnostic snapshot"
-                    )
-                    let enabled = self.devices.filter {
-                        self.routing[$0.id]?.enabled == true
-                    }
-                    let enabledAirPlay = enabled.filter {
-                        $0.transport == .airplay2
-                    }
-                    let activeAirPlay = enabledAirPlay.filter {
-                        routerStates.states[$0.id] == .connected
-                    }
-                    let airplayConnectionStates = Dictionary(
-                        uniqueKeysWithValues: enabledAirPlay.map {
-                            (
-                                $0.id,
-                                (routerStates.states[$0.id] ?? .unknown).rawValue
-                            )
-                        }
-                    )
-                    guard enabled.contains(where: { $0.transport == .coreAudio }),
-                          !enabledAirPlay.isEmpty
-                    else {
-                        return nil
-                    }
-                    return CalibrationDiagnosticServer.Snapshot(
-                        devices: self.devices,
-                        microphoneDeviceID: self.effectiveMicID,
-                        currentDelayMs: appliedDelayMs ?? self.airplayDelayMs,
-                        contextSignature: self.autoCalibrationContextSignature(),
-                        delayLocked: {
-                            if case .locked = self.delayLockState { return true }
-                            return false
-                        }(),
-                        enabledAirplayCount: enabledAirPlay.count,
-                        activeAirplayCount: activeAirPlay.count,
-                        airplayTimingEpoch: airplayTimingEpoch,
-                        airplayConnectionStates: airplayConnectionStates,
-                        syncContextState: self.syncContextState.rawValue,
-                        syncContextReason: self.syncContextReason,
-                        syncContextRevision: self.syncContextRevision,
-                        syncContextUpdatedUnix: self.syncContextUpdatedAt
-                            .timeIntervalSince1970,
-                        passiveDryRunTargetDelayMs: self
-                            .pendingPassiveDryRunCandidate?.targetDelayMs,
-                        passiveDryRunCurrentDelayMs: self
-                            .pendingPassiveDryRunCandidate?.currentDelayMs,
-                        passiveDryRunContextSignature: self
-                            .pendingPassiveDryRunCandidate?.contextSignature,
-                        passiveDryRunCaptureBackend: self
-                            .pendingPassiveDryRunCandidate?.captureBackend,
-                        passiveDryRunEnabledAirplayCount: self
-                            .pendingPassiveDryRunCandidate?
-                            .enabledAirplayCount,
-                        passiveDryRunActiveAirplayCount: self
-                            .pendingPassiveDryRunCandidate?
-                            .activeAirplayCount,
-                        passiveDryRunAirplayTimingEpoch: self
-                            .pendingPassiveDryRunCandidate?
-                            .airplayTimingEpoch,
-                        passiveDryRunAcceptedFromSyncContextState: self
-                            .pendingPassiveDryRunCandidate?
-                            .acceptedFromSyncContextState,
-                        passiveDryRunAcceptedFromSyncContextRevision: self
-                            .pendingPassiveDryRunCandidate?
-                            .acceptedFromSyncContextRevision,
-                        passiveDryRunAcceptedSyncContextRevision: self
-                            .pendingPassiveDryRunCandidate?
-                            .acceptedSyncContextRevision,
-                        passiveDryRunSessionRoot: self
-                            .pendingPassiveDryRunCandidate?.sessionRoot,
-                        passiveDryRunControlReport: self
-                            .pendingPassiveDryRunCandidate?.controlReport,
-                        passiveDryRunAcceptedUnix: self
-                            .pendingPassiveDryRunCandidate?.acceptedUnix
-                    )
-                }
-            },
-            activeProbeMethodsEnabled: AppModel.activeAcousticCalibrationEnabled,
-            delayApplier: { [weak self] ms in
-                guard let self else {
-                    throw Router.CalibrationFailure.engineFailed("app gone")
-                }
-                return try await self.applyCalibrationDelayFromDiagnostic(ms)
-            },
-            passiveDelayApplier: { [weak self] candidate in
-                guard let self else {
-                    throw Router.CalibrationFailure.engineFailed("app gone")
-                }
-                return try await self.applyPassiveDelayCandidateFromDiagnostic(candidate)
-            },
-            syncContextMarker: { [weak self] reason, request in
-                guard let self else {
-                    throw Router.CalibrationFailure.engineFailed("app gone")
-                }
-                return try await self.markPassiveBaselineValidFromDiagnostic(
-                    reason: reason,
-                    request: request
-                )
-            }
-        )
-    }
-
-    private func applyCalibrationDelayFromDiagnostic(_ ms: Int) async throws -> Int {
-        guard case .unlocked = delayLockState else {
-            throw Router.CalibrationFailure.engineFailed("delay is locked")
-        }
-        let clamped = min(max(ms, AppModel.airplayDelayMsRange.lowerBound),
-                          AppModel.airplayDelayMsRange.upperBound)
-        airplayDelayCommitTask?.cancel()
-        let applied = try await router.setLocalFifoDelayMs(clamped)
-        airplayDelayMs = applied
-        UserDefaults.standard.set(applied, forKey: AppModel.airplayDelayMsKey)
-        pendingAutoCalibrationApply = nil
-        SyncCastLog.log("airplayDelay applied by diagnostic calibration: \(applied)ms")
-        markSyncContextApplied(
-            reason: "diagnostic passive/app RPC applied delay",
-            delayMs: applied
-        )
-        return applied
-    }
-
-    private func applyPassiveDelayCandidateFromDiagnostic(
-        _ candidate: PassiveApplyCandidate
-    ) async throws -> Int {
-        guard let candidateState = candidate.syncContextState,
-              candidateState == syncContextState.rawValue
-        else {
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context state changed before passive delay apply"
-            )
-        }
-        guard let candidateRevision = candidate.syncContextRevision,
-              candidateRevision == syncContextRevision
-        else {
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context revision changed before passive delay apply"
-            )
-        }
-        let currentDelay = await router.localFifoCurrentDelayMsForDiagnostics()
-            ?? airplayDelayMs
-        guard candidate.currentDelayMs == currentDelay else {
-            throw Router.CalibrationFailure.engineFailed(
-                "current delay changed before passive delay apply"
-            )
-        }
-        guard candidate.contextSignature == autoCalibrationContextSignature() else {
-            throw Router.CalibrationFailure.engineFailed(
-                "route context changed before passive delay apply"
-            )
-        }
-        let enabledAirPlay = devices.filter { device in
-            guard device.transport == .airplay2,
-                  let route = routing[device.id],
-                  route.enabled,
-                  !route.muted,
-                  route.volume > 0.01
-            else {
-                return false
-            }
-            let state = connectionStates[device.id] ?? .unknown
-            return state != .failed && state != .disconnected
-        }
-        guard candidate.enabledAirplayCount == enabledAirPlay.count else {
-            throw Router.CalibrationFailure.engineFailed(
-                "enabled AirPlay count changed before passive delay apply"
-            )
-        }
-        let routerStates = await router.connectionStatesSnapshot()
-        let activeAirPlayCount = enabledAirPlay.filter {
-            routerStates.states[$0.id] == .connected
-        }.count
-        guard activeAirPlayCount == enabledAirPlay.count else {
-            throw Router.CalibrationFailure.engineFailed(
-                "AirPlay outputs are not fully connected before passive delay apply"
-            )
-        }
-        let liveEpoch = await router.airplayTimingEpochForDiagnostics()
-        guard candidate.airplayTimingEpoch == liveEpoch else {
-            throw Router.CalibrationFailure.engineFailed(
-                "AirPlay timing epoch changed before passive delay apply"
-            )
-        }
-        if let candidateBackend = candidate.captureBackend?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() {
-            let liveBackend = await router.captureBackendNameForDiagnostics()
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            guard candidateBackend == liveBackend else {
-                throw Router.CalibrationFailure.engineFailed(
-                    "capture backend changed before passive delay apply"
-                )
-            }
-        }
-        guard candidateState == syncContextState.rawValue,
-              candidateRevision == syncContextRevision,
-              candidate.contextSignature == autoCalibrationContextSignature()
-        else {
-            throw Router.CalibrationFailure.engineFailed(
-                "sync context changed during passive delay apply freshness check"
-            )
-        }
-        return try await applyCalibrationDelayFromDiagnostic(candidate.targetDelayMs)
-    }
-
-    // MARK: - Passive no-probe autosync
-
-    private struct PassiveAutosyncRunSummary {
-        let verdict: String
-        let detail: String
-        let sessionRoot: String?
-        let controlReport: String?
-        let stage: String?
-        let nextAction: String?
-        let safetyIssue: Bool
-        let dryRunWouldApply: Bool
-        let targetDelayMs: Int?
-        let currentDelayMs: Int?
-        let contextSignature: String?
-        let captureBackend: String?
-        let enabledAirplayCount: Int?
-        let activeAirplayCount: Int?
-        let airplayTimingEpoch: UInt64?
-        let candidateSyncContextState: String?
-        let candidateSyncContextRevision: UInt64?
-    }
-
-    private static let passiveAutosyncSamples = 3
-    private static let passiveAutosyncSampleIntervalSec = 20
-    private static let passiveAutosyncDurationSec = 4
-    private static var passiveAutosyncMaxSteps: Int {
-        passiveAutosyncAllowsAcceptedDelayApply ? 7 : 4
-    }
-    private static let passiveAutosyncEventSettleS: TimeInterval = 15
-    private static let passiveAutosyncEventCooldownS: TimeInterval = 180
-    private static let passiveAutosyncCancelKillDelayS: TimeInterval = 5
-
-    func runPassiveAutosyncOnce() {
-        Task { await runManualPassiveAutosync() }
-    }
-
-    private func runManualPassiveAutosync() async {
-        guard !passiveAutosyncBusy else { return }
-        guard passiveAutosyncCorePreflightAllowsMicRequest() else { return }
-
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            runPassiveAutosync(reason: "manual Passive Check")
-        case .notDetermined:
-            let permissionRunID = UUID()
-            passiveAutosyncRunID = permissionRunID
-            passiveAutosyncState = .requestingPermission(startedAt: Date())
-            SyncCastLog.log(
-                "passiveAutosync: requesting microphone permission for manual Passive Check"
-            )
-            let granted = await requestMicrophonePermission()
-            guard passiveAutosyncRunID == permissionRunID else {
-                SyncCastLog.log(
-                    "passiveAutosync: microphone permission result ignored after cancel/stale run"
-                )
-                return
-            }
-            guard granted else {
-                passiveAutosyncRunID = nil
-                passiveAutosyncState = .failed(
-                    verdict: "mic_denied",
-                    detail: "microphone access was not granted"
-                )
-                SyncCastLog.log(
-                    "passiveAutosync: microphone permission not granted"
-                )
-                return
-            }
-            passiveAutosyncRunID = nil
-            pendingPassiveAutosyncReason = nil
-            passiveAutosyncState = .idle
-            runPassiveAutosync(reason: "manual Passive Check")
-        case .denied, .restricted:
-            passiveAutosyncState = .failed(
-                verdict: "mic_denied",
-                detail: "microphone access is not available"
-            )
-        @unknown default:
-            passiveAutosyncState = .failed(
-                verdict: "mic_denied",
-                detail: "unexpected microphone permission state"
-            )
-        }
-    }
-
-    private func passiveAutosyncCorePreflightAllowsMicRequest() -> Bool {
-        guard passiveAutosyncActiveProbeLaneAvailable() else {
-            passiveAutosyncState = .failed(
-                verdict: "active_diagnostics_running",
-                detail: "turn off active acoustic diagnostics before Passive Check"
-            )
-            return false
-        }
-        guard mode == .wholeHome else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "switch to AirPlay experimental mode first"
-            )
-            return false
-        }
-        guard streamingState == .running else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "start playback routing before passive sync check"
-            )
-            return false
-        }
-        guard hasEnabledLocalAndAirPlayOutputs else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "enable at least one local output and one AirPlay output"
-            )
-            return false
-        }
-        guard hasEnabledAirPlayOutputNotKnownDisconnected else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "AirPlay receiver is not available"
-            )
-            return false
-        }
-        guard case .unlocked = delayLockState else {
-            passiveAutosyncState = .failed(
-                verdict: "delay_locked",
-                detail: "unlock the manual delay before passive sync check"
-            )
-            return false
-        }
-        return true
-    }
-
-    private func runPassiveAutosync(reason: String) {
-        guard !passiveAutosyncBusy else { return }
-        guard passiveAutosyncActiveProbeLaneAvailable() else {
-            passiveAutosyncState = .failed(
-                verdict: "active_diagnostics_running",
-                detail: "turn off active acoustic diagnostics before Passive Check"
-            )
-            return
-        }
-        guard mode == .wholeHome else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "switch to AirPlay experimental mode first"
-            )
-            return
-        }
-        guard streamingState == .running else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "start playback routing before passive sync check"
-            )
-            return
-        }
-        guard hasEnabledLocalAndAirPlayOutputs else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "enable at least one local output and one AirPlay output"
-            )
-            return
-        }
-        guard hasEnabledAirPlayOutputNotKnownDisconnected else {
-            passiveAutosyncState = .failed(
-                verdict: "not_ready",
-                detail: "AirPlay receiver is not available"
-            )
-            return
-        }
-        guard case .unlocked = delayLockState else {
-            passiveAutosyncState = .failed(
-                verdict: "delay_locked",
-                detail: "unlock the manual delay before passive sync check"
-            )
-            return
-        }
-        guard hasMicrophonePermission else {
-            passiveAutosyncState = .failed(
-                verdict: "mic_denied",
-                detail: "microphone access is not available"
-            )
-            return
-        }
-        guard let toolRoot = AppModel.resolvePassiveToolRoot() else {
-            passiveAutosyncState = .failed(
-                verdict: "tools_missing",
-                detail: "passive tools were not found in the app bundle or ~/syncast"
-            )
-            return
-        }
-        guard let python = AppModel.resolvePassivePython() else {
-            passiveAutosyncState = .failed(
-                verdict: "python_missing",
-                detail: "python3 runtime was not found"
-            )
-            return
-        }
-
-        let stateRoot = AppModel.passiveAutosyncStateRoot()
-        let runsRoot = stateRoot.appendingPathComponent("runs", isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: runsRoot,
-            withIntermediateDirectories: true
-        )
-        let runID = UUID()
-        passiveAutosyncRunID = runID
-        let stamp = "\(Int(Date().timeIntervalSince1970))-\(getpid())-\(runID.uuidString.prefix(8))"
-        let output = runsRoot.appendingPathComponent("autosync-\(stamp).json")
-        let stdout = runsRoot.appendingPathComponent("autosync-\(stamp).stdout")
-        let stderr = runsRoot.appendingPathComponent("autosync-\(stamp).stderr")
-        let launchContext = PassiveAutosyncLaunchContext(
-            syncContextState: syncContextState,
-            syncContextRevision: syncContextRevision,
-            routeSignature: passiveAutosyncRouteSignature()
-        )
-
-        passiveAutosyncArtifactPath = output.path
-        passiveAutosyncSessionRoot = nil
-        passiveAutosyncState = .running(startedAt: Date(), output: output.path)
-        SyncCastLog.log(
-            "passiveAutosync: starting no-probe controller reason=\(reason) output=\(output.path) tools=\(toolRoot.path)"
-        )
-
-        passiveAutosyncTask = Task { [weak self] in
-            guard let self else { return }
-            await self.runPassiveAutosyncProcess(
-                python: python,
-                toolRoot: toolRoot,
-                stateRoot: stateRoot,
-                output: output,
-                stdout: stdout,
-                stderr: stderr,
-                runID: runID,
-                launchContext: launchContext
-            )
-        }
-    }
-
-    private func passiveAutosyncActiveProbeLaneAvailable() -> Bool {
-        guard AppModel.activeAcousticCalibrationEnabled else { return true }
-        switch calibrationStatus {
-        case .running, .requestingPermission:
-            return false
-        case .idle, .completed, .failed:
-            break
-        }
-        return !backgroundCalibrationActive
-            && !backgroundCalibrationEnabled
-            && postApplyValidationTask == nil
-    }
-
-    private func schedulePassiveAutosync(
-        reason: String,
-        settleDelayS: TimeInterval? = nil
-    ) {
-        guard mode == .wholeHome else { return }
-        guard streamingState == .running else {
-            SyncCastLog.log(
-                "passiveAutosync event skipped: engine not running reason=\(reason)"
-            )
-            return
-        }
-        guard hasEnabledLocalAndAirPlayOutputs else {
-            SyncCastLog.log(
-                "passiveAutosync event skipped: needs local+AirPlay reason=\(reason)"
-            )
-            return
-        }
-        guard hasEnabledAirPlayOutputNotKnownDisconnected else {
-            SyncCastLog.log(
-                "passiveAutosync event skipped: AirPlay receiver failed/disconnected reason=\(reason)"
-            )
-            return
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "passiveAutosync event skipped: delay locked reason=\(reason)"
-            )
-            return
-        }
-        guard syncContextState == .suspect else {
-            SyncCastLog.log(
-                "passiveAutosync event skipped: sync context \(syncContextState.rawValue) is not suspect reason=\(reason)"
-            )
-            return
-        }
-        guard hasMicrophonePermission else {
-            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-                pendingPassiveAutosyncReason = reason
-            }
-            SyncCastLog.log(
-                "passiveAutosync event skipped: microphone permission missing reason=\(reason)"
-            )
-            return
-        }
-        if passiveAutosyncBusy {
-            pendingPassiveAutosyncReason = reason
-            SyncCastLog.log(
-                "passiveAutosync event deferred: check already running reason=\(reason)"
-            )
-            return
-        }
-        let now = Date()
-        if let last = lastPassiveAutosyncFinishedAt,
-           now.timeIntervalSince(last) <
-                AppModel.passiveAutosyncEventCooldownS,
-           lastPassiveAutosyncFinishedRevision == syncContextRevision {
-            let remaining = max(
-                5,
-                AppModel.passiveAutosyncEventCooldownS
-                    - now.timeIntervalSince(last)
-            )
-            passiveAutosyncEventTask?.cancel()
-            SyncCastLog.log(
-                "passiveAutosync event deferred \(Int(remaining))s: cooldown active reason=\(reason)"
-            )
-            let expectedSyncContextState = syncContextState
-            let expectedSyncContextRevision = syncContextRevision
-            passiveAutosyncEventTask = Task { [weak self] in
-                do {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(remaining * 1_000_000_000)
-                    )
-                } catch {
-                    return
-                }
-                guard let self else { return }
-                await self.runScheduledPassiveAutosyncIfStillValid(
-                    reason: reason,
-                    expectedSyncContextState: expectedSyncContextState,
-                    expectedSyncContextRevision: expectedSyncContextRevision
-                )
-            }
-            return
-        } else if let last = lastPassiveAutosyncFinishedAt,
-                  now.timeIntervalSince(last) <
-                    AppModel.passiveAutosyncEventCooldownS,
-                  let lastRevision = lastPassiveAutosyncFinishedRevision {
-            SyncCastLog.log(
-                "passiveAutosync event bypassing cooldown: sync revision changed last=\(lastRevision) current=\(syncContextRevision) reason=\(reason)"
-            )
-        }
-
-        let settle = settleDelayS ?? AppModel.passiveAutosyncEventSettleS
-        passiveAutosyncEventTask?.cancel()
-        SyncCastLog.log(
-            "passiveAutosync event scheduled in \(Int(settle))s reason=\(reason)"
-        )
-        let expectedSyncContextState = syncContextState
-        let expectedSyncContextRevision = syncContextRevision
-        passiveAutosyncEventTask = Task { [weak self] in
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(settle * 1_000_000_000)
-                )
-            } catch {
-                return
-            }
-            guard let self else { return }
-            await self.runScheduledPassiveAutosyncIfStillValid(
-                reason: reason,
-                expectedSyncContextState: expectedSyncContextState,
-                expectedSyncContextRevision: expectedSyncContextRevision
-            )
-        }
-    }
-
-    private func runScheduledPassiveAutosyncIfStillValid(
-        reason: String,
-        expectedSyncContextState: SyncContextState,
-        expectedSyncContextRevision: UInt64
-    ) async {
-        if Task.isCancelled { return }
-        passiveAutosyncEventTask = nil
-        guard syncContextState == expectedSyncContextState,
-              syncContextRevision == expectedSyncContextRevision
-        else {
-            SyncCastLog.log(
-                "passiveAutosync event aborted: stale sync context expected=\(expectedSyncContextState.rawValue)#\(expectedSyncContextRevision) actual=\(syncContextState.rawValue)#\(syncContextRevision) reason=\(reason)"
-            )
-            return
-        }
-        guard mode == .wholeHome,
-              streamingState == .running,
-              hasEnabledLocalAndAirPlayOutputs,
-              hasEnabledAirPlayOutputNotKnownDisconnected,
-              hasMicrophonePermission
-        else {
-            SyncCastLog.log(
-                "passiveAutosync event aborted: preconditions changed reason=\(reason)"
-            )
-            return
-        }
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "passiveAutosync event aborted: delay locked reason=\(reason)"
-            )
-            return
-        }
-        guard !passiveAutosyncBusy else {
-            pendingPassiveAutosyncReason = reason
-            SyncCastLog.log(
-                "passiveAutosync event deferred: check already running reason=\(reason)"
-            )
-            return
-        }
-        runPassiveAutosync(reason: "auto: \(reason)")
-    }
-
-    func cancelPassiveAutosync() {
-        passiveAutosyncEventTask?.cancel()
-        passiveAutosyncEventTask = nil
-        pendingPassiveAutosyncReason = nil
-        if let process = passiveAutosyncProcess {
-            passiveAutosyncState = .canceling(
-                startedAt: Date(),
-                output: passiveAutosyncArtifactPath
-            )
-            let runID = passiveAutosyncRunID
-            let pid = process.processIdentifier
-            process.terminate()
-            SyncCastLog.log("passiveAutosync: cancel requested")
-            Task { [weak self, weak process] in
-                do {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(
-                            AppModel.passiveAutosyncCancelKillDelayS
-                                * 1_000_000_000
-                        )
-                    )
-                } catch {
-                    return
-                }
-                guard let self,
-                      let process,
-                      self.passiveAutosyncRunID == runID,
-                      self.passiveAutosyncProcess === process,
-                      process.isRunning
-                else { return }
-                SyncCastLog.log(
-                    "passiveAutosync: force killing canceled controller pid=\(pid)"
-                )
-                _ = Darwin.kill(pid, SIGKILL)
-            }
-            return
-        }
-        passiveAutosyncTask?.cancel()
-        passiveAutosyncTask = nil
-        passiveAutosyncRunID = nil
-        passiveAutosyncState = .failed(
-            verdict: "canceled",
-            detail: "passive check canceled"
-        )
-        SyncCastLog.log("passiveAutosync: canceled before process launch")
-    }
-
-    private func runPassiveAutosyncProcess(
-        python: URL,
-        toolRoot: URL,
-        stateRoot: URL,
-        output: URL,
-        stdout: URL,
-        stderr: URL,
-        runID: UUID,
-        launchContext: PassiveAutosyncLaunchContext
-    ) async {
-        let process = Process()
-        process.executableURL = python
-        process.currentDirectoryURL = toolRoot
-        var arguments = [
-            "scripts/passive_autosync_controller.py",
-            "--state-root", stateRoot.path,
-            "--socket", AppModel.calibrationDiagnosticSocketURL.path,
-            "--process-pid", "\(ProcessInfo.processInfo.processIdentifier)",
-            "--samples", "\(AppModel.passiveAutosyncSamples)",
-            "--sample-interval-sec", "\(AppModel.passiveAutosyncSampleIntervalSec)",
-            "--duration-sec", "\(AppModel.passiveAutosyncDurationSec)",
-            "--output", output.path,
-            "--execute",
-            "--max-steps", "\(AppModel.passiveAutosyncMaxSteps)",
-        ]
-        if AppModel.passiveAutosyncAllowsAcceptedDelayApply {
-            arguments.append("--allow-accepted-delay-apply")
-        }
-        process.arguments = arguments
-        var environment = ProcessInfo.processInfo.environment
-        for key in Array(environment.keys) where key.hasPrefix("SYNCAST_PASSIVE_") {
-            environment.removeValue(forKey: key)
-        }
-        environment["PYTHONPATH"] = "scripts"
-        environment["PATH"] =
-            "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
-        environment["SYNCAST_PASSIVE_SOCKET"] =
-            AppModel.calibrationDiagnosticSocketURL.path
-        environment["SYNCAST_PASSIVE_PROCESS_PID"] =
-            "\(ProcessInfo.processInfo.processIdentifier)"
-        environment["SYNCAST_PASSIVE_WORKFLOW_GUARD"] = "enforce"
-        environment.removeValue(forKey: "SYNCAST_ENABLE_ACTIVE_CALIBRATION")
-        environment.removeValue(forKey: "SYNCAST_ALLOW_AUDIBLE_PROBES")
-        environment.removeValue(forKey: "SYNCAST_CONFIRM_AUDIBLE_PROBE_TEST")
-        environment.removeValue(forKey: "SYNCAST_ACTIVE_PROBE_LAB_SESSION")
-        environment.removeValue(forKey: "SYNCAST_ACTIVE_PROBE_LAB_SESSION_FILE")
-        process.environment = environment
-
-        FileManager.default.createFile(atPath: stdout.path, contents: nil)
-        FileManager.default.createFile(atPath: stderr.path, contents: nil)
-        let stdoutHandle = try? FileHandle(forWritingTo: stdout)
-        let stderrHandle = try? FileHandle(forWritingTo: stderr)
-        process.standardOutput = stdoutHandle
-        process.standardError = stderrHandle
-
-        guard !Task.isCancelled, passiveAutosyncRunID == runID else {
-            stdoutHandle?.closeFile()
-            stderrHandle?.closeFile()
-            return
-        }
-        passiveAutosyncProcess = process
-
-        do {
-            try process.run()
-        } catch {
-            stdoutHandle?.closeFile()
-            stderrHandle?.closeFile()
-            guard passiveAutosyncRunID == runID else { return }
-            passiveAutosyncProcess = nil
-            passiveAutosyncTask = nil
-            passiveAutosyncRunID = nil
-            passiveAutosyncState = .failed(
-                verdict: "launch_failed",
-                detail: "\(error)"
-            )
-            SyncCastLog.log("passiveAutosync: launch failed \(error)")
-            return
-        }
-
-        let exitCode = await Task.detached(priority: .utility) {
-            process.waitUntilExit()
-            return process.terminationStatus
-        }.value
-        stdoutHandle?.closeFile()
-        stderrHandle?.closeFile()
-        guard passiveAutosyncRunID == runID else { return }
-        let wasCanceling: Bool
-        if case .canceling = passiveAutosyncState {
-            wasCanceling = true
-        } else {
-            wasCanceling = false
-        }
-        passiveAutosyncProcess = nil
-        passiveAutosyncTask = nil
-        passiveAutosyncRunID = nil
-        lastPassiveAutosyncFinishedAt = Date()
-        lastPassiveAutosyncFinishedRevision = launchContext.syncContextRevision
-
-        if wasCanceling {
-            passiveAutosyncState = .failed(
-                verdict: "canceled",
-                detail: "passive check canceled"
-            )
-            SyncCastLog.log(
-                "passiveAutosync: canceled exit=\(exitCode) artifact=\(output.path)"
-            )
-            return
-        }
-
-        if Task.isCancelled { return }
-        guard passiveAutosyncLaunchContextStillCurrent(launchContext) else {
-            passiveAutosyncState = .failed(
-                verdict: "stale_context",
-                detail: "route, delay, or sync context changed during passive check"
-            )
-            SyncCastLog.log(
-                "passiveAutosync: stale context after run expected=\(launchContext.syncContextState.rawValue)#\(launchContext.syncContextRevision) actual=\(syncContextState.rawValue)#\(syncContextRevision) artifact=\(output.path)"
-            )
-            drainPendingPassiveAutosync(reason: "stale context after passive check")
-            return
-        }
-        let summary = AppModel.readPassiveAutosyncSummary(
-            output: output,
-            exitCode: exitCode
-        )
-        passiveAutosyncSessionRoot = summary.sessionRoot
-        if let controlReport = summary.controlReport {
-            passiveAutosyncArtifactPath = controlReport
-        } else {
-            passiveAutosyncArtifactPath = output.path
-        }
-        if exitCode == 0 {
-            passiveAutosyncState = .completed(
-                verdict: summary.verdict,
-                detail: summary.detail
-            )
-            await markPassiveDryRunReadyIfCurrent(summary)
-        } else {
-            passiveAutosyncState = .failed(
-                verdict: summary.verdict,
-                detail: summary.detail
-            )
-        }
-        SyncCastLog.log(
-            "passiveAutosync: finished exit=\(exitCode) verdict=\(summary.verdict) stage=\(summary.stage ?? "") next=\(summary.nextAction ?? "") detail=\(summary.detail) artifact=\(passiveAutosyncArtifactPath ?? output.path)"
-        )
-        if let pending = pendingPassiveAutosyncReason {
-            drainPendingPassiveAutosync(
-                reason: "passive check finished",
-                pendingReason: pending
-            )
-        }
-    }
-
-    private func drainPendingPassiveAutosync(
-        reason: String,
-        pendingReason: String? = nil
-    ) {
-        guard let pending = pendingReason ?? pendingPassiveAutosyncReason else { return }
-        pendingPassiveAutosyncReason = nil
-        schedulePassiveAutosync(
-            reason: "pending after \(reason): \(pending)",
-            settleDelayS: 5
-        )
-    }
-
-    private func stopPassiveAutosyncForRouteChange(reason: String) {
-        passiveAutosyncEventTask?.cancel()
-        passiveAutosyncEventTask = nil
-        pendingPassiveAutosyncReason = nil
-        guard let process = passiveAutosyncProcess else {
-            if passiveAutosyncTask != nil {
-                passiveAutosyncTask?.cancel()
-                passiveAutosyncTask = nil
-                passiveAutosyncRunID = nil
-                passiveAutosyncState = .failed(
-                    verdict: "canceled",
-                    detail: "passive check canceled: \(reason)"
-                )
-                SyncCastLog.log(
-                    "passiveAutosync: canceled before controller launch after route change reason=\(reason)"
-                )
-                return
-            }
-            if case .requestingPermission = passiveAutosyncState {
-                passiveAutosyncRunID = nil
-                passiveAutosyncState = .failed(
-                    verdict: "canceled",
-                    detail: "passive check canceled: \(reason)"
-                )
-            }
-            return
-        }
-        let pid = process.processIdentifier
-        process.terminate()
-        passiveAutosyncTask?.cancel()
-        passiveAutosyncTask = nil
-        passiveAutosyncProcess = nil
-        passiveAutosyncRunID = nil
-        passiveAutosyncState = .failed(
-            verdict: "canceled",
-            detail: "passive check canceled: \(reason)"
-        )
-        SyncCastLog.log(
-            "passiveAutosync: terminating controller after route change pid=\(pid) reason=\(reason)"
-        )
-        Task { [weak process] in
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(
-                        AppModel.passiveAutosyncCancelKillDelayS
-                            * 1_000_000_000
-                    )
-                )
-            } catch {
-                return
-            }
-            guard let process, process.isRunning else { return }
-            SyncCastLog.log(
-                "passiveAutosync: force killing route-change controller pid=\(pid)"
-            )
-            _ = Darwin.kill(pid, SIGKILL)
-        }
-    }
-
-    private static func readPassiveAutosyncSummary(
-        output: URL,
-        exitCode: Int32
-    ) -> PassiveAutosyncRunSummary {
-        guard let data = try? Data(contentsOf: output),
-              let raw = try? JSONSerialization.jsonObject(with: data),
-              let payload = raw as? [String: Any]
-        else {
-            return PassiveAutosyncRunSummary(
-                verdict: "exit_\(exitCode)",
-                detail: "controller did not write a readable JSON report",
-                sessionRoot: nil,
-                controlReport: nil,
-                stage: "controller_report",
-                nextAction: "inspect stdout/stderr and rerun Passive Check",
-                safetyIssue: true,
-                dryRunWouldApply: false,
-                targetDelayMs: nil,
-                currentDelayMs: nil,
-                contextSignature: nil,
-                captureBackend: nil,
-                enabledAirplayCount: nil,
-                activeAirplayCount: nil,
-                airplayTimingEpoch: nil,
-                candidateSyncContextState: nil,
-                candidateSyncContextRevision: nil
-            )
-        }
-        let execution = payload["execution"] as? [String: Any]
-        let chainSummary = payload["chainSummary"] as? [String: Any]
-        let sessionRoot =
-            stringField(execution, "sessionRoot")
-            ?? stringField(payload, "sessionRoot")
-        let controlReport =
-            stringField(execution, "controlReport")
-            ?? sessionRoot.map { URL(fileURLWithPath: $0)
-                .appendingPathComponent("control_report.json").path
-            }
-        let controlPayload: [String: Any]?
-        if let controlReport {
-            controlPayload = jsonDictionary(at: URL(fileURLWithPath: controlReport))
-        } else {
-            controlPayload = nil
-        }
-        let passiveApplyResult =
-            dictionaryField(execution, "passiveApplyResult")
-            ?? dictionaryField(controlPayload, "passiveApplyResult")
-        let passiveAcceptedApplyResult =
-            dictionaryField(execution, "passiveAcceptedApplyResult")
-        let passiveRollbackResult =
-            dictionaryField(execution, "passiveRollbackResult")
-        let passiveAcceptedApplyVerdict =
-            stringField(execution, "passiveAcceptedApplyVerdict")
-        let passiveRollbackVerdict =
-            stringField(execution, "passiveRollbackVerdict")
-        let verdict =
-            stringField(execution, "verdict")
-            ?? stringField(chainSummary, "finalVerdict")
-            ?? stringField(controlPayload, "verdict")
-            ?? stringField(payload, "verdict")
-            ?? "exit_\(exitCode)"
-        let reason =
-            stringField(execution, "reason")
-            ?? stringField(controlPayload, "reason")
-            ?? stringField(payload, "reason")
-            ?? ""
-        let nextAction =
-            stringField(execution, "nextAction")
-            ?? stringField(chainSummary, "finalNextAction")
-            ?? stringField(controlPayload, "nextAction")
-            ?? stringField(payload, "nextAction")
-        let stage =
-            stringField(execution, "blockingStage")
-            ?? stringField(controlPayload, "blockingStage")
-            ?? stringField(execution, "phase")
-            ?? stringField(controlPayload, "phase")
-            ?? stringField(controlPayload, "readinessStage")
-            ?? stringField(payload, "readinessStage")
-        let workflow =
-            stringField(execution, "readinessRecommendedWorkflow")
-            ?? stringField(controlPayload, "readinessRecommendedWorkflow")
-            ?? stringField(payload, "recommendedWorkflow")
-        let emittedAudio =
-            boolField(execution, "emitsAudio")
-            || boolField(controlPayload, "emitsAudio")
-            || boolField(chainSummary, "emitsAudio")
-        let appliedDelay =
-            boolField(execution, "appliesDelay")
-            || boolField(controlPayload, "appliesDelay")
-            || boolField(chainSummary, "appliesDelay")
-            || boolField(passiveApplyResult, "applied")
-            || boolField(passiveAcceptedApplyResult, "applied")
-            || boolField(passiveRollbackResult, "applied")
-        let acceptedApplySummary = passiveAcceptedApplyVerdict.map { verdict in
-            "acceptedApply=\(verdict)"
-        }
-        let rollbackSummary = passiveRollbackVerdict.map { verdict in
-            var value = "rollback=\(verdict)"
-            if let previous = intField(passiveRollbackResult, "previousDelayMs"),
-               let applied = intField(passiveRollbackResult, "appliedDelayMs") {
-                value += " \(previous)->\(applied)ms"
-            }
-            return value
-        }
-        let safetyIssue =
-            boolField(execution, "safetyIssue")
-            || boolField(controlPayload, "safetyIssue")
-            || emittedAudio
-            || (appliedDelay && !AppModel.passiveAutosyncAllowsAcceptedDelayApply)
-        let safety = [
-            "mic=\(boolField(execution, "opensMicrophone") || boolField(controlPayload, "opensMicrophone") || boolField(chainSummary, "opensMicrophone"))",
-            "audio=\(emittedAudio)",
-            "delay=\(appliedDelay)",
-        ].joined(separator: "/")
-        let essentialDetailParts = [
-            safetyIssue ? "SAFETY issue reported" : nil,
-            stage.map { "stage=\($0)" },
-            workflow.map { "workflow=\($0)" },
-            acceptedApplySummary,
-            rollbackSummary,
-        ]
-            .compactMap { value -> String? in
-                guard let value,
-                      !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                else { return nil }
-                return value
-            }
-        let secondaryDetailParts = [
-            reason,
-            nextAction.map { "next=\($0)" },
-        ]
-            .compactMap { value -> String? in
-                guard let value,
-                      !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                else { return nil }
-                return value
-            }
-        let detailParts = essentialDetailParts + secondaryDetailParts + [safety]
-        let detail: String
-        if detailParts.count > 6 {
-            let secondaryBudget = max(0, 5 - essentialDetailParts.count)
-            detail = (
-                essentialDetailParts
-                + Array(secondaryDetailParts.prefix(secondaryBudget))
-                + [safety]
-            ).joined(separator: " | ")
-        } else {
-            detail = detailParts.joined(separator: " | ")
-        }
-        return PassiveAutosyncRunSummary(
-            verdict: verdict,
-            detail: detail,
-            sessionRoot: sessionRoot,
-            controlReport: controlReport,
-            stage: stage,
-            nextAction: nextAction,
-            safetyIssue: safetyIssue,
-            dryRunWouldApply: boolField(passiveApplyResult, "wouldApply"),
-            targetDelayMs: intField(passiveApplyResult, "targetDelayMs"),
-            currentDelayMs: intField(passiveApplyResult, "currentDelayMs"),
-            contextSignature: stringField(passiveApplyResult, "contextSignature"),
-            captureBackend: stringField(passiveApplyResult, "captureBackend"),
-            enabledAirplayCount: intField(passiveApplyResult, "enabledAirplayCount"),
-            activeAirplayCount: intField(passiveApplyResult, "activeAirplayCount"),
-            airplayTimingEpoch: uint64Field(passiveApplyResult, "airplayTimingEpoch"),
-            candidateSyncContextState: stringField(passiveApplyResult, "syncContextState"),
-            candidateSyncContextRevision: uint64Field(passiveApplyResult, "syncContextRevision")
-        )
-    }
-
-    private func markPassiveDryRunReadyIfCurrent(
-        _ summary: PassiveAutosyncRunSummary
-    ) async {
-        guard summary.verdict == "dry_run_ready" else { return }
-        guard !summary.safetyIssue, summary.dryRunWouldApply else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready not promoted safety=\(summary.safetyIssue) wouldApply=\(summary.dryRunWouldApply)"
-            )
-            return
-        }
-        guard mode == .wholeHome else { return }
-        guard case .unlocked = delayLockState else { return }
-        guard let targetDelayMs = summary.targetDelayMs,
-              let currentDelayMs = summary.currentDelayMs,
-              let contextSignature = summary.contextSignature,
-              let captureBackend = summary.captureBackend,
-              let enabledAirplayCount = summary.enabledAirplayCount,
-              let activeAirplayCount = summary.activeAirplayCount,
-              let airplayTimingEpoch = summary.airplayTimingEpoch
-        else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored; missing accepted-candidate context"
-            )
-            return
-        }
-        guard syncContextState != .locked,
-              syncContextState != .measuring,
-              syncContextState != .dryRunReady
-        else { return }
-        if let candidateState = summary.candidateSyncContextState,
-           candidateState != syncContextState.rawValue {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after sync state changed candidate=\(candidateState) current=\(syncContextState.rawValue)"
-            )
-            return
-        }
-        if let candidateRevision = summary.candidateSyncContextRevision,
-           candidateRevision != syncContextRevision {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after sync revision changed candidate=\(candidateRevision) current=\(syncContextRevision)"
-            )
-            return
-        }
-        let liveDelay = await router.localFifoCurrentDelayMsForDiagnostics()
-            ?? airplayDelayMs
-        guard currentDelayMs == liveDelay else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after delay changed candidate=\(currentDelayMs)ms current=\(liveDelay)ms"
-            )
-            return
-        }
-        guard contextSignature == autoCalibrationContextSignature() else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after context changed"
-            )
-            return
-        }
-        guard enabledAirplayCount == enabledAirPlayOutputNotKnownDisconnectedCount
-        else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after AirPlay count changed candidate=\(enabledAirplayCount) current=\(enabledAirPlayOutputNotKnownDisconnectedCount)"
-            )
-            return
-        }
-        guard activeAirplayCount == activeAirPlayOutputCount,
-              activeAirplayCount == enabledAirplayCount
-        else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after active AirPlay count changed candidate=\(activeAirplayCount)/\(enabledAirplayCount) current=\(activeAirPlayOutputCount)/\(enabledAirPlayOutputNotKnownDisconnectedCount)"
-            )
-            return
-        }
-        let liveEpoch = await router.airplayTimingEpochForDiagnostics()
-        guard airplayTimingEpoch == liveEpoch else {
-            SyncCastLog.log(
-                "passiveAutosync: dry-run ready ignored after AirPlay epoch changed candidate=\(airplayTimingEpoch) current=\(liveEpoch)"
-            )
-            return
-        }
-        let fromState = syncContextState.rawValue
-        let fromRevision = syncContextRevision
-        let acceptedUnix = Date().timeIntervalSince1970
-        setSyncContext(
-            .dryRunReady,
-            reason: "passive dry-run accepted candidate \(currentDelayMs)ms -> \(targetDelayMs)ms",
-            delayMs: currentDelayMs
-        )
-        pendingPassiveDryRunCandidate = PendingPassiveDryRunCandidate(
-            targetDelayMs: targetDelayMs,
-            currentDelayMs: currentDelayMs,
-            contextSignature: contextSignature,
-            captureBackend: captureBackend,
-            enabledAirplayCount: enabledAirplayCount,
-            activeAirplayCount: activeAirplayCount,
-            airplayTimingEpoch: airplayTimingEpoch,
-            acceptedFromSyncContextState: fromState,
-            acceptedFromSyncContextRevision: fromRevision,
-            acceptedSyncContextRevision: syncContextRevision,
-            sessionRoot: summary.sessionRoot,
-            controlReport: summary.controlReport,
-            acceptedUnix: acceptedUnix
-        )
-        schedulePassiveDryRunCandidateExpiryCheck(
-            acceptedUnix: acceptedUnix,
-            syncContextRevision: syncContextRevision
-        )
-    }
-
-    private static func jsonDictionary(at url: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: url),
-              let raw = try? JSONSerialization.jsonObject(with: data)
-        else { return nil }
-        return raw as? [String: Any]
-    }
-
-    private static func stringField(
-        _ payload: [String: Any]?,
-        _ key: String
-    ) -> String? {
-        guard let value = payload?[key] else { return nil }
-        if let string = value as? String { return string }
-        if value is NSNull { return nil }
-        return "\(value)"
-    }
-
-    private static func dictionaryField(
-        _ payload: [String: Any]?,
-        _ key: String
-    ) -> [String: Any]? {
-        payload?[key] as? [String: Any]
-    }
-
-    private static func intField(
-        _ payload: [String: Any]?,
-        _ key: String
-    ) -> Int? {
-        guard let value = payload?[key] else { return nil }
-        if let int = value as? Int { return int }
-        if let number = value as? NSNumber { return number.intValue }
-        if let string = value as? String {
-            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return nil
-    }
-
-    private static func uint64Field(
-        _ payload: [String: Any]?,
-        _ key: String
-    ) -> UInt64? {
-        guard let value = payload?[key] else { return nil }
-        if let uint = value as? UInt64 { return uint }
-        if let int = value as? Int, int >= 0 { return UInt64(int) }
-        if let number = value as? NSNumber { return number.uint64Value }
-        if let string = value as? String {
-            return UInt64(string.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return nil
-    }
-
-    private static func boolField(
-        _ payload: [String: Any]?,
-        _ key: String
-    ) -> Bool {
-        guard let value = payload?[key] else { return false }
-        if let bool = value as? Bool { return bool }
-        if let number = value as? NSNumber { return number.boolValue }
-        if let string = value as? String {
-            return ["1", "true", "yes"].contains(string.lowercased())
-        }
-        return false
-    }
-
-    private static func passiveAutosyncStateRoot() -> URL {
-        let support = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.homeDirectoryForCurrentUser
-        return support
-            .appendingPathComponent("SyncCast", isDirectory: true)
-            .appendingPathComponent("PassiveAutosync", isDirectory: true)
-    }
-
-    private static func resolvePassiveToolRoot() -> URL? {
-        let fm = FileManager.default
-        let env = ProcessInfo.processInfo.environment["SYNCAST_PASSIVE_TOOL_ROOT"]
-        let candidates: [URL?] = [
-            env.map(URL.init(fileURLWithPath:)),
-            Bundle.main.resourceURL?.appendingPathComponent(
-                "passive-tools",
-                isDirectory: true
-            ),
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("syncast", isDirectory: true),
-        ]
-        return candidates.compactMap { $0 }.first { root in
-            fm.fileExists(
-                atPath: root
-                    .appendingPathComponent("scripts/passive_autosync_controller.py")
-                    .path
-            )
-        }
-    }
-
-    private static func resolvePassivePython() -> URL? {
-        let fm = FileManager.default
-        let env = ProcessInfo.processInfo.environment["SYNCAST_PASSIVE_PYTHON"]
-        let candidates = [
-            env,
-            "/usr/bin/python3",
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-        ]
-        return candidates.compactMap { $0 }.map(URL.init(fileURLWithPath:))
-            .first { fm.isExecutableFile(atPath: $0.path) }
-    }
-
-    /// Where the diagnostic socket lives. UID-scoped to match
-    /// `SidecarLauncher`'s convention so multiple users on the same
-    /// machine don't collide.
-    static var calibrationDiagnosticSocketURL: URL {
-        URL(fileURLWithPath: "/tmp/syncast-\(getuid()).calibration.sock")
-    }
-
-    // MARK: - Background continuous calibration lifecycle
-
-    /// Drive the calibrator engine on or off. Idempotent. Wired into
-    /// mode/streamingState/permission/toggle observers. ACTIVE iff:
-    /// wholeHome AND running AND enabled AND mic-OK AND an eligible
-    /// Local+connected-AirPlay route is live. The Router runs
-    /// the v4 ContinuousActiveCalibrator loop which periodically
-    /// drives ActiveCalibrator and pushes corrected delay values
-    /// through setLocalFifoDelayMs internally; this AppModel layer
-    /// just records samples for the UI caption.
-    func reconcileBackgroundCalibration() {
-        guard AppModel.activeAcousticCalibrationEnabled else {
-            if backgroundCalibrationEnabled {
-                backgroundCalibrationEnabled = false
-                UserDefaults.standard.set(false, forKey: AppModel.bgEnabledKey)
-            }
-            if backgroundCalibrationActive {
-                SyncCastLog.log("bgCalib: stopping active-probe loop; diagnostics disabled")
-                stopBackgroundCalibration(thenReconcile: false)
-            }
-            return
-        }
-        // Pause for manual one-shot: stop engine, hold here.
-        if continuousPausedForManual {
-            if backgroundCalibrationActive { stopBackgroundCalibration(thenReconcile: false) }
-            return
-        }
-        let delayUnlocked: Bool = {
-            if case .unlocked = delayLockState { return true }
-            return false
-        }()
-        let shouldRun = mode == .wholeHome && streamingState == .running
-            && backgroundCalibrationEnabled && hasMicrophonePermission
-            && delayUnlocked
-            && hasEnabledLocalAndAirPlayOutputs
-            && hasEnabledConnectedAirPlayOutput
-
-        // Surface mic-denied separately so the UI can show Settings hint.
-        let permDenied: Bool = backgroundCalibrationEnabled && {
-            let a = AVCaptureDevice.authorizationStatus(for: .audio)
-            return a == .denied || a == .restricted
-        }()
-        if permDenied != backgroundCalibrationMicDenied {
-            backgroundCalibrationMicDenied = permDenied
-        }
-
-        switch (backgroundCalibrationActive, shouldRun) {
-        case (false, true):
-            backgroundCalibrationActive = true
-            let interval = backgroundCalibrationIntervalS
-            let micID = effectiveMicID
-            let initialDelay = airplayDelayMs
-            SyncCastLog.log("bgCalib: starting (v4 active) interval=\(interval)s mic=\(micID.map(String.init) ?? "default") initialDelay=\(initialDelay)ms")
-            Task { [weak self] in
-                guard let self else { return }
-                // Provider closure: captured weakly so a torn-down
-                // AppModel doesn't hold the loop alive. Returns the
-                // empty list on shutdown — the runner will fail with
-                // noEnabledDevices and the next cycle will retry.
-                let deviceProvider: @Sendable () async -> [Device] = {
-                    [weak self] in
-                    guard let self else { return [] }
-                    return await MainActor.run { self.devices }
-                }
-                do {
-                    try await self.router.startContinuousActiveCalibration(
-                        intervalSeconds: interval,
-                        microphoneDeviceID: micID,
-                        initialDelayMs: initialDelay,
-                        deviceProvider: deviceProvider,
-                        onSample: { sample in
-                            Task { @MainActor [weak self] in
-                                self?.handleBackgroundCalibrationSample(sample)
-                            }
-                        }
-                    )
-                } catch {
-                    SyncCastLog.log("bgCalib: start failed: \(error)")
-                    await MainActor.run {
-                        self.backgroundCalibrationActive = false
-                    }
-                }
-            }
-        case (true, false):
-            SyncCastLog.log("bgCalib: stopping (preconditions no longer hold)")
-            stopBackgroundCalibration(thenReconcile: false)
-        default:
-            break
-        }
-    }
-
-    /// Stop the engine. Optionally re-reconcile after — used when an
-    /// interval change requires a stop+start cycle.
-    private func stopBackgroundCalibration(thenReconcile: Bool) {
-        Task { [weak self] in
-            guard let self else { return }
-            await self.router.stopContinuousActiveCalibration()
-            await MainActor.run {
-                self.backgroundCalibrationActive = false
-                self.lastCalibrationSample = nil
-                // Drop history too; if we keep it, the trend timeline
-                // mixes stale-pre-restart values with fresh post-restart
-                // ones and the user reads phantom drift.
-                self.calibrationSampleHistory = []
-                if thenReconcile { self.reconcileBackgroundCalibration() }
-            }
-        }
-    }
-
-    private func restartBackgroundCalibrationIfActive() {
-        guard backgroundCalibrationActive else { return }
-        stopBackgroundCalibration(thenReconcile: true)
-    }
-
-    /// Receive a Sample from the continuous loop. Router has already
-    /// pushed any delay-line correction through setLocalFifoDelayMs
-    /// (when |delta| ≥ 30 ms AND confidence ≥ floor); we just mirror
-    /// the applied value into airplayDelayMs so the slider reflects
-    /// reality and surface the sample for the UI caption.
-    private func handleBackgroundCalibrationSample(_ sample: ContinuousActiveCalibrator.Sample) {
-        lastCalibrationSample = sample
-        guard case .unlocked = delayLockState else {
-            SyncCastLog.log(
-                "bgCalib sample ignored while delay locked: measured=\(sample.measuredDeltaMs)ms applied=\(sample.appliedDelayMs)ms"
-            )
-            return
-        }
-        // Ring-buffer semantics: append, then drop the oldest when over
-        // capacity. We replace the array (vs in-place mutation) so the
-        // @Observable invalidation fires on every cycle, redrawing the
-        // trend timeline + drift indicators in MainPopover.
-        var next = calibrationSampleHistory
-        next.append(sample)
-        if next.count > AppModel.calibrationHistoryCapacity {
-            next.removeFirst(next.count - AppModel.calibrationHistoryCapacity)
-        }
-        calibrationSampleHistory = next
-        SyncCastLog.log("bgCalib sample: drift=\(sample.measuredDeltaMs)ms applied=\(sample.appliedDelayMs)ms conf=\(String(format: "%.2f", sample.confidence))")
-        let previousDelayMs = airplayDelayMs
-        // Mirror the loop-applied value so the slider stays in sync.
-        // We bypass `setAirplayDelay`'s debounced sidecar push — the
-        // loop already pushed via setLocalFifoDelayMs — and just
-        // update the UI-facing field + persist.
-        if previousDelayMs != sample.appliedDelayMs {
-            airplayDelayMs = sample.appliedDelayMs
-            UserDefaults.standard.set(
-                sample.appliedDelayMs, forKey: AppModel.airplayDelayMsKey
-            )
-            markSyncContextApplied(
-                reason: "continuous active calibration applied delay",
-                delayMs: sample.appliedDelayMs
-            )
-        }
-    }
-
-    /// Permission flow when the user toggles Continuous on. Mirrors
-    /// `runAutoCalibrate` — prompt if undetermined, surface denied banner.
-    func ensureMicPermissionForBackgroundCalibration() async {
-        guard AppModel.activeAcousticCalibrationEnabled else {
-            backgroundCalibrationEnabled = false
-            UserDefaults.standard.set(false, forKey: AppModel.bgEnabledKey)
-            backgroundCalibrationMicDenied = false
-            SyncCastLog.log("bgCalib: microphone request skipped; active diagnostics disabled")
-            return
-        }
-        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
-        switch auth {
-        case .authorized:
-            scheduleEventDrivenCalibration(
-                reason: "microphone permission available"
-            )
-            return
-        case .denied, .restricted:
-            backgroundCalibrationMicDenied = true
-        case .notDetermined:
-            let granted = await requestMicrophonePermission()
-            backgroundCalibrationMicDenied = !granted
-            reconcileBackgroundCalibration()
-            if granted {
-                scheduleEventDrivenCalibration(
-                    reason: "microphone permission granted"
-                )
-            }
-        @unknown default:
-            return
-        }
-    }
-
     // MARK: - Manual delay lock
 
     /// Pin the broadcast-side AirPlay delay to the current `airplayDelayMs`.
-    /// Subsequent calibrators / closed-loop drivers can read
-    /// `delayLockState` to decide whether to apply an automated correction.
     /// The locked value is persisted in UserDefaults so it survives a
     /// relaunch (see `loadPersistedDelayMs` + `loadPersistedLockedAt`).
     public func lockAirplayDelay() {
@@ -4920,28 +2254,15 @@ final class AppModel {
         UserDefaults.standard.set(value, forKey: AppModel.airplayDelayLockedAtKey)
         delayLockState = .locked(at: value)
         userDelayRevision &+= 1
-        pendingAutoCalibrationApply = nil
-        eventDrivenCalibrationTask?.cancel()
-        postApplyValidationTask?.cancel()
-        pendingEventDrivenCalibrationReason = nil
-        reconcileBackgroundCalibration()
-        setSyncContext(.locked, reason: "user locked Local+AirPlay delay", delayMs: value)
         SyncCastLog.log("delayLock: locked at \(value)ms")
     }
 
-    /// Release the lock so calibrators can drive the slider again. Stores
+    /// Release the lock so the slider is free-running again. Stores
     /// 0 as the persisted lock target so a future launch sees "no lock".
     public func unlockAirplayDelay() {
         UserDefaults.standard.set(0, forKey: AppModel.airplayDelayLockedAtKey)
         delayLockState = .unlocked
         userDelayRevision &+= 1
-        pendingAutoCalibrationApply = nil
-        eventDrivenCalibrationTask?.cancel()
-        postApplyValidationTask?.cancel()
-        pendingEventDrivenCalibrationReason = nil
-        reconcileBackgroundCalibration()
-        markSyncContextSuspect(reason: "delay unlocked")
-        scheduleEventDrivenCalibration(reason: "delay unlocked")
         SyncCastLog.log("delayLock: unlocked")
     }
 
@@ -4959,146 +2280,6 @@ final class AppModel {
         setAirplayDelay(clamped)
     }
 
-    // MARK: - Audition state machine
-
-    /// Side-switch cadence (seconds). The audition flips between A and B
-    /// every 1.2 s within a single round.
-    private static let auditionSideSwitchSeconds: Double = 1.2
-
-    /// Bracket size around the baseline (ms). Side A plays at
-    /// baseline-150 ms, side B at baseline+150 ms.
-    private static let auditionBracketMs: Int = 150
-
-    /// Per-choice baseline narrowing (ms). chooseAuditionA shifts the
-    /// baseline down by 75 ms; chooseAuditionB shifts it up.
-    private static let auditionNarrowingMs: Int = 75
-
-    /// Total user-decision rounds before auto-stop. Round 5 triggers
-    /// `stopAudition()`.
-    private static let auditionTotalRounds: Int = 4
-
-    /// Begin the A/B audition loop. No-op if an audition is already
-    /// running or if the slider is otherwise unavailable. The current
-    /// `airplayDelayMs` becomes the baseline; round 1 / side A is
-    /// applied immediately and the side-switching Task is started.
-    public func startAudition() {
-        guard auditionState == .idle else { return }
-        auditionBaselineMs = airplayDelayMs
-        SyncCastLog.log("audition: start baseline=\(auditionBaselineMs)ms")
-        auditionState = .running(round: 1, side: .A)
-        applyAuditionSide(.A)
-        startAuditionSideSwitchLoop()
-    }
-
-    /// Cancel any in-flight audition and restore the original baseline.
-    /// Idempotent — safe to call from `idle`. Matches the implicit
-    /// auto-stop that fires after round 4 chooses.
-    public func stopAudition() {
-        auditionSideSwitchTask?.cancel()
-        auditionSideSwitchTask = nil
-        if auditionState != .idle {
-            SyncCastLog.log("audition: stop, restoring baseline=\(auditionBaselineMs)ms")
-            // Restore the slider to whatever was active when start was
-            // called. Goes through the debounced setter so the sidecar
-            // is updated.
-            setAirplayDelay(auditionBaselineMs)
-        }
-        auditionState = .idle
-    }
-
-    /// User picked side A this round. Narrow the baseline downward by
-    /// 75 ms, advance to the next round, or auto-stop after round 4.
-    public func chooseAuditionA() {
-        chooseAuditionSide(narrowBy: -AppModel.auditionNarrowingMs)
-    }
-
-    /// User picked side B this round. Narrow the baseline upward by
-    /// 75 ms, advance to the next round, or auto-stop after round 4.
-    public func chooseAuditionB() {
-        chooseAuditionSide(narrowBy: +AppModel.auditionNarrowingMs)
-    }
-
-    /// Shared body for chooseAuditionA / chooseAuditionB. The sign of
-    /// `narrowBy` determines which way the baseline shifts.
-    private func chooseAuditionSide(narrowBy delta: Int) {
-        guard case .running(let round, _) = auditionState else { return }
-        let nextBaseline = max(
-            AppModel.airplayDelayMsRange.lowerBound,
-            min(AppModel.airplayDelayMsRange.upperBound,
-                auditionBaselineMs + delta)
-        )
-        auditionBaselineMs = nextBaseline
-        SyncCastLog.log("audition: round=\(round) choose Δ=\(delta)ms → baseline=\(nextBaseline)ms")
-        // Round 5 means we just heard the 4th pair and chose; auto-stop.
-        let nextRound = round + 1
-        if nextRound > AppModel.auditionTotalRounds {
-            // Apply final baseline as the new airplayDelayMs (NOT the
-            // restore behaviour — the user's choices are the result).
-            auditionSideSwitchTask?.cancel()
-            auditionSideSwitchTask = nil
-            setAirplayDelay(nextBaseline)
-            auditionState = .idle
-            SyncCastLog.log("audition: complete after \(AppModel.auditionTotalRounds) rounds at \(nextBaseline)ms")
-            return
-        }
-        // Otherwise restart the side-switch loop with the new baseline.
-        auditionState = .running(round: nextRound, side: .A)
-        applyAuditionSide(.A)
-        startAuditionSideSwitchLoop()
-    }
-
-    /// Apply baseline ± bracket to the slider. Bypasses the debounced
-    /// IPC path used by user drags because the audition wants the change
-    /// to land instantly; it still goes through `setAirplayDelay` to
-    /// share the clamp + sidecar push.
-    private func applyAuditionSide(_ side: AuditionSide) {
-        let target: Int
-        switch side {
-        case .A: target = auditionBaselineMs - AppModel.auditionBracketMs
-        case .B: target = auditionBaselineMs + AppModel.auditionBracketMs
-        }
-        setAirplayDelay(target)
-    }
-
-    /// Kick off (or restart) the 1.2 s flip Task for the current round.
-    /// The Task alternates side every 1.2 s and updates `auditionState`
-    /// in place. Cancelled by stopAudition / chooseX before each new
-    /// round and on app teardown via Task.isCancelled checks.
-    ///
-    /// The Task inherits `@MainActor` isolation from its surrounding
-    /// context (this method is on the `@MainActor`-isolated AppModel),
-    /// so the body runs on the main actor without an explicit hop.
-    private func startAuditionSideSwitchLoop() {
-        auditionSideSwitchTask?.cancel()
-        auditionSideSwitchTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let nanos = UInt64(AppModel.auditionSideSwitchSeconds * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                if Task.isCancelled { return }
-                guard let self else { return }
-                guard case .running(let round, let side) = self.auditionState else { return }
-                let nextSide: AuditionSide = (side == .A) ? .B : .A
-                self.auditionState = .running(round: round, side: nextSide)
-                self.applyAuditionSide(nextSide)
-            }
-        }
-    }
-
-    /// Devices the user can plausibly target. Excludes:
-    ///   - BlackHole (virtual capture sink — routing audio TO it could
-    ///     feedback into our SCK capture path).
-    ///   - Our own private aggregate devices (UID prefix
-    ///     `io.syncast.aggregate.v1.`) — these are created by the Router
-    ///     to drive multi-output sync; user must never see them.
-    ///
-    /// Notably we DO show user-created aggregate / multi-output devices
-    /// from Audio MIDI Setup. Earlier versions filtered these blanket-
-    /// style as a feedback safeguard, but with the Router now operating
-    /// its own aggregate, blanket-filtering would surprise users who
-    /// built their own. Routing into a USER-created aggregate that
-    /// happens to include the system input would feedback, so we still
-    /// rely on SCK's `excludesCurrentProcessAudio` defense at the
-    /// capture layer.
     private func isUserSelectableOutput(_ d: Device) -> Bool {
         if let uid = d.coreAudioUID, uid.contains("BlackHole") { return false }
         // Our own private aggregate (created by Router.reconcileLocalDriver)
@@ -5124,6 +2305,16 @@ final class AppModel {
         case .stereo:
             return d.transport == .coreAudio
         case .wholeHome:
+            // Direction B: this Mac's own AirPlay Receiver is NEVER a target.
+            // The local speakers participate as an OwnTone fifo output, on
+            // OwnTone's player clock — no self-target, no full-screen PIN.
+            // Making the Receiver a target would render into the system
+            // default output the capture tap covers, closing a feedback loop,
+            // and reintroduce the self-pair deadlock direction B removes. This
+            // is the UI selectability gate; `pushAirplayState` independently
+            // refuses to register a local-machine receiver with OwnTone, so
+            // there are two separate enforcement points, not one.
+            if d.isLocalMachineReceiver { return false }
             return true
         }
     }
@@ -5141,134 +2332,17 @@ final class AppModel {
             $0.transport == .airplay2 && isSelectableInMode($0, mode: mode)
         }
     }
+
+    /// Genuinely remote AirPlay receivers (Mac mini, Xiaomi, …) — the only
+    /// legal AirPlay targets. `airPlayDevices` already drops the local-machine
+    /// receiver via `isSelectableInMode`; the repeated `isLocalMachineReceiver`
+    /// filter here is defensive but NOT independent (it reads the same flag).
+    /// The genuinely independent backstop lives in `pushAirplayState`, which is
+    /// the choke point that hands a device to OwnTone.
+    var remoteAirPlayDevices: [Device] {
+        airPlayDevices.filter { !$0.isLocalMachineReceiver }
+    }
     var enabledDeviceCount: Int { routing.values.filter(\.enabled).count }
-
-    // MARK: - Calibration mic intents
-
-    /// Re-query CoreAudio for the current set of input-capable devices
-    /// and update `availableInputDevices`. Also resolves the persisted
-    /// UID preference back to a live `AudioDeviceID` and assigns it to
-    /// `selectedMicID` if the device is still attached. Idempotent and
-    /// cheap (only HAL property reads, no IOProc work).
-    ///
-    /// Called at bootstrap, on hot-plug events from the HAL listener,
-    /// and any time the UI wants a manual refresh (the calibration sheet
-    /// can call this when it appears).
-    func refreshInputDevices() {
-        let fresh = InputDeviceEnumerator.enumerate()
-        availableInputDevices = fresh
-        // Resolve persisted UID → live AudioDeviceID.
-        let persistedUID = UserDefaults.standard.string(
-            forKey: AppModel.micUIDDefaultsKey
-        )
-        let resolvedFromPersist = persistedUID.flatMap { uid in
-            fresh.first(where: { $0.uid == uid })
-        }
-        // Drop any selection that no longer matches an attached device.
-        // The didSet for selectedMicID re-persists, so set the underlying
-        // value carefully — assigning resolvedFromPersist?.id rewrites
-        // the same UID back to UserDefaults, which is fine. Assigning nil
-        // when persistedUID is set but the device is gone DELIBERATELY
-        // leaves the persisted UID alone (so replug restores selection).
-        if let resolved = resolvedFromPersist {
-            if selectedMicID != resolved.id {
-                // Bypass the didSet — this is a refresh-driven re-binding,
-                // not a user choice. Re-persisting the same UID is a no-op
-                // but we still want the assignment to flow through observers.
-                selectedMicID = resolved.id
-            }
-        } else if persistedUID == nil {
-            // No persisted preference at all → fall through to default.
-            // Leave selectedMicID == nil; effectiveMicID handles fallback.
-            if selectedMicID != nil { selectedMicID = nil }
-        } else {
-            // Persisted UID set but device not attached. Surface as nil
-            // (effectiveMicID falls back to system default), but DO NOT
-            // wipe the persisted UID — replug should restore selection.
-            if selectedMicID != nil {
-                // Suppress the persistence side-effect for this path so
-                // we don't overwrite the saved UID with nil.
-                suppressMicPersist = true
-                selectedMicID = nil
-                suppressMicPersist = false
-            }
-        }
-    }
-
-    /// User picked a specific input device. Pass `nil` to clear the
-    /// override and revert to the system default. The choice is persisted
-    /// by UID so it survives replug / restart.
-    func setSelectedMic(_ id: AudioDeviceID?) {
-        // Validate: if a non-nil id was passed but it's not in the live
-        // list, treat it as "clear". Avoids storing a junk id.
-        if let id, !availableInputDevices.contains(where: { $0.id == id }) {
-            selectedMicID = nil
-            pendingAutoCalibrationApply = nil
-            return
-        }
-        selectedMicID = id
-        pendingAutoCalibrationApply = nil
-    }
-
-    /// Request mic access (TCC class `kTCCServiceMicrophone`). Returns
-    /// `true` if the user has granted access (already-authorized counts
-    /// as `true` and does NOT re-prompt). Returns `false` if denied or
-    /// restricted. Wraps `AVCaptureDevice.requestAccess(for:.audio)`,
-    /// which blocks until the user dismisses the prompt — call from
-    /// the calibrate-button handler, not from view body.
-    func requestMicrophonePermission() async -> Bool {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
-        switch status {
-        case .authorized:
-            return true
-        case .denied, .restricted:
-            // Already a hard "no". Don't prompt again — the OS won't
-            // show a second prompt once the user has denied. The UI is
-            // expected to surface a "Open System Settings → Privacy"
-            // affordance in this state.
-            return false
-        case .notDetermined:
-            return await AVCaptureDevice.requestAccess(for: .audio)
-        @unknown default:
-            return false
-        }
-    }
-
-    /// Persist `selectedMicID` as a UID string. UID, not AudioDeviceID:
-    /// the live id is reassigned by CoreAudio on every hot-plug, so
-    /// storing it would silently lose the user's pick. UID survives.
-    private func persistSelectedMic() {
-        if suppressMicPersist { return }
-        let defaults = UserDefaults.standard
-        if let id = selectedMicID,
-           let info = availableInputDevices.first(where: { $0.id == id }),
-           !info.uid.isEmpty {
-            defaults.set(info.uid, forKey: AppModel.micUIDDefaultsKey)
-        } else {
-            defaults.removeObject(forKey: AppModel.micUIDDefaultsKey)
-        }
-    }
-
-    /// One-shot suppression flag for `persistSelectedMic`. Used by
-    /// `refreshInputDevices` to clear the live id when a previously-
-    /// selected USB mic is unplugged WITHOUT discarding the persisted
-    /// UID (so replug restores the selection automatically).
-    private var suppressMicPersist: Bool = false
-
-    /// Install the CoreAudio device-list listener and run the first
-    /// refresh. Called from `bootstrap`. The listener is held on
-    /// `inputDeviceListener` so it lives for the AppModel's lifetime.
-    fileprivate func startInputDeviceWatch() {
-        refreshInputDevices()
-        inputDeviceListener = InputDeviceListener(queue: .main) { [weak self] in
-            // HAL callback runs on .main (DispatchQueue). MainActor
-            // requires explicit hop because we're in a Sendable closure
-            // outside any actor context.
-            Task { @MainActor [weak self] in
-                self?.refreshInputDevices()
-            }
-        }
-    }
 
     // MARK: - Sleep/wake auto-recovery (Round 12)
     //
@@ -5299,9 +2373,8 @@ final class AppModel {
     //
     // Stereo still gets the stronger local-driver rebuild because DPMS can
     // leave AUHAL wired to dead AudioDeviceIDs. Whole-home takes the safer
-    // recovery path: mark the AirPlay timing domain suspect, bump the Router
-    // AirPlay timing epoch, and reconcile bridges/receiver selection/socket
-    // without running any microphone capture or acoustic probe.
+    // recovery path: bump the Router AirPlay timing epoch and reconcile
+    // bridges / receiver selection / socket.
 
     /// Holds NSWorkspace observer tokens (`NSObjectProtocol`). One per
     /// notification name we subscribe to. Kept as `[Any]` per the
@@ -5342,6 +2415,9 @@ final class AppModel {
             return
         }
         let nc = NSWorkspace.shared.notificationCenter
+        // Direction B parks nothing on the system default output, so there is
+        // no willSleep cleanup to do — only wake recovery for transiently
+        // dropped local outputs.
         let names: [Notification.Name] = [
             NSWorkspace.didWakeNotification,
             NSWorkspace.screensDidWakeNotification,
@@ -5369,7 +2445,7 @@ final class AppModel {
     ///   `Router.forceLocalDriverRebuild`, bypassing the
     ///   `alreadyCorrect` short-circuit.
     /// - Whole-home mode invalidates the AirPlay timing domain and
-    ///   reconciles route state without opening the mic or emitting probes.
+    ///   reconciles route state.
     private func handleWake(notification: Notification) {
         SyncCastLog.log("AppModel: wake event \(notification.name.rawValue)")
         let now = Date()
@@ -5435,12 +2511,8 @@ final class AppModel {
                 )
                 await MainActor.run {
                     if self.mode == .wholeHome {
-                        self.markSyncContextSuspect(
-                            reason: "wake event; AirPlay timing domain may have relocked"
-                        )
                         if snapshot.isRunning && snapshot.hasEnabledRouting {
                             self.reconcileEngine()
-                            self.reconcileBackgroundCalibration()
                         } else {
                             SyncCastLog.log("AppModel: post-wake whole-home reconcile skipped (engine \(snapshot.stateName), hasEnabled=\(snapshot.hasEnabledRouting))")
                         }
@@ -5568,8 +2640,7 @@ final class AppModel {
 
     // No `deinit` cleanup for `sleepWakeObservers`: AppModel is
     // process-lifetime (the menubar app's only top-level model), so
-    // the observers naturally die with the process. The same convention
-    // applies to `inputDeviceListener` above. Adding a deinit would
+    // the observers naturally die with the process. Adding a deinit would
     // require unsafe-isolation gymnastics around `@MainActor` for zero
     // real benefit (NSWorkspace's notification center cleans up
     // observers on process exit anyway).

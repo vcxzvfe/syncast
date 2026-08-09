@@ -17,6 +17,11 @@ DEVICE_NOT_FOUND = -32000
 DEVICE_NOT_CONNECTED = -32001
 STREAM_NOT_ACTIVE = -32002
 CAPABILITY_UNSUPPORTED = -32003
+# AirPlay pairing. The receiver demands a credential we do not hold, an
+# interactive attempt is already running, or an attempt failed.
+PAIRING_REQUIRED = -32004
+PAIRING_IN_PROGRESS = -32005
+PAIRING_FAILED = -32006
 PROTOCOL_VERSION_MISMATCH = -32099
 
 

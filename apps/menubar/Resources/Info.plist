@@ -27,13 +27,10 @@
     <true/>
     <!-- System audio capture currently defaults to ScreenCaptureKit. Tap
          mode should use the system-audio capture permission instead of
-         Screen Recording once fully shipped. The microphone is used only by
-         explicit diagnostic measurement flows; normal playback does not
-         open the mic or emit calibration tones. -->
+         Screen Recording once fully shipped. SyncCast never opens the
+         microphone. -->
     <key>NSAudioCaptureUsageDescription</key>
     <string>SyncCast captures system audio so it can play the same audio through the output devices you enable.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>SyncCast can use the microphone only when you explicitly run diagnostics to compare room audio timing. Normal playback and Stereo mode do not use the microphone or play calibration tones.</string>
     <!-- Required since macOS Sequoia for any app that browses mDNS / Bonjour
          services. Without this key the OS denies the browse silently. -->
     <key>NSLocalNetworkUsageDescription</key>

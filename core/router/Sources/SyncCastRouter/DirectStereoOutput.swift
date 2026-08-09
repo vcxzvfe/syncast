@@ -267,8 +267,9 @@ public final class DirectStereoOutput {
     /// settability claim, so classification and readback kept trusting
     /// the stale CoreAudio mirror instead of the DDC cache.
     ///
-    /// The decision properties are pure and covered by
-    /// SyncCastRouterTimingCheck.
+    /// The decision properties are pure. Their standalone verifier
+    /// (`SyncCastRouterTimingCheck`) was retired on 2026-08-09, so they are
+    /// unit-checkable but currently uncovered.
     public struct HardwareVolumeApplyOutcome: Equatable, Sendable {
         /// The intent reached the backends (output active + UID covered).
         public let attempted: Bool
@@ -316,7 +317,8 @@ public final class DirectStereoOutput {
 
     /// Pure plan for the VolumeScalar level of one volume/mute intent —
     /// the CoreAudio mirror of `DDCVolumeLevels.planned`'s two-layer
-    /// semantics (covered by SyncCastRouterTimingCheck).
+    /// semantics. (Its verifier was retired on 2026-08-09; see
+    /// `HardwareVolumeApplyOutcome`.)
     ///
     /// Devices whose Mute property accepted the write keep VolumeScalar at
     /// the user's level even while muted: silencing is the Mute property's
@@ -465,7 +467,7 @@ public final class DirectStereoOutput {
         return (newID, uid)
     }
 
-    private static func readDefaultOutput() throws -> AudioObjectID {
+    static func readDefaultOutput() throws -> AudioObjectID {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -487,14 +489,14 @@ public final class DirectStereoOutput {
         return id
     }
 
-    private static func setDefaultOutputOrThrow(_ id: AudioObjectID) throws {
+    static func setDefaultOutputOrThrow(_ id: AudioObjectID) throws {
         let status = setDefaultOutput(id)
         guard status == noErr else {
             throw DirectStereoError.setDefaultFailed(status)
         }
     }
 
-    private static func setDefaultOutput(_ id: AudioObjectID) -> OSStatus {
+    static func setDefaultOutput(_ id: AudioObjectID) -> OSStatus {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -512,7 +514,7 @@ public final class DirectStereoOutput {
         )
     }
 
-    private static func deviceID(forUID uid: String) throws -> AudioObjectID {
+    static func deviceID(forUID uid: String) throws -> AudioObjectID {
         do {
             return try Capture.deviceID(forUID: uid)
         } catch {
@@ -520,7 +522,7 @@ public final class DirectStereoOutput {
         }
     }
 
-    private static func fallbackDefaultOutputID(
+    static func fallbackDefaultOutputID(
         coveredUIDs: Set<String>,
         excluding excludedIDs: Set<AudioObjectID> = []
     ) -> AudioObjectID? {
@@ -593,13 +595,13 @@ public final class DirectStereoOutput {
         return pid_t(pid)
     }
 
-    private static func processIsAlive(_ pid: pid_t) -> Bool {
+    static func processIsAlive(_ pid: pid_t) -> Bool {
         guard pid > 0 else { return false }
         if kill(pid, 0) == 0 { return true }
         return errno == EPERM
     }
 
-    private static func processOwnsLiveSyncCastAggregate(_ pid: pid_t) -> Bool {
+    static func processOwnsLiveSyncCastAggregate(_ pid: pid_t) -> Bool {
         guard processIsAlive(pid) else { return false }
         guard let looksLikeSyncCast = processExecutableLooksLikeSyncCast(pid) else {
             return true
@@ -621,8 +623,16 @@ public final class DirectStereoOutput {
         let executable = URL(fileURLWithPath: path)
             .lastPathComponent
             .lowercased()
-        return executable.contains("syncast")
+        // Both spellings are load-bearing. The repository, the helper
+        // binaries and the socket paths use "syncast" (one c); every Swift
+        // product is named "SyncCast…" (two c), which lowercases to
+        // "synccast…". Testing only the first form silently fails to
+        // recognise the menubar app itself — the one process whose live
+        // aggregates most need protecting.
+        return Self.executableNameNeedles.contains { executable.contains($0) }
     }
+
+    static let executableNameNeedles = ["syncast", "synccast"]
 
     static func isOrdinaryOutputUID(_ uid: String) -> Bool {
         guard !uid.hasPrefix(Self.uidPrefix),
@@ -634,7 +644,7 @@ public final class DirectStereoOutput {
         return ordinaryOutputScore(id) != nil
     }
 
-    private static func ordinaryOutputScore(_ id: AudioObjectID) -> Int? {
+    static func ordinaryOutputScore(_ id: AudioObjectID) -> Int? {
         guard let uid = readDeviceUID(id),
               !uid.hasPrefix(Self.uidPrefix),
               !uid.hasPrefix(AggregateDevice.uidPrefix),
@@ -685,7 +695,7 @@ public final class DirectStereoOutput {
         return status == noErr && classID == kAudioAggregateDeviceClassID
     }
 
-    private static func readUInt32(
+    static func readUInt32(
         _ id: AudioObjectID,
         _ selector: AudioObjectPropertySelector
     ) -> UInt32? {
@@ -707,7 +717,7 @@ public final class DirectStereoOutput {
         return status == noErr ? value : nil
     }
 
-    private static func enumerateAllDevices() -> [AudioObjectID] {
+    static func enumerateAllDevices() -> [AudioObjectID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -738,7 +748,7 @@ public final class DirectStereoOutput {
         return ids
     }
 
-    private static func readDeviceUID(_ id: AudioObjectID) -> String? {
+    static func readDeviceUID(_ id: AudioObjectID) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,
             mScope: kAudioObjectPropertyScopeGlobal,
