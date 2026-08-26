@@ -38,6 +38,18 @@ public actor DiscoveryService {
         }
     }
 
+    /// Ask every transport to look again, now.
+    ///
+    /// Deliberately does not touch `pumpTask`: restarting it would rebuild
+    /// both `AsyncStream`s, which replays the entire registry as a fresh
+    /// round of `.appeared` events and mints new device ids. The transports
+    /// refresh in place instead, so only genuine deltas reach subscribers.
+    public func rescan() {
+        guard pumpTask != nil else { return }
+        coreAudio.refreshNow()
+        airplay.rescan()
+    }
+
     public func stop() {
         pumpTask?.cancel()
         pumpTask = nil

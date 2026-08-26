@@ -17,6 +17,19 @@ struct MainPopover: View {
                 volumeKeyPermissionHint
                 Divider().padding(.horizontal, 12)
             }
+            // Above the master fader on purpose: while this is showing, every
+            // control below it is describing only half of what the user hears.
+            if model.wholeHomeSinkDisplaced {
+                wholeHomeSinkDisplacedBanner
+                Divider().padding(.horizontal, 12)
+            }
+            // Master fader sits directly above the device list so the
+            // hierarchy reads top-down: one total, then the per-speaker
+            // balance under it.
+            if model.mode == .wholeHome {
+                masterVolumeSection
+                Divider().padding(.horizontal, 12)
+            }
             deviceList
             // Sync slider is only meaningful in whole-home mode.
             if model.mode == .wholeHome {
@@ -59,6 +72,91 @@ struct MainPopover: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
+    }
+
+    /// Shown only while whole-home is running and macOS has stopped pointing
+    /// at the 「AirPlay 全屋」 sink. That state is silent-but-wrong: system
+    /// audio reaches the newly-selected output directly AND still goes through
+    /// the capture → OwnTone path, so everything plays twice at two different
+    /// latencies. Recovery is one click, and deliberately a click rather than
+    /// automatic — see `AppModel.wholeHomeSinkDisplaced`.
+    private var wholeHomeSinkDisplacedBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+            Text("系统输出已不是「\(WholeHomeSinkOutput.displayName)」— 声音会播两遍")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button("切回") { model.reclaimWholeHomeSinkAsDefault() }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .accessibilityIdentifier("wholeHomeSinkReclaimButton")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Master volume
+    //
+    // Whole-home only, and only there because this fader is implemented in
+    // `AudioSocketWriter`, which does not run in stereo. Showing an inert
+    // control in stereo would be worse than showing none — and stereo already
+    // has per-device hardware volume plus the media keys.
+    //
+    // Placed ABOVE the device rows: it is the total, they are the balance.
+    private var masterVolumeSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("总音量")
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                if model.masterVolumePercent != VolumeCurve.defaultPercent
+                    || model.masterMuted {
+                    Button("Reset") { model.resetMasterVolume() }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 10))
+                        .accessibilityIdentifier("masterVolumeResetButton")
+                }
+            }
+            HStack(spacing: 8) {
+                Image(systemName: model.masterMuted
+                      ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(model.masterMuted ? .orange : .secondary)
+                    .frame(width: 14)
+                    .onTapGesture { model.toggleMasterMute() }
+                    .accessibilityIdentifier("masterVolumeMuteButton")
+                Slider(value: Binding(
+                    get: { Double(model.masterVolumePercent) },
+                    set: { model.setMasterVolumePercent(Int($0.rounded())) }
+                ), in: volumePercentSliderRange, step: 1)
+                    .controlSize(.small)
+                    .disabled(model.masterMuted)
+                    .accessibilityIdentifier("masterVolumeSlider")
+                    .accessibilityValue(
+                        Text(VolumeCurve.percentLabel(model.masterVolumePercent))
+                    )
+                Text(VolumeCurve.percentLabel(model.masterVolumePercent))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(model.masterMuted
+                                     ? AnyShapeStyle(HierarchicalShapeStyle.secondary)
+                                     : AnyShapeStyle(.primary))
+                    .frame(width: 38, alignment: .trailing)
+            }
+            // The one thing about this control that is not self-evident: it
+            // is applied before OwnTone, so it is the only fader that can
+            // truly silence an AirPlay receiver — and, being upstream of the
+            // 16-bit conversion, the one worth leaving high.
+            Text("作用于所有音箱（在 OwnTone 之前）。保持高位、用每个音箱的滑块配平音量更好。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Sync section (manual)
@@ -232,6 +330,7 @@ struct MainPopover: View {
                       systemImage: model.sidecarRunning ? "bolt.fill" : "bolt.slash")
                     .foregroundStyle(model.sidecarRunning ? .green : .red)
                 Spacer()
+                rescanControl
             }
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -245,6 +344,45 @@ struct MainPopover: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
     }
+
+    /// Rescan affordance for the status strip: an icon button that swaps to
+    /// a spinner while a scan is running.
+    ///
+    /// Button and spinner share one fixed-width slot so the counts to its
+    /// left never shift when it changes. Wording stays neutral — restarting
+    /// the Bonjour browser is a nudge, not a guarantee that a receiver
+    /// appears immediately.
+    private var rescanControl: some View {
+        Group {
+            if model.discoveryRescanInFlight {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.small)
+                    .scaleEffect(Self.rescanSpinnerScale)
+            } else {
+                Button {
+                    model.rescanDevices()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.borderless)
+                .help("重新扫描设备")
+                .accessibilityLabel(Text("重新扫描设备"))
+                .accessibilityIdentifier("rescanDevicesButton")
+            }
+        }
+        .frame(width: Self.rescanControlWidth, alignment: .trailing)
+    }
+
+    /// Width of the fixed slot holding either the rescan button or its
+    /// spinner. Sized to the small circular ProgressView so neither state
+    /// reflows the strip.
+    private static let rescanControlWidth: CGFloat = 18
+
+    /// AppKit's smallest circular spinner still reads larger than a 10 pt
+    /// glyph; this trims it to match the strip.
+    private static let rescanSpinnerScale: CGFloat = 0.5
 
     private var header: some View {
         HStack(spacing: 8) {
@@ -316,6 +454,20 @@ struct MainPopover: View {
                         .foregroundStyle(.tertiary)
                     Text("Looking for speakers…")
                         .font(.caption).foregroundStyle(.secondary)
+                    // The screen where the user actually hit this: a
+                    // receiver that is powered on but whose Bonjour
+                    // announcement has not reached us yet. The strip's
+                    // icon button is easy to miss from here.
+                    if model.discoveryRescanInFlight {
+                        Text("扫描中…")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button("重新扫描") { model.rescanDevices() }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 11))
+                            .accessibilityIdentifier("rescanDevicesEmptyStateButton")
+                    }
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 24)
             } else {
@@ -420,6 +572,11 @@ private struct DeviceRow: View {
         model.routing[deviceID] ?? DeviceRouting(deviceID: deviceID)
     }
 
+    /// This row's fader position on the shared percent grid.
+    private var volumePercent: Int {
+        model.deviceVolumePercent(for: deviceID)
+    }
+
     var body: some View {
         // If discovery has dropped the device while the menu is open, render
         // nothing for that row rather than holding a stale reference.
@@ -506,11 +663,52 @@ private struct DeviceRow: View {
                             // Device returned by `model.devices.first`.
                             .onTapGesture { model.toggleMute(deviceID) }
                         VolumeSlider(
-                            value: Binding(
-                                get: { Double(routing.volume) },
-                                set: { model.setVolume(Float($0), for: deviceID) }
-                            )
+                            percent: Binding(
+                                get: { model.deviceVolumePercent(for: deviceID) },
+                                set: {
+                                    model.setDeviceVolumePercent($0, for: deviceID)
+                                }
+                            ),
+                            deviceID: deviceID
                         )
+                        Text(VolumeCurve.percentLabel(volumePercent))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(
+                                volumePercent == VolumeCurve.defaultPercent
+                                    ? AnyShapeStyle(HierarchicalShapeStyle.secondary)
+                                    : AnyShapeStyle(.primary)
+                            )
+                            .frame(width: 34, alignment: .trailing)
+                        // Per-row reset appears only when there is something
+                        // to reset, so an untouched row gains no chrome —
+                        // same rule the delay trim row follows.
+                        if volumePercent != VolumeCurve.defaultPercent {
+                            Button {
+                                model.resetDeviceVolume(for: deviceID)
+                            } label: {
+                                Image(systemName: "arrow.uturn.backward")
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 9))
+                            .help("Reset this speaker to 100%")
+                            .accessibilityIdentifier(
+                                "deviceVolumeResetButton-\(deviceID)"
+                            )
+                        }
+                    }
+                    // Swallow taps in the volume row: missing the slider by a
+                    // few points must not toggle the speaker off mid-tuning.
+                    .contentShape(Rectangle())
+                    .onTapGesture { }
+                    // The fader bottoms out at -30 dB on BOTH legs (OwnTone
+                    // cannot go lower, and the local bridge matches it so the
+                    // two stay equally loud), so "0" is audible on every
+                    // speaker and "muted" is audible on AirPlay ones. Say so.
+                    if let floorHint = model.volumeFloorHint(for: deviceID) {
+                        Text(floorHint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     // Direct Stereo: devices with no controllable hardware
                     // volume (backend == .none — no CoreAudio volume, no
@@ -574,6 +772,13 @@ private struct DeviceRow: View {
             routing.enabled ? "enabled" : "disabled",
             syncLabel,
         ]
+        if routing.enabled {
+            parts.append(
+                routing.muted
+                    ? "muted"
+                    : "volume \(VolumeCurve.percentLabel(volumePercent))"
+            )
+        }
         let trim = model.deviceTrimMs(for: deviceID)
         if model.mode == .wholeHome && routing.enabled && trim != 0 {
             parts.append("delay \(trim > 0 ? "+" : "")\(trim) milliseconds")
@@ -744,12 +949,35 @@ private struct DeviceRow: View {
     }
 }
 
+/// Per-speaker fader.
+///
+/// Works in whole percents rather than a 0…1 fraction because that is the grid
+/// both legs quantise to: OwnTone's per-output volume is an integer percent,
+/// and `VolumeCurve` maps the same integer onto the local bridge's linear
+/// gain. Keeping the control on that grid is what lets one drag move both legs
+/// in identical steps.
 private struct VolumeSlider: View {
-    @Binding var value: Double
+    @Binding var percent: Int
+    let deviceID: String
 
     var body: some View {
-        Slider(value: $value, in: 0.0...1.0)
-            .controlSize(.small)
-            .accessibilityValue(Text("\(Int(value * 100))%"))
+        Slider(
+            value: Binding(
+                get: { Double(percent) },
+                set: { percent = Int($0.rounded()) }
+            ),
+            in: volumePercentSliderRange,
+            step: 1
+        )
+        .controlSize(.small)
+        .accessibilityIdentifier("deviceVolumeSlider-\(deviceID)")
+        .accessibilityValue(Text(VolumeCurve.percentLabel(percent)))
     }
 }
+
+/// `VolumeCurve.percentRange` as the `Double` range SwiftUI's `Slider` wants.
+/// Hoisted out of the view bodies because writing the `...` across two lines
+/// inside a `Slider(...)` argument list does not parse.
+private let volumePercentSliderRange: ClosedRange<Double> =
+    Double(VolumeCurve.percentRange.lowerBound)
+        ... Double(VolumeCurve.percentRange.upperBound)

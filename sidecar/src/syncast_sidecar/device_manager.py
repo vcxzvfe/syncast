@@ -9,8 +9,11 @@ Architecture (per ADR-006):
   • One shared `OwnToneBackend` per sidecar process.
   • Each AirPlay 2 device maps to an OwnTone "output" identified by its
     name/host/port. We call REST `/api/outputs` to enable the right ones
-    for the active stream and `/api/outputs/{id}/volume` for per-device
-    gain.
+    for the active stream, and `PUT /api/outputs/{id}` with a `volume`
+    body for per-device gain. (Not `/api/outputs/{id}/volume` — that path
+    returns HTTP 400; see `OwnToneBackend.set_output_volume`.) OwnTone's
+    0-100 scale is linear in DECIBELS, not amplitude: it maps onto
+    -30 dB..0 dB, so 0 is a floor rather than silence.
   • The audio data path runs in parallel: `AudioSocketReader` accepts
     PCM packets from the Swift router on a SOCK_SEQPACKET socket and
     forwards them straight into OwnTone's FIFO pipe.
@@ -454,6 +457,14 @@ class DeviceManager:
         return {"removed": True}
 
     async def set_volume(self, device_id: str, volume: float) -> dict[str, Any]:
+        """Set one output's volume.
+
+        ``volume`` is 0.0-1.0 and is scaled to OwnTone's 0-100. That scale is
+        linear in decibels (-30 dB..0 dB, ``outputs/airplay.c:1805-1821``), so
+        ``0.0`` attenuates by 30 dB rather than muting — OwnTone's real "off"
+        value (-144) is not reachable through the REST API. Callers wanting
+        silence must attenuate the samples before they reach OwnTone.
+        """
         if not 0.0 <= volume <= 1.0:
             raise jsonrpc.RpcError(jsonrpc.INVALID_PARAMS, "volume out of range")
         dev = self._devices.get(device_id)

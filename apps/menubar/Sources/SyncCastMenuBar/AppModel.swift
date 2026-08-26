@@ -125,6 +125,16 @@ final class AppModel {
     /// Last sidecar `actual_delivery_lag_ms` reading; nil before first
     /// sample or outside whole-home. Drives the slider's caption.
     var measuredLagMs: Int? = nil
+
+    /// Whole-home is running but macOS no longer points at the 「AirPlay 全屋」
+    /// sink, so system audio is playing twice — once straight out of whatever
+    /// the user selected, once through the capture → OwnTone path. Sampled by
+    /// the 1 Hz health poller; drives the warning banner in the popover.
+    ///
+    /// Nothing fixes this on its own: re-asserting the default automatically
+    /// would fight a deliberate choice (plugging in headphones is a legitimate
+    /// thing to do mid-session), so the user gets a banner and a button.
+    private(set) var wholeHomeSinkDisplaced: Bool = false
     static let airplayDelayMsKey = "syncast.airplayDelayMs"
     /// Fresh-install broadcast-delay default. CORRECTED to 0 to match the
     /// Direction-B timing model (sidecar `DEFAULT_LOCAL_FIFO_DELAY_MS`):
@@ -297,9 +307,13 @@ final class AppModel {
 
     /// Media-key gate on the enter-running hardware snapshot (Codex P2):
     /// eligibility flips on synchronously, but until the async snapshot
-    /// lands the routing values are last session's persisted sliders — a
-    /// key press in that window would step from and WRITE those stale
-    /// levels to hardware. Pure transitions live in
+    /// lands the routing values do not reflect the hardware at all — they
+    /// are whatever this session last set, or the 100 % default on a fresh
+    /// launch. (Per-device volume is deliberately NOT persisted in stereo;
+    /// see `deviceVolumeIsPersistable`. The gate's reason for existing is
+    /// unchanged either way.) A key press in that window would step from,
+    /// and WRITE, a level the device is not actually at. Pure transitions
+    /// live in
     /// `DirectStereoVolumeLogic.SnapshotGate` (harness-checked); this is
     /// just the live state plus the fallback timer that guarantees keys
     /// can never stay dead when a snapshot stalls or fails.
@@ -365,6 +379,110 @@ final class AppModel {
     /// after the last drag fires the IPC + UserDefaults write.
     private var airplayDelayCommitTask: Task<Void, Never>?
 
+    // MARK: - Manual device rescan
+
+    /// Re-entrancy + cooldown state for `rescanDevices()`. Transitions live
+    /// in `DiscoveryRescanGate`.
+    private var discoveryRescanState = DiscoveryRescanGate.State()
+
+    /// True while a manual rescan's feedback window is open. The popover
+    /// swaps the rescan button for a spinner while it is set, which is the
+    /// second gate behind `DiscoveryRescanGate`: a button that is not on
+    /// screen cannot be mashed.
+    private(set) var discoveryRescanInFlight: Bool = false
+
+    /// Clears `discoveryRescanInFlight` after the feedback window.
+    private var discoveryRescanFeedbackTask: Task<Void, Never>?
+
+    /// Start of the most recent rescan, kept only to measure how long the
+    /// first AirPlay `.appeared` after it takes to arrive. We do not
+    /// actually know yet whether restarting the browser shortens the ~90 s
+    /// cold-start the user hit — mDNSResponder caches across processes and
+    /// the receiver's own announcement interval may dominate. This log line
+    /// is how that gets answered with a number instead of a guess.
+    private var discoveryRescanLatencyProbeStartedAt: Date?
+
+    /// Minimum spacing between accepted manual rescans.
+    static let discoveryRescanCooldownSeconds: Double = 3.0
+
+    /// How long the spinner stays up. Derived from the discovery layer's
+    /// removal-suppression window rather than being its own number, so
+    /// "still scanning" in the UI and "still ignoring removals" underneath
+    /// are the same stretch of time by construction.
+    static var discoveryRescanFeedbackSeconds: Double {
+        AirPlayDiscovery.rescanRemovalGraceSeconds
+    }
+
+    /// Re-run device discovery on demand.
+    ///
+    /// Exists because Bonjour discovery of a receiver that is already
+    /// powered on can lag a cold app launch by a minute or more, and the
+    /// only recourse was to wait or relaunch.
+    func rescanDevices() {
+        let now = Date()
+        let decision = DiscoveryRescanGate.decide(
+            state: discoveryRescanState,
+            now: now,
+            cooldown: AppModel.discoveryRescanCooldownSeconds
+        )
+        guard decision == .start else {
+            SyncCastLog.log("rescan: dropped (\(decision))")
+            return
+        }
+        discoveryRescanState = DiscoveryRescanGate.started(
+            from: discoveryRescanState, at: now
+        )
+        discoveryRescanInFlight = true
+        discoveryRescanLatencyProbeStartedAt = now
+        SyncCastLog.log(
+            "rescan: requested (devices=\(devices.count) "
+            + "airplay=\(airPlayDevices.count))"
+        )
+        Task { [discovery] in
+            await discovery.rescan()
+        }
+        discoveryRescanFeedbackTask?.cancel()
+        discoveryRescanFeedbackTask = Task { [weak self] in
+            let seconds = AppModel.discoveryRescanFeedbackSeconds
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            if Task.isCancelled { return }
+            // Inherits MainActor isolation from the enclosing method, so
+            // this is already on the right actor.
+            self?.finishDiscoveryRescan()
+        }
+    }
+
+    private func finishDiscoveryRescan() {
+        discoveryRescanState = DiscoveryRescanGate.finished(
+            from: discoveryRescanState
+        )
+        discoveryRescanInFlight = false
+        if discoveryRescanLatencyProbeStartedAt != nil {
+            // Nothing new showed up inside the window. Recorded because
+            // "the button did nothing" is itself the measurement that
+            // decides whether restarting the browser is worth keeping.
+            SyncCastLog.log(
+                "rescan: no new AirPlay device within "
+                + "\(AppModel.discoveryRescanFeedbackSeconds)s"
+            )
+            discoveryRescanLatencyProbeStartedAt = nil
+        }
+    }
+
+    /// Records how long after a manual rescan the first AirPlay receiver
+    /// surfaced. One line per rescan; a device that was already known does
+    /// not re-arm the probe.
+    private func noteDiscoveryRescanLatency(for dev: Device) {
+        guard dev.transport == .airplay2,
+              let started = discoveryRescanLatencyProbeStartedAt else { return }
+        let elapsed = Date().timeIntervalSince(started)
+        SyncCastLog.log(
+            "rescan: first AirPlay device after "
+            + String(format: "%.1f", elapsed) + "s (\(dev.name))"
+        )
+        discoveryRescanLatencyProbeStartedAt = nil
+    }
+
     init() {
         self.discovery = DiscoveryService()
         self.router = Router()
@@ -394,6 +512,10 @@ final class AppModel {
         volumeController.start()
         self.systemVolumeKeyController = volumeController
         updateVolumeKeyEligibility(reason: "init")
+        // Seed the master fader once. The Router keeps the value even before
+        // a writer exists and re-applies it to every writer it builds, so
+        // this single push covers sidecar restarts too.
+        pushMasterVolume()
         Task { await self.bootstrap() }
     }
 
@@ -512,6 +634,7 @@ final class AppModel {
                 guard let self else { return }
                 await self.refreshConnectionStates()
                 await self.refreshLocalFifoLag()
+                await self.refreshWholeHomeSinkState()
                 await self.refreshPairingStates()
             }
         }
@@ -677,10 +800,19 @@ final class AppModel {
                     // burst of discovery events costs one commit.
                     scheduleDeviceTrimCommitTask()
                 }
+                // Same stable-key → transient-id re-seed for per-device
+                // volume. A reverted volume is more obviously wrong than a
+                // reverted trim: the speaker jumps back to full scale.
+                // `reconcileEngine` is the shared debounced path that pushes
+                // routing to both legs.
+                if applyPersistedDeviceVolumes() {
+                    reconcileEngine()
+                }
             }
             switch event {
             case .appeared(let dev):
                 SyncCastLog.log("[SyncCast] device appeared: \(dev.name) (\(dev.transport.rawValue))".replacingOccurrences(of: "[SyncCast] ", with: ""))
+                noteDiscoveryRescanLatency(for: dev)
                 // Round 12: device came back. Clear it from the
                 // "transiently missing while user-intent-enabled" set
                 // (used by the post-wake recovery handler).
@@ -864,6 +996,33 @@ final class AppModel {
         }
     }
 
+    /// Sample whether the whole-home sink is still the macOS default output.
+    ///
+    /// Cheap enough for the 1 Hz loop (one CoreAudio property read plus a UID
+    /// read) and only ever true in whole-home mode, so stereo pays nothing.
+    /// The Router owns the comparison; this just mirrors it for the view.
+    private func refreshWholeHomeSinkState() async {
+        let displaced = await router.wholeHomeSinkDisplaced
+        await MainActor.run {
+            guard self.wholeHomeSinkDisplaced != displaced else { return }
+            self.wholeHomeSinkDisplaced = displaced
+            SyncCastLog.log(
+                displaced
+                    ? "whole-home sink displaced: system default output is no longer 「\(WholeHomeSinkOutput.displayName)」 — audio is playing twice"
+                    : "whole-home sink is the system default output again"
+            )
+        }
+    }
+
+    /// User-driven recovery from `wholeHomeSinkDisplaced`. Deliberately manual
+    /// — see the property's documentation.
+    func reclaimWholeHomeSinkAsDefault() {
+        Task { [router] in
+            await router.reassertWholeHomeSink()
+            await self.refreshWholeHomeSinkState()
+        }
+    }
+
     /// Two `Device` values describe the same physical/logical device when
     /// their stable transport identity matches: coreAudioUID for local,
     /// host+name for AirPlay. Used by `applyEvent` to detect when discovery
@@ -887,7 +1046,10 @@ final class AppModel {
         }
     }
 
-    // BlackHole detection removed — SCK doesn't need it.
+    // BlackHole detection removed — SCK doesn't need it, and whole-home mode
+    // now resolves BlackHole itself in `WholeHomeSinkOutput.resolveBlackHoleUID`,
+    // which throws a user-actionable `blackHoleNotInstalled` out of
+    // `Router.start` instead of leaving the UI to guess.
     private func detectBlackHole(in dev: Device) { /* no-op, retained for call-site compat */ }
 
     /// When the set of enabled devices changes (or whole-house mode flips),
@@ -1291,6 +1453,30 @@ final class AppModel {
         if newMode == .wholeHome {
             applyRememberedWholeHomeLocalOutputs()
         }
+        // `routing[*].volume` means two different things in the two modes and
+        // NOTHING else re-seeds it at the boundary, so without this the number
+        // survives the switch and is re-read under the wrong law:
+        //
+        //  * into whole-home — Direct Stereo leaves a MIRROR OF THE HARDWARE
+        //    level there (`applyDirectStereoVolumeSnapshot`). 30 % hardware
+        //    became `VolumeCurve.amplitude(30)` = -21 dB of EXTRA bridge gain
+        //    on a device already sitting at 30 %, ignoring whatever the user
+        //    had persisted for whole-home — until some unrelated discovery
+        //    event fired the `applyEvent` defer and snapped the room ~21 dB
+        //    louder mid-track.
+        //  * out of whole-home — a dB POSITION (50 % = -15 dB) was handed to
+        //    `Router.replan()` as a raw linear gain (= -6 dB), a ~9 dB jump
+        //    with the slider unmoved.
+        //
+        // Leaving whole-home resets to unity rather than to anything
+        // remembered: in stereo the hardware is the authority, and the Direct
+        // Stereo snapshot overwrites these values with the real levels within
+        // the same reconcile. Unity is the only safe thing to hold in between.
+        if newMode == .wholeHome {
+            applyPersistedDeviceVolumes()
+        } else {
+            resetDeviceVolumesToUnity()
+        }
         // Force a full pipeline restart by stopping the engine, then
         // reconciling. The two modes have different audio paths
         // (stereo: local Aggregate AUHAL; wholeHome: SCK→OwnTone→
@@ -1394,7 +1580,43 @@ final class AppModel {
         }
     }
 
+    /// Whole-home's counterpart to `directStereoVolumeKeyEligible`.
+    ///
+    /// Worth capturing the keys here specifically BECAUSE of the named sink:
+    /// the system default output is then a SyncCast aggregate that exposes no
+    /// `kAudioDevicePropertyVolumeScalar`, so an uncaptured volume key gets
+    /// the "forbidden" OSD and does nothing. Capturing it turns that dead key
+    /// into the master fader.
+    ///
+    /// Only ever active with Accessibility granted — without it the controller
+    /// falls back to an NSEvent monitor that sees keys only while SyncCast is
+    /// frontmost, which a menu-bar app essentially never is. That degradation
+    /// is explained in the panel (`volumeKeyNeedsAccessibilityHint`); the
+    /// panel's own faders remain the primary, always-available control, and
+    /// nothing here ever raises a permission prompt.
+    private var wholeHomeVolumeKeyEligible: Bool {
+        mode == .wholeHome && streamingState == .running
+    }
+
+    /// Either mode's gate — what the key controller is actually told.
+    private var systemVolumeKeyEligible: Bool {
+        directStereoVolumeKeyEligible || wholeHomeVolumeKeyEligible
+    }
+
+    /// Master fader movement per key press, in percent.
+    ///
+    /// Deliberately not macOS's 1/16 (6.25 %): on an integer percent grid that
+    /// step rounds every press and never lands back on exactly 0 or 100. 5 %
+    /// divides the range exactly, so the ends are always reachable — worth
+    /// more than matching Apple's step count, and it is ~1.5 dB per press on
+    /// `VolumeCurve`, a normal-feeling increment.
+    static let masterVolumeKeyStepPercent: Int = 5
+
     private func handleSystemVolumeKey(_ action: SystemVolumeKeyAction) {
+        if wholeHomeVolumeKeyEligible {
+            handleWholeHomeVolumeKey(action)
+            return
+        }
         guard directStereoVolumeKeyEligible else { return }
         // Snapshot gate (Codex P2): until the enter-running hardware
         // snapshot lands, `routing` still holds last session's persisted
@@ -1449,6 +1671,45 @@ final class AppModel {
                 return next
             }
         }
+    }
+
+    /// Media keys in whole-home mode drive the MASTER fader, not the
+    /// per-device ones.
+    ///
+    /// The master is the only stage that behaves like a system volume: it is
+    /// one number, it reaches every speaker at once, and (being upstream of
+    /// OwnTone) its zero is real silence. Stepping the per-device faders
+    /// instead would flatten the balance the user dialled in, which is the
+    /// same mistake the Direct Stereo path documents having made.
+    ///
+    /// No `reconcileEngine()`: this crosses no IPC and cannot change the
+    /// device set — it ends as one Float store the socket writer picks up on
+    /// its next packet.
+    ///
+    /// Internal rather than private so the unit tests can drive the stepping
+    /// directly (same reason as `applyPersistedDeviceTrims`); it is not part
+    /// of the UI surface.
+    func handleWholeHomeVolumeKey(_ action: SystemVolumeKeyAction) {
+        switch action {
+        case .volumeUp:
+            // Stepping up from a muted state unmutes, matching macOS and the
+            // Direct Stereo path (`DirectStereoVolumeLogic.unmutesOnStep`).
+            if masterMuted { setMasterMuted(false) }
+            setMasterVolumePercent(
+                masterVolumePercent + AppModel.masterVolumeKeyStepPercent
+            )
+        case .volumeDown:
+            setMasterVolumePercent(
+                masterVolumePercent - AppModel.masterVolumeKeyStepPercent
+            )
+        case .mute:
+            toggleMasterMute()
+        }
+        SyncCastLog.log(
+            "systemVolumeKey: whole-home \(action) → master "
+            + "\(VolumeCurve.percentLabel(masterVolumePercent))"
+            + "\(masterMuted ? " (muted)" : "")"
+        )
     }
 
     /// Apply one media-key action across the covered set.
@@ -1539,8 +1800,13 @@ final class AppModel {
     /// `streamingState` didSet plus init, so every state transition is
     /// covered without sprinkling calls over the reconcile paths.
     private func updateVolumeKeyEligibility(reason: String) {
+        // The controller is told about EITHER mode, but everything below is
+        // Direct Stereo's hardware-snapshot machinery and stays keyed to it.
+        // Whole-home has no hardware to snapshot — its keys drive the master
+        // fader, which is always in a known state — so arming the gate there
+        // would hold keys hostage waiting for a snapshot that never comes.
+        systemVolumeKeyController?.setEligible(systemVolumeKeyEligible)
         let eligible = directStereoVolumeKeyEligible
-        systemVolumeKeyController?.setEligible(eligible)
         if eligible {
             // Snapshot gate (Codex P2): keys stay held (tap consumes,
             // AppModel drops) until the snapshot below lands or the
@@ -1804,7 +2070,7 @@ final class AppModel {
     /// Popover hint visibility: direct stereo is running but the event
     /// tap can't exist without Accessibility.
     var volumeKeyNeedsAccessibilityHint: Bool {
-        directStereoVolumeKeyEligible
+        systemVolumeKeyEligible
             && volumeKeyCaptureState == .needsPermission
     }
 
@@ -1835,12 +2101,298 @@ final class AppModel {
         return "音量不可控 — 请用显示器按键/OSD 调节"
     }
 
+    /// Percent at or below which the -30 dB floor is worth explaining.
+    static let volumeFloorHintPercent: Int = VolumeCurve.mutePercent
+
+    /// Whole-home only: a per-speaker fader at the bottom of its travel is
+    /// `VolumeCurve.minDb`, NOT silence — on either leg.
+    ///
+    /// OwnTone's per-output volume cannot go below that floor, and the local
+    /// bridge deliberately reproduces the same floor so the two legs stay
+    /// equally attenuated at every slider position (that parity is the entire
+    /// point of `VolumeCurve`). So a row showing `0%` is still audible whether
+    /// it is a Xiaomi Sound or the MacBook's own speakers, and the hint must
+    /// cover BOTH — gating it on `.airplay2`, as it used to, left a local
+    /// speaker reading `0%` while still playing at ~1/32 amplitude with
+    /// nothing on screen to explain it.
+    ///
+    /// Mute is the one place the legs legitimately diverge: the local bridge
+    /// writes true zeros, OwnTone cannot. A muted local speaker is therefore
+    /// genuinely silent and needs no hint; a muted AirPlay receiver does.
+    /// The escape route named in the copy differs for the same reason.
+    func volumeFloorHint(for deviceID: String) -> String? {
+        guard mode == .wholeHome,
+              let route = routing[deviceID], route.enabled,
+              let transport = devices.first(where: { $0.id == deviceID })?.transport
+        else { return nil }
+        let isAirPlay = transport == .airplay2
+        if route.muted {
+            // Local mute already reaches `VolumeCurve.silentAmplitude`.
+            guard isAirPlay else { return nil }
+        } else {
+            guard deviceVolumePercent(for: deviceID)
+                <= AppModel.volumeFloorHintPercent
+            else { return nil }
+        }
+        let escape = isAirPlay
+            ? "要真静音请用总音量"
+            : "要真静音请点左侧扬声器图标"
+        return "最低档 ≈ "
+            + VolumeCurve.decibelLabel(VolumeCurve.mutePercent)
+            + "，并非完全静音 — " + escape
+    }
+
+    // MARK: - Volume
+    //
+    // Two stages, and which is which matters:
+    //
+    //  * MASTER — one fader for the whole system, applied upstream of OwnTone
+    //    in `AudioSocketWriter`. Both legs receive the same attenuated
+    //    samples, and it is the only stage that can reach true silence (see
+    //    `VolumeCurve`). Whole-home only: in stereo the writer does not run
+    //    and each device already has a real hardware volume.
+    //  * PER-DEVICE — relative balance between speakers, applied at each
+    //    leg's own attenuator. Locally that is the bridge's render gain; on
+    //    AirPlay it is OwnTone's per-output volume. `VolumeCurve` is what
+    //    makes those two land on the same loudness for the same slider
+    //    position.
+    //
+    // Both are stored as integer percent, which is exactly OwnTone's grid, so
+    // nothing is lost converting between the UI, the wire and the plist.
+
+    /// Per-device volume, keyed by `Device.persistenceKey` (`ca:<UID>` /
+    /// `ap:<hex>`) — NOT by `Device.id`, which is minted fresh each process.
+    /// Same reasoning as `deviceTrimDefaultsKey`.
+    static let deviceVolumeDefaultsKey = "syncast.deviceVolumePercent"
+
+    /// Master fader position. Separate key so clearing one does not disturb
+    /// the other.
+    static let masterVolumeDefaultsKey = "syncast.masterVolumePercent"
+
+    private var persistedDeviceVolumes: [String: Int] =
+        AppModel.loadPersistedDeviceVolumes()
+
+    /// Whether per-device volume is OURS to remember in the current mode.
+    ///
+    /// Whole-home only, and this is not a scoping convenience — it is a
+    /// correctness rule. In Direct Stereo, `routing[*].volume` is a MIRROR of
+    /// the device's own hardware volume: `applyDirectStereoVolumeSnapshot` and
+    /// `HardwareVolumeObserver` continuously write the real level back into
+    /// it, and macOS already persists that level per device. Storing a second
+    /// copy would mean restoring a stale value on launch that the next
+    /// hardware snapshot immediately overwrites — a visible slider jump, and a
+    /// fight between two authorities over one number.
+    ///
+    /// In whole-home nothing else remembers it: the level lives in our own
+    /// bridge gain and in OwnTone's per-output volume, both of which reset
+    /// every session.
+    private var deviceVolumeIsPersistable: Bool { mode == .wholeHome }
+
+    /// Whole-home master fader, 0…100.
+    private(set) var masterVolumePercent: Int =
+        AppModel.loadPersistedMasterVolume()
+
+    /// Master mute. Deliberately NOT persisted: a mute that survives a
+    /// relaunch presents as "SyncCast has no audio" with no visible cause,
+    /// and the user has no reason to suspect a setting they last touched days
+    /// ago. The fader position IS persisted, so nothing they dialled is lost.
+    private(set) var masterMuted: Bool = false
+
+    private static func loadPersistedDeviceVolumes() -> [String: Int] {
+        guard let raw = UserDefaults.standard
+            .dictionary(forKey: deviceVolumeDefaultsKey)
+        else { return [:] }
+        var out: [String: Int] = [:]
+        for (key, value) in raw {
+            guard let percent = value as? Int else { continue }
+            out[key] = VolumeCurve.clampPercent(percent)
+        }
+        return out
+    }
+
+    private static func loadPersistedMasterVolume() -> Int {
+        guard UserDefaults.standard.object(forKey: masterVolumeDefaultsKey) != nil
+        else { return VolumeCurve.defaultPercent }
+        return VolumeCurve.clampPercent(
+            UserDefaults.standard.integer(forKey: masterVolumeDefaultsKey)
+        )
+    }
+
+    private func persistDeviceVolumes() {
+        UserDefaults.standard.set(
+            persistedDeviceVolumes, forKey: AppModel.deviceVolumeDefaultsKey
+        )
+    }
+
+    /// The slider position for a device, on the 0…100 percent grid.
+    func deviceVolumePercent(for deviceID: String) -> Int {
+        guard let volume = routing[deviceID]?.volume else {
+            return VolumeCurve.defaultPercent
+        }
+        return VolumeCurve.percent(forFraction: Double(volume))
+    }
+
+    /// Re-seed `routing[*].volume` from the persisted store.
+    ///
+    /// Runs after every discovery event for the same reason the trim re-seed
+    /// does: `Device.id` is per-process and per-appearance, so a receiver that
+    /// flapped on Bonjour comes back under a fresh id with a default routing
+    /// entry. Without this its volume silently reverts to full scale — which,
+    /// unlike a reverted delay trim, is immediately and unpleasantly audible.
+    ///
+    /// - Returns: whether anything changed, so the caller can decide whether
+    ///   to spend a push to the legs.
+    @discardableResult
+    func applyPersistedDeviceVolumes() -> Bool {
+        guard deviceVolumeIsPersistable else { return false }
+        var changed = false
+        for dev in devices {
+            guard let key = dev.persistenceKey else { continue }
+            let stored = persistedDeviceVolumes[key] ?? VolumeCurve.defaultPercent
+            // A device with no routing entry yet has nothing to re-seed INTO;
+            // writing through the optional chain would no-op while still
+            // reporting a change, queueing work on every discovery event.
+            guard var r = routing[dev.id],
+                  VolumeCurve.percent(forFraction: Double(r.volume)) != stored
+            else { continue }
+            r.volume = Float(VolumeCurve.fraction(forPercent: stored))
+            routing[dev.id] = r
+            changed = true
+        }
+        return changed
+    }
+
+    /// Drop every routing entry's volume back to full scale.
+    ///
+    /// Called when LEAVING whole-home. `routing[*].volume` is a `VolumeCurve`
+    /// position in whole-home and a plain linear gain everywhere else, so a
+    /// value carried across the boundary is re-read under the wrong law (see
+    /// `setMode`). Unity is the only value that means the same thing in both,
+    /// and in stereo it is immediately replaced by the real hardware level.
+    ///
+    /// - Returns: whether anything changed, matching
+    ///   `applyPersistedDeviceVolumes`'s contract.
+    @discardableResult
+    func resetDeviceVolumesToUnity() -> Bool {
+        let unity = Float(VolumeCurve.fraction(forPercent: VolumeCurve.defaultPercent))
+        var changed = false
+        for (id, route) in routing where route.volume != unity {
+            var r = route
+            r.volume = unity
+            routing[id] = r
+            changed = true
+        }
+        return changed
+    }
+
     func setVolume(_ value: Float, for id: String) {
+        setDeviceVolumePercent(VolumeCurve.percent(forFraction: Double(value)), for: id)
+    }
+
+    /// Set one output's volume on the percent grid.
+    ///
+    /// Snapping to whole percents is not cosmetic: it is the grid OwnTone
+    /// quantises to, so an unsnapped slider position would let the local leg
+    /// sit between two steps the AirPlay leg can express. It also makes the
+    /// "unchanged ⇒ do nothing" guard below effective, which is what keeps a
+    /// continuous drag from spending a reconcile per pixel.
+    func setDeviceVolumePercent(_ percent: Int, for id: String) {
+        let clamped = VolumeCurve.clampPercent(percent)
+        // Materialise the entry BEFORE the "unchanged ⇒ do nothing" guard.
+        // `deviceVolumePercent` reports `defaultPercent` for a device with no
+        // routing entry, so guarding on it first made setting 100 % on such a
+        // device a silent no-op — the entry was never created and neither the
+        // bridge push nor the reconcile ever ran. `resetDeviceVolume` IS
+        // exactly that call, so the Reset button did nothing on any row whose
+        // entry had not been created yet (fresh appearance, post-id-migration).
         var r = routing[id] ?? DeviceRouting(deviceID: id)
-        r.volume = max(0, min(1, value))
+        let isNewEntry = routing[id] == nil
+        let current = VolumeCurve.percent(forFraction: Double(r.volume))
+        guard current != clamped || isNewEntry else { return }
+        r.volume = Float(VolumeCurve.fraction(forPercent: clamped))
         routing[id] = r
+        if deviceVolumeIsPersistable, let key = persistenceKey(for: id) {
+            // Full scale is the default, so drop the key rather than storing
+            // it — an untouched speaker leaves no trace in the plist.
+            if clamped == VolumeCurve.defaultPercent {
+                persistedDeviceVolumes.removeValue(forKey: key)
+            } else {
+                persistedDeviceVolumes[key] = clamped
+            }
+            persistDeviceVolumes()
+        }
+        pushLocalVolumeImmediately(r)
         applyDirectStereoHardwareVolumeIfNeeded(for: id)
         reconcileEngine()
+    }
+
+    func resetDeviceVolume(for deviceID: String) {
+        setDeviceVolumePercent(VolumeCurve.defaultPercent, for: deviceID)
+    }
+
+    /// Push one routing entry straight to the Router so the local bridge's
+    /// gain tracks the drag, instead of waiting for the debounced reconcile.
+    ///
+    /// Whole-home only, and deliberately so. `setRouting` → `replan()` is
+    /// cheap for bridges (an atomic Float store the render callback picks up
+    /// on its next block) but in stereo the same path also drives hardware /
+    /// DDC writes on the physical DACs, and firing those per drag frame would
+    /// put a slow I2C transaction in the middle of a slider drag. Stereo keeps
+    /// its existing behaviour untouched.
+    private func pushLocalVolumeImmediately(_ r: DeviceRouting) {
+        guard mode == .wholeHome else { return }
+        Task { [router] in await router.setRouting(r) }
+    }
+
+    // MARK: Master volume
+
+    /// Linear amplitude currently in force for the master stage, accounting
+    /// for mute. Exposed for the panel's readout and for tests.
+    var masterVolumeAmplitude: Float {
+        masterMuted
+            ? VolumeCurve.silentAmplitude
+            : VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)
+    }
+
+    func setMasterVolumePercent(_ percent: Int) {
+        let clamped = VolumeCurve.clampPercent(percent)
+        guard clamped != masterVolumePercent else { return }
+        masterVolumePercent = clamped
+        UserDefaults.standard.set(
+            clamped, forKey: AppModel.masterVolumeDefaultsKey
+        )
+        pushMasterVolume()
+    }
+
+    func setMasterMuted(_ muted: Bool) {
+        guard muted != masterMuted else { return }
+        masterMuted = muted
+        pushMasterVolume()
+        SyncCastLog.log("masterVolume: \(muted ? "muted" : "unmuted")")
+    }
+
+    func toggleMasterMute() {
+        setMasterMuted(!masterMuted)
+    }
+
+    func resetMasterVolume() {
+        setMasterMuted(false)
+        setMasterVolumePercent(VolumeCurve.defaultPercent)
+    }
+
+    /// Send the master stage to the Router.
+    ///
+    /// Not debounced: this crosses no IPC and touches no AirPlay session — it
+    /// ends as one atomic Float store the socket writer picks up on its next
+    /// 10 ms packet and ramps into. Debouncing it would only add lag to a
+    /// control the user is actively dragging.
+    private func pushMasterVolume() {
+        // Mute is expressed as a master of zero, which is genuine digital
+        // silence upstream of OwnTone — the only mute in the system that also
+        // silences AirPlay receivers, whose per-output volume floors at
+        // -30 dB.
+        let percent = masterMuted ? VolumeCurve.mutePercent : masterVolumePercent
+        Task { [router] in await router.setMasterVolume(percent: percent) }
     }
 
     func toggleMute(_ id: String) {
@@ -2280,14 +2832,27 @@ final class AppModel {
         setAirplayDelay(clamped)
     }
 
+    /// UID namespaces of devices SyncCast creates itself. None of them is ever
+    /// a legitimate user destination:
+    ///   - `AggregateDevice`     — private stereo fan-out target; invisible by
+    ///     construction (`IsPrivate=1`), filtered as belt-and-braces.
+    ///   - `DirectStereoOutput`  — public Direct Stereo aggregate; selecting it
+    ///     would nest it inside itself.
+    ///   - `WholeHomeSinkOutput` — public "AirPlay 全屋" wrapper around
+    ///     BlackHole. It does NOT contain "blackhole" in its name, so the name
+    ///     check below cannot catch it, and enabling it would close a feedback
+    ///     loop (bridge → sink → BlackHole → ScreenCaptureKit → OwnTone →
+    ///     bridge).
+    private static let syncCastOwnedUIDPrefixes = [
+        AggregateDevice.uidPrefix,
+        DirectStereoOutput.uidPrefix,
+        WholeHomeSinkOutput.uidPrefix,
+    ]
+
     private func isUserSelectableOutput(_ d: Device) -> Bool {
         if let uid = d.coreAudioUID, uid.contains("BlackHole") { return false }
-        // Our own private aggregate (created by Router.reconcileLocalDriver)
-        // is invisible-by-construction (kAudioAggregateDeviceIsPrivateKey=1)
-        // but as a belt-and-braces filter in case macOS ever surfaces it,
-        // hide it by UID prefix.
         if let uid = d.coreAudioUID,
-           uid.hasPrefix("io.syncast.aggregate.v1.") {
+           AppModel.syncCastOwnedUIDPrefixes.contains(where: uid.hasPrefix) {
             return false
         }
         let lower = d.name.lowercased()

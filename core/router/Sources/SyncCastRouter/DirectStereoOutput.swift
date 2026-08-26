@@ -571,6 +571,19 @@ public final class DirectStereoOutput {
         uid: String?,
         fallbackUIDs: Set<String>
     ) -> (AudioObjectID?, String?) {
+        // A whole-home sink is NEVER a valid restore target: it is a
+        // SyncCast-owned device that is torn down when whole-home mode ends,
+        // so remembering it here would leave the system default pointed at a
+        // destroyed device (presents as total silence, no error anywhere).
+        // The Router already stops the sink before Direct Stereo snapshots the
+        // default, so reaching this branch means a crash or a race — this is
+        // the belt to that braces.
+        if let uid, uid.hasPrefix(WholeHomeSinkOutput.uidPrefix) {
+            if let fallback = fallbackDefaultOutputID(coveredUIDs: fallbackUIDs) {
+                return (fallback, readDeviceUID(fallback))
+            }
+            return (nil, nil)
+        }
         guard let uid,
               uid.hasPrefix(Self.uidPrefix),
               let pid = processID(from: uid),
@@ -637,6 +650,7 @@ public final class DirectStereoOutput {
     static func isOrdinaryOutputUID(_ uid: String) -> Bool {
         guard !uid.hasPrefix(Self.uidPrefix),
               !uid.hasPrefix(AggregateDevice.uidPrefix),
+              !uid.hasPrefix(WholeHomeSinkOutput.uidPrefix),
               let id = try? deviceID(forUID: uid)
         else {
             return false
@@ -648,6 +662,7 @@ public final class DirectStereoOutput {
         guard let uid = readDeviceUID(id),
               !uid.hasPrefix(Self.uidPrefix),
               !uid.hasPrefix(AggregateDevice.uidPrefix),
+              !uid.hasPrefix(WholeHomeSinkOutput.uidPrefix),
               !isAggregate(id)
         else {
             return nil

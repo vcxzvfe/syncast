@@ -74,9 +74,11 @@ log "Installing sidecar Python deps…"
 cat <<'EOF'
 
 Next steps:
-  • Open  System Settings → Sound  and ensure  "BlackHole 2ch"  is set as the
-    output device while SyncCast is running. (SyncCast will offer to do this
-    for you in the first-run wizard.)
+  • You no longer need to select "BlackHole 2ch" by hand. Entering whole-home
+    mode switches the system output to  "AirPlay 全屋"  (a SyncCast-owned
+    wrapper around BlackHole) and restores your previous output on exit.
+    Note that the macOS volume slider is greyed out while it is selected —
+    use SyncCast's own panel for volume.
   • If you want the Mac mini in your group, enable
     System Settings → General → AirDrop & Handoff → AirPlay Receiver
     on that Mac and set "Allow AirPlay for: Anyone on the same network".

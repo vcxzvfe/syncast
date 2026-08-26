@@ -55,6 +55,99 @@ public final class AudioSocketWriter: @unchecked Sendable {
     /// second concurrent writer — the same 2.2× over-rate bug feb56ca
     /// originally fixed.
     private var writerGeneration: UInt64 = 0
+
+    // MARK: - Master volume
+    //
+    // The master fader is applied HERE, on the samples going into OwnTone's
+    // input fifo, and nowhere else. That placement is load-bearing:
+    //
+    //  * Both output legs descend from this one stream — the AirPlay leg from
+    //    OwnTone's AirPlay outputs, the local leg from OwnTone's fifo output
+    //    fanned back to `LocalAirPlayBridge`. One multiply here is therefore
+    //    bit-identically applied to both, with no curve reconciliation needed.
+    //  * OwnTone's per-output volume floors at -30 dB (see `VolumeCurve`), so a
+    //    master implemented as per-output volume could not mute, and — worse —
+    //    any combination summing below -30 dB would clamp on the AirPlay leg
+    //    while the local leg took the full attenuation, pulling the two legs
+    //    apart by up to 15 dB. Upstream has no floor.
+    //  * This loop is a plain async Task paced on the wall clock, not a
+    //    real-time thread. A multiply per sample does not move the packet
+    //    cadence, so the Layer-2 PLL sees nothing at all.
+    //
+    // The cost is that attenuation happens before the s16 quantisation below,
+    // so the master spends headroom: one bit per 6.02 dB. The master follows
+    // `VolumeCurve`, NOT a linear fader, so read the budget off
+    // `VolumeCurve.decibels(forPercent:)` rather than off slider travel —
+    // 50 % is -15 dB (~2.5 bits, ~13.5 left of 16), 25 % is -22.5 dB
+    // (~3.7 bits, ~12.3 left). Both are fine; users who want to run very low
+    // should pull the per-speaker faders instead, which act after OwnTone.
+    // `VolumeCurveTests` derives these numbers rather than trusting the prose.
+
+    /// Ramp time for a master change, matching
+    /// `LocalAirPlayBridge.volumeRampMs` for the same reason: an instantaneous
+    /// gain step on a non-zero signal is an audible click. One packet is
+    /// `frameCount / sampleRate` = 10 ms, so a ramp completes inside a single
+    /// packet and never straddles a socket write.
+    public static let masterRampMs: Double = 10.0
+
+    /// No attenuation.
+    public static let masterGainDefault: Float = 1.0
+
+    /// Guards the two gain fields only. Deliberately NOT `lock` — that one
+    /// guards `fd` and is taken inside the send loop, and a fader drag must
+    /// never contend with an in-flight write.
+    private let masterGainLock = NSLock()
+    private var _masterGainTarget: Float = AudioSocketWriter.masterGainDefault
+    private var _masterGainCurrent: Float = AudioSocketWriter.masterGainDefault
+
+    /// Set the master linear amplitude. Takes effect on the next packet and
+    /// ramps in over `masterRampMs`.
+    public func setMasterGain(_ gain: Float) {
+        let clamped = Self.clampGain(gain)
+        masterGainLock.withLock { _masterGainTarget = clamped }
+    }
+
+    /// Set the master amplitude with NO ramp, for a writer that has not
+    /// emitted a packet yet.
+    ///
+    /// `Router.attachIpc` builds a brand-new writer on every sidecar
+    /// (re)connection and re-seeds it from the user's current setting. Doing
+    /// that through `setMasterGain` only moved the TARGET, leaving `current`
+    /// at `masterGainDefault` — so a sidecar restart with the fader at 10 %
+    /// (or muted) began its very first packet at full scale and ramped down
+    /// over 480 frames, putting ~10 ms of full-volume audio onto every AirPlay
+    /// receiver and local bridge at exactly the moment the user had the system
+    /// turned down. There is nothing to ramp away from before the first
+    /// packet, so seeding both fields is both safe and correct.
+    ///
+    /// Only valid before `start()`; afterwards use `setMasterGain` so live
+    /// changes keep their click-free ramp.
+    public func seedMasterGain(_ gain: Float) {
+        let clamped = Self.clampGain(gain)
+        masterGainLock.withLock {
+            _masterGainTarget = clamped
+            _masterGainCurrent = clamped
+        }
+    }
+
+    private static func clampGain(_ gain: Float) -> Float {
+        guard gain.isFinite else { return masterGainDefault }
+        return max(0, min(1, gain))
+    }
+
+    /// The last value passed to `setMasterGain`, not the in-flight ramp
+    /// position — set/get symmetry for the Router's re-seed on reconnect.
+    public var masterGain: Float {
+        masterGainLock.withLock { _masterGainTarget }
+    }
+
+    /// Where the ramp currently sits, i.e. the gain the NEXT packet starts at.
+    /// Internal: the only consumer is the test that pins `seedMasterGain`
+    /// moving this and `setMasterGain` deliberately not.
+    var masterGainRampPosition: Float {
+        masterGainLock.withLock { _masterGainCurrent }
+    }
+
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
         self.socketPath = socketPath
@@ -171,6 +264,13 @@ public final class AudioSocketWriter: @unchecked Sendable {
         var startNs = Clock.nowNs()
         var packetsConsumed: UInt64 = 0
 
+        // Longest ramp segment, in frames. Computed once: `sampleRate` and
+        // `masterRampMs` are both constant for the life of the writer, and the
+        // per-packet path must stay allocation-free.
+        let masterRampFrames = max(
+            1, Int(Self.masterRampMs / 1000.0 * sampleRate)
+        )
+
         while !Task.isCancelled {
             // 1. Wall-clock pacing. Sleep until our scheduled wake-up for
             //    THIS packet. If we're already late by ≤ 2 packets, we
@@ -229,12 +329,36 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 nextRead &+= Int64(frameCount)
             }
 
+            // Master fader + Float→s16 conversion in one pass. One lock
+            // acquisition per packet (not per sample); the ramp itself runs
+            // off loop-local values so the fader can be dragged concurrently
+            // without ever contending here.
+            let masterSnapshot = masterGainLock.withLock {
+                (current: _masterGainCurrent, target: _masterGainTarget)
+            }
+            var gain = masterSnapshot.current
+            let ramping = masterSnapshot.current != masterSnapshot.target
+            let rampFrames = min(frameCount, masterRampFrames)
+            let gainStep = ramping
+                ? (masterSnapshot.target - masterSnapshot.current) / Float(rampFrames)
+                : 0
             for f in 0..<frameCount {
+                if ramping {
+                    gain = f < rampFrames ? gain + gainStep : masterSnapshot.target
+                }
                 for ch in 0..<channelCount {
-                    let v = planar[ch][f]
+                    let v = planar[ch][f] * gain
                     let clamped = max(-1.0, min(1.0, v))
                     packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
                 }
+            }
+            if ramping {
+                // `rampFrames <= frameCount` by construction, so a ramp always
+                // completes within the packet that started it. Persisting the
+                // reached value (rather than the target) keeps this honest if
+                // that ever stops being true.
+                let reached = frameCount >= rampFrames ? masterSnapshot.target : gain
+                masterGainLock.withLock { _masterGainCurrent = reached }
             }
 
             // 3. Send one well-framed packet down the Unix stream socket.

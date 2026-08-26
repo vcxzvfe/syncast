@@ -106,7 +106,21 @@ Disconnect.
 {"method":"device.set_volume","params":{"device_id":"...","volume":0.65}}
 ```
 
-`volume` is `0.0`–`1.0`, linear.
+`volume` is `0.0`–`1.0`. The sidecar multiplies by 100 and rounds to reach
+OwnTone's per-output scale, so senders should stay on the whole-percent grid
+(`n/100`) or the value silently snaps.
+
+**Not linear in amplitude — linear in decibels.** OwnTone maps `0`–`100` onto
+`-30 dB`–`0 dB` (`outputs/airplay.c:1805-1821`, with
+`AIRPLAY_CONFIG_MAX_VOLUME = 11` and no `max_volume` configured), i.e.
+`dB = -30 + 0.3 × percent`. Any caller that also attenuates locally must use
+the same law or the two legs drift apart — up to 10.5 dB at mid-scale. The
+Swift side does this in `VolumeCurve`.
+
+`volume: 0.0` is therefore **-30 dB, not silence**: `-144` is OwnTone's only
+"off" value and is unreachable through this call (`player.c` rejects a
+negative volume). Real silence has to come from attenuating the samples
+upstream of OwnTone.
 
 ### `stream.start`
 

@@ -231,8 +231,19 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// Diagnostic — render callback ticks. Same role as
     /// `LocalOutput.renderTickCount`.
     public private(set) var renderTickCount: UInt64 = 0
-    /// Diagnostic — peak abs sample of the most recent rendered block.
+    /// Diagnostic — peak abs sample of the most recent rendered block,
+    /// measured BEFORE the volume gain is applied.
+    ///
+    /// Pre-gain deliberately. `peak: 0.0000` is this project's long-standing
+    /// "no audio is reaching this bridge" signal, and once the user can
+    /// actually attenuate a speaker, a post-gain peak would shrink whenever
+    /// they turned it down — making a working bridge look like a starved one.
+    /// The gain in force is published separately as `lastRenderGain`, so the
+    /// audible level is still recoverable as `lastRenderPeak * lastRenderGain`.
     public private(set) var lastRenderPeak: Float = 0
+    /// Diagnostic — volume gain in force at the end of the most recent
+    /// rendered block (the ramp's landing value, not its target).
+    public private(set) var lastRenderGain: Float = 1
     /// Diagnostic — most recent error string (empty if everything's OK).
     public private(set) var lastError: String = ""
 
@@ -264,6 +275,11 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     private var _volumeGainCurrent: Float = 1.0
     private var _volumeGainTarget: Float = 1.0
     private static let volumeRampMs: Double = 10.0
+
+    /// How many leading samples of a block the peak diagnostic inspects. A
+    /// bounded prefix rather than the whole block so the cost per render is
+    /// constant regardless of the device's render quantum.
+    private static let peakMeasurementSamples: Int = 128
 
     // MARK: - Per-device delay trim (user listening-position compensation)
     //
@@ -1399,6 +1415,16 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             newTrimCurrent = snapshot.trimTarget
         }
 
+        // Peak measurement, taken here — after the ring read and any trim
+        // cross-fade, but BEFORE the volume gain — so the "is audio arriving
+        // at all?" diagnostic stays independent of how loud the user set this
+        // speaker. See `lastRenderPeak`. Plain reads and a max, no allocation.
+        var pk: Float = 0
+        let peakSamples = min(frames, Self.peakMeasurementSamples)
+        let peakChannel = outPtrs[0]
+        for i in 0..<peakSamples { pk = max(pk, abs(peakChannel[i])) }
+        lastRenderPeak = pk
+
         // Software gain: ramp per-sample if current != target, vDSP
         // fast path otherwise. Ramped to suppress click on sudden
         // 1.0 → 0 transitions (pop-suppressing).
@@ -1457,11 +1483,7 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // Diagnostics + tail accounting. Done on the RT thread but
         // they're just simple writes, no allocation.
         renderTickCount &+= 1
-        var pk: Float = 0
-        let n = min(frames, 128)
-        let p0 = outPtrs[0]
-        for i in 0..<n { pk = max(pk, abs(p0[i])) }
-        lastRenderPeak = pk
+        lastRenderGain = gainCurrentSnapshot
         return noErr
     }
 

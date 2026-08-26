@@ -126,6 +126,12 @@ public actor Router {
     /// format and the aggregate's exposed stream layout).
     private var aggregateStreamDiagnostic: AggregateDevice.StreamDiagnostic?
     private var directStereoOutput: DirectStereoOutput?
+    /// Whole-home mode's named system sink ("AirPlay 全屋"): a public
+    /// aggregate wrapping BlackHole 2ch that we install as the macOS default
+    /// output for the duration of whole-home mode. Nil in stereo mode and
+    /// after teardown. See `WholeHomeSinkOutput` for why the rename cannot be
+    /// done on BlackHole itself.
+    private var wholeHomeSink: WholeHomeSinkOutput?
     private var routing: [String: DeviceRouting] = [:]
     /// Monotonic route/context epoch. Incremented for user/app-driven route,
     /// mode, AirPlay active-set, connection, and measured-latency changes.
@@ -163,6 +169,15 @@ public actor Router {
     /// calls on the same connection.
     var ipc: IpcClient?
     private var audioWriter: AudioSocketWriter?
+
+    /// Whole-home master fader, 0…100 on `VolumeCurve`'s scale.
+    ///
+    /// Held here rather than only inside the writer because `attachIpc`
+    /// constructs a NEW `AudioSocketWriter` every time the sidecar connection
+    /// is (re)established. Without a Router-side copy to re-seed from, a
+    /// sidecar restart would silently snap the master back to full scale
+    /// under a UI still showing the user's setting.
+    private var masterVolumePercent: Int = VolumeCurve.defaultPercent
     /// Per-device connection state, keyed by SyncCast device ID. Updated
     /// in the sidecar-notification handler on every `event.device_state`
     /// arrival (see `attachSidecar`). Surfaced to the UI via
@@ -263,6 +278,14 @@ public actor Router {
         let directReaped = DirectStereoOutput.sweepOrphans()
         if directReaped > 0 {
             print("[Router] swept \(directReaped) orphan direct stereo aggregate device(s) at init")
+        }
+        // Whole-home sinks share that hazard — they also become the macOS
+        // default output, so a SIGKILL can leave the system pointed at a
+        // device nobody owns. The sweep moves the default to a real speaker
+        // before destroying such a leftover.
+        let sinkReaped = WholeHomeSinkOutput.sweepOrphans()
+        if sinkReaped > 0 {
+            print("[Router] swept \(sinkReaped) orphan whole-home sink device(s) at init")
         }
         if #available(macOS 14.2, *) {
             let tapReaped = TapCapture.sweepOrphans()
@@ -366,6 +389,16 @@ public actor Router {
         // untrimmed for the rest of the session.
         lastPushedAirplayTrimsMs = [:]
         let writer = AudioSocketWriter(ring: capture.ringBuffer, socketPath: sockets.audio)
+        // Re-seed the master fader: this writer is brand new and would
+        // otherwise start at unity, overriding the user's setting the moment
+        // the sidecar reconnects. `seedMasterGain`, not `setMasterGain` —
+        // the latter only moves the ramp target, so the first packet after a
+        // reconnect would start at full scale and ramp DOWN to the user's
+        // level, i.e. ~10 ms of full-volume audio out of a system they had
+        // turned down or muted.
+        writer.seedMasterGain(
+            VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)
+        )
         self.audioWriter = writer
     }
 
@@ -412,10 +445,16 @@ public actor Router {
             if mode == .stereo, stereoOutputPath == .direct {
                 await capture.stopAndWait()
                 tearDownLocalDriver()
+                // Restore the user's real default output BEFORE Direct Stereo
+                // snapshots it. Reversed, Direct Stereo would remember our
+                // sink as "the previous default" and restore the system to a
+                // device that no longer exists.
+                try stopWholeHomeSink()
                 try reconcileDirectStereo(devices: devices, allowEmpty: false)
             } else if mode == .stereo {
                 try await capture.start()
                 try stopDirectStereoOutput()
+                try stopWholeHomeSink()
                 reconcileLocalDriver(devices: devices)
             } else {
                 try await capture.start()
@@ -424,6 +463,14 @@ public actor Router {
                 // from a previous mode. tearDownLocalDriver is idempotent
                 // (no-op if localOutputs is already empty + aggregate is nil).
                 tearDownLocalDriver()
+                // Install the named silent sink as the system default output.
+                // This is the AUTHORITATIVE bring-up point (rather than
+                // `setMode`) because it is the one whole-home path that can
+                // report failure to the user: a throw here lands in the catch
+                // below, sets state = .error, and surfaces `lastError` — which
+                // is exactly what a missing BlackHole must do instead of
+                // silently double-playing every track.
+                try startWholeHomeSink()
             }
             replan()
             state = .running
@@ -431,6 +478,7 @@ public actor Router {
             state = .error
             lastError = "\(error)"
             _ = try? stopDirectStereoOutput()
+            _ = try? stopWholeHomeSink()
             tearDownLocalDriver()
             await capture.stopAndWait()
             throw error
@@ -471,6 +519,16 @@ public actor Router {
             try stopDirectStereoOutput()
         } catch {
             lastError = "direct stereo stop failed: \(error)"
+            state = .error
+            return
+        }
+        // 3b. Give the user's default output back. Same fail-loud contract as
+        //     Direct Stereo: if we cannot restore it we must NOT let the app
+        //     quit, or macOS is left pointed at a device that dies with us.
+        do {
+            try stopWholeHomeSink()
+        } catch {
+            lastError = "whole-home sink stop failed: \(error)"
             state = .error
             return
         }
@@ -590,10 +648,16 @@ public actor Router {
         // Whole-home bridges (Strategy 1): one line per active bridge
         // with packet + render counters. Empty when not in wholeHome
         // mode or no bridges are active.
+        // `peak` is measured PRE-gain, so `peak: 0.0000` still means "nothing
+        // is arriving" no matter where the user left the faders; `gain` is
+        // reported beside it so the audible level is still recoverable.
         var bridgeInfo = ""
         for (id, b) in localBridges {
-            bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) err:\(b.lastError.isEmpty ? "none" : b.lastError)"
+            bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) gain:\(String(format: "%.3f", b.lastRenderGain)) err:\(b.lastError.isEmpty ? "none" : b.lastError)"
         }
+        let masterInfo =
+            " master=\(masterVolumePercent)%"
+            + "/\(String(format: "%.3f", VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)))"
         // Per-subdevice hardware-volume rejection counters. Surfaced
         // here because the stderr log emits ONCE per UID per session;
         // a support ticket needs to see total rejection counts for
@@ -609,6 +673,10 @@ public actor Router {
         let directInfo = directStereoOutput.map {
             " \($0.diagnostic)\(DDCDisplayVolumeController.shared.diagnosticSuffix())"
         } ?? ""
+        // Whole-home sink state. Present in field logs so "the system default
+        // output silently went back to a real speaker" is diagnosable without
+        // asking the user to open System Settings.
+        let sinkInfo = wholeHomeSink.map { " \($0.diagnostic)" } ?? ""
         let captureInfo: String
         if mode == .stereo,
            let direct = directStereoOutput,
@@ -617,7 +685,7 @@ public actor Router {
         } else {
             captureInfo = capture.diagnosticReport()
         }
-        return "\(captureInfo)\(driverInfo)\(directInfo)\(streamInfo)\(renderInfo)\(awInfo)\(bridgeInfo)\(hwVolInfo)"
+        return "\(captureInfo)\(driverInfo)\(directInfo)\(sinkInfo)\(streamInfo)\(renderInfo)\(awInfo)\(masterInfo)\(bridgeInfo)\(hwVolInfo)"
     }
 
     /// Backward-compatible wrapper for older diagnostic call sites.
@@ -949,6 +1017,16 @@ public actor Router {
             // so the next whole-home session re-pushes rather than being
             // silenced by the deadband against a figure no longer in force.
             lastPushedAirplayOffsetMs = nil
+            // Hand the default output back BEFORE any stereo path starts.
+            // Direct Stereo snapshots the current default when it starts, so
+            // leaving our sink installed here would make it remember a device
+            // that is about to be destroyed.
+            do {
+                try stopWholeHomeSink()
+            } catch {
+                lastError = "mode.set(\(newMode.rawValue)): whole-home sink stop failed: \(error)"
+                return
+            }
         case .wholeHome:
             // Going to whole_home: tear down the SCK→aggregate path.
             // Otherwise reconcileEngineAsync's running-true→wholeHome
@@ -1026,6 +1104,11 @@ public actor Router {
             // driver path, defeating the purpose.
             if uid.hasPrefix(AggregateDevice.uidPrefix) { return nil }
             if uid.hasPrefix(DirectStereoOutput.uidPrefix) { return nil }
+            // Our own whole-home sink wraps BlackHole under a friendly name,
+            // so the name-based filter below cannot see it. Rendering a bridge
+            // into it would close a feedback loop: bridge → sink → BlackHole →
+            // ScreenCaptureKit → OwnTone → bridge.
+            if uid.hasPrefix(WholeHomeSinkOutput.uidPrefix) { return nil }
             // Same blackhole filter as stereo mode — never route audio
             // back into the loopback source.
             if dev.name.lowercased().contains("blackhole") { return nil }
@@ -1089,7 +1172,7 @@ public actor Router {
             // doesn't briefly play at full volume before the next
             // replan() snaps it to the right level.
             let r = routing[t.deviceID] ?? DeviceRouting(deviceID: t.deviceID)
-            bridge.setVolume(r.muted ? 0 : r.volume)
+            bridge.setVolume(Self.localBridgeGain(for: r))
             do {
                 try bridge.start()
                 localBridges[t.deviceID] = bridge
@@ -1152,6 +1235,8 @@ public actor Router {
             guard let uid = dev.coreAudioUID else { return nil }
             let lower = dev.name.lowercased()
             if lower.contains("blackhole") { return nil }
+            // `isOrdinaryOutputUID` already rejects every SyncCast-owned UID
+            // prefix (including the whole-home sink) and every aggregate.
             guard DirectStereoOutput.isOrdinaryOutputUID(uid) else { return nil }
             return DirectStereoOutput.Target(uid: uid, name: dev.name)
         }
@@ -1201,6 +1286,76 @@ public actor Router {
         return status
     }
 
+    // MARK: - Whole-home system sink ("AirPlay 全屋")
+
+    /// Install the named silent sink as the macOS default output.
+    /// Idempotent — safe to call from every whole-home start path.
+    /// Throws `WholeHomeSinkOutput.WholeHomeSinkError.blackHoleNotInstalled`
+    /// when the loopback driver is missing, which is the one condition that
+    /// used to fail silently into double-played audio.
+    private func startWholeHomeSink() throws {
+        guard WholeHomeSinkOutput.enabled else { return }
+        let sink = wholeHomeSink ?? WholeHomeSinkOutput()
+        try sink.start()
+        wholeHomeSink = sink
+        FileHandle.standardError.write(Data(
+            "[Router] whole-home sink active: \(sink.diagnostic)\n".utf8
+        ))
+    }
+
+    /// Restore the user's previous default output and destroy the sink.
+    /// Throws when the restore failed, so callers can refuse to proceed (and
+    /// `Router.stop` can block app termination) rather than leaving macOS
+    /// pointed at a device that is about to disappear.
+    @discardableResult
+    private func stopWholeHomeSink() throws -> String? {
+        guard let sink = wholeHomeSink else { return nil }
+        guard sink.stop() else {
+            let status = sink.lastStopStatusText ?? sink.diagnostic
+            FileHandle.standardError.write(Data(
+                "[Router] whole-home sink stop failed: \(status) \(sink.diagnostic)\n".utf8
+            ))
+            throw WholeHomeSinkOutput.WholeHomeSinkError.stopFailed(status)
+        }
+        let status = sink.lastStopStatusText
+        FileHandle.standardError.write(Data(
+            "[Router] whole-home sink stopped: \(status ?? "unknown")\n".utf8
+        ))
+        wholeHomeSink = nil
+        return status
+    }
+
+    /// True when whole-home is running but macOS is no longer sending system
+    /// audio into our sink — i.e. the user (or a headphone plug) moved the
+    /// default output away and every track is now playing twice: once out of
+    /// the new default directly, once through the SCK tap → OwnTone → outputs.
+    ///
+    /// Polled by the app's 1 Hz health loop. See
+    /// `WholeHomeSinkOutput.isSystemDefaultOutput` for why this is a poll
+    /// rather than a CoreAudio property listener.
+    public var wholeHomeSinkDisplaced: Bool {
+        guard mode == .wholeHome, let sink = wholeHomeSink, sink.isActive else {
+            return false
+        }
+        return !sink.isSystemDefaultOutput
+    }
+
+    /// Put the named sink back as the macOS default output. Driven only by an
+    /// explicit user action — see `WholeHomeSinkOutput.reassertDefaultOutput`
+    /// for why this must never be automatic.
+    @discardableResult
+    public func reassertWholeHomeSink() -> Bool {
+        guard let sink = wholeHomeSink else { return false }
+        let ok = sink.reassertDefaultOutput()
+        if !ok {
+            lastError = "whole-home sink: could not reclaim the default output"
+        }
+        FileHandle.standardError.write(Data(
+            "[Router] whole-home sink reassert: \(ok ? "ok" : "failed") \(sink.diagnostic)\n".utf8
+        ))
+        return ok
+    }
+
     private func reconcileLocalDriver(devices: [Device]) {
         // Index name lookups so master picker can score by device name.
         var nameByUID: [String: String] = [:]
@@ -1225,6 +1380,9 @@ public actor Router {
             guard let uid = dev.coreAudioUID else { return nil }
             if uid.hasPrefix(AggregateDevice.uidPrefix) { return nil }
             if uid.hasPrefix(DirectStereoOutput.uidPrefix) { return nil }
+            // The whole-home sink is a BlackHole wrapper under a friendly
+            // name; the name check below cannot catch it.
+            if uid.hasPrefix(WholeHomeSinkOutput.uidPrefix) { return nil }
             let lower = dev.name.lowercased()
             if lower.contains("blackhole") { return nil }
             return EnabledLocalOutput(deviceID: dev.id, uid: uid, name: dev.name)
@@ -1524,6 +1682,50 @@ public actor Router {
         }
     }
 
+    // MARK: - Master volume
+
+    /// Set the whole-home master fader (0…100).
+    ///
+    /// Applied once, upstream of OwnTone, by `AudioSocketWriter` — so it
+    /// reaches the AirPlay receivers and the local bridges as the same
+    /// samples, and needs no per-leg curve reconciliation. See
+    /// `AudioSocketWriter`'s master-volume note for why no other placement
+    /// works.
+    ///
+    /// Idempotent, and safe to call when no writer exists (stereo mode, or
+    /// before the sidecar has connected): the value is remembered and applied
+    /// to the next writer that is built.
+    public func setMasterVolume(percent: Int) {
+        let clamped = VolumeCurve.clampPercent(percent)
+        masterVolumePercent = clamped
+        audioWriter?.setMasterGain(
+            VolumeCurve.masterAmplitude(forPercent: clamped)
+        )
+    }
+
+    /// Current master fader position, for UI re-sync and tests.
+    public var currentMasterVolumePercent: Int { masterVolumePercent }
+
+    /// Linear gain one whole-home local bridge should apply for a routing
+    /// entry.
+    ///
+    /// The slider's 0…1 position is a POSITION, not an amplitude:
+    /// `VolumeCurve` converts it to the same decibel attenuation OwnTone
+    /// applies on the AirPlay leg for the identical slider position, which is
+    /// what keeps a MacBook speaker and a Xiaomi Sound equally loud at the
+    /// same setting. Passing `r.volume` straight through — as this used to —
+    /// made the local leg up to 10.5 dB louder mid-scale.
+    ///
+    /// Mute is the deliberate exception: locally we can write true zeros, so
+    /// we do, even though the AirPlay leg's mute can only reach OwnTone's
+    /// -30 dB floor.
+    static func localBridgeGain(for routing: DeviceRouting) -> Float {
+        VolumeCurve.deviceAmplitude(
+            forPercent: VolumeCurve.percent(forFraction: Double(routing.volume)),
+            muted: routing.muted
+        )
+    }
+
     /// Set per-device volume for an AirPlay device on the sidecar.
     public func setAirplayVolume(id: String, volume: Float) async {
         await setAirplayVolume(id: id, volume: volume, invalidatesTiming: true)
@@ -1534,7 +1736,13 @@ public actor Router {
         volume: Float,
         invalidatesTiming: Bool
     ) async {
-        let clamped = max(0, min(1, volume))
+        // Snap onto OwnTone's integer-percent grid before anything else. The
+        // sidecar rounds to a percent anyway, so sending an unsnapped fraction
+        // would leave `lastAirplayVolumeByID` holding a value the receiver
+        // never actually got — and would let the local leg (which reads the
+        // same slider through `VolumeCurve`) land on a different step.
+        let percent = VolumeCurve.percent(forFraction: Double(volume))
+        let clamped = Float(VolumeCurve.fraction(forPercent: percent))
         if Self.airplayVolumeChangeInvalidatesTiming(
             previous: lastAirplayVolumeByID[id],
             next: clamped,
@@ -1553,7 +1761,7 @@ public actor Router {
         do {
             _ = try await ipc.call("device.set_volume", params: [
                 "device_id": id,
-                "volume": Double(clamped),
+                "volume": VolumeCurve.fraction(forPercent: percent),
             ])
         } catch {
             lastError = "set_volume(\(id.prefix(8))): \(error)"
@@ -1724,8 +1932,7 @@ public actor Router {
         // for any bridge-driven device (the user-reported regression).
         for (devID, bridge) in localBridges {
             let r = routing[devID] ?? DeviceRouting(deviceID: devID)
-            let target = r.muted ? Float(0) : r.volume
-            bridge.setVolume(target)
+            bridge.setVolume(Self.localBridgeGain(for: r))
         }
 
         // Per-device delay trim, local leg. Cheap and idempotent — a bridge

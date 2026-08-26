@@ -33,6 +33,24 @@ public final class CoreAudioDiscovery: @unchecked Sendable {
         }
     }
 
+    /// Re-run the device diff on demand and emit whatever changed.
+    ///
+    /// This is the same idempotent full diff the hot-plug listener runs, so
+    /// a device that did not change produces no event. It is NOT
+    /// `enumerate()` — that returns an array and feeds nothing into the
+    /// stream, which makes it useless as a refresh.
+    ///
+    /// A no-op before `events()` has been called: `refresh` would populate
+    /// `snapshot` with no subscriber attached, and the initial scan that
+    /// follows would then see "no change" and never announce the devices
+    /// that were already present.
+    public func refreshNow() {
+        queue.async { [weak self] in
+            guard let self, self.continuation != nil else { return }
+            self.refresh(initial: false)
+        }
+    }
+
     /// One-shot enumeration without subscriptions. Useful for the CLI.
     public func enumerate() -> [Device] {
         let ids = currentDeviceIDs()
