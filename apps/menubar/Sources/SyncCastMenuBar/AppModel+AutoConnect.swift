@@ -143,6 +143,12 @@ extension AppModel {
     func autoConnectSetEnabled(_ enabled: Bool) {
         guard var profile = autoConnectProfile, profile.enabled != enabled else { return }
         profile.enabled = enabled
+        if !enabled {
+            // Drop the episode as well as flipping the flag, so a rule that
+            // had already fired cannot answer a later unplug with a stop and a
+            // volume change the user has just switched off.
+            autoConnectCoordinator.forgetProfile(profile.id)
+        }
         autoConnectReplaceProfiles([profile], reason: "enabled=\(enabled)")
         if enabled {
             // Turning the switch on is an explicit "apply this now" — the same

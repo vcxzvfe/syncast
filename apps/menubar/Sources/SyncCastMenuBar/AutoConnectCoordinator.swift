@@ -215,7 +215,12 @@ struct AutoConnectCoordinator {
             // has nothing to undo, so it closes silently and the loop moves on
             // to the next departing rule.
             episodes[profile.id] = EpisodeState()
-            guard state.activated else { continue }
+            // A rule switched off after it fired stays switched off: the user
+            // turning the feature off must not be answered later by the loudest
+            // thing it can do. `enabled` is checked here as well as at the
+            // owner's `forgetProfile` call because this is the choke point that
+            // actually emits the action.
+            guard state.activated, profile.enabled else { continue }
             // Deliberately fires even when the user overrode us afterwards.
             // The disconnect action is a safety behaviour ("do not let the
             // laptop blast in public"), not a routing preference, and the

@@ -236,6 +236,20 @@ final class AutoConnectCoordinatorTests: XCTestCase {
         )
     }
 
+    /// Switching the rule off after it fired must not be answered later by the
+    /// loudest thing it can do (stop + force the built-in level).
+    func testRuleDisabledAfterFiringDoesNotDeactivateOnUnplug() {
+        let id = UUID()
+        let on = profile(id: id)
+        var c = AutoConnectCoordinator()
+        _ = c.evaluate(input([on], present: [builtIn, monitor], at: 0))
+        _ = c.evaluate(input([on], present: [builtIn, monitor], at: 2))  // activate
+
+        let off = profile(id: id, enabled: false)
+        _ = c.evaluate(input([off], present: [builtIn], at: 3))
+        XCTAssertEqual(c.evaluate(input([off], present: [builtIn], at: 5)).action, .none)
+    }
+
     func testTriggerLeavingWithoutHavingActivatedIsSilent() {
         let rule = profile(enabled: false)
         var c = AutoConnectCoordinator()
