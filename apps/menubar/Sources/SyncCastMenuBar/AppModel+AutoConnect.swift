@@ -400,6 +400,12 @@ extension AppModel {
     /// All the judgement is in `AutoConnectPlan.restore`; this reads the world
     /// and executes the verdict.
     func autoConnectRestoreBuiltInLevel(memberUIDs: [String]) {
+        // A disconnect's delayed half may still be in the air — a monitor that
+        // came back inside the 0.8 s window is exactly the case this runs in.
+        // Its own re-check would stand it down, but relying on that would make
+        // the ordering (restore 0.62, then a stale write forces 0) depend on
+        // `streamingState` having caught up. Cancel it outright instead.
+        autoConnectDeactivateTask?.cancel()
         let builtInUID = AutoConnect.builtInOutputUID(in: devices)
         let snapshot = AutoConnectBuiltInVolumeStore.load()
         let current = builtInUID.flatMap { AggregateDevice.readHardwareVolume(uid: $0) }
