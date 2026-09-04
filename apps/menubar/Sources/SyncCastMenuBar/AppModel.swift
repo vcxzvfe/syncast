@@ -26,8 +26,10 @@ final class AppModel {
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased() ?? "sck"
 
-    private static let selectedStereoOutputPath =
-        StereoOutputPathPolicy.selectedPath()
+    /// Resolved once, against the sink devices installed on this machine, so
+    /// the UI can never advertise a path the Router is not running.
+    static let selectedStereoOutputPath =
+        StereoOutputPathPolicy.resolvedPath()
 
     private static let requestedInitialMode: String? = ProcessInfo.processInfo
         .environment["SYNCAST_INITIAL_MODE"]?
@@ -40,7 +42,10 @@ final class AppModel {
 
     private static var initialPathNeedsScreenRecording: Bool {
         if requestedCaptureBackend == "tap" { return false }
-        if selectedStereoOutputPath == .direct && !startsInWholeHome { return false }
+        // Neither local Stereo path uses ScreenCaptureKit: Direct Stereo
+        // captures nothing at all, and the sink path uses a Process Tap
+        // (System Audio Recording, not Screen Recording).
+        if selectedStereoOutputPath != .capture && !startsInWholeHome { return false }
         return true
     }
 
@@ -281,6 +286,13 @@ final class AppModel {
     private let sidecarLauncher = SidecarLauncher()
     var sidecarRunning: Bool = false
     private var systemVolumeKeyController: SystemVolumeKeyController?
+    /// System-sink path state + the system-volume listener. All of its logic
+    /// lives in `AppModel+SystemSink.swift`.
+    let systemSink = SystemSinkCoordinator()
+    /// Set when the user moved the default output away from the sink while the
+    /// sink path was running; cleared by `resumeAfterSystemSinkDisplacement()`
+    /// or by a mode change. Gates `reconcileEngineAsync`'s `shouldRun`.
+    var systemSinkPausedByDisplacement = false
 
     /// How media volume keys are currently captured (event tap / monitor
     /// fallback / permission missing). Mirrored from the controller so
@@ -635,6 +647,7 @@ final class AppModel {
                 await self.refreshConnectionStates()
                 await self.refreshLocalFifoLag()
                 await self.refreshWholeHomeSinkState()
+                await self.pollSystemSinkStatus()
                 await self.refreshPairingStates()
             }
         }
@@ -1151,6 +1164,9 @@ final class AppModel {
     }
 
     private var runtimeAudioPathLabel: String {
+        if mode == .stereo, AppModel.selectedStereoOutputPath == .sink {
+            return "System Sink Stereo"
+        }
         if mode == .stereo, AppModel.selectedStereoOutputPath == .direct {
             return "Direct Stereo"
         }
@@ -1164,7 +1180,7 @@ final class AppModel {
         if AppModel.requestedCaptureBackend == "tap" {
             return false
         }
-        if mode == .stereo, AppModel.selectedStereoOutputPath == .direct {
+        if mode == .stereo, AppModel.selectedStereoOutputPath != .capture {
             return false
         }
         return true
@@ -1201,7 +1217,12 @@ final class AppModel {
         // determines WHICH path runs (stereo = local aggregate; wholeHome
         // = SCK → OwnTone → AirPlay receivers + local FIFO bridges), not
         // WHETHER it runs.
-        let shouldRun = hasEnabledOutputs
+        // `systemSinkPausedByDisplacement` is the one non-user reason the
+        // engine may refuse to run: on the sink path the user picked another
+        // output in the Sound menu, which we treat as intent (see
+        // `pollSystemSinkStatus`) rather than something to fight by grabbing
+        // the default output back.
+        let shouldRun = hasEnabledOutputs && !systemSinkPausedByDisplacement
         switch (streamingState, shouldRun) {
         case (.idle, true), (.error, true):
             streamingState = .starting
@@ -1834,6 +1855,9 @@ final class AppModel {
             // hardware may have moved while we weren't watching.
             lastDirectStereoSnapshotFingerprint = nil
         }
+        // The sink path's counterpart: attach/detach the system-volume
+        // listener on exactly the same transitions (see AppModel+SystemSink).
+        refreshSystemSinkPath(reason: reason)
     }
 
     /// Bounded release for the snapshot gate: if the enter-running
@@ -2843,6 +2867,9 @@ final class AppModel {
     ///     check below cannot catch it, and enabling it would close a feedback
     ///     loop (bridge → sink → BlackHole → ScreenCaptureKit → OwnTone →
     ///     bridge).
+    ///   - `SystemSinkDevice`   — the virtual sink that owns the system
+    ///     volume on the sink path. Selecting it as an OUTPUT would route our
+    ///     own fan-out back into the device we tap.
     private static let syncCastOwnedUIDPrefixes = [
         AggregateDevice.uidPrefix,
         DirectStereoOutput.uidPrefix,
@@ -2850,6 +2877,7 @@ final class AppModel {
     ]
 
     private func isUserSelectableOutput(_ d: Device) -> Bool {
+        if let uid = d.coreAudioUID, SystemSinkDevice.isSinkUID(uid) { return false }
         if let uid = d.coreAudioUID, uid.contains("BlackHole") { return false }
         if let uid = d.coreAudioUID,
            AppModel.syncCastOwnedUIDPrefixes.contains(where: uid.hasPrefix) {

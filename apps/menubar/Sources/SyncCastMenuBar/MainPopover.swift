@@ -23,6 +23,10 @@ struct MainPopover: View {
                 wholeHomeSinkDisplacedBanner
                 Divider().padding(.horizontal, 12)
             }
+            if let line = model.systemSinkStatusLine {
+                systemSinkStatusRow(line)
+                Divider().padding(.horizontal, 12)
+            }
             // Master fader sits directly above the device list so the
             // hierarchy reads top-down: one total, then the per-speaker
             // balance under it.
@@ -97,6 +101,61 @@ struct MainPopover: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
+    }
+
+    // MARK: - System sink (system volume) status
+
+    /// One line saying which device currently owns the macOS system volume,
+    /// plus the two actions that line can imply: resume after the user moved
+    /// the output away, and install SyncCast's own driver when the fallback
+    /// sink (BlackHole) is carrying the path.
+    @ViewBuilder
+    private func systemSinkStatusRow(_ line: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "speaker.wave.2.circle")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Text(line)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            if model.systemSinkPausedByDisplacement {
+                Button("继续") { model.resumeAfterSystemSinkDisplacement() }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10))
+                    .accessibilityIdentifier("systemSinkResumeButton")
+            } else if model.showsDriverInstallAction {
+                systemSinkDriverInstallButton
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var systemSinkDriverInstallButton: some View {
+        switch model.systemSink.driverInstallState {
+        case .running:
+            Text("安装中…")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        case .succeeded:
+            Text("已安装，重启 SyncCast")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Button("重试安装") { model.installSystemSinkDriver() }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .help(message)
+                .accessibilityIdentifier("systemSinkInstallDriverButton")
+        case .idle:
+            Button("安装 SyncCast 音频驱动") { model.installSystemSinkDriver() }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .accessibilityIdentifier("systemSinkInstallDriverButton")
+        }
     }
 
     // MARK: - Master volume
@@ -715,6 +774,15 @@ private struct DeviceRow: View {
                     // DDC path) get a one-line hint; .ddc and CoreAudio
                     // hardware backends render the normal slider only.
                     if let hint = model.volumeControlHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    // Sink path: say how this output's level is carried, since
+                    // "the slider is a balance under the system volume" is not
+                    // guessable from the control itself.
+                    if let hint = model.systemSinkVolumeHint(for: deviceID) {
                         Text(hint)
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)

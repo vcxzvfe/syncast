@@ -46,7 +46,14 @@ final class HardwareVolumeObserver {
     private static let suppressionWindow: TimeInterval = 0.35
     /// Listener debounce — CoreAudio fires once per channel element for a
     /// single user action; coalesce before reading.
-    private static let readDebounce: DispatchTimeInterval = .milliseconds(120)
+    static let defaultReadDebounce: DispatchTimeInterval = .milliseconds(120)
+
+    /// Debounce for THIS observer. The system-sink path passes a much shorter
+    /// window: there the watched device is the system volume itself, a held
+    /// volume key repeats every ~33 ms, and a 120 ms coalesce would make the
+    /// speakers visibly lag the on-screen HUD. Direct Stereo keeps the longer
+    /// window, where the reads are only a mirror of state we already wrote.
+    private let readDebounce: DispatchTimeInterval
 
     private final class Entry {
         /// `var`: a `.retarget` rewatch (same UID + HAL device, new
@@ -71,7 +78,11 @@ final class HardwareVolumeObserver {
     /// uid → suppression deadline. Queue-confined.
     private var suppressedUntil: [String: Date] = [:]
 
-    init(onExternalChange: @escaping (ExternalChange) -> Void) {
+    init(
+        readDebounce: DispatchTimeInterval = HardwareVolumeObserver.defaultReadDebounce,
+        onExternalChange: @escaping (ExternalChange) -> Void
+    ) {
+        self.readDebounce = readDebounce
         self.onExternalChange = onExternalChange
     }
 
@@ -215,7 +226,7 @@ final class HardwareVolumeObserver {
             self?.performReadOnQueue(uid: uid)
         }
         entry.pendingRead = item
-        queue.asyncAfter(deadline: .now() + Self.readDebounce, execute: item)
+        queue.asyncAfter(deadline: .now() + readDebounce, execute: item)
     }
 
     private func performReadOnQueue(uid: String) {
