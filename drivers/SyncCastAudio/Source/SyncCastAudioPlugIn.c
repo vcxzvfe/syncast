@@ -1,0 +1,410 @@
+//
+//  SyncCastAudioPlugIn.c
+//  SyncCastAudio.driver
+//
+//  The COM plumbing, the driver interface table, and the IO path.
+//  Property handling lives in SyncCastAudioProperties.c.
+//
+//  See SyncCastAudio.h for what this driver is and why it exists.
+//
+
+#include "SyncCastAudio.h"
+
+#include <CoreFoundation/CoreFoundation.h>
+
+#pragma mark - State
+
+pthread_mutex_t             gPlugIn_StateMutex          = PTHREAD_MUTEX_INITIALIZER;
+AudioServerPlugInHostRef    gPlugIn_Host                = NULL;
+UInt32                      gPlugIn_RefCount            = 0;
+
+Float64                     gDevice_SampleRate          = kDevice_DefaultSampleRate;
+UInt64                      gDevice_IORunningCounter    = 0;
+Float64                     gDevice_HostTicksPerFrame   = 0.0;
+UInt64                      gDevice_NumberTimeStamps    = 0;
+Float64                     gDevice_AnchorSampleTime    = 0.0;
+UInt64                      gDevice_AnchorHostTime      = 0;
+
+// Full scale, unmuted: the device must not silence a machine that has just
+// selected it. macOS restores the user's last level for a device it knows.
+Float32                     gVolume_Output_Scalar       = 1.0f;
+bool                        gMute_Output_Value          = false;
+
+#pragma mark - Volume law (pure, mirrored by SystemSinkVolumeLaw.swift)
+
+Float32 SyncCastAudio_ClampScalar(Float32 inScalar)
+{
+    if(!(inScalar > 0.0f))  { return 0.0f; }   // also catches NaN
+    if(inScalar > 1.0f)     { return 1.0f; }
+    return inScalar;
+}
+
+Float32 SyncCastAudio_ScalarToDecibels(Float32 inScalar)
+{
+    // dB(s) = minDB * (1 - s): linear in decibels, the curve measured on the
+    // built-in speakers. See the header for the measured points.
+    return kVolume_MinDB * (1.0f - SyncCastAudio_ClampScalar(inScalar));
+}
+
+Float32 SyncCastAudio_DecibelsToScalar(Float32 inDecibels)
+{
+    Float32 theDecibels = inDecibels;
+    if(theDecibels < kVolume_MinDB) { theDecibels = kVolume_MinDB; }
+    if(theDecibels > kVolume_MaxDB) { theDecibels = kVolume_MaxDB; }
+    return SyncCastAudio_ClampScalar(1.0f + (theDecibels / (-kVolume_MinDB)));
+}
+
+#pragma mark - Prototypes
+
+static HRESULT      SyncCastAudio_QueryInterface(void* inDriver, REFIID inUUID, LPVOID* outInterface);
+static ULONG        SyncCastAudio_AddRef(void* inDriver);
+static ULONG        SyncCastAudio_Release(void* inDriver);
+static OSStatus     SyncCastAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost);
+static OSStatus     SyncCastAudio_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID);
+static OSStatus     SyncCastAudio_DestroyDevice(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID);
+static OSStatus     SyncCastAudio_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo);
+static OSStatus     SyncCastAudio_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo);
+static OSStatus     SyncCastAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo);
+static OSStatus     SyncCastAudio_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo);
+static OSStatus     SyncCastAudio_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID);
+static OSStatus     SyncCastAudio_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID);
+static OSStatus     SyncCastAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
+static OSStatus     SyncCastAudio_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace);
+static OSStatus     SyncCastAudio_BeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo);
+static OSStatus     SyncCastAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, AudioObjectID inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
+static OSStatus     SyncCastAudio_EndIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo);
+
+#pragma mark - The interface
+
+static AudioServerPlugInDriverInterface gAudioServerPlugInDriverInterface =
+{
+    NULL,
+    SyncCastAudio_QueryInterface,
+    SyncCastAudio_AddRef,
+    SyncCastAudio_Release,
+    SyncCastAudio_Initialize,
+    SyncCastAudio_CreateDevice,
+    SyncCastAudio_DestroyDevice,
+    SyncCastAudio_AddDeviceClient,
+    SyncCastAudio_RemoveDeviceClient,
+    SyncCastAudio_PerformDeviceConfigurationChange,
+    SyncCastAudio_AbortDeviceConfigurationChange,
+    SyncCastAudio_HasProperty,
+    SyncCastAudio_IsPropertySettable,
+    SyncCastAudio_GetPropertyDataSize,
+    SyncCastAudio_GetPropertyData,
+    SyncCastAudio_SetPropertyData,
+    SyncCastAudio_StartIO,
+    SyncCastAudio_StopIO,
+    SyncCastAudio_GetZeroTimeStamp,
+    SyncCastAudio_WillDoIOOperation,
+    SyncCastAudio_BeginIOOperation,
+    SyncCastAudio_DoIOOperation,
+    SyncCastAudio_EndIOOperation
+};
+
+static AudioServerPlugInDriverInterface*    gAudioServerPlugInDriverInterfacePtr    = &gAudioServerPlugInDriverInterface;
+static AudioServerPlugInDriverRef           gAudioServerPlugInDriverRef             = &gAudioServerPlugInDriverInterfacePtr;
+
+#pragma mark - Factory
+
+// Referenced by Info.plist's CFPlugInFactories. The HAL asks for exactly one
+// interface type; anything else is refused so a mismatched host cannot get a
+// half-initialised driver.
+void* SyncCastAudio_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
+{
+    #pragma unused(inAllocator)
+    void* theAnswer = NULL;
+    if(CFEqual(inRequestedTypeUUID, kAudioServerPlugInTypeUUID))
+    {
+        theAnswer = gAudioServerPlugInDriverRef;
+    }
+    return theAnswer;
+}
+
+#pragma mark - COM
+
+static HRESULT SyncCastAudio_QueryInterface(void* inDriver, REFIID inUUID, LPVOID* outInterface)
+{
+    if((inDriver != gAudioServerPlugInDriverRef) || (outInterface == NULL))
+    {
+        return kAudioHardwareIllegalOperationError;
+    }
+
+    CFUUIDRef theRequestedUUID = CFUUIDCreateFromUUIDBytes(NULL, inUUID);
+    if(theRequestedUUID == NULL)
+    {
+        return kAudioHardwareIllegalOperationError;
+    }
+
+    HRESULT theAnswer = E_NOINTERFACE;
+    if(CFEqual(theRequestedUUID, IUnknownUUID) || CFEqual(theRequestedUUID, kAudioServerPlugInDriverInterfaceUUID))
+    {
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        ++gPlugIn_RefCount;
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        *outInterface = gAudioServerPlugInDriverRef;
+        theAnswer = S_OK;
+    }
+    CFRelease(theRequestedUUID);
+    return theAnswer;
+}
+
+static ULONG SyncCastAudio_AddRef(void* inDriver)
+{
+    if(inDriver != gAudioServerPlugInDriverRef) { return 0; }
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(gPlugIn_RefCount < UINT32_MAX) { ++gPlugIn_RefCount; }
+    ULONG theAnswer = gPlugIn_RefCount;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return theAnswer;
+}
+
+static ULONG SyncCastAudio_Release(void* inDriver)
+{
+    if(inDriver != gAudioServerPlugInDriverRef) { return 0; }
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(gPlugIn_RefCount > 0) { --gPlugIn_RefCount; }
+    ULONG theAnswer = gPlugIn_RefCount;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return theAnswer;
+}
+
+#pragma mark - Lifecycle
+
+static OSStatus SyncCastAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost)
+{
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+
+    gPlugIn_Host = inHost;
+
+    // Host ticks per frame — the whole timeline is derived from this, so it is
+    // recomputed on every sample-rate change too.
+    struct mach_timebase_info theTimeBaseInfo;
+    mach_timebase_info(&theTimeBaseInfo);
+    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
+    theHostClockFrequency *= 1000000000.0;
+    gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+
+    // Restore the user's last level, the way a real device would. A settings
+    // read that fails simply leaves full scale.
+    if(gPlugIn_Host != NULL)
+    {
+        CFPropertyListRef theValue = NULL;
+        gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("volumeScalar"), &theValue);
+        if(theValue != NULL)
+        {
+            if(CFGetTypeID(theValue) == CFNumberGetTypeID())
+            {
+                Float32 theScalar = 1.0f;
+                CFNumberGetValue((CFNumberRef)theValue, kCFNumberFloat32Type, &theScalar);
+                gVolume_Output_Scalar = SyncCastAudio_ClampScalar(theScalar);
+            }
+            CFRelease(theValue);
+        }
+    }
+
+    return 0;
+}
+
+// This driver publishes its single device statically; it does not support the
+// HAL asking for extra devices to be created (that is for aggregate-style
+// plug-ins). Refusing is the documented answer.
+static OSStatus SyncCastAudio_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID)
+{
+    #pragma unused(inDescription, inClientInfo, outDeviceObjectID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    return kAudioHardwareUnsupportedOperationError;
+}
+
+static OSStatus SyncCastAudio_DestroyDevice(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID)
+{
+    #pragma unused(inDeviceObjectID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    return kAudioHardwareUnsupportedOperationError;
+}
+
+static OSStatus SyncCastAudio_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
+{
+    #pragma unused(inClientInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    return 0;
+}
+
+static OSStatus SyncCastAudio_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
+{
+    #pragma unused(inClientInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    return 0;
+}
+
+// The only configuration change this device makes is a sample-rate change,
+// requested from SetPropertyData and carried here as the new rate.
+static OSStatus SyncCastAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo)
+{
+    #pragma unused(inChangeInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    Float64 theNewSampleRate = (Float64)inChangeAction;
+    if((theNewSampleRate != kDevice_SampleRate_44100) &&
+       (theNewSampleRate != kDevice_DefaultSampleRate) &&
+       (theNewSampleRate != kDevice_SampleRate_96000))
+    {
+        return kAudioHardwareBadObjectError;
+    }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    gDevice_SampleRate = theNewSampleRate;
+
+    struct mach_timebase_info theTimeBaseInfo;
+    mach_timebase_info(&theTimeBaseInfo);
+    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
+    theHostClockFrequency *= 1000000000.0;
+    gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+
+    // The timeline must restart at the new rate, or the HAL sees a jump.
+    gDevice_NumberTimeStamps = 0;
+    gDevice_AnchorSampleTime = 0.0;
+    gDevice_AnchorHostTime = mach_absolute_time();
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo)
+{
+    #pragma unused(inChangeAction, inChangeInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    return 0;
+}
+
+#pragma mark - IO
+//
+// There is no hardware and no loopback: the device exists to be selected, to
+// carry a volume control, and to be tapped. So IO is only about publishing a
+// coherent timeline; the samples themselves are discarded.
+
+static OSStatus SyncCastAudio_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
+{
+    #pragma unused(inClientID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(gDevice_IORunningCounter == 0)
+    {
+        gDevice_NumberTimeStamps = 0;
+        gDevice_AnchorSampleTime = 0.0;
+        gDevice_AnchorHostTime = mach_absolute_time();
+    }
+    ++gDevice_IORunningCounter;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
+{
+    #pragma unused(inClientID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(gDevice_IORunningCounter > 0) { --gDevice_IORunningCounter; }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed)
+{
+    #pragma unused(inClientID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+
+    UInt64 theCurrentHostTime = mach_absolute_time();
+    Float64 theHostTicksPerRingBuffer = gDevice_HostTicksPerFrame * ((Float64)kDevice_RingBufferSize);
+    Float64 theHostTickOffset = ((Float64)(gDevice_NumberTimeStamps + 1)) * theHostTicksPerRingBuffer;
+    UInt64 theNextHostTime = gDevice_AnchorHostTime + ((UInt64)theHostTickOffset);
+
+    if(theNextHostTime <= theCurrentHostTime)
+    {
+        ++gDevice_NumberTimeStamps;
+        gDevice_AnchorSampleTime += (Float64)kDevice_RingBufferSize;
+    }
+
+    *outSampleTime = gDevice_AnchorSampleTime;
+    *outHostTime = gDevice_AnchorHostTime + (UInt64)(((Float64)gDevice_NumberTimeStamps) * theHostTicksPerRingBuffer);
+    *outSeed = 1;
+
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace)
+{
+    #pragma unused(inClientID)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    Boolean willDo = false;
+    Boolean willDoInPlace = true;
+    switch(inOperationID)
+    {
+        case kAudioServerPlugInIOOperationWriteMix:
+            // Accepted and thrown away. Accepting it is what makes the device
+            // a valid output; a Process Tap pinned to this device sees the mix
+            // BEFORE it reaches us, which is the whole design.
+            willDo = true;
+            willDoInPlace = true;
+            break;
+        default:
+            break;
+    }
+
+    if(outWillDo != NULL)           { *outWillDo = willDo; }
+    if(outWillDoInPlace != NULL)    { *outWillDoInPlace = willDoInPlace; }
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_BeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo)
+{
+    #pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    return 0;
+}
+
+static OSStatus SyncCastAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, AudioObjectID inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer)
+{
+    #pragma unused(inStreamObjectID, inClientID, inIOCycleInfo, ioSecondaryBuffer)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    // The mix is discarded. Deliberately NOT scaled by the volume control:
+    // this device carries no audio anywhere, and SyncCast applies the volume
+    // on the real outputs. Scaling here would attenuate twice for anyone who
+    // ever did read from us.
+    if((inOperationID == kAudioServerPlugInIOOperationWriteMix) && (ioMainBuffer != NULL))
+    {
+        memset(ioMainBuffer, 0, (size_t)inIOBufferFrameSize * kDevice_BytesPerFrame);
+    }
+
+    return 0;
+}
+
+static OSStatus SyncCastAudio_EndIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo)
+{
+    #pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
+    if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
+    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    return 0;
+}

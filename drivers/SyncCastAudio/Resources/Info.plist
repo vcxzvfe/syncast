@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>SyncCastAudio</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.syncast.audio.driver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>SyncCastAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>SyncCast — virtual output device that owns the macOS system volume.</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<!-- The HAL loads a plug-in through CFPlugIn: it looks up the type UUID
+	     below (kAudioServerPlugInTypeUUID), finds the factory UUID it maps to,
+	     and calls the named C function. Both UUIDs are load-bearing strings —
+	     a typo makes the driver silently invisible with no error anywhere. -->
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>C72775BF-DE3C-4A4C-AE9F-8748B489E5BE</key>
+		<string>SyncCastAudio_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- kAudioServerPlugInTypeUUID -->
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>C72775BF-DE3C-4A4C-AE9F-8748B489E5BE</string>
+		</array>
+	</dict>
+</dict>
+</plist>
