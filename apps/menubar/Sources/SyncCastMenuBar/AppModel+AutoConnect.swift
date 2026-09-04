@@ -30,6 +30,12 @@ extension AppModel {
     /// `coreaudiod` settle plus a margin for the device list to come back.
     static let autoConnectWakeSettleSeconds: Double = 3.0
 
+    /// How long to wait before re-attempting an activation the app refused to
+    /// apply. The only known cause is `setMode` single-flighting a transition
+    /// that is already running, and that transition is a `router.stop()` plus a
+    /// reconcile — comfortably inside a second.
+    static let autoConnectActivationRetrySeconds: Double = 1.0
+
     /// Debug hatch: comma-separated CoreAudio UIDs to hide from the
     /// coordinator, so the disconnect branch can be exercised on hardware
     /// without physically unplugging anything.
@@ -272,17 +278,36 @@ extension AppModel {
                 "autoconnect: activate rule \(profileID.uuidString.prefix(8)) "
                 + "members=[\(memberUIDs.joined(separator: ","))] (\(reason))"
             )
-            autoConnectApplyActivation(memberUIDs: memberUIDs)
-            autoConnectScheduleRecheck(after: 0.2, reason: "post-activate")
+            if autoConnectApplyActivation(memberUIDs: memberUIDs) {
+                autoConnectScheduleRecheck(after: 0.2, reason: "post-activate")
+            } else {
+                autoConnectHandleActivationFailure(profileID: profileID)
+            }
             return
-        case .deactivate(let profileID, let restoreBuiltIn, let volumePercent):
+        case .claimSatisfied(let profileID, let memberUIDs):
+            // Nothing to start: the audio path is already what the rule would
+            // have built. The episode is claimed by the coordinator; all this
+            // owes the user is the built-in level a previous disconnect may
+            // have forced down, which no `.activate` will ever come along to
+            // hand back on this path.
+            SyncCastLog.log(
+                "autoconnect: rule \(profileID.uuidString.prefix(8)) already satisfied; "
+                + "claiming the episode without touching the audio path (\(reason))"
+            )
+            autoConnectRestoreBuiltInLevel(memberUIDs: memberUIDs)
+            return
+        case .deactivate(let profileID, let memberUIDs, let restoreBuiltIn, let volumePercent):
             SyncCastLog.log(
                 "autoconnect: deactivate rule \(profileID.uuidString.prefix(8)) "
+                + "members=[\(memberUIDs.joined(separator: ","))] "
                 + "restoreBuiltIn=\(restoreBuiltIn) "
                 + "volume=\(volumePercent.map { "\($0)%" } ?? "unchanged") (\(reason))"
             )
             autoConnectApplyDeactivation(
-                restoreBuiltIn: restoreBuiltIn, volumePercent: volumePercent
+                profileID: profileID,
+                memberUIDs: memberUIDs,
+                restoreBuiltIn: restoreBuiltIn,
+                volumePercent: volumePercent
             )
             autoConnectScheduleRecheck(after: 0.2, reason: "post-deactivate")
             return
@@ -314,12 +339,29 @@ extension AppModel {
 
     // MARK: - Applying actions
 
-    private func autoConnectApplyActivation(memberUIDs: [String]) {
+    /// - Returns: false when the app refused the switch to local Stereo, in
+    ///   which case NOTHING else was touched and the caller must arrange a
+    ///   retry. Enabling the members anyway would leave them switched on in
+    ///   whole-home, which is the wrong mode for every one of them.
+    private func autoConnectApplyActivation(memberUIDs: [String]) -> Bool {
         autoConnectApplying = true
         defer { autoConnectApplying = false }
         if mode != .stereo {
             setMode(.stereo)
+            // `setMode` is single-flight: it drops the call and returns
+            // silently when a previous transition is still stopping the
+            // engine. `mode` is the only signal that it did.
+            guard mode == .stereo else {
+                SyncCastLog.log(
+                    "autoconnect: setMode(.stereo) was dropped (mode=\(mode.rawValue)); "
+                    + "leaving the selection untouched"
+                )
+                return false
+            }
         }
+        // Before the members go on, never after: the Direct Stereo snapshot
+        // that runs on enabling reads the hardware as the authority.
+        autoConnectRestoreBuiltInLevel(memberUIDs: memberUIDs)
         let wanted = Set(memberUIDs)
         for device in localDevices {
             guard let uid = device.coreAudioUID else { continue }
@@ -329,47 +371,176 @@ extension AppModel {
             setDeviceEnabled(shouldEnable, for: device.id)
         }
         reconcileEngine()
+        return true
     }
 
-    /// Stop, then (optionally) hand the system back to the built-in speakers
-    /// at a fixed level.
+    /// Retry, or give up loudly. Never silently.
+    private func autoConnectHandleActivationFailure(profileID: UUID) {
+        guard autoConnectCoordinator.markActivationFailed(profileID) else {
+            SyncCastLog.log(
+                "autoconnect: rule \(profileID.uuidString.prefix(8)) could not be applied "
+                + "after \(AutoConnectCoordinator.maxActivationAttempts) attempts; "
+                + "standing down until the trigger is unplugged and reconnected"
+            )
+            lastError = "自动连接：切换到本地 Stereo 失败，本次不再重试"
+            return
+        }
+        SyncCastLog.log(
+            "autoconnect: retrying rule \(profileID.uuidString.prefix(8)) in "
+            + "\(AppModel.autoConnectActivationRetrySeconds)s"
+        )
+        autoConnectScheduleRecheck(
+            after: AppModel.autoConnectActivationRetrySeconds, reason: "activation retry"
+        )
+    }
+
+    /// Hand the built-in speakers back the level a previous disconnect forced
+    /// down, if this activation is the one that owes it.
     ///
-    /// The built-in half runs after a settle delay because it has to win
-    /// against `DirectStereoOutput.stop()`, which restores the PREVIOUS
-    /// default output — the monitor that just left.
+    /// All the judgement is in `AutoConnectPlan.restore`; this reads the world
+    /// and executes the verdict.
+    func autoConnectRestoreBuiltInLevel(memberUIDs: [String]) {
+        let builtInUID = AutoConnect.builtInOutputUID(in: devices)
+        let snapshot = AutoConnectBuiltInVolumeStore.load()
+        let current = builtInUID.flatMap { AggregateDevice.readHardwareVolume(uid: $0) }
+        switch AutoConnectPlan.restore(
+            memberUIDs: memberUIDs,
+            builtInUID: builtInUID,
+            snapshot: snapshot,
+            currentScalar: current
+        ) {
+        case .none(let reason):
+            SyncCastLog.log("autoconnect: built-in level left alone — \(reason)")
+        case .write(let scalar, let clearSnapshot, let reason):
+            guard let builtInUID else { return }
+            let ok = AggregateDevice.applyHardwareVolume(uid: builtInUID, volume: scalar)
+            SyncCastLog.log(
+                "autoconnect: built-in level → \(String(format: "%.2f", scalar)) "
+                + "ok=\(ok) — \(reason)"
+            )
+            if clearSnapshot {
+                AutoConnectBuiltInVolumeStore.clear()
+            }
+        }
+    }
+
+    /// Switch the rule's own members off, then (optionally, and after a settle
+    /// delay) hand the system back to the built-in speakers at a fixed level.
+    ///
+    /// The scope of the teardown and the whole-home carve-out are both decided
+    /// by `AutoConnectPlan.deactivation` — read that for the reasoning. The
+    /// built-in half runs after a delay because it has to win against
+    /// `DirectStereoOutput.stop()`, which restores the PREVIOUS default output
+    /// — the monitor that just left.
     private func autoConnectApplyDeactivation(
+        profileID: UUID,
+        memberUIDs: [String],
         restoreBuiltIn: Bool,
         volumePercent: Int?
     ) {
-        autoConnectApplying = true
-        for device in devices where routing[device.id]?.enabled == true {
-            setDeviceEnabled(false, for: device.id)
-        }
-        reconcileEngine()
-        autoConnectApplying = false
-
-        guard restoreBuiltIn || volumePercent != nil else { return }
         let builtInUID = AutoConnect.builtInOutputUID(in: devices)
-        guard let builtInUID else {
-            SyncCastLog.log("autoconnect: no built-in output found; leaving system output alone")
+        let plan = AutoConnectPlan.deactivation(
+            memberUIDs: memberUIDs,
+            restoreBuiltIn: restoreBuiltIn,
+            builtInVolumePercent: volumePercent,
+            isWholeHome: mode == .wholeHome,
+            builtInUID: builtInUID
+        )
+        autoConnectApplyMemberTeardown(plan.disableUIDs)
+
+        guard plan.touchesBuiltIn, let builtInUID else {
+            if let reason = plan.skipReason {
+                SyncCastLog.log("autoconnect: built-in fallback skipped — \(reason)")
+            }
             return
         }
-        Task { @MainActor in
+        // The trigger this teardown answers, captured now: by the time the
+        // follow-up wakes the rule may have been deleted out from under it.
+        let triggerUID = autoConnectProfiles.first { $0.id == profileID }?.triggerUID
+        autoConnectDeactivateTask?.cancel()
+        autoConnectDeactivateTask = Task { @MainActor [weak self] in
             try? await Task.sleep(
                 nanoseconds: UInt64(AppModel.autoConnectDeactivateSettleSeconds * 1_000_000_000)
             )
-            if restoreBuiltIn {
-                let ok = SystemDefaultOutput.setDefaultOutput(uid: builtInUID)
-                SyncCastLog.log("autoconnect: default output → \(builtInUID) ok=\(ok)")
-            }
-            guard let percent = volumePercent else { return }
-            // Linear scalar on purpose: this is the macOS slider position, so
-            // 0 % is genuinely silent. See DisconnectAction.builtInVolumePercent.
-            let ok = AggregateDevice.applyHardwareVolume(
-                uid: builtInUID,
-                volume: AutoConnect.hardwareScalar(forPercent: percent)
+            guard !Task.isCancelled, let self else { return }
+            self.autoConnectApplyBuiltInFallback(
+                plan: plan, builtInUID: builtInUID, triggerUID: triggerUID
             )
-            SyncCastLog.log("autoconnect: built-in volume → \(percent)% ok=\(ok)")
+        }
+    }
+
+    /// Switch off exactly the rule's members, and only local outputs.
+    ///
+    /// `devices` filtered by transport rather than `localDevices`, which also
+    /// filters by "selectable in the current mode" — a member that has become
+    /// unselectable is precisely one that still needs switching off.
+    private func autoConnectApplyMemberTeardown(_ disableUIDs: Set<String>) {
+        autoConnectApplying = true
+        defer { autoConnectApplying = false }
+        for device in devices where device.transport == .coreAudio {
+            guard let uid = device.coreAudioUID,
+                  disableUIDs.contains(uid),
+                  routing[device.id]?.enabled == true
+            else { continue }
+            setDeviceEnabled(false, for: device.id)
+        }
+        reconcileEngine()
+    }
+
+    /// The delayed half: point macOS back at the built-in speakers and force
+    /// their level, having first checked that the world still wants it.
+    private func autoConnectApplyBuiltInFallback(
+        plan: AutoConnectPlan.Deactivation,
+        builtInUID: String,
+        triggerUID: String?
+    ) {
+        let triggerPresent = triggerUID.map { autoConnectPresentUIDs().contains($0) } ?? false
+        let isStreaming = streamingState == .running
+        guard AutoConnectPlan.builtInFallbackStillWanted(
+            triggerPresent: triggerPresent, isStreaming: isStreaming
+        ) else {
+            SyncCastLog.log(
+                "autoconnect: built-in fallback stood down "
+                + "(trigger back=\(triggerPresent) streaming=\(isStreaming))"
+            )
+            return
+        }
+        if plan.restoreBuiltIn {
+            let ok = SystemDefaultOutput.setDefaultOutput(uid: builtInUID)
+            SyncCastLog.log("autoconnect: default output → \(builtInUID) ok=\(ok)")
+        }
+        guard let percent = plan.builtInVolumePercent else { return }
+        autoConnectRememberBuiltInLevel(uid: builtInUID)
+        // Linear scalar on purpose: this is the macOS slider position, so
+        // 0 % is genuinely silent. See DisconnectAction.builtInVolumePercent.
+        let ok = AggregateDevice.applyHardwareVolume(
+            uid: builtInUID,
+            volume: AutoConnect.hardwareScalar(forPercent: percent)
+        )
+        SyncCastLog.log("autoconnect: built-in volume → \(percent)% ok=\(ok)")
+    }
+
+    /// Remember the level we are about to overwrite, so the next activation
+    /// can give it back. See `AutoConnectPlan.capture`.
+    private func autoConnectRememberBuiltInLevel(uid: String) {
+        let current = AggregateDevice.readHardwareVolume(uid: uid)
+        switch AutoConnectPlan.capture(
+            existing: AutoConnectBuiltInVolumeStore.load(),
+            uid: uid,
+            currentScalar: current
+        ) {
+        case .skip(let reason):
+            SyncCastLog.log("autoconnect: not snapshotting the built-in level — \(reason)")
+        case .capture(let scalar):
+            AutoConnectBuiltInVolumeStore.save(
+                AutoConnectBuiltInVolumeSnapshot(
+                    uid: uid, scalar: scalar, capturedAt: Date()
+                )
+            )
+            SyncCastLog.log(
+                "autoconnect: remembered built-in level \(String(format: "%.2f", scalar)) "
+                + "before forcing it down"
+            )
         }
     }
 }

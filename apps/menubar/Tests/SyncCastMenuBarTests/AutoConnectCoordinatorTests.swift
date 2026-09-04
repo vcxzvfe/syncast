@@ -127,7 +127,13 @@ final class AutoConnectCoordinatorTests: XCTestCase {
             input([rule], present: [builtIn, monitor], enabled: [builtIn, monitor],
                   streaming: true, at: 2)
         )
-        XCTAssertEqual(settled.action, .none)
+        // `.claimSatisfied`, not `.activate`: nothing about the audio path is
+        // restarted. It is also not `.none`, because the owner still has to
+        // hand back a built-in level a previous disconnect forced down.
+        XCTAssertEqual(
+            settled.action,
+            .claimSatisfied(profileID: rule.id, memberUIDs: [builtIn, monitor])
+        )
         // And the episode is spent, so a later user change is not undone.
         XCTAssertEqual(
             c.evaluate(input([rule], present: [builtIn, monitor], enabled: [builtIn],
@@ -232,8 +238,90 @@ final class AutoConnectCoordinatorTests: XCTestCase {
         _ = c.evaluate(input([rule], present: [builtIn], at: 3))
         XCTAssertEqual(
             c.evaluate(input([rule], present: [builtIn], at: 5)).action,
-            .deactivate(profileID: rule.id, restoreBuiltIn: true, builtInVolumePercent: 0)
+            .deactivate(
+                profileID: rule.id,
+                memberUIDs: [builtIn, monitor],
+                restoreBuiltIn: true,
+                builtInVolumePercent: 0
+            )
         )
+    }
+
+    /// The teardown has to name the rule's own members, because the owner is
+    /// only entitled to undo those. Regression for: rule fires in stereo, the
+    /// user then switches to whole-home and enables two AirPlay receivers, and
+    /// the unplug switched off *everything that was enabled*.
+    func testDisconnectActionCarriesTheRulesOwnMembers() {
+        let rule = profile(members: [builtIn, monitor])
+        var c = AutoConnectCoordinator()
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 0))
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 2))  // activate
+        _ = c.evaluate(input([rule], present: [builtIn], at: 3))
+        // The user has since enabled two receivers the rule knows nothing
+        // about; they must not appear in the payload.
+        let action = c.evaluate(
+            input([rule], present: [builtIn],
+                  enabled: [builtIn, monitor, "MacMiniUID", "XiaomiUID"],
+                  streaming: true, at: 5)
+        ).action
+        guard case .deactivate(_, let members, _, _) = action else {
+            return XCTFail("expected a deactivate, got \(action)")
+        }
+        XCTAssertEqual(members, [builtIn, monitor])
+    }
+
+    // MARK: - Activation the owner could not apply
+
+    /// `setMode` drops a mode switch while a previous transition is in flight.
+    /// The episode is marked spent when the action is emitted, so without
+    /// `markActivationFailed` the rule would never try again.
+    func testFailedActivationIsRetriedAndThenGivenUpOn() {
+        let rule = profile()
+        var c = AutoConnectCoordinator()
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 0))
+        let expected = AutoConnectCoordinator.Action
+            .activate(profileID: rule.id, memberUIDs: [builtIn, monitor])
+        XCTAssertEqual(c.evaluate(input([rule], present: [builtIn, monitor], at: 2)).action, expected)
+
+        // Attempt 1 failed → the shot goes back and the next tick re-emits.
+        XCTAssertTrue(c.markActivationFailed(rule.id))
+        XCTAssertEqual(c.evaluate(input([rule], present: [builtIn, monitor], at: 3)).action, expected)
+        // Attempt 2 failed → same again.
+        XCTAssertTrue(c.markActivationFailed(rule.id))
+        XCTAssertEqual(c.evaluate(input([rule], present: [builtIn, monitor], at: 4)).action, expected)
+        // Attempt 3 failed → give up rather than spin.
+        XCTAssertFalse(c.markActivationFailed(rule.id))
+        XCTAssertEqual(c.evaluate(input([rule], present: [builtIn, monitor], at: 5)).action, .none)
+    }
+
+    /// A successful activation after a failure must not leave the failure
+    /// count armed for the next episode.
+    func testActivationFailuresResetWithTheEpisode() {
+        let rule = profile()
+        var c = AutoConnectCoordinator()
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 0))
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 2))
+        XCTAssertTrue(c.markActivationFailed(rule.id))
+        XCTAssertTrue(c.markActivationFailed(rule.id))
+        XCTAssertFalse(c.markActivationFailed(rule.id))  // spent
+
+        // Unplug, settle, replug: a fresh episode gets a full budget again.
+        _ = c.evaluate(input([rule], present: [builtIn], at: 6))
+        _ = c.evaluate(input([rule], present: [builtIn], at: 8))
+        _ = c.evaluate(input([rule], present: [builtIn, monitor], at: 9))
+        XCTAssertEqual(
+            c.evaluate(input([rule], present: [builtIn, monitor], at: 11)).action,
+            .activate(profileID: rule.id, memberUIDs: [builtIn, monitor])
+        )
+        XCTAssertTrue(c.markActivationFailed(rule.id))
+    }
+
+    /// Reporting a failure for a rule the coordinator has forgotten (deleted
+    /// mid-apply) must not resurrect its episode.
+    func testFailureForAnUnknownRuleIsIgnored() {
+        var c = AutoConnectCoordinator()
+        XCTAssertFalse(c.markActivationFailed(UUID()))
+        XCTAssertTrue(c.episodes.isEmpty)
     }
 
     /// Switching the rule off after it fired must not be answered later by the

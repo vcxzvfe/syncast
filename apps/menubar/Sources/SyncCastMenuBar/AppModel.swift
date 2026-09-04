@@ -419,6 +419,11 @@ final class AppModel {
     @ObservationIgnored var autoConnectApplying = false
     /// Pending re-evaluation (debounce deadline, launch settle, post-wake).
     @ObservationIgnored var autoConnectRecheckTask: Task<Void, Never>?
+    /// The delayed second half of a disconnect (point macOS back at the
+    /// built-in speakers, force their level). Held so a second disconnect
+    /// cancels and replaces the first rather than racing it, and so the
+    /// pending write can be dropped if the trigger comes straight back.
+    @ObservationIgnored var autoConnectDeactivateTask: Task<Void, Never>?
 
     /// Minimum spacing between accepted manual rescans.
     static let discoveryRescanCooldownSeconds: Double = 3.0

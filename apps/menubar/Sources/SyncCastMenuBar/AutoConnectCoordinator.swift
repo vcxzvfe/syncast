@@ -32,10 +32,25 @@ struct AutoConnectCoordinator {
         case none
         /// Switch to local Stereo and enable exactly these UIDs.
         case activate(profileID: UUID, memberUIDs: [String])
-        /// The trigger for an activated rule is gone: stop, and optionally put
-        /// the built-in speakers back as the default output at a fixed level.
+        /// The rule's conditions are met and the audio path is ALREADY exactly
+        /// what the rule would have built, so the episode is claimed without
+        /// restarting anything.
+        ///
+        /// This is a distinct action rather than `.none` because the two are
+        /// not the same event to the owner: the audio path needs nothing, but
+        /// the built-in speakers may still be sitting at a level a previous
+        /// disconnect forced on them, and only an activation is allowed to
+        /// hand that back. See `AutoConnectPlan.restore`.
+        case claimSatisfied(profileID: UUID, memberUIDs: [String])
+        /// The trigger for an activated rule is gone: switch the rule's own
+        /// members off, and optionally put the built-in speakers back as the
+        /// default output at a fixed level.
+        ///
+        /// `memberUIDs` rides along because the owner must undo what the rule
+        /// did and nothing else — see `AutoConnectPlan.deactivation`.
         case deactivate(
             profileID: UUID,
+            memberUIDs: [String],
             restoreBuiltIn: Bool,
             builtInVolumePercent: Int?
         )
@@ -95,7 +110,21 @@ struct AutoConnectCoordinator {
         var activated = false
         /// The user overrode us this episode; stay out of the way.
         var suppressed = false
+        /// How many times the owner has failed to APPLY an activation this
+        /// episode. Not the same thing as `activated`: the rule was entitled
+        /// to fire and the world refused it, which is worth retrying.
+        var activationFailures = 0
     }
+
+    /// How many times one episode may re-attempt an activation the owner could
+    /// not apply before the rule gives up and waits for the next unplug.
+    ///
+    /// Bounded rather than open-ended because the failure this exists for
+    /// (`AppModel.setMode` single-flighting a mode switch that is already in
+    /// flight) resolves in well under a second, so a failure that survives
+    /// three attempts is a different problem and a retry loop would only bury
+    /// it under log noise.
+    static let maxActivationAttempts = 3
 
     /// How long the present-set has to hold still before it is believed.
     ///
@@ -149,6 +178,29 @@ struct AutoConnectCoordinator {
     /// Forget a rule entirely (deleted in the UI).
     mutating func forgetProfile(_ id: UUID) {
         episodes.removeValue(forKey: id)
+    }
+
+    /// The owner emitted an `.activate` but could not apply it.
+    ///
+    /// The episode is marked spent the moment the action is emitted, which is
+    /// right for the normal path (the owner applies it and re-evaluates) and
+    /// wrong for the failing one: `AppModel.setMode` drops a mode switch while
+    /// a previous transition is still in flight and returns silently, so the
+    /// members would be left enabled in whole-home with the episode already
+    /// spent and nothing that could ever try again.
+    ///
+    /// Clearing `activated` puts the shot back so the next `evaluate` re-emits.
+    ///
+    /// - Returns: true when another attempt is worth scheduling. On the last
+    ///   attempt the shot is deliberately NOT returned, so the rule falls
+    ///   silent for the rest of the episode instead of retrying forever.
+    mutating func markActivationFailed(_ id: UUID) -> Bool {
+        guard var state = episodes[id] else { return false }
+        state.activationFailures += 1
+        let retry = state.activationFailures < Self.maxActivationAttempts
+        state.activated = !retry
+        episodes[id] = state
+        return retry
     }
 
     // MARK: - Decision
@@ -228,6 +280,7 @@ struct AutoConnectCoordinator {
             return Decision(
                 action: .deactivate(
                     profileID: profile.id,
+                    memberUIDs: profile.memberUIDs,
                     restoreBuiltIn: profile.onDisconnect.restoreBuiltIn,
                     builtInVolumePercent: profile.onDisconnect.builtInVolumePercent
                 ),
@@ -269,12 +322,23 @@ struct AutoConnectCoordinator {
             // Already exactly right: claim the episode without touching the
             // audio path, so a launch into the correct state is silent and a
             // later manual change is still treated as the user's.
+            //
+            // This is a deliberate behaviour, not an optimisation, and it has
+            // a consequence worth stating: an episode claimed this way sets
+            // `activated`, so the following unplug DOES run the full
+            // disconnect action even though the rule never moved anything.
+            // That is the safety framing the feature was asked for — "unplug →
+            // the laptop must not be audible" — and it is kept on purpose.
+            // What the claim must NOT do is skip the built-in level the last
+            // disconnect forced down, which is why it reports `.claimSatisfied`
+            // rather than `.none`.
             let satisfied = input.isStereoMode
                 && input.isStreaming
                 && input.enabledUIDs == Set(profile.memberUIDs)
-            if satisfied { continue }
             result = Decision(
-                action: .activate(profileID: profile.id, memberUIDs: profile.memberUIDs),
+                action: satisfied
+                    ? .claimSatisfied(profileID: profile.id, memberUIDs: profile.memberUIDs)
+                    : .activate(profileID: profile.id, memberUIDs: profile.memberUIDs),
                 recheckAfter: nil
             )
         }
