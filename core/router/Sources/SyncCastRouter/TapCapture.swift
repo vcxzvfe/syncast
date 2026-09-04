@@ -65,11 +65,30 @@ public final class TapCapture: @unchecked Sendable {
     private let scratchChannels: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
     private let scratchSlabs: [UnsafeMutablePointer<Float>]
 
+    /// When set, the tap is PINNED to this CoreAudio device
+    /// (`CATapDescription.deviceUID`) instead of tapping the whole system:
+    /// only audio rendered to that device is captured.
+    ///
+    /// This is what the system-sink Stereo path uses. macOS renders every
+    /// app's audio into the sink (it is the default output), we tap the sink,
+    /// and fan the result out to the real speakers. Pinning matters twice
+    /// over: a global tap would also pick up whatever we render to the real
+    /// outputs (a feedback loop), and it would keep capturing audio the user
+    /// deliberately routed somewhere else.
+    ///
+    /// Verified 2026-09-05 on this machine: a tap pinned to BlackHole 2ch
+    /// captures PRE-driver audio — captured RMS was 0.35355 with the sink's
+    /// own VolumeScalar at 1.0, 0.5 and 0.0 alike. The sink's scalar is
+    /// therefore pure user intent, free for us to reuse as the master volume.
+    private let tapDeviceUID: String?
+
     public init(
         sampleRate: Double = 48_000,
         channelCount: Int = 2,
-        ringCapacityFrames: Int = 1 << 18
+        ringCapacityFrames: Int = 1 << 18,
+        tapDeviceUID: String? = nil
     ) {
+        self.tapDeviceUID = tapDeviceUID
         self.sampleRate = sampleRate
         self.channelCount = channelCount
         self.ringBuffer = RingBuffer(
@@ -114,7 +133,13 @@ public final class TapCapture: @unchecked Sendable {
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
         description.name = "SyncCast System Audio Tap"
         description.isPrivate = true
+        // muteBehavior 0 = unmuted: the tap observes, it does not silence the
+        // device. Harmless on a sink (nothing is listening to it anyway) and
+        // required on a global tap.
         description.muteBehavior = CATapMuteBehavior(rawValue: 0) ?? description.muteBehavior
+        if let tapDeviceUID {
+            description.deviceUID = tapDeviceUID
+        }
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(description, &newTapID)
@@ -294,7 +319,7 @@ public final class TapCapture: @unchecked Sendable {
     }
 
     public func diagnosticReport() -> String {
-        "backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) asbd={\(debugLastASBD)} last=\(debugLastReason)"
+        "pin=\(tapDeviceUID ?? "global") backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) asbd={\(debugLastASBD)} last=\(debugLastReason)"
     }
 
     private static func currentProcessObjectID() throws -> AudioObjectID {
