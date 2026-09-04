@@ -66,8 +66,46 @@ enum SystemDefaultOutput {
         return id
     }
 
+    /// Resolve a UID to a device that can actually be a default OUTPUT.
+    ///
+    /// The output-channel test is not belt-and-braces. Plenty of hardware
+    /// registers its input and output halves as separate `AudioObjectID`s that
+    /// report the same device UID (USB interfaces and virtual drivers both do
+    /// it), and `allDeviceIDs` returns them in whatever order CoreAudio feels
+    /// like. Matching on UID alone can therefore hand back the capture half,
+    /// and writing that into `kAudioHardwarePropertyDefaultOutputDevice` fails
+    /// with an opaque OSStatus that reads exactly like "the write was refused"
+    /// — while the real speakers were sitting right behind it in the list.
     private static func deviceID(forUID uid: String) -> AudioObjectID? {
-        allDeviceIDs().first { self.uid(of: $0) == uid }
+        allDeviceIDs().first { self.uid(of: $0) == uid && hasOutputChannels($0) }
+    }
+
+    /// True when the device's output-scope stream configuration reports at
+    /// least one channel.
+    private static func hasOutputChannels(_ id: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr,
+              size >= UInt32(MemoryLayout<AudioBufferList>.size)
+        else { return false }
+        // AudioBufferList is variable-length, so it cannot be stack-allocated
+        // at a fixed size: ask for the reported byte count and rebind.
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, raw) == noErr else {
+            return false
+        }
+        let list = UnsafeMutableAudioBufferListPointer(
+            raw.assumingMemoryBound(to: AudioBufferList.self)
+        )
+        return list.contains { $0.mNumberChannels > 0 }
     }
 
     private static func allDeviceIDs() -> [AudioObjectID] {
