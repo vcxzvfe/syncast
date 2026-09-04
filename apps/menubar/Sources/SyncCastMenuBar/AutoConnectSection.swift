@@ -60,7 +60,9 @@ struct AutoConnectSection: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
-            Text("选一个「一出现就自动连上」的设备，当前已开启的输出会成为规则成员。")
+            Text(model.autoConnectEnabledLocalDevices.isEmpty
+                 ? "先勾好想同时出声的输出，再选一个「一出现就自动连上」的设备。"
+                 : "选一个「一出现就自动连上」的设备，当前已开启的输出会成为规则成员。")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -86,7 +88,13 @@ struct AutoConnectSection: View {
                 }
                 .buttonStyle(.borderless)
                 .font(.system(size: 10))
-                .disabled(effectiveTriggerUID == nil)
+                // Disabled rather than letting the model's guard reject the
+                // press: a rule created from an empty selection could never
+                // fire, and a refusal after the fact reads as a bug.
+                .disabled(
+                    effectiveTriggerUID == nil
+                    || model.autoConnectEnabledLocalDevices.isEmpty
+                )
                 .accessibilityIdentifier("autoConnectCreateButton")
             }
         }
