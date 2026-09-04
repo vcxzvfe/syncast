@@ -39,7 +39,9 @@ extension AppModel {
     /// Only the auto-connect view of the device list is affected — discovery,
     /// the popover and the engine still see the device — so this simulates
     /// "the rule thinks it is gone", not "the device is gone".
-    static var autoConnectSimulatedAbsentUIDs: Set<String> {
+    /// Read once at first use: the environment cannot change under a running
+    /// process, and this is consulted on every evaluation.
+    static let autoConnectSimulatedAbsentUIDs: Set<String> = {
         guard let raw = ProcessInfo.processInfo
             .environment["SYNCAST_AUTOCONNECT_SIMULATE_ABSENT"]
         else { return [] }
@@ -48,7 +50,7 @@ extension AppModel {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
         )
-    }
+    }()
 
     // MARK: - Rule access
 
