@@ -120,14 +120,16 @@ Every decision is logged to `~/Library/Logs/SyncCast/launch.log` with the
 
 ## Verification
 
-- `swift build` and `swift test` in `apps/menubar`: 171 tests, 0 failures
-  (38 of them new: `AutoConnectCoordinatorTests`, `AutoConnectProfileTests`).
+- `swift build` and `swift test` in `apps/menubar`: 172 tests, 0 failures
+  (39 of them new: `AutoConnectCoordinatorTests`, `AutoConnectProfileTests`).
+  All four packages build; `core/router` (90) and `core/discovery` (21) stay green.
 - Covered by tests: debounce (including a five-edge flapping burst), fire-once
   per episode, missing member, disabled rule, launch-already-correct,
   whole-home-with-same-members, user override, override does not touch absent
   triggers, `resetSuppression`, disconnect action + payload, brief dropout does
   not deactivate, deactivate once, first-match-wins (and the loser staying
-  quiet), rule deletion, JSON round trip, garbage/wrong-shape/absent data,
+  quiet), rule deletion, a rule switched off after firing not acting on the
+  unplug, JSON round trip, garbage/wrong-shape/absent data,
   clamping, dedupe, duplicate ids, the `UserDefaults` round trip, the linear
   scalar law, and built-in lookup by UID / prefix / name.
 - **Not verified on hardware by this track**: the supervisor owns real-machine
