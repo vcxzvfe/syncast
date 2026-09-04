@@ -39,6 +39,7 @@ extension AppModel {
     /// Only the auto-connect view of the device list is affected — discovery,
     /// the popover and the engine still see the device — so this simulates
     /// "the rule thinks it is gone", not "the device is gone".
+    ///
     /// Read once at first use: the environment cannot change under a running
     /// process, and this is consulted on every evaluation.
     static let autoConnectSimulatedAbsentUIDs: Set<String> = {
