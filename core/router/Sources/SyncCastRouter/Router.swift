@@ -1524,9 +1524,21 @@ public actor Router {
             return [:]
         }
         var result: [String: SystemSinkVolumeLaw.Backend] = [:]
+        var changed = false
         for uid in sinkOutputUIDs() {
-            result[uid] = classifySinkVolumeBackend(uid: uid)
+            let backend = classifySinkVolumeBackend(uid: uid)
+            result[uid] = backend
+            if sinkVolumeBackends[uid] != backend {
+                sinkVolumeBackends[uid] = backend
+                changed = true
+            }
         }
+        // The DDC verdict lands ASYNCHRONOUSLY. Until it does, a display with
+        // no CoreAudio volume classifies as `.softwareGain` — correct, but the
+        // cached verdict would then keep it there forever. Adopting the
+        // settled answer here (and replanning when it moved) is what promotes
+        // the display to its own DDC volume once the probe finishes.
+        if changed { replan() }
         return result
     }
 
