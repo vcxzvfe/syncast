@@ -303,3 +303,159 @@ final class RingReadPlannerTests: XCTestCase {
         XCTAssertEqual(result.startFrame, 1_000_000 - 4800 - 1024)
     }
 }
+
+/// The read window the per-device delay compensation adds.
+///
+/// With per-pair offsets the cursor is anchored to the MOST delayed pair and
+/// the least delayed one reads `readWindowFrames` above it, so the floor has to
+/// be that much deeper and every "is there audio there" question is about the
+/// top of the window, not about the cursor. Default 0 must reproduce the
+/// original arithmetic exactly — that is what keeps an untouched install
+/// bit-identical.
+final class RingReadWindowTests: XCTestCase {
+    private let capacity = 1 << 18
+    private let block = 512
+    private let floor: Int64 = 1440           // 30 ms @ 48k
+    private let driftLimit: Int64 = 12_000    // 250 ms @ 48k
+
+    private func plan(
+        writePosition: Int64, cursor: Int64, window: Int64
+    ) -> RingReadPlan {
+        RingReadPlanner.plan(
+            writePosition: writePosition,
+            cursor: cursor,
+            frames: block,
+            floorFrames: floor,
+            compensationFrames: 0,
+            capacityFrames: capacity,
+            driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+    }
+
+    func testZeroWindowIsExactlyTheOriginalPlan() {
+        for cursor: Int64 in [0, 90_000, 97_000, 99_900] {
+            let withParameter = plan(writePosition: 100_000, cursor: cursor, window: 0)
+            let without = RingReadPlanner.plan(
+                writePosition: 100_000,
+                cursor: cursor,
+                frames: block,
+                floorFrames: floor,
+                compensationFrames: 0,
+                capacityFrames: capacity,
+                driftLimitFrames: driftLimit
+            )
+            XCTAssertEqual(withParameter, without, "cursor=\(cursor)")
+        }
+    }
+
+    func testTheFloorIsDeepenedByTheWindow() {
+        let window: Int64 = 4_800
+        let result = plan(writePosition: 1_000_000, cursor: 0, window: window)
+        XCTAssertTrue(result.didResync)
+        XCTAssertEqual(
+            result.startFrame, 1_000_000 - floor - Int64(block) - window
+        )
+        // The pair reading highest still has exactly floor + block ahead of it,
+        // which is the whole point of deepening rather than borrowing.
+        XCTAssertEqual(result.waterLevelFrames, floor + Int64(block))
+        XCTAssertEqual(result.underrunFrames, 0)
+    }
+
+    /// The most-delayed pair reads at the cursor, so the block it needs must
+    /// still be inside the ring. A cursor older than the ring re-anchors.
+    func testTheMostDelayedPairNeverReadsBeforeTheOldestValidFrame() {
+        let window: Int64 = 9_600
+        let writePosition: Int64 = 5_000_000
+        let stale = writePosition - Int64(capacity) - 1
+        let result = plan(writePosition: writePosition, cursor: stale, window: window)
+        XCTAssertTrue(result.didResync)
+        XCTAssertGreaterThanOrEqual(
+            result.startFrame, writePosition - Int64(capacity),
+            "start frame must sit inside the ring"
+        )
+        // And the top of the window is still behind the producer.
+        XCTAssertLessThanOrEqual(
+            result.startFrame + window + Int64(block), writePosition
+        )
+    }
+
+    /// A cursor that is fine for an undelayed read is an underrun once the
+    /// window is added, because the pair reading highest runs past the
+    /// producer. Catching it at the top of the window is the difference
+    /// between counting the dropout and hiding it.
+    func testUnderrunIsJudgedAtTheTopOfTheWindow() {
+        let writePosition: Int64 = 100_000
+        let cursor: Int64 = writePosition - Int64(block)
+        let undelayed = plan(writePosition: writePosition, cursor: cursor, window: 0)
+        XCTAssertEqual(undelayed.underrunFrames, 0)
+        XCTAssertFalse(undelayed.didResync)
+
+        let delayed = plan(writePosition: writePosition, cursor: cursor, window: 480)
+        XCTAssertTrue(delayed.didResync)
+        // Re-anchored, so the block it actually serves is backed by audio.
+        XCTAssertEqual(delayed.underrunFrames, 0)
+        XCTAssertEqual(
+            delayed.startFrame, writePosition - floor - Int64(block) - 480
+        )
+    }
+
+    func testUnderrunIsStillCountedWhenTheProducerIsTooYoungToServeTheWindow() {
+        // Producer has written less than floor + window + block.
+        let result = plan(writePosition: 2_000, cursor: 0, window: 4_800)
+        XCTAssertEqual(result.startFrame, 0)
+        XCTAssertGreaterThan(result.underrunFrames, 0)
+        XCTAssertLessThanOrEqual(result.underrunFrames, block)
+    }
+
+    // MARK: - Sequencer
+
+    func testSequencerTreatsTheWindowAsPartOfTheBlockItNeeds() {
+        var sequencer = RingReadSequencer()
+        let window: Int64 = 4_800
+        // Prime with an active producer.
+        _ = sequencer.plan(
+            writePosition: 200_000, cursor: 0, frames: block,
+            floorFrames: floor, compensationFrames: 0,
+            capacityFrames: capacity, driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+        // Producer stops. The cursor still has a block of audio above it, but
+        // not a block PLUS the window, so this is idle, not merely behind.
+        let idle = sequencer.plan(
+            writePosition: 200_000, cursor: 200_000 - Int64(block) - 100,
+            frames: block, floorFrames: floor, compensationFrames: 0,
+            capacityFrames: capacity, driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+        XCTAssertTrue(idle.producerIdle)
+    }
+
+    func testResumeFromIdleRebuildsTheFloorBehindTheWindow() {
+        var sequencer = RingReadSequencer()
+        let window: Int64 = 2_400
+        _ = sequencer.plan(
+            writePosition: 500_000, cursor: 0, frames: block,
+            floorFrames: floor, compensationFrames: 0,
+            capacityFrames: capacity, driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+        _ = sequencer.plan(
+            writePosition: 500_000, cursor: 499_000, frames: block,
+            floorFrames: floor, compensationFrames: 0,
+            capacityFrames: capacity, driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+        let resumed = sequencer.plan(
+            writePosition: 520_000, cursor: 499_000, frames: block,
+            floorFrames: floor, compensationFrames: 0,
+            capacityFrames: capacity, driftLimitFrames: driftLimit,
+            readWindowFrames: window
+        )
+        XCTAssertTrue(resumed.resumedFromIdle)
+        XCTAssertEqual(
+            resumed.startFrame, 520_000 - floor - Int64(block) - window
+        )
+        XCTAssertEqual(resumed.waterLevelFrames, floor + Int64(block))
+    }
+}
