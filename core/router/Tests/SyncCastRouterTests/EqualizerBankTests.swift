@@ -483,6 +483,109 @@ final class EqualizerBankTests: XCTestCase {
         XCTAssertFalse(bank.setSettings(graphic([1_000: 6]), pair: -1))
     }
 
+    // MARK: - Full-band measurement
+
+    /// Measure the bank's transfer function by pushing an impulse through the
+    /// SHIPPING render path and evaluating a DFT of the response at each band
+    /// centre. Faster than a sine per frequency and it measures every band from
+    /// one pass, which is what makes the ten-band table below cheap enough to
+    /// assert on.
+    private func impulseResponseGainDb(
+        bank: EqualizerBank,
+        frequencies: [Double],
+        responseFrames: Int = 32_768
+    ) -> [Double] {
+        let block = 512
+        let amplitude = 0.25
+        var response = [Double]()
+        response.reserveCapacity(responseFrames)
+        var buffer = [Float](repeating: 0, count: block)
+
+        func push(impulse: Bool, collect: Bool) {
+            for index in 0..<block { buffer[index] = 0 }
+            if impulse { buffer[0] = Float(amplitude) }
+            buffer.withUnsafeMutableBufferPointer { channel in
+                var pointers = [channel.baseAddress!]
+                pointers.withUnsafeMutableBufferPointer { table in
+                    bank.process(
+                        pair: 0, channels: table.baseAddress!,
+                        channelOffset: 0, channelCount: 1, frames: block
+                    )
+                }
+            }
+            if collect {
+                for index in 0..<block where response.count < responseFrames {
+                    response.append(Double(buffer[index]))
+                }
+            }
+        }
+
+        // Retire any crossfade first, so the measured response is the settled
+        // curve and not a mixture of the old and new one.
+        for _ in 0..<8 { push(impulse: false, collect: false) }
+        var first = true
+        while response.count < responseFrames {
+            push(impulse: first, collect: true)
+            first = false
+        }
+
+        return frequencies.map { hz in
+            let omega = 2 * Double.pi * hz / sampleRate
+            var real = 0.0
+            var imaginary = 0.0
+            for (index, sample) in response.enumerated() {
+                let phase = omega * Double(index)
+                real += sample * cos(phase)
+                imaginary -= sample * sin(phase)
+            }
+            return 20 * log10(max(sqrt(real * real + imaginary * imaginary) / amplitude, 1e-12))
+        }
+    }
+
+    /// The ten-band table: each band boosted alone by +6 dB, measured through
+    /// `process()` at every band centre, checked against the analytic response.
+    ///
+    /// Printed as well as asserted — this is the offline proof that the
+    /// shipping DSP does what the UI promises, and the numbers belong in the
+    /// requirements document rather than only in an assertion.
+    func testTenBandTableThroughTheShippingRenderPath() {
+        let centres = EqualizerLimits.graphicFrequencies
+        print("EQ measured response, +6 dB on one band at a time, 48 kHz")
+        print(
+            "band       "
+                + centres.map { String(format: "%8.1f", $0) }.joined()
+        )
+        for (bandIndex, centre) in centres.enumerated() {
+            let settings = graphic([centre: 6])
+            let bank = makeBank()
+            bank.setSettings(settings, pair: 0)
+            let measured = impulseResponseGainDb(bank: bank, frequencies: centres)
+            print(
+                String(format: "%-11.1f", centre)
+                    + measured.map { String(format: "%8.2f", $0) }.joined()
+            )
+            // The boosted band reaches its dialled gain…
+            XCTAssertEqual(measured[bandIndex], 6, accuracy: 0.35, "band \(centre) Hz")
+            // …and every band two octaves away is untouched.
+            for (other, otherCentre) in centres.enumerated()
+            where abs(other - bandIndex) >= 2 {
+                XCTAssertEqual(
+                    measured[other], 0, accuracy: 0.5,
+                    "\(centre) Hz boost leaked into \(otherCentre) Hz"
+                )
+            }
+            // …and the whole measured curve agrees with the analytic one.
+            for (index, hz) in centres.enumerated() {
+                XCTAssertEqual(
+                    measured[index],
+                    settings.responseDb(atHz: hz, sampleRate: sampleRate),
+                    accuracy: 0.35,
+                    "measured vs analytic at \(hz) Hz for a \(centre) Hz boost"
+                )
+            }
+        }
+    }
+
     // MARK: - Analytic response helper
 
     func testResponseDbAgreesWithTheMeasuredBank() {

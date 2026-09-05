@@ -245,21 +245,14 @@ public final class EqualizerBank {
         // Coefficients first, OUTSIDE the lock: this is the `pow`/`sin`/`cos`
         // work, and the render thread may be holding nothing but waiting on
         // the same lock for a memcpy.
-        var coefficients = [BiquadCoefficients](repeating: .identity, count: maxBands)
-        var active = [UInt8](repeating: 0, count: maxBands)
         let bands = Array(clean.bands.prefix(maxBands))
-        var anyActive = false
-        for (index, band) in bands.enumerated() {
-            let coefficient = clean.bypassed
-                ? BiquadCoefficients.identity
-                : BiquadCoefficients.make(band: band, sampleRate: sampleRate)
-            coefficients[index] = coefficient
-            let isActive = coefficient != .identity
-            active[index] = isActive ? 1 : 0
-            anyActive = anyActive || isActive
+        let coefficients: [BiquadCoefficients] = (0..<maxBands).map { index in
+            guard index < bands.count, !clean.bypassed else { return .identity }
+            return BiquadCoefficients.make(band: bands[index], sampleRate: sampleRate)
         }
+        let active: [UInt8] = coefficients.map { $0 == .identity ? 0 : 1 }
         let trim = clean.trimAmplitude
-        let identity = !anyActive && trim == 1
+        let identity = !active.contains(1) && trim == 1
 
         return paramLock.withLock {
             if lastRequested[pair] == clean { return false }
