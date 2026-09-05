@@ -78,3 +78,68 @@ public enum RouterLog {
         queue.sync {}
     }
 }
+
+/// Wall-clock stopwatch for a multi-step operation, reported through
+/// `RouterLog`.
+///
+/// # Why
+///
+/// `Router.start` took 108 s to return on 2026-09-05 and the log said only
+/// that it had started and (eventually) finished. Every candidate explanation —
+/// the sink takeover, the 48 kHz settle, the process tap, opening the output —
+/// was equally consistent with that. One `mark()` per phase is the difference
+/// between "the sink path is slow" and "`AudioHardwareCreateProcessTap` took
+/// 107.9 s of it".
+///
+/// Monotonic (`DispatchTime`), so a clock adjustment mid-start cannot produce
+/// a negative or absurd duration.
+public struct PhaseTimer {
+    /// Prefix for every line, e.g. `[Router] systemSink.start`.
+    private let scope: String
+    private let now: () -> UInt64
+    private let emit: (String) -> Void
+    private let startedAt: UInt64
+    private var lastMark: UInt64
+
+    /// Phases slower than this are worth a reader's attention. Everything is
+    /// logged either way; this only decides whether the line says so.
+    public static let slowPhaseMs: Double = 250
+
+    public init(
+        scope: String,
+        now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        emit: @escaping (String) -> Void = { RouterLog.write($0) }
+    ) {
+        self.scope = scope
+        self.now = now
+        self.emit = emit
+        let t = now()
+        self.startedAt = t
+        self.lastMark = t
+    }
+
+    /// Record that `phase` just finished. Logs its own duration and the total
+    /// so far — the total is what tells you whether you are reading the line
+    /// that explains a stall or one that came after it.
+    @discardableResult
+    public mutating func mark(_ phase: String) -> Double {
+        let t = now()
+        let phaseMs = Self.milliseconds(from: lastMark, to: t)
+        let totalMs = Self.milliseconds(from: startedAt, to: t)
+        lastMark = t
+        let flag = phaseMs >= Self.slowPhaseMs ? " SLOW" : ""
+        emit(String(
+            format: "%@: %@ %.1f ms (total %.1f ms)%@",
+            scope, phase, phaseMs, totalMs, flag
+        ))
+        return phaseMs
+    }
+
+    /// Total elapsed since construction, in milliseconds.
+    public var totalMs: Double { Self.milliseconds(from: startedAt, to: now()) }
+
+    private static func milliseconds(from: UInt64, to: UInt64) -> Double {
+        guard to > from else { return 0 }
+        return Double(to - from) / 1_000_000.0
+    }
+}

@@ -1686,6 +1686,12 @@ public actor Router {
         //
         // Placed FIRST, so the failure costs nothing: no sink installed, no
         // sample rate changed, no default output to give back.
+        //
+        // Phase timing runs from here. The 108 s stall on 2026-09-05 left a
+        // log that said only "started" and "finished", which fits every
+        // candidate cause equally well; `PhaseTimer` makes the next one name
+        // itself. Cheap: four `DispatchTime.now()` reads per start.
+        var phases = PhaseTimer(scope: "[Router] systemSink.start")
         let virtualTargets = enabledLocalOutputs(devices: devices)
             .filter { VirtualOutputPolicy.isVirtualOutput(uid: $0.uid) }
         if !virtualTargets.isEmpty {
@@ -1708,8 +1714,13 @@ public actor Router {
                     "sink device \(candidate.uid) exposes no volume control; refusing to make it the default output"
             ])
         }
+        phases.mark("preflight")
         let sink = systemSink ?? SystemSinkDevice(candidate: candidate)
+        // `SystemSinkDevice.start` emits its own sub-phases (sample-rate
+        // settle, default-output write, system-output write, volume seed), so
+        // this mark is the takeover total those add up to.
         try sink.start(seedVolume: systemSinkSeedVolume(devices: devices))
+        phases.mark("sink takeover")
         systemSink = sink
         sinkVolumeLaw = SystemSinkVolumeLaw.law(forDeviceUID: candidate.uid)
         // Seed the master from the device so the first replan reproduces the
@@ -1728,7 +1739,9 @@ public actor Router {
         }
         do {
             try await tap.start()
+            phases.mark("tap start")
         } catch {
+            phases.mark("tap start (failed)")
             // If the rollback ALSO fails to give the default output back, keep
             // the sink: the outer unwind (`stopSystemSinkPathIgnoringErrors`)
             // is the only thing left that can retry, and it needs an object to
@@ -1748,6 +1761,7 @@ public actor Router {
             "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n"
         )
         reconcileLocalDriver(devices: devices)
+        phases.mark("output open")
         // `reconcileLocalDriver` reports failures by setting `lastError` and
         // returning — fine on the other paths, fatal here: the sink is already
         // the system default, so "no output opened" means macOS is rendering

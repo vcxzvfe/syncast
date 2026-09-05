@@ -244,6 +244,11 @@ public final class SystemSinkDevice {
     /// value we then push back to that device is the value it already had.
     public func start(seedVolume: Float? = nil) throws {
         if isActive { return }
+        // Sub-phases of the Router's "sink takeover" phase. The sample-rate
+        // settle below polls for up to a second and the seed retries for up to
+        // ~360 ms, so a slow takeover has three different plausible causes;
+        // these marks say which one it was rather than leaving it to guesswork.
+        var phases = PhaseTimer(scope: "[SystemSink] start")
         let id = try Self.deviceID(forUID: candidate.uid)
 
         let rawDefaultID = try Self.readDefault(Self.defaultOutputSelector)
@@ -263,6 +268,7 @@ public final class SystemSinkDevice {
         let systemSnapshot = rawSystemID.map { id in
             Self.restorablePrevious(id: id, uid: DirectStereoOutput.readDeviceUID(id))
         }
+        phases.mark("snapshot previous defaults")
 
         // Pin the sample rate BEFORE macOS starts rendering into the sink, so
         // no app opens it at the old rate and gets re-rated underneath.
@@ -288,6 +294,7 @@ public final class SystemSinkDevice {
                 )
             }
         }
+        phases.mark("sample-rate settle")
 
         do {
             try Self.setDefaultOrThrow(Self.defaultOutputSelector, id)
@@ -300,8 +307,10 @@ public final class SystemSinkDevice {
                 _ = Self.setNominalSampleRate(id, rate: rate)
                 previousNominalSampleRate = nil
             }
+            phases.mark("default-output write (failed)")
             throw error
         }
+        phases.mark("default-output write")
         // The system-output write is best effort: a machine that refuses it
         // still gets a working master volume from the main default output, and
         // failing the whole path over alert routing would be a bad trade.
@@ -332,10 +341,12 @@ public final class SystemSinkDevice {
         // remembered level. Writing after (and verifying) is the only ordering
         // that holds. Nothing is audible during the gap: the sink discards
         // audio and our own outputs do not start until `start()` returns.
+        phases.mark("system-output write")
         if let seedVolume {
             Self.seedVolumeAfterTakeover(
                 uid: candidate.uid, target: max(0, min(1, seedVolume))
             )
+            phases.mark("volume seed")
         }
 
         deviceID = id
