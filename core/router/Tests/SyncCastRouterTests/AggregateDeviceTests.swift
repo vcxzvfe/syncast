@@ -8,7 +8,8 @@ import CoreAudio
 /// that requires an actual physical audio device to point the master at,
 /// is brittle in CI (Linux / containers have no CoreAudio), and the
 /// observable behavior is already exercised by manual hardware tests
-/// driven via `SYNCAST_AUTO_TEST=mbp,display`. What we CAN test cheaply:
+/// driven via `SYNCAST_AUTO_TEST=<output name>,<output name>`. What we CAN
+/// test cheaply:
 ///   - The stream-config query helper returns a sane shape on bogus
 ///     inputs (does not crash, returns zero counts).
 ///   - The hardware-volume path is value-clamping correctly (the
