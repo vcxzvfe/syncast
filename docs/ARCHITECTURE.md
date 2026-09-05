@@ -71,13 +71,13 @@
 
 | Module | Language | Responsibility |
 |---|---|---|
-| `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, the per-device equalizer (`EqualizerSettings` + `EqualizerBank`), the per-device stereo image (`StereoImageSettings` + `StereoImageProcessor`), the per-device local delay compensation (`LocalDelayTrim` + `PairDelayBank`), IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
+| `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour browsing (`_airplay._tcp`, `_raop._tcp`, and `_synccast-pcm._udp` for LAN receivers). Produces stable `Device` records. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, the per-device equalizer (`EqualizerSettings` + `EqualizerBank`), the per-device stereo image (`StereoImageSettings` + `StereoImageProcessor`), the per-device local delay compensation (`LocalDelayTrim` + `PairDelayBank`), the per-device channel assignment (`ChannelMatrixSettings` + `ChannelMatrixBank`), the LAN PCM link (`LanPcmProtocol` + `LanClockModel` + `LanReceiverLink` + `LanReceiverOutput`), IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
 | `drivers/SyncCastAudio` | C (AudioServerPlugIn) | Output-only virtual HAL device named "SyncCast" with volume + mute controls. Discards audio; exists so macOS has something volume-controllable to make the default output. Installed to `/Library/Audio/Plug-Ins/HAL` by `scripts/install-driver.sh`. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
-| `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
+| `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`) and the LAN PCM link's wire format (`lan-pcm-link.md`, implemented by both this repo and the receiver daemon). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
-| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls (volume, delay trim, equalizer, stereo image, local delay compensation), and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`), the per-device equalizer store (`DeviceEqualizerStore` / `AppModel+Equalizer` / `EqualizerSection`) and the per-device stereo-image store (`DeviceStereoImageStore` / `AppModel+StereoImage` / `StereoImageSection`). |
+| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls (volume, delay trim, equalizer, stereo image, local delay compensation), and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`), the per-device equalizer store (`DeviceEqualizerStore` / `AppModel+Equalizer` / `EqualizerSection`), the per-device stereo-image store (`DeviceStereoImageStore` / `AppModel+StereoImage` / `StereoImageSection`), the per-device channel-assignment store (`DeviceChannelMatrixStore` / `AppModel+ChannelMatrix` / `ChannelMatrixSection`) and the LAN receiver rows plus their keychain-backed token store (`LanReceiverTokenStore` / `AppModel+LanReceiver` / `LanReceiverSection` / `LanTokenWindowController`). |
 
 ## 4. Audio data path
 
@@ -92,8 +92,9 @@
      Displacement — the user picking another output in the Sound menu — is ONE condition with one policy across every default-output owner (`Router.systemSinkDisplaced`): stop routing, restore nothing, offer 「继续」. SyncCast never re-asserts the default output on a timer.
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
-4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, reads that pair at its own **delay offset** when one is dialled in (`PairDelayBank`, see §8c), applies that pair's **equalizer** (`EqualizerBank`, see §8b) and then its **stereo image** (`StereoImageProcessor`, see §8b-2), then the per-device gain, and writes into AUHAL's output buffer. The equalizer sits before the gain stage so the volume slider stays the last attenuator; a pair with no curve takes a fast path that leaves the buffer byte-identical.
-5. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
+4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, reads that pair at its own **delay offset** when one is dialled in (`PairDelayBank`, see §8c), applies that pair's **equalizer** (`EqualizerBank`, see §8b), then its **stereo image** (`StereoImageProcessor`, see §8b-2), then its **channel assignment** (`ChannelMatrixBank`, see §8d), then the per-device gain, and writes into AUHAL's output buffer. Everything sits before the gain stage so the volume slider stays the last attenuator; a pair with nothing dialled in takes a fast path at every stage that leaves the buffer byte-identical.
+5. **LAN receiver fan-out** (local Stereo only, see §8e): `LanReceiverOutput` is the same shape one stage further out — a 5 ms `DispatchSourceTimer` reads 240 frames from the same ring at a cursor held a constant distance behind the producer, runs the same equalizer → stereo image → channel matrix → balance chain, converts to Int16 and sends a 984-byte UDP packet stamped `play_at_ns = ringTime(frame) + target_ms`. The timestamp is derived from the RING frame number (`RingWriteClock`), not from the send timer, which is what rate-locks the receiver to the audio source rather than to a timer on either machine.
+6. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
 
 ## 5. Sync model
 
@@ -294,6 +295,68 @@ per-device millisecond control that closes it, remembered on the device.
   `replan()`, both idempotent.
 - Full rationale:
   [requirements_2026-09-05-local-delay-trim.md](requirements_2026-09-05-local-delay-trim.md).
+
+## 8d. Per-device channel assignment (2026-09-05)
+
+Which source channel each output plays, as a 2×2 gain matrix per channel pair.
+
+- **Where**: `ChannelMatrixBank`, immediately after `StereoImageProcessor` and
+  before the gain stage, in `LocalOutput.render()` (per pair),
+  `LocalAirPlayBridge.render()` (one pair) and `LanReceiverOutput`'s producer.
+- **Presets**: 立体声 `[[1,0],[0,1]]`, 左 `[[1,0],[1,0]]`, 右 `[[0,1],[0,1]]`,
+  单声道 `[[.5,.5],[.5,.5]]`, plus 自定义 with four −∞…+6 dB sliders. 左/右 put
+  the chosen channel on BOTH output channels: the target is one cabinet with
+  two drivers, not half a pair. 单声道 sums at exactly 0.5 so correlated full
+  scale lands at full scale rather than clipping.
+- **RT safety**: no allocation, generation-counted publish, and a fast path at
+  立体声 that leaves the buffer byte-identical.
+- **Smoothing**: a 20 ms **coefficient ramp**, not two parallel chains. The
+  operator is memoryless and linear, so interpolating the matrix is exactly
+  equivalent to crossfading two chains' outputs — unlike a biquad or a delay
+  line, where it is not.
+- **Clip protection**: hard clamp to ±1 with a lock-free count, surfaced as
+  `matClip:<n>` in the diagnostic line.
+- **Scope**: one leg WIDER than the stereo imager's — the `localOutputs` pairs,
+  the `localBridges`, AND the LAN receiver legs. NOT the whole-home AirPlay
+  group (one stream, so one assignment for the whole house) and NOT Direct
+  Stereo.
+- **Re-application**: `Router.applyChannelMatrices()` alongside
+  `applyEqualizers()` in every `reconcileLocalDriver` and `replan()`; store is
+  `syncast.deviceChannelMatrix.v1`, keyed by output UID (`ca:`/`lan:`).
+- Full rationale:
+  [requirements_2026-09-05-channel-matrix.md](requirements_2026-09-05-channel-matrix.md).
+
+## 8e. LAN receiver output (2026-09-05)
+
+A second Mac running the `synccast-receiver` daemon, playing as one leg of the
+local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
+
+- **Discovery**: `LanReceiverDiscovery` browses `_synccast-pcm._udp` and
+  produces `Device` records with `transport == .lanReceiver`, identified by
+  their Bonjour instance name (`persistenceKey` = `lan:<instance name>`).
+- **Wire format**: [`proto/lan-pcm-link.md`](../proto/lan-pcm-link.md) — TCP
+  newline-JSON control, UDP audio, 240 frames of Int16 LE per 5 ms packet
+  behind a 24-byte header.
+- **Timing**: `RingWriteClock` maps ring frames to sender monotonic ns with a
+  minimum-filtered, deadbanded PI loop; `LanSendPlanner` holds the cursor a
+  constant distance behind the producer and sends whole packets. The receiver
+  closes its own DAC-clock difference with a water-level PI loop and a
+  fractional resampler.
+- **Alignment**: `LanAlignmentPlanner` computes how far the local CoreAudio
+  legs must be held back to land with the receiver, and it is applied as
+  `LocalDelayTrimPlanner`'s `extraHoldFrames` — after normalisation, because a
+  constant added to every per-device seed would cancel to nothing.
+  `LocalDelayTrim.maxOffsetMs` went 500 → 800 ms so the hold cannot reach the
+  clamp at the top of the target slider.
+- **Volume**: the sink master travels as a `gain` control message so the
+  receiver can use its own hardware volume; the per-device balance and the
+  render chain are applied on the sender before packetising.
+- **Security**: RFC1918/link-local/loopback peers only, a shared token in the
+  **keychain** (`syncast.lanReceiverTokens.v1`), never logged.
+- **Scope**: local Stereo only, and not on Direct Stereo (no capture ring to
+  read). Never whole-home.
+- Full rationale, timing model and honest latency expectations:
+  [requirements_2026-09-05-lan-receiver.md](requirements_2026-09-05-lan-receiver.md).
 
 ## 9. Build & distribution
 

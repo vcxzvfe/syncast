@@ -49,7 +49,14 @@ extension Router {
         switch device.transport {
         case .airplay2:
             return "name:\(device.name)"
-        case .coreAudio:
+        case .coreAudio, .lanReceiver:
+            // Neither reaches here in practice: a CoreAudio device always has
+            // a UID and a LAN receiver always has a Bonjour instance name, so
+            // `persistenceKey` answered above. A LAN receiver also has nothing
+            // to do with AirPlay pairing — its own shared token is a different
+            // mechanism entirely (see `LanReceiverLink`) — so the per-launch id
+            // is the right inert answer rather than a `name:` key the sidecar
+            // would then try to match against an OwnTone output.
             return device.id
         }
     }

@@ -48,8 +48,9 @@ func parseArgs() -> Args {
 func formatDevice(_ d: Device) -> String {
     let badge: String
     switch d.transport {
-    case .coreAudio: badge = "CA"
-    case .airplay2:  badge = "AP"
+    case .coreAudio:   badge = "CA"
+    case .airplay2:    badge = "AP"
+    case .lanReceiver: badge = "LAN"
     }
     let host = d.host.map { " @ \($0):\(d.port ?? 7000)" } ?? ""
     let rate = d.nominalSampleRate.map { String(format: " %.0fHz", $0) } ?? ""

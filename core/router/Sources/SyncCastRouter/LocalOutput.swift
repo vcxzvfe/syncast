@@ -115,6 +115,17 @@ public final class LocalOutput {
     /// Costs nothing while every pair is neutral: `StereoImageProcessor.process`
     /// exits on one atomic load and leaves the buffer byte-identical.
     private let stereoImage: StereoImageProcessor
+    /// Per-channel-pair channel assignment (the 2×2 "声道分配" matrix). Same
+    /// `pairCount` and the same pair→physical-device mapping as `equalizer`,
+    /// applied in `render()` immediately AFTER the stereo imager and BEFORE the
+    /// gain stage: the tone curve and the imager shape a stereo pair, the
+    /// matrix then decides which of that reaches which driver, and the volume
+    /// slider stays the last attenuator.
+    ///
+    /// Costs nothing while every pair is at 立体声: `ChannelMatrixBank.process`
+    /// exits on one atomic load plus four float compares and leaves the buffer
+    /// byte-identical.
+    private let channelMatrix: ChannelMatrixBank
     /// Per-channel-pair read offset — the local Stereo path's delay
     /// compensation. Sized to the same `pairCount` as `_softwareGains`, so in
     /// aggregate mode pair `p` is physical device `p` and each speaker can be
@@ -303,6 +314,11 @@ public final class LocalOutput {
             channelsPerPair: channelCount,
             sampleRate: sampleRate
         )
+        self.channelMatrix = ChannelMatrixBank(
+            pairCount: pairCount,
+            channelsPerPair: channelCount,
+            sampleRate: sampleRate
+        )
         self.pairDelays = PairDelayBank(pairCount: pairCount, sampleRate: sampleRate)
         // We deliberately leak the placeholder; deinit deallocates outPtrs
         // and the staging slabs. The actual outPtrs used per-render are
@@ -390,6 +406,7 @@ public final class LocalOutput {
         sc_atomic_store_release(idleBlockCounter, 0)
         equalizer.resetClipCount()
         stereoImage.resetClipCount()
+        channelMatrix.resetClipCount()
         renderTickCount = 0
     }
 
@@ -407,8 +424,11 @@ public final class LocalOutput {
         // Same rule for the imager's limiter: reported only once it fires.
         let imageClips = stereoImageClipCount
         let imageClipInfo = imageClips > 0 ? " imgClip:\(imageClips)" : ""
+        // Same rule again for the channel matrix's limiter.
+        let matrixClips = channelMatrixClipCount
+        let matrixClipInfo = matrixClips > 0 ? " matClip:\(matrixClips)" : ""
         return "resync:\(resyncCount) underrun:\(underrunCount) minWater:\(water)"
-            + " idle:\(idleBlockCount)\(clipInfo)\(imageClipInfo)"
+            + " idle:\(idleBlockCount)\(clipInfo)\(imageClipInfo)\(matrixClipInfo)"
     }
 
     // MARK: - Hardware latency probing
@@ -573,6 +593,33 @@ public final class LocalOutput {
 
     /// True when at least one pair has imaging that changes the signal.
     public var stereoImageIsEngaged: Bool { stereoImage.isEngaged }
+
+    // MARK: - Channel matrix
+
+    /// Install one channel pair's channel assignment.
+    ///
+    /// `pair` follows the same convention as `setEqualizer`. Idempotent:
+    /// re-installing an unchanged matrix returns false without touching the
+    /// render thread, which is what lets the Router re-apply its whole
+    /// UID → setting map on every replan.
+    @discardableResult
+    public func setChannelMatrix(pair: Int, settings: ChannelMatrixSettings) -> Bool {
+        channelMatrix.setSettings(settings, pair: pair)
+    }
+
+    /// Drop every pair back to 立体声. Used when an output is being repurposed
+    /// so a rebuilt aggregate never inherits the previous device's assignment.
+    public func resetChannelMatrices() {
+        channelMatrix.resetAll()
+    }
+
+    /// Samples the channel matrix's output limiter had to clamp this session.
+    /// Non-zero means a boosted coefficient — or a sum of two loud channels —
+    /// is driving the output past full scale.
+    public var channelMatrixClipCount: Int64 { channelMatrix.clipCount }
+
+    /// True when at least one pair has an assignment that changes the signal.
+    public var channelMatrixIsEngaged: Bool { channelMatrix.isEngaged }
 
     // MARK: - Per-device delay compensation
 
@@ -1045,6 +1092,25 @@ public final class LocalOutput {
         // opens the panel gets the pre-feature render path bit for bit.
         for p in 0..<pairCount {
             stereoImage.process(
+                pair: p,
+                channels: outPtrs,
+                channelOffset: p * channelCount,
+                channelCount: channelCount,
+                frames: frames
+            )
+        }
+
+        // Per-device channel assignment, immediately after the imager and
+        // still before the gain stage. Order matters both ways round: the
+        // matrix routes what the tone curve and the imager produced (so "this
+        // speaker plays the left channel" means the *processed* left channel),
+        // and the volume slider remains the last thing on the signal.
+        //
+        // A pair at 立体声 takes the bank's fast exit and leaves the buffers
+        // exactly as the imager left them, so a user who never opens the panel
+        // gets the pre-feature render path bit for bit.
+        for p in 0..<pairCount {
+            channelMatrix.process(
                 pair: p,
                 channels: outPtrs,
                 channelOffset: p * channelCount,

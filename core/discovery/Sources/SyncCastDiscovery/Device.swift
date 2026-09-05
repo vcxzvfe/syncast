@@ -4,6 +4,12 @@ import Foundation
 public enum Transport: String, Codable, Sendable, CaseIterable {
     case coreAudio       // local CoreAudio device (built-in, USB, HDMI/DP, virtual)
     case airplay2        // AirPlay 2 receiver (HomePod, Xiaomi, Mac AirPlay-Receiver)
+    /// A second Mac running the SyncCast receiver daemon, reachable over the
+    /// LAN with SyncCast's own low-latency PCM link (`_synccast-pcm._udp`).
+    /// NOT AirPlay: the sender packetises 5 ms of Int16 straight from the
+    /// capture ring and stamps a playout time, so the receiver can be one leg
+    /// of the local Stereo path alongside this Mac's own speakers.
+    case lanReceiver = "lan_receiver"
     // Future: snapcast, rtp, chromecast, etc.
 }
 
@@ -43,6 +49,25 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
     /// which is what makes it safe for a laptop that moves between an office
     /// and a home network.
     public let isLocalMachineReceiver: Bool
+    /// Bonjour instance name of a `.lanReceiver`, e.g. `receiver-a`. nil for
+    /// every other transport.
+    ///
+    /// This is the receiver's stable identity: it is what the daemon was
+    /// started with, it is what the user sees, and it is what
+    /// `persistenceKey` is built from. The resolved IP is deliberately NOT
+    /// stored — DHCP moves it, and the link re-resolves the service on every
+    /// connect.
+    public let lanServiceName: String?
+    /// Bonjour domain the service was found in (`local` in practice). Carried
+    /// so the link can rebuild the exact `NWEndpoint.service` it was seen at.
+    public let lanServiceDomain: String?
+    /// The 8-hex `token=` hint from the TXT record.
+    ///
+    /// A HINT, never the secret: it lets the UI say "this is the receiver
+    /// whose log printed 3f2a…" without the full token ever being on the
+    /// wire unencrypted. The full token is typed once by the user and lives
+    /// in the keychain.
+    public let lanTokenHint: String?
 
     public init(
         id: String,
@@ -56,7 +81,10 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
         supportsHardwareVolume: Bool = true,
         nominalSampleRate: Double? = nil,
         airplayDeviceID: String? = nil,
-        isLocalMachineReceiver: Bool = false
+        isLocalMachineReceiver: Bool = false,
+        lanServiceName: String? = nil,
+        lanServiceDomain: String? = nil,
+        lanTokenHint: String? = nil
     ) {
         self.id = id
         self.transport = transport
@@ -70,6 +98,9 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
         self.nominalSampleRate = nominalSampleRate
         self.airplayDeviceID = airplayDeviceID
         self.isLocalMachineReceiver = isLocalMachineReceiver
+        self.lanServiceName = lanServiceName
+        self.lanServiceDomain = lanServiceDomain
+        self.lanTokenHint = lanTokenHint
     }
 
     /// Key under which a user's selection of this device should be persisted.
@@ -81,7 +112,21 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
             return coreAudioUID.map { "ca:\($0)" }
         case .airplay2:
             return Device.normalizedAirplayDeviceID(airplayDeviceID).map { "ap:\($0)" }
+        case .lanReceiver:
+            return Device.lanReceiverUID(serviceName: lanServiceName)
         }
+    }
+
+    /// Canonical UID of a LAN receiver: `lan:<bonjour instance name>`.
+    ///
+    /// Namespaced so it cannot collide with a CoreAudio UID in any of the
+    /// per-device stores (equalizer, stereo image, channel matrix), which are
+    /// all keyed by this same string.
+    public static func lanReceiverUID(serviceName: String?) -> String? {
+        guard let trimmed = serviceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return "lan:\(trimmed)"
     }
 
     /// Canonical uppercase colon-free form of an AirPlay `deviceid`, e.g.

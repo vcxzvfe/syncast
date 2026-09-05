@@ -537,6 +537,34 @@ struct MainPopover: View {
                         DeviceRow(deviceID: dev.id)
                     }
                 }
+                // Second Macs running the receiver daemon. A separate section
+                // rather than a badge in "Local", because the thing a reader
+                // needs to know at a glance is that these are on the network
+                // and carry their own latency budget — not that they happen
+                // to be reachable.
+                if !model.lanReceiverDevices.isEmpty {
+                    sectionHeader("LAN")
+                    if let hint = model.lanReceiverUnsupportedHint() {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 2)
+                    }
+                    if let lag = model.lanTotalLagHint {
+                        Text(lag)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 2)
+                            .accessibilityIdentifier("lanTotalLagHint")
+                    }
+                    ForEach(model.lanReceiverDevices) { dev in
+                        DeviceRow(deviceID: dev.id)
+                    }
+                }
                 // Only genuinely remote AirPlay receivers are targets. This
                 // Mac's own AirPlay Receiver is never listed: under direction
                 // B the local speakers are an OwnTone output (the "Local"
@@ -747,6 +775,14 @@ private struct DeviceRow: View {
                         if model.stereoImageIsAvailable(for: deviceID) {
                             StereoImageToggleButton(deviceID: deviceID)
                         }
+                        // Per-speaker channel assignment, on the same paths
+                        // and under the same rule as the two buttons beside
+                        // it — with one wider case: a LAN receiver has no
+                        // CoreAudio UID but IS assignable, because the sender
+                        // applies the matrix before packetising.
+                        if model.channelMatrixIsAvailable(for: deviceID) {
+                            ChannelMatrixToggleButton(deviceID: deviceID)
+                        }
                         // Per-row reset appears only when there is something
                         // to reset, so an untouched row gains no chrome —
                         // same rule the delay trim row follows.
@@ -814,6 +850,12 @@ private struct DeviceRow: View {
                     if model.mode == .wholeHome && routing.enabled {
                         delayTrimRow(for: device)
                     }
+                    // A LAN receiver's own controls: the pairing prompt while
+                    // it has no token, and the target-latency slider plus the
+                    // link readout once it does.
+                    if device.transport == .lanReceiver {
+                        LanReceiverControls(deviceID: deviceID)
+                    }
                     // Local Stereo's own delay compensation, for the latency a
                     // display's internal processing adds and never reports.
                     // Hidden on Direct Stereo for the same reason the EQ button
@@ -832,6 +874,14 @@ private struct DeviceRow: View {
                        model.stereoImageIsAvailable(for: deviceID) {
                         StereoImageEditor(deviceID: deviceID)
                     }
+                    // Inline channel-assignment panel for the one row the user
+                    // opened. The availability half of the condition is
+                    // load-bearing: it closes the panel by itself when the
+                    // path or the mode changes under it.
+                    if model.channelMatrixEditorDeviceID == deviceID,
+                       model.channelMatrixIsAvailable(for: deviceID) {
+                        ChannelMatrixEditor(deviceID: deviceID)
+                    }
                     // A remembered curve that the current path cannot apply
                     // says so, rather than looking as if it were in effect.
                     if let hint = model.equalizerInactiveHint(for: deviceID) {
@@ -842,6 +892,13 @@ private struct DeviceRow: View {
                     }
                     // Same for a remembered stereo image.
                     if let hint = model.stereoImageInactiveHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    // Same for a remembered channel assignment.
+                    if let hint = model.channelMatrixInactiveHint(for: deviceID) {
                         Text(hint)
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
@@ -909,6 +966,9 @@ private struct DeviceRow: View {
         }
         if let summary = model.stereoImageSummary(for: deviceID) {
             parts.append("stereo image \(summary)")
+        }
+        if let summary = model.channelMatrixSummary(for: deviceID) {
+            parts.append("channel assignment \(summary)")
         }
         return parts.joined(separator: ", ")
     }
@@ -1001,15 +1061,28 @@ private struct DeviceRow: View {
             return "hifispeaker"
         case .airplay2:
             return "airplayaudio"
+        case .lanReceiver:
+            // A second machine on the network, not a speaker and not AirPlay.
+            return "desktopcomputer"
         }
     }
 
     private func transportBadge(for device: Device) -> some View {
-        Text(device.transport == .airplay2 ? "AirPlay" : "Local")
+        Text(DeviceRow.transportLabel(for: device.transport))
             .font(.system(size: 9, weight: .semibold))
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(.secondary.opacity(0.15), in: Capsule())
             .foregroundStyle(.secondary)
+    }
+
+    /// The capsule text per transport. A `switch` rather than the previous
+    /// ternary so a transport added later cannot silently render as "Local".
+    static func transportLabel(for transport: Transport) -> String {
+        switch transport {
+        case .coreAudio: return "Local"
+        case .airplay2: return "AirPlay"
+        case .lanReceiver: return "LAN"
+        }
     }
 
     /// The most recent connection state for THIS row's device, polled

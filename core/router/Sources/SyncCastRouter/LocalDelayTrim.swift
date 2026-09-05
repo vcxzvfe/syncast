@@ -49,14 +49,24 @@ public enum LocalDelayTrim {
     /// offset a listener can resolve on a fixed pair of speakers.
     public static let stepMs: Int = 1
 
-    /// Hard ceiling on the NORMALISED offset any one pair may carry, seed
-    /// included. The user range alone can produce a 200 ms span (−100 here,
-    /// +100 there); an honest hardware seed adds tens more. 500 ms leaves that
-    /// comfortable headroom while keeping a malfunctioning latency probe —
-    /// a device reporting nonsense — from parking the read cursor seconds
-    /// behind the producer, where the ring would serve silence and the fault
-    /// would present as "one speaker went quiet".
-    public static let maxOffsetMs: Int = 500
+    /// Hard ceiling on the NORMALISED offset any one pair may carry, seed and
+    /// LAN alignment hold included.
+    ///
+    /// The budget it has to cover: the user range alone can produce a 200 ms
+    /// span (−100 here, +100 there); an honest hardware seed adds tens more;
+    /// and when a LAN receiver leg is in play every local pair is additionally
+    /// held back by up to `LanPcmWire.targetRangeMs.upperBound` (300 ms) minus
+    /// the local budget — see `LanAlignmentPlanner.localHoldFrames`. 500 ms was
+    /// exactly the first two and left the third with nothing, so a user at the
+    /// top of the target slider would have silently lost alignment to the
+    /// clamp; 800 ms covers all three with room to spare.
+    ///
+    /// It is still far below what the ring can serve (`headroomFrames` is
+    /// ~2.6 s at the shipped capacity), and it still keeps a malfunctioning
+    /// latency probe — a device reporting nonsense — from parking the read
+    /// cursor seconds behind the producer, where the ring would serve silence
+    /// and the fault would present as "one speaker went quiet".
+    public static let maxOffsetMs: Int = 800
 
     /// Clamp a user value into `rangeMs`.
     public static func clamp(_ ms: Int) -> Int {
@@ -110,14 +120,23 @@ public enum LocalDelayTrimPlanner {
     ///     derives it from ring capacity and floor; 0 disables the feature
     ///     entirely (every pair gets 0), which is the correct answer for a
     ///     ring too small to hold a backlog.
-    /// - Returns: one non-negative offset per pair, index 0..<pairCount, with
-    ///   at least one entry equal to 0.
+    ///   - extraHoldFrames: a non-negative hold added to EVERY pair *after*
+    ///     normalisation. This is the LAN receiver leg's alignment term (see
+    ///     `LanAlignmentPlanner`): the whole local set has to move later
+    ///     together, relative to a leg that is not one of these pairs. It
+    ///     cannot be folded into `seedFrames`, because normalisation subtracts
+    ///     the minimum and a constant added to every seed would cancel to
+    ///     nothing. 0 — the default, and the value whenever no LAN leg is
+    ///     active — reproduces the original arithmetic exactly.
+    /// - Returns: one non-negative offset per pair, index 0..<pairCount. With
+    ///   `extraHoldFrames == 0` at least one entry is exactly 0.
     public static func offsetFrames(
         pairCount: Int,
         seedFrames: [Int: Int],
         userMs: [Int: Int],
         sampleRate: Double,
-        headroomFrames: Int
+        headroomFrames: Int,
+        extraHoldFrames: Int = 0
     ) -> [Int] {
         guard pairCount > 0 else { return [] }
         guard headroomFrames > 0 else { return Array(repeating: 0, count: pairCount) }
@@ -136,7 +155,8 @@ public enum LocalDelayTrimPlanner {
             headroomFrames,
             LocalDelayTrim.frames(ms: LocalDelayTrim.maxOffsetMs, sampleRate: sampleRate)
         )
-        return raw.map { min(max(0, $0 - minimum), ceiling) }
+        let hold = max(0, extraHoldFrames)
+        return raw.map { min(max(0, $0 - minimum) + hold, ceiling) }
     }
 
     /// Largest offset the ring can serve behind an already-established floor.
