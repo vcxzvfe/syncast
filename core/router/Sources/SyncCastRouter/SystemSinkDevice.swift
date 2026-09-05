@@ -280,12 +280,12 @@ public final class SystemSinkDevice {
                 if !Self.waitForSampleRate(id, rate: Self.requiredSampleRate) {
                     let observed = Self.nominalSampleRate(id).map { "\($0)" } ?? "?"
                     let message = "[SystemSink] \(candidate.uid) did not reach 48 kHz within \(Self.sampleRateSettleTimeoutMs) ms (still \(observed)); the process tap will refuse the format\n"
-                    FileHandle.standardError.write(Data(message.utf8))
+                    RouterLog.write(message)
                 }
             } else {
-                FileHandle.standardError.write(Data(
-                    "[SystemSink] could not set \(candidate.uid) to 48 kHz (currently \(originalRate)); the process tap will refuse a non-48 kHz format\n".utf8
-                ))
+                RouterLog.write(
+                    "[SystemSink] could not set \(candidate.uid) to 48 kHz (currently \(originalRate)); the process tap will refuse a non-48 kHz format\n"
+                )
             }
         }
 
@@ -311,16 +311,16 @@ public final class SystemSinkDevice {
             if systemStatus == noErr {
                 systemTakenOver = true
             } else {
-                FileHandle.standardError.write(Data(
-                    "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n".utf8
-                ))
+                RouterLog.write(
+                    "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n"
+                )
             }
             previousSystemOutputID = systemTakenOver ? systemSnapshot.0 : nil
             previousSystemOutputUID = systemTakenOver ? systemSnapshot.1 : nil
         } else {
-            FileHandle.standardError.write(Data(
-                "[SystemSink] could not read the previous default SYSTEM output; leaving it alone rather than restoring a guess later\n".utf8
-            ))
+            RouterLog.write(
+                "[SystemSink] could not read the previous default SYSTEM output; leaving it alone rather than restoring a guess later\n"
+            )
             previousSystemOutputID = nil
             previousSystemOutputUID = nil
         }
@@ -676,9 +676,9 @@ public final class SystemSinkDevice {
         }
         let observed = AggregateDevice.readHardwareVolume(uid: uid)
             .map { String(format: "%.4f", $0) } ?? "?"
-        FileHandle.standardError.write(Data(
-            "[SystemSink] could not seed \(uid) to \(target) (still \(observed)); the system volume may jump on takeover\n".utf8
-        ))
+        RouterLog.write(
+            "[SystemSink] could not seed \(uid) to \(target) (still \(observed)); the system volume may jump on takeover\n"
+        )
     }
 
     private static let seedAttempts = 6

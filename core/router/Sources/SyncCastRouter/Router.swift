@@ -263,12 +263,12 @@ public actor Router {
         self.channelCount = channelCount
         self.stereoOutputPath = StereoOutputPathPolicy.resolvedPath()
         if let warning = StereoOutputPathPolicy.warningForUnknownValue() {
-            FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
+            RouterLog.write("[Router] \(warning)\n")
         }
         if let warning = StereoOutputPathPolicy.sinkFallbackWarning(
             sinkAvailable: StereoOutputPathPolicy.sinkPathUsable
         ) {
-            FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
+            RouterLog.write("[Router] \(warning)\n")
         }
         // A SIGKILLed previous run can leave the macOS default output pointed
         // at a silent sink: audio "works" everywhere in the UI and nothing is
@@ -276,7 +276,7 @@ public actor Router {
         // user who deliberately selected BlackHole for their own recording
         // setup is never disturbed by SyncCast merely launching.
         if let swept = SystemSinkDevice.sweepStaleDefault() {
-            print("[Router] system sink recovery: \(swept)")
+            RouterLog.write("[Router] system sink recovery: \(swept)")
         }
 
         let requestedBackend = ProcessInfo.processInfo
@@ -287,9 +287,9 @@ public actor Router {
             if #available(macOS 14.2, *) {
                 self.capture = TapCapture(sampleRate: sampleRate, channelCount: channelCount)
             } else {
-                FileHandle.standardError.write(Data(
-                    "[Router] SYNCAST_CAPTURE_BACKEND=tap requested but macOS 14.2+ is required; failing closed instead of falling back to SCK\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] SYNCAST_CAPTURE_BACKEND=tap requested but macOS 14.2+ is required; failing closed instead of falling back to SCK\n"
+                )
                 self.capture = UnavailableSystemAudioCapture(
                     backendName: "tap-unavailable",
                     reason: "Process Tap capture requires macOS 14.2 or later; refusing to fall back to ScreenCaptureKit"
@@ -297,9 +297,9 @@ public actor Router {
             }
         } else {
             if let requestedBackend, requestedBackend != "sck" {
-                FileHandle.standardError.write(Data(
-                    "[Router] unknown SYNCAST_CAPTURE_BACKEND=\(requestedBackend); falling back to SCK\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] unknown SYNCAST_CAPTURE_BACKEND=\(requestedBackend); falling back to SCK\n"
+                )
             }
             self.capture = SCKCapture(sampleRate: sampleRate, channelCount: channelCount)
         }
@@ -313,14 +313,14 @@ public actor Router {
         if reaped > 0 {
             // Logged as a warning so we notice in the field if SIGKILL
             // crashes start happening.
-            print("[Router] swept \(reaped) orphan aggregate device(s) at init")
+            RouterLog.write("[Router] swept \(reaped) orphan aggregate device(s) at init")
         }
         // Public Direct Stereo aggregates can become the macOS default
         // output. Sweep them on every launch, not only direct-mode launches,
         // so a normal fallback launch can recover after a prior SIGKILL.
         let directReaped = DirectStereoOutput.sweepOrphans()
         if directReaped > 0 {
-            print("[Router] swept \(directReaped) orphan direct stereo aggregate device(s) at init")
+            RouterLog.write("[Router] swept \(directReaped) orphan direct stereo aggregate device(s) at init")
         }
         // Whole-home sinks share that hazard — they also become the macOS
         // default output, so a SIGKILL can leave the system pointed at a
@@ -328,12 +328,12 @@ public actor Router {
         // before destroying such a leftover.
         let sinkReaped = WholeHomeSinkOutput.sweepOrphans()
         if sinkReaped > 0 {
-            print("[Router] swept \(sinkReaped) orphan whole-home sink device(s) at init")
+            RouterLog.write("[Router] swept \(sinkReaped) orphan whole-home sink device(s) at init")
         }
         if #available(macOS 14.2, *) {
             let tapReaped = TapCapture.sweepOrphans()
             if tapReaped > 0 {
-                print("[Router] swept \(tapReaped) orphan process tap aggregate device(s) at init")
+                RouterLog.write("[Router] swept \(tapReaped) orphan process tap aggregate device(s) at init")
             }
         }
         // Wire the capture backend's "I died" notification into the actor.
@@ -373,9 +373,9 @@ public actor Router {
         aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
         if !loggedHwVolumeRejectionUIDs.contains(uid) {
             loggedHwVolumeRejectionUIDs.insert(uid)
-            FileHandle.standardError.write(Data(
-                ("[Router] DDC volume intent for \(uid.prefix(20)) was accepted while probing but dropped — probe concluded unsupported; use the device OSD or hardware controls (further rejections silenced)\n").utf8
-            ))
+            RouterLog.write(
+                ("[Router] DDC volume intent for \(uid.prefix(20)) was accepted while probing but dropped — probe concluded unsupported; use the device OSD or hardware controls (further rejections silenced)\n")
+            )
         }
     }
 
@@ -386,9 +386,9 @@ public actor Router {
     /// in-flight rebuild. Logging only is sufficient: AppModel fires
     /// `forceLocalDriverRebuild` after every wake event.
     private func handleCaptureDied() {
-        FileHandle.standardError.write(Data(
-            "[Router] capture backend \(capture.backendName) died unexpectedly — wake handler's forceLocalDriverRebuild will restart it\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] capture backend \(capture.backendName) died unexpectedly — wake handler's forceLocalDriverRebuild will restart it\n"
+        )
     }
 
     public func attachSidecar(_ sockets: SidecarSockets) async throws {
@@ -862,9 +862,9 @@ public actor Router {
             aggregateHwVolumeRejectionCounts[uid, default: 0] += 1
             if !loggedHwVolumeRejectionUIDs.contains(uid) {
                 loggedHwVolumeRejectionUIDs.insert(uid)
-                FileHandle.standardError.write(Data(
-                    ("[Router] direct stereo hardware volume unsupported for \(uid.prefix(20)) — neither CoreAudio nor DDC/CI can control this device; use the device OSD or hardware controls\n").utf8
-                ))
+                RouterLog.write(
+                    ("[Router] direct stereo hardware volume unsupported for \(uid.prefix(20)) — neither CoreAudio nor DDC/CI can control this device; use the device OSD or hardware controls\n")
+                )
             }
         }
         _ = deviceID
@@ -1004,18 +1004,18 @@ public actor Router {
             // but the pinned tap and the AUHALs on HDMI/DP subdevices do not.
             // Rebuild the whole chain rather than only the outputs — an AUHAL
             // reading a dead tap's ring is silent with no error.
-            FileHandle.standardError.write(Data(
-                "[Router] forceLocalDriverRebuild: rebuilding system sink path\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] forceLocalDriverRebuild: rebuilding system sink path\n"
+            )
             tearDownLocalDriver()
             let stopStatus: String?
             do {
                 stopStatus = try stopSystemSinkPath()
             } catch {
                 lastError = "system sink rebuild failed to stop cleanly: \(error)"
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: system sink stop failed — \(error)\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: system sink stop failed — \(error)\n"
+                )
                 return false
             }
             // Same rule as the Direct Stereo branch: if the user moved the
@@ -1024,9 +1024,9 @@ public actor Router {
             // is not consent — the AppModel's displacement policy owns the
             // decision to resume.
             if stopStatus?.contains("user changed default") == true {
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: system sink rebuild skipped because the user changed the default output\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: system sink rebuild skipped because the user changed the default output\n"
+                )
                 replan()
                 return true
             }
@@ -1034,15 +1034,15 @@ public actor Router {
             do {
                 try await startSystemSinkPath(devices: devices)
                 replan()
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: system sink rebuild OK\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: system sink rebuild OK\n"
+                )
                 return true
             } catch {
                 lastError = "system sink rebuild failed: \(error)"
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: system sink rebuild failed — \(error)\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: system sink rebuild failed — \(error)\n"
+                )
                 // Same unwind `start()` performs: a half-built sink path can
                 // leave macOS pointed at a silent device, and nothing else
                 // runs after a failed rebuild to notice.
@@ -1051,35 +1051,35 @@ public actor Router {
             }
         }
         if mode == .stereo, stereoOutputPath == .direct {
-            FileHandle.standardError.write(Data(
-                "[Router] forceLocalDriverRebuild: rebuilding direct stereo default output\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] forceLocalDriverRebuild: rebuilding direct stereo default output\n"
+            )
             do {
                 let stopStatus = try stopDirectStereoOutput()
                 if stopStatus?.contains("user changed default") == true {
-                    FileHandle.standardError.write(Data(
-                        "[Router] forceLocalDriverRebuild: direct stereo rebuild skipped because user changed default output\n".utf8
-                    ))
+                    RouterLog.write(
+                        "[Router] forceLocalDriverRebuild: direct stereo rebuild skipped because user changed default output\n"
+                    )
                     replan()
                     return true
                 }
                 try reconcileDirectStereo(devices: devices, allowEmpty: false)
                 replan()
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: direct stereo rebuild OK\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: direct stereo rebuild OK\n"
+                )
                 return true
             } catch {
                 lastError = "direct stereo rebuild failed: \(error)"
-                FileHandle.standardError.write(Data(
-                    "[Router] forceLocalDriverRebuild: direct stereo rebuild failed — \(error.localizedDescription)\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] forceLocalDriverRebuild: direct stereo rebuild failed — \(error.localizedDescription)\n"
+                )
                 return false
             }
         }
-        FileHandle.standardError.write(Data(
-            "[Router] forceLocalDriverRebuild: tearing down + rebuilding (incl. capture backend \(capture.backendName))\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] forceLocalDriverRebuild: tearing down + rebuilding (incl. capture backend \(capture.backendName))\n"
+        )
         // 1. Tear down the local driver (aggregate device + any AUHALs).
         tearDownLocalDriver()
 
@@ -1100,13 +1100,13 @@ public actor Router {
         do {
             try await capture.start()
             captureOK = true
-            FileHandle.standardError.write(Data(
-                "[Router] forceLocalDriverRebuild: capture restart OK (\(capture.backendName))\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] forceLocalDriverRebuild: capture restart OK (\(capture.backendName))\n"
+            )
         } catch {
-            FileHandle.standardError.write(Data(
-                "[Router] forceLocalDriverRebuild: capture restart failed (\(capture.backendName)) — \(error.localizedDescription)\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] forceLocalDriverRebuild: capture restart failed (\(capture.backendName)) — \(error.localizedDescription)\n"
+            )
         }
 
         // 3. Rebuild the local driver against the post-wake device snapshot.
@@ -1318,9 +1318,9 @@ public actor Router {
                 noteWholeHomeTimingInstability(
                     reason: "local bridge rebuilt \(t.name)"
                 )
-                FileHandle.standardError.write(Data(
-                    "[Router] bridge: rebuilt \(t.name) after AudioDeviceID changed \(existing.deviceID) -> \(coreAudioID)\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] bridge: rebuilt \(t.name) after AudioDeviceID changed \(existing.deviceID) -> \(coreAudioID)\n"
+                )
             }
             let bridge = LocalAirPlayBridge(
                 deviceID: coreAudioID,
@@ -1424,9 +1424,9 @@ public actor Router {
         DDCDisplayVolumeController.shared.refreshCapabilities(
             uids: Array(direct.coveredOutputUIDs)
         )
-        FileHandle.standardError.write(Data(
-            "[Router] direct stereo active: \(direct.diagnostic)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] direct stereo active: \(direct.diagnostic)\n"
+        )
     }
 
     @discardableResult
@@ -1434,15 +1434,15 @@ public actor Router {
         guard let direct = directStereoOutput else { return nil }
         guard direct.stop() else {
             let status = direct.lastStopStatusText ?? direct.diagnostic
-            FileHandle.standardError.write(Data(
-                "[Router] direct stereo stop failed: \(status) \(direct.diagnostic)\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] direct stereo stop failed: \(status) \(direct.diagnostic)\n"
+            )
             throw DirectStereoOutput.DirectStereoError.stopFailed(status)
         }
         let status = direct.lastStopStatusText
-        FileHandle.standardError.write(Data(
-            "[Router] direct stereo stopped: \(status ?? "unknown")\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] direct stereo stopped: \(status ?? "unknown")\n"
+        )
         directStereoOutput = nil
         return status
     }
@@ -1714,16 +1714,16 @@ public actor Router {
             if sink.stop() {
                 systemSink = nil
             } else {
-                FileHandle.standardError.write(Data(
-                    "[Router] system sink rollback could not restore the default output (\(sink.lastStopStatusText ?? "unknown")); keeping ownership so teardown can retry\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] system sink rollback could not restore the default output (\(sink.lastStopStatusText ?? "unknown")); keeping ownership so teardown can retry\n"
+                )
             }
             throw error
         }
         sinkCapture = tap
-        FileHandle.standardError.write(Data(
-            "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n"
+        )
         reconcileLocalDriver(devices: devices)
         // `reconcileLocalDriver` reports failures by setting `lastError` and
         // returning — fine on the other paths, fatal here: the sink is already
@@ -1751,15 +1751,15 @@ public actor Router {
         guard let sink = systemSink else { return nil }
         guard sink.stop() else {
             let status = sink.lastStopStatusText ?? sink.diagnostic
-            FileHandle.standardError.write(Data(
-                "[Router] system sink stop failed: \(status)\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] system sink stop failed: \(status)\n"
+            )
             throw SystemSinkDevice.SystemSinkError.stopFailed(status)
         }
         let status = sink.lastStopStatusText
-        FileHandle.standardError.write(Data(
-            "[Router] system sink stopped: \(status ?? "unknown")\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] system sink stopped: \(status ?? "unknown")\n"
+        )
         systemSink = nil
         return status
     }
@@ -1770,9 +1770,9 @@ public actor Router {
         do {
             try stopSystemSinkPath()
         } catch {
-            FileHandle.standardError.write(Data(
-                "[Router] system sink unwind failed: \(error)\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] system sink unwind failed: \(error)\n"
+            )
         }
     }
 
@@ -1867,9 +1867,9 @@ public actor Router {
             let resolvedPair = pair ?? 0
             if pair == nil, !loggedHwVolumeRejectionUIDs.contains(uid) {
                 loggedHwVolumeRejectionUIDs.insert(uid)
-                FileHandle.standardError.write(Data(
-                    "[Router] system sink: no channel-pair offset for \(uid.prefix(20)); applying software gain to pair 0 (further reports silenced)\n".utf8
-                ))
+                RouterLog.write(
+                    "[Router] system sink: no channel-pair offset for \(uid.prefix(20)); applying software gain to pair 0 (further reports silenced)\n"
+                )
             }
             output.setSoftwareGain(
                 pair: resolvedPair, gain: plan.softwareAmplitude ?? 0
@@ -1889,9 +1889,9 @@ public actor Router {
         let sink = wholeHomeSink ?? WholeHomeSinkOutput()
         try sink.start()
         wholeHomeSink = sink
-        FileHandle.standardError.write(Data(
-            "[Router] whole-home sink active: \(sink.diagnostic)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] whole-home sink active: \(sink.diagnostic)\n"
+        )
     }
 
     /// Restore the user's previous default output and destroy the sink.
@@ -1903,15 +1903,15 @@ public actor Router {
         guard let sink = wholeHomeSink else { return nil }
         guard sink.stop() else {
             let status = sink.lastStopStatusText ?? sink.diagnostic
-            FileHandle.standardError.write(Data(
-                "[Router] whole-home sink stop failed: \(status) \(sink.diagnostic)\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] whole-home sink stop failed: \(status) \(sink.diagnostic)\n"
+            )
             throw WholeHomeSinkOutput.WholeHomeSinkError.stopFailed(status)
         }
         let status = sink.lastStopStatusText
-        FileHandle.standardError.write(Data(
-            "[Router] whole-home sink stopped: \(status ?? "unknown")\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] whole-home sink stopped: \(status ?? "unknown")\n"
+        )
         wholeHomeSink = nil
         return status
     }
@@ -1941,9 +1941,9 @@ public actor Router {
         if !ok {
             lastError = "whole-home sink: could not reclaim the default output"
         }
-        FileHandle.standardError.write(Data(
-            "[Router] whole-home sink reassert: \(ok ? "ok" : "failed") \(sink.diagnostic)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] whole-home sink reassert: \(ok ? "ok" : "failed") \(sink.diagnostic)\n"
+        )
         return ok
     }
 
@@ -2047,7 +2047,7 @@ public actor Router {
         let resolved = RingFloorPolicy.resolveSinkFloorMs()
         if logWarnings, let warning = resolved.warning, warning != lastSinkFloorWarning {
             lastSinkFloorWarning = warning
-            FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
+            RouterLog.write("[Router] \(warning)\n")
         }
         return RingFloorPolicy.frames(ms: resolved.ms, sampleRate: source.sampleRate)
     }
@@ -2113,9 +2113,9 @@ public actor Router {
         // physical speaker is silent — the user-reported bug.
         let diag = agg.diagnoseStreamConfig()
         // stderr — Router has no SyncCastLog dependency.
-        FileHandle.standardError.write(Data(
-            "[Router] aggregate stream diag: \(diag.summary) outputCh=\(agg.outputChannelCount)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] aggregate stream diag: \(diag.summary) outputCh=\(agg.outputChannelCount)\n"
+        )
         aggregateStreamDiagnostic = diag
 
         // AUHAL is configured for the aggregate's REAL channel count.
@@ -2257,9 +2257,9 @@ public actor Router {
 
     private func bumpAirplayTimingEpoch(reason: String) {
         airplayTimingEpoch &+= 1
-        FileHandle.standardError.write(Data(
-            "[Router] AirPlay timing epoch \(airplayTimingEpoch): \(reason)\n".utf8
-        ))
+        RouterLog.write(
+            "[Router] AirPlay timing epoch \(airplayTimingEpoch): \(reason)\n"
+        )
     }
 
     private func airplayRouteSignature(enabled devices: [Device]) -> String {
@@ -2777,9 +2777,9 @@ public actor Router {
         aggregateHwVolumeUnsupportedUIDs.insert(uid)
         if !loggedHwVolumeRejectionUIDs.contains(uid) {
             loggedHwVolumeRejectionUIDs.insert(uid)
-            FileHandle.standardError.write(Data(
-                ("[Router] hardware volume unsupported for \(uid.prefix(20)) — falling back to software gain (this device's level must be controlled via its OSD or via SyncCast's per-device slider; further rejections silenced)\n").utf8
-            ))
+            RouterLog.write(
+                ("[Router] hardware volume unsupported for \(uid.prefix(20)) — falling back to software gain (this device's level must be controlled via its OSD or via SyncCast's per-device slider; further rejections silenced)\n")
+            )
         }
         // Route the slider value into the AUHAL's per-pair gain. The
         // channel-pair index is the subdevice's first output channel
@@ -2959,9 +2959,9 @@ public actor Router {
             let applied = try await setAirPlayOffsetMs(
                 target, source: Self.airplayOffsetMeasuredSource
             )
-            FileHandle.standardError.write(Data(
-                "[Router] airplay offset: L_local measured \(target) ms, applied \(applied) ms\n".utf8
-            ))
+            RouterLog.write(
+                "[Router] airplay offset: L_local measured \(target) ms, applied \(applied) ms\n"
+            )
         } catch {
             lastError = "airplay offset push failed: \(error)"
         }
