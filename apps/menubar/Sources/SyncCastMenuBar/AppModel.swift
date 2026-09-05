@@ -671,6 +671,7 @@ final class AppModel {
                 await self.pollSystemSinkStatus()
                 await self.refreshEqualizerClipCounts()
                 await self.refreshStereoImageClipCounts()
+                await self.refreshChannelMatrixClipCounts()
                 await self.refreshPairingStates()
                 await self.logPeriodicHealthIfDue()
             }
@@ -1069,6 +1070,13 @@ final class AppModel {
             // exists precisely to bridge the case where the SyncCast id
             // differs.
             return a.name == b.name && (a.host ?? "") == (b.host ?? "")
+        case .lanReceiver:
+            // The Bonjour instance name IS the receiver's identity: the daemon
+            // is started with it and refuses to advertise without one, so a
+            // friendly name that changed in the TXT record must still resolve
+            // to the same row.
+            guard let sa = a.lanServiceName, let sb = b.lanServiceName else { return false }
+            return sa == sb
         }
     }
 
@@ -1302,6 +1310,7 @@ final class AppModel {
                 // the engine start is the one transition it cannot see coming.
                 await pushDeviceEqualizers()
                 await pushDeviceStereoImages()
+                await pushDeviceChannelMatrices()
                 await pushLocalDelayTrims()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
@@ -1348,6 +1357,7 @@ final class AppModel {
                 // and delay-compensated.
                 await pushDeviceEqualizers()
                 await pushDeviceStereoImages()
+                await pushDeviceChannelMatrices()
                 await pushLocalDelayTrims()
                 // The covered set may have changed (toggle / hot-plug /
                 // discovery republishing a UID under a new device id)
@@ -2337,6 +2347,26 @@ final class AppModel {
     /// time, for the same reason the equalizer allows one: a 340 pt popover
     /// has room for one panel.
     var stereoImageEditorDeviceID: String?
+
+    // MARK: - Per-device channel assignment
+    //
+    // Behaviour lives in `AppModel+ChannelMatrix.swift`; only the state is
+    // here, because a Swift extension cannot declare stored properties.
+
+    /// Remembered 2×2 channel assignments, keyed by output UID. The UID space
+    /// is wider than the other two stores': a LAN receiver's `lan:` UID is a
+    /// legal key, because the sender applies the matrix before packetising.
+    var deviceChannelMatrices: [String: DeviceChannelMatrixProfile] =
+        DeviceChannelMatrixStore.load()
+
+    /// Debounced push of `deviceChannelMatrices` to the Router.
+    var channelMatrixCommitTask: Task<Void, Never>?
+
+    /// Router limiter counts for the matrix, keyed by output UID.
+    var channelMatrixClipCounts: [String: Int64] = [:]
+
+    /// Which channel-assignment panel is open, if any, by `Device.id`.
+    var channelMatrixEditorDeviceID: String?
 
     // MARK: - Per-device local delay compensation
     //
