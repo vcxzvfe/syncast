@@ -1322,10 +1322,11 @@ final class AppModel {
                     await router.setRouting(r)
                 }
                 await pushAirplayState()
-                // Seed every open AUHAL with its remembered tone curve. The
-                // Router re-applies on its own reconciles too, but the engine
-                // start is the one transition it cannot see coming.
+                // Seed every open AUHAL with its remembered tone curve and
+                // delay. The Router re-applies on its own reconciles too, but
+                // the engine start is the one transition it cannot see coming.
                 await pushDeviceEqualizers()
+                await pushLocalDelayTrims()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
                 if mode == .wholeHome {
@@ -1367,8 +1368,10 @@ final class AppModel {
                 await router.syncLocalOutputs(devices: devices)
                 // The enabled set may have changed, which means the driver may
                 // have been rebuilt with fresh (flat) AUHALs. Re-push so a
-                // speaker that was just switched back on comes up equalised.
+                // speaker that was just switched back on comes up equalised
+                // and delay-compensated.
                 await pushDeviceEqualizers()
+                await pushLocalDelayTrims()
                 // The covered set may have changed (toggle / hot-plug /
                 // discovery republishing a UID under a new device id)
                 // without a streamingState transition, so the didSet hook
@@ -2302,6 +2305,21 @@ final class AppModel {
     /// Router limiter counts, keyed by CoreAudio UID, sampled by the same 1 Hz
     /// poll as the connection states. Drives the editor's clip indicator.
     var equalizerClipCounts: [String: Int64] = [:]
+
+    // MARK: - Per-device local delay compensation
+    //
+    // Behaviour lives in `AppModel+LocalDelayTrim.swift`; only the state is
+    // here, because a Swift extension cannot declare stored properties.
+
+    /// Remembered local-Stereo delays, keyed by CoreAudio UID. Distinct from
+    /// `persistedDeviceTrims` above, which is the whole-home
+    /// listening-position trim on a different leg — see `LocalDelayTrimStore`
+    /// for why one number cannot serve both.
+    var localDelayTrims: [String: LocalDelayTrimProfile] = LocalDelayTrimStore.load()
+
+    /// Debounced push of `localDelayTrims` to the Router, so dragging the
+    /// slider costs one actor hop per settle rather than one per pixel.
+    var localDelayTrimCommitTask: Task<Void, Never>?
 
     /// Which row currently has its equalizer panel open, if any.
     ///

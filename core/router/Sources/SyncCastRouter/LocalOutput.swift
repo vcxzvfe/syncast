@@ -106,6 +106,15 @@ public final class LocalOutput {
     /// Costs nothing while every pair is flat: `EqualizerBank.process` exits on
     /// two atomic loads and leaves the buffer byte-identical.
     private let equalizer: EqualizerBank
+    /// Per-channel-pair read offset — the local Stereo path's delay
+    /// compensation. Sized to the same `pairCount` as `_softwareGains`, so in
+    /// aggregate mode pair `p` is physical device `p` and each speaker can be
+    /// held back by its own number of frames.
+    ///
+    /// Costs nothing while every pair is at 0: `render()` keeps its original
+    /// single-read splat and the output is bit-identical to the pre-feature
+    /// build. See `PairDelayBank` for the window/cursor bookkeeping.
+    private let pairDelays: PairDelayBank
     /// Pre-allocated channel pointer slot for the render callback so we
     /// don't allocate a Swift Array on every render tick. Sized to
     /// `outputChannelCount`, NOT `channelCount`.
@@ -120,6 +129,14 @@ public final class LocalOutput {
     /// Per-channel slabs for staging. We allocate one Float* per source
     /// channel and slice into them per render. Allocated once at init.
     private let stagingSlabs: [UnsafeMutablePointer<Float>]
+    /// Second staging set, used ONLY while a pair's delay offset is
+    /// crossfading: the pair's outgoing read position lands here and the
+    /// incoming one in `stagingChannels`, and the two are mixed straight into
+    /// that pair's output channels. Allocated once (32 KB) rather than on
+    /// demand, because the alternative is a heap allocation on the render
+    /// thread the first time the user touches the control.
+    private let stagingChannelsB: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    private let stagingSlabsB: [UnsafeMutablePointer<Float>]
     /// Diagnostic — incremented on every AUHAL render callback.
     public private(set) var renderTickCount: UInt64 = 0
     /// Peak abs sample of the most recent rendered frame block.
@@ -242,6 +259,17 @@ public final class LocalOutput {
         let stagingPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
         for i in 0..<channelCount { stagingPtrs[i] = slabs[i] }
         self.stagingChannels = stagingPtrs
+        var slabsB: [UnsafeMutablePointer<Float>] = []
+        slabsB.reserveCapacity(channelCount)
+        for _ in 0..<channelCount {
+            let p = UnsafeMutablePointer<Float>.allocate(capacity: Self.stagingFrameCapacity)
+            p.initialize(repeating: 0, count: Self.stagingFrameCapacity)
+            slabsB.append(p)
+        }
+        self.stagingSlabsB = slabsB
+        let stagingPtrsB = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
+        for i in 0..<channelCount { stagingPtrsB[i] = slabsB[i] }
+        self.stagingChannelsB = stagingPtrsB
         // Per-pair software gain — one entry per output channel pair.
         // Default 1.0 (no attenuation). Heap-allocated so the render
         // callback can index it without going through a Swift Array
@@ -261,6 +289,7 @@ public final class LocalOutput {
             channelsPerPair: channelCount,
             sampleRate: sampleRate
         )
+        self.pairDelays = PairDelayBank(pairCount: pairCount, sampleRate: sampleRate)
         // We deliberately leak the placeholder; deinit deallocates outPtrs
         // and the staging slabs. The actual outPtrs used per-render are
         // owned by CoreAudio.
@@ -270,7 +299,8 @@ public final class LocalOutput {
         stop()
         outPtrs.deallocate()
         stagingChannels.deallocate()
-        for slab in stagingSlabs {
+        stagingChannelsB.deallocate()
+        for slab in stagingSlabs + stagingSlabsB {
             slab.deinitialize(count: Self.stagingFrameCapacity)
             slab.deallocate()
         }
@@ -335,6 +365,11 @@ public final class LocalOutput {
     public func resetGlitchCounters() {
         tally.reset()
         sequencer.reset()
+        // The render-thread half of the delay bank belongs to this session
+        // too: a half-finished crossfade or a stale window carried into a
+        // restarted AUHAL would shift the cursor for a change nobody made.
+        // The published offsets survive — they are the user's setting.
+        pairDelays.resetRenderState()
         sc_atomic_store_release(resyncCounter, 0)
         sc_atomic_store_release(underrunCounter, 0)
         sc_atomic_store_release(minWaterLevelCounter, Self.waterLevelUnset)
@@ -492,6 +527,36 @@ public final class LocalOutput {
 
     /// True when at least one pair has a curve that changes the signal.
     public var equalizerIsEngaged: Bool { equalizer.isEngaged }
+
+    // MARK: - Per-device delay compensation
+
+    /// Install the whole pair → read-offset map, in frames.
+    ///
+    /// Offsets are non-negative holds: a pair with a larger offset reads older
+    /// audio and therefore sounds later. Pairs absent from the map are 0, so
+    /// "the user cleared this device" and "the user never touched it" are the
+    /// same call — which is what lets the Router re-push its full map on every
+    /// reconcile without special-casing removals.
+    ///
+    /// Idempotent: an unchanged map returns false and never reaches the render
+    /// thread, so no crossfade is spent.
+    ///
+    /// The values come from `LocalDelayTrimPlanner.offsetFrames`, which does
+    /// the normalisation and the clamping; this call clamps negatives away as
+    /// a backstop but does not re-derive anything.
+    @discardableResult
+    public func setPairDelays(_ framesByPair: [Int: Int]) -> Bool {
+        pairDelays.setOffsets(framesByPair)
+    }
+
+    /// Drop every pair's delay back to 0. Used when an output is repurposed so
+    /// a rebuilt aggregate never inherits the previous device set's offsets.
+    public func resetPairDelays() {
+        pairDelays.resetOffsets()
+    }
+
+    /// The offsets last accepted, indexed by pair. For diagnostics and tests.
+    public func pairDelayFrames() -> [Int] { pairDelays.requestedOffsets() }
 
     /// Reset every pair's software gain back to 1.0. Called by the
     /// Router when a device's hardware-volume probe succeeds (we no
@@ -659,7 +724,11 @@ public final class LocalOutput {
         }
     }
 
-    private func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    /// Internal rather than private so `LocalOutputDelayRenderTests` can push
+    /// blocks through the SHIPPING render path with a hand-built
+    /// `AudioBufferList` and no CoreAudio device. Nothing else calls it; the
+    /// AUHAL reaches it through the C callback.
+    func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         guard let ioData = ioData else { return noErr }
         let bufList = UnsafeMutableAudioBufferListPointer(ioData)
         // AUHAL gives us `outputChannelCount` non-interleaved buffers.
@@ -693,6 +762,17 @@ public final class LocalOutput {
         }
         let compensation = max(0, maxLatencyFrames - deviceLatencyFrames)
 
+        // Per-device delay compensation. Adopt whatever the app thread
+        // published, then slide the cursor by the change in the read window so
+        // that pairs the user did NOT touch keep reading exactly the samples
+        // they would have read anyway — see `PairDelayBank`. A cursor of 0 is
+        // the "never rendered" sentinel and must stay 0; the floor of 1 keeps
+        // a large negative shift during warm-up from landing back on it.
+        let delay = pairDelays.adoptPublishedChanges()
+        let cursor: Int64 = snapshot.cursor == 0
+            ? 0
+            : max(1, snapshot.cursor &+ delay.cursorShift)
+
         // CRITICAL: anchor reads on the previous render's end position.
         // Recomputing startFrame from `writePos` every render meant
         // adjacent render blocks could overlap or leave gaps in the
@@ -708,12 +788,13 @@ public final class LocalOutput {
         // allocation, unit-tested in RingReadPolicyTests.
         let plan = sequencer.plan(
             writePosition: writePos,
-            cursor: snapshot.cursor,
+            cursor: cursor,
             frames: frames,
             floorFrames: snapshot.floor,
             compensationFrames: compensation,
             capacityFrames: ring.capacityFrames,
-            driftLimitFrames: Int64(Self.driftResyncLimitMs) * Int64(sampleRate) / 1000
+            driftLimitFrames: Int64(Self.driftResyncLimitMs) * Int64(sampleRate) / 1000,
+            readWindowFrames: delay.window
         )
         let startFrame: Int64 = plan.startFrame
 
@@ -769,6 +850,13 @@ public final class LocalOutput {
             }
             renderTickCount &+= 1
             lastRenderPeak = 0
+            // Write the (possibly window-shifted) cursor back even though it
+            // did not advance: dropping the shift here would leave the cursor
+            // describing the previous window. The resume-from-idle re-anchor
+            // would paper over it, but only by accident.
+            if cursor != snapshot.cursor {
+                stateLock.withLock { _readCursor = cursor }
+            }
             return noErr
         }
 
@@ -780,8 +868,7 @@ public final class LocalOutput {
         // frame outside [writePos − capacity, writePos), so the tail of the
         // block is silence, not stale ring content from a lap ago. A short
         // silence is the least-bad dropout and it is counted above.
-        ring.read(at: startFrame, frames: frames, into: stagingChannels)
-
+        //
         // Splat: write the source stereo into every output channel
         // pair. For (sourceCh=2, outputCh=2): writes one pair (no-op
         // in individual mode beyond a copy). For (sourceCh=2,
@@ -797,13 +884,62 @@ public final class LocalOutput {
         // Snapshot for the splat path so we don't iterate stagingSlabs
         // (which is a Swift Array — boxed).
         let stage = stagingChannels
-        for p in 0..<pairCount {
-            for ch in 0..<channelCount {
-                let dst = outPtrs[p * channelCount + ch]
-                let src = stage[ch]
-                // memcpy-style copy — RT-safe.
-                dst.update(from: src, count: frames)
+        if pairDelays.isSettledAtZero {
+            // FAST PATH — nothing dialled in, no fade running. One ring read
+            // for the whole AUHAL, splatted. Byte-for-byte what this callback
+            // did before per-device delay existed.
+            ring.read(at: startFrame, frames: frames, into: stage)
+            for p in 0..<pairCount {
+                for ch in 0..<channelCount {
+                    let dst = outPtrs[p * channelCount + ch]
+                    let src = stage[ch]
+                    // memcpy-style copy — RT-safe.
+                    dst.update(from: src, count: frames)
+                }
             }
+        } else {
+            // SLOW PATH — at least one pair is held back. Each pair gets its
+            // own read at `startFrame + lead`, where a larger delay means a
+            // smaller lead and therefore older audio. `startFrame` is anchored
+            // to the MOST delayed pair, so every lead is ≥ 0 and the block the
+            // planner reserved (`readWindowFrames`) covers all of them.
+            //
+            // One extra `RingBuffer.read` per pair. That is a bounded memcpy
+            // of `frames * channelCount` floats with no allocation and no
+            // lock, and it only happens once the user has asked for it.
+            let stageB = stagingChannelsB
+            for p in 0..<pairCount {
+                let lead = pairDelays.readLeadFrames(pair: p)
+                ring.read(at: startFrame &+ lead, frames: frames, into: stage)
+                let remaining = pairDelays.fadeRemainingFrames(pair: p)
+                let base = p * channelCount
+                if remaining <= 0 {
+                    for ch in 0..<channelCount {
+                        outPtrs[base + ch].update(from: stage[ch], count: frames)
+                    }
+                    continue
+                }
+                // Crossfading to a new offset: read the outgoing position too
+                // and mix, so a moved slider is a 20 ms blend rather than a
+                // step discontinuity in the read position (an audible click).
+                let previousLead = pairDelays.previousReadLeadFrames(pair: p)
+                ring.read(at: startFrame &+ previousLead, frames: frames, into: stageB)
+                let fadeFrames = pairDelays.fadeFrames
+                for ch in 0..<channelCount {
+                    let dst = outPtrs[base + ch]
+                    let incoming = stage[ch]
+                    let outgoing = stageB[ch]
+                    var i = 0
+                    while i < frames {
+                        let w = PairDelayBank.fadeWeight(
+                            remaining: remaining, index: i, fadeFrames: fadeFrames
+                        )
+                        dst[i] = outgoing[i] * (1 - w) + incoming[i] * w
+                        i += 1
+                    }
+                }
+            }
+            pairDelays.advance(frames: frames)
         }
         // Zero any odd surplus output channels (e.g. 5-ch aggregate
         // with 2-ch source: channels 0..3 written from pairs, channel
@@ -819,13 +955,14 @@ public final class LocalOutput {
         // Per-render diagnostics: bump tick count + sample peak so the
         // engine can tell whether AUHAL is firing AND emitting non-zero
         // audio. Done before gain is applied (so we measure actual
-        // captured audio, not gain-attenuated). Sample from the source
-        // (staging) channel 0 — if any pair is going to play it's this
-        // signal that gets routed.
+        // captured audio, not gain-attenuated). Sampled from output channel 0
+        // — the first pair's left channel, which on the fast path is the same
+        // buffer the staging read produced and on the delayed path is the one
+        // that pair actually plays.
         renderTickCount &+= 1
         var pk: Float = 0
         let n = min(frames, 128)
-        let p0 = stage[0]
+        let p0 = outPtrs[0]
         for i in 0..<n { pk = max(pk, abs(p0[i])) }
         lastRenderPeak = pk
 

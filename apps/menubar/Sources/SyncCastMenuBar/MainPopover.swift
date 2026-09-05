@@ -815,6 +815,13 @@ private struct DeviceRow: View {
                     if model.mode == .wholeHome && routing.enabled {
                         delayTrimRow(for: device)
                     }
+                    // Local Stereo's own delay compensation, for the latency a
+                    // display's internal processing adds and never reports.
+                    // Hidden on Direct Stereo for the same reason the EQ button
+                    // is: those samples never pass through our render callback.
+                    if model.localDelayTrimIsAvailable(for: deviceID) {
+                        LocalDelayTrimControl(deviceID: deviceID)
+                    }
                     // Inline equalizer panel for the one row the user opened.
                     if model.equalizerEditorDeviceID == deviceID,
                        model.equalizerIsAvailable(for: deviceID) {
@@ -823,6 +830,13 @@ private struct DeviceRow: View {
                     // A remembered curve that the current path cannot apply
                     // says so, rather than looking as if it were in effect.
                     if let hint = model.equalizerInactiveHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    // Same for a remembered delay.
+                    if let hint = model.localDelayTrimInactiveHint(for: deviceID) {
                         Text(hint)
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
@@ -873,6 +887,10 @@ private struct DeviceRow: View {
         let trim = model.deviceTrimMs(for: deviceID)
         if model.mode == .wholeHome && routing.enabled && trim != 0 {
             parts.append("delay \(trim > 0 ? "+" : "")\(trim) milliseconds")
+        }
+        let localDelay = model.localDelayTrimMs(for: deviceID)
+        if model.localDelayTrimIsAvailable(for: deviceID) && localDelay != 0 {
+            parts.append("output delay \(localDelay > 0 ? "+" : "")\(localDelay) milliseconds")
         }
         if let summary = model.equalizerSummary(for: deviceID) {
             parts.append("equalizer \(summary)")

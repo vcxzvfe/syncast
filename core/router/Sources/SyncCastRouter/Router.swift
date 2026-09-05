@@ -1975,7 +1975,7 @@ public actor Router {
     /// therefore equalise. Empty on Direct Stereo and in whole-home mode —
     /// which is exactly the question the UI asks before offering the control.
     public func equalizableOutputUIDs() -> [String] {
-        equalizerTargets().map(\.uid)
+        localPairTargets().map(\.uid)
     }
 
     /// Per-device limiter counts, keyed by UID. Non-zero means that device's
@@ -1986,7 +1986,7 @@ public actor Router {
         // Named honestly in the UI ("this output chain is clipping") rather
         // than pretending to a per-speaker figure we do not have.
         var result: [String: Int64] = [:]
-        for target in equalizerTargets() {
+        for target in localPairTargets() {
             result[target.uid] = target.output.equalizerClipCount
         }
         return result
@@ -1994,13 +1994,18 @@ public actor Router {
 
     /// UID → (AUHAL, channel-pair) for every physical output we render.
     ///
+    /// The addressing every per-device render feature shares: the equalizer
+    /// and the per-device delay compensation both need "which AUHAL, which
+    /// channel pair" for a CoreAudio UID, and two copies of that mapping would
+    /// be two chances to disagree about which speaker is pair 1.
+    ///
     /// Mirrors `applySystemSinkVolumes`'s mapping: in aggregate mode the pair
     /// comes from the aggregate's subdevice channel offset, in individual mode
     /// there is one output and one pair. A subdevice whose offset cannot be
     /// resolved is SKIPPED rather than defaulted to pair 0 — unlike a volume,
-    /// applying the wrong speaker's tone curve is silent and confusing, and
-    /// the fallback would put device B's bass cut on device A.
-    private func equalizerTargets() -> [(uid: String, output: LocalOutput, pair: Int)] {
+    /// applying the wrong speaker's tone curve (or delay) is silent and
+    /// confusing, and the fallback would put device B's setting on device A.
+    private func localPairTargets() -> [(uid: String, output: LocalOutput, pair: Int)] {
         guard mode == .stereo else { return [] }
         if let aggregate = aggregateDevice,
            let output = localOutputs[aggregate.aggregateUID] {
@@ -2019,11 +2024,173 @@ public actor Router {
     /// so this rides along with every reconcile and replan rather than needing
     /// its own trigger.
     private func applyEqualizers() {
-        for target in equalizerTargets() {
+        for target in localPairTargets() {
             target.output.setEqualizer(
                 pair: target.pair,
                 settings: equalizerSettingsByUID[target.uid] ?? .flat
             )
+        }
+    }
+
+    // MARK: - Per-device delay compensation (local Stereo)
+    //
+    // A millisecond hold per physical output, applied inside
+    // `LocalOutput.render()` on that device's own channel pair. It exists
+    // because a display's internal audio processing adds tens of milliseconds
+    // that `kAudioDevicePropertyLatency` does not describe, so two speakers
+    // fed the identical stream still arrive apart.
+    //
+    // Two parts, both in frames, summed and then normalised so the earliest
+    // output sits at 0 (nothing can play early — see `LocalDelayTrimPlanner`):
+    //
+    //   * an automatic seed from what each device DOES report, so honestly
+    //     specified hardware lines up before the user touches anything;
+    //   * the user's signed trim, for the latency nothing reports.
+    //
+    // SCOPE, same as the equalizer's: the `localOutputs` path only. Direct
+    // Stereo never routes samples through us, and whole-home has its own
+    // per-output trim (`DeviceDelayTrim` / `applyDeviceDelayTrims`) on a
+    // different leg with a different clock domain. The two are deliberately
+    // separate settings — see `LocalDelayTrim`.
+
+    /// User trims in milliseconds, keyed by CoreAudio UID. Absent means 0.
+    private var localDelayTrimMsByUID: [String: Int] = [:]
+    /// Automatic seed in frames, keyed by CoreAudio UID. NEGATIVE of the
+    /// device's reported output latency: a device that reports more latency
+    /// already sounds later and therefore needs less hold.
+    private var localDelaySeedFramesByUID: [String: Int] = [:]
+    /// The UID set `localDelaySeedFramesByUID` was probed for. Probing walks
+    /// CoreAudio properties, so it is redone when the covered set changes
+    /// rather than on every replan.
+    private var localDelaySeedProbedUIDs: Set<String> = []
+    /// Seeds already logged, so a re-probe that finds the same numbers does
+    /// not add a line per reconcile.
+    private var loggedLocalDelaySeeds: [String: Int] = [:]
+
+    /// Replace the whole UID → trim map. The menubar owns the persisted store
+    /// and pushes it in full, which keeps "the user cleared this device" and
+    /// "the user changed it" on one path.
+    public func setLocalDelayTrims(_ msByUID: [String: Int]) {
+        var sanitized: [String: Int] = [:]
+        for (uid, ms) in msByUID where !uid.isEmpty {
+            let clamped = LocalDelayTrim.clamp(ms)
+            // 0 is the default; storing it would make every reconcile push an
+            // identical no-op forever, and absent already means 0.
+            guard clamped != 0 else { continue }
+            sanitized[uid] = clamped
+        }
+        guard sanitized != localDelayTrimMsByUID else { return }
+        localDelayTrimMsByUID = sanitized
+        applyLocalPairDelays()
+    }
+
+    /// Set (or clear, with 0) one device's trim.
+    public func setLocalDelayTrim(uid: String, ms: Int) {
+        guard !uid.isEmpty else { return }
+        var next = localDelayTrimMsByUID
+        let clamped = LocalDelayTrim.clamp(ms)
+        if clamped == 0 { next.removeValue(forKey: uid) } else { next[uid] = clamped }
+        setLocalDelayTrims(next)
+    }
+
+    /// The trims the Router currently holds. Mostly for tests and reports.
+    public func localDelayTrims() -> [String: Int] { localDelayTrimMsByUID }
+
+    /// CoreAudio UIDs whose samples this process renders itself, and which can
+    /// therefore be delayed. Empty on Direct Stereo and in whole-home mode —
+    /// the same question the UI asks before offering the control.
+    public func localDelayTrimmableOutputUIDs() -> [String] {
+        localPairTargets().map(\.uid)
+    }
+
+    /// The automatic seed actually in force, in milliseconds, keyed by UID.
+    /// Reported so a field log can tell "this device declares 21 ms" apart
+    /// from "the user dialled 21 ms".
+    public func localDelaySeedMs() -> [String: Double] {
+        let rate = activeCapture.sampleRate
+        return localDelaySeedFramesByUID.mapValues {
+            LocalDelayTrim.milliseconds(frames: $0, sampleRate: rate)
+        }
+    }
+
+    /// Probe each covered device's reported output latency and store its
+    /// negative as the seed.
+    ///
+    /// Sign: `LocalDelayTrimPlanner` reads a larger value as "hold this pair
+    /// back more". A device with a LARGER reported latency already presents
+    /// later, so it needs LESS hold — hence the negation, after which
+    /// normalisation slides the whole set non-negative again.
+    ///
+    /// Latency the device does not report is exactly what the user's trim is
+    /// for; this only removes the part the hardware is honest about.
+    private func refreshLocalDelaySeeds(uids: Set<String>) {
+        guard uids != localDelaySeedProbedUIDs else { return }
+        localDelaySeedProbedUIDs = uids
+        let extraByUID = aggregateDevice?.subdeviceExtraLatencyFrames() ?? [:]
+        var seeds: [String: Int] = [:]
+        for uid in uids {
+            guard let deviceID = try? Capture.deviceID(forUID: uid), deviceID != 0 else {
+                // A UID we cannot resolve gets no seed rather than a guessed
+                // one; the user's trim still applies on top of 0.
+                continue
+            }
+            let reported = LocalOutput.outputLatencyFrames(deviceID: deviceID)
+                + Int64(extraByUID[uid] ?? 0)
+            seeds[uid] = -Int(clamping: reported)
+        }
+        localDelaySeedFramesByUID = seeds
+        let rate = activeCapture.sampleRate
+        for (uid, frames) in seeds where loggedLocalDelaySeeds[uid] != frames {
+            loggedLocalDelaySeeds[uid] = frames
+            let ms = LocalDelayTrim.milliseconds(frames: -frames, sampleRate: rate)
+            RouterLog.write(
+                String(
+                    format: "[Router] delay seed: %@ reports %.1f ms output latency\n",
+                    String(uid.prefix(20)), ms
+                )
+            )
+        }
+    }
+
+    /// Push seed + user trim onto every live output's channel pairs.
+    ///
+    /// Idempotent (`LocalOutput.setPairDelays` no-ops on an unchanged map), so
+    /// this rides along with every reconcile and replan the way the equalizer
+    /// does. Distinct from the whole-home `applyLocalDelayTrims(_:)` above it,
+    /// which pushes `DeviceDelayTrim` values to `localBridges`.
+    private func applyLocalPairDelays() {
+        let targets = localPairTargets()
+        guard !targets.isEmpty else { return }
+        refreshLocalDelaySeeds(uids: Set(targets.map(\.uid)))
+        // Group by AUHAL: normalisation is per output, because the pairs of
+        // one output share one read cursor. In aggregate mode that is a single
+        // group covering every physical device, which is exactly the set the
+        // user is comparing by ear.
+        var groups: [ObjectIdentifier: (output: LocalOutput, seeds: [Int: Int], user: [Int: Int])] = [:]
+        for target in targets {
+            let key = ObjectIdentifier(target.output)
+            var group = groups[key] ?? (output: target.output, seeds: [:], user: [:])
+            group.seeds[target.pair] = localDelaySeedFramesByUID[target.uid] ?? 0
+            group.user[target.pair] = localDelayTrimMsByUID[target.uid] ?? 0
+            groups[key] = group
+        }
+        let rate = activeCapture.sampleRate
+        let headroom = LocalDelayTrimPlanner.headroomFrames(
+            capacityFrames: activeCapture.ringBuffer.capacityFrames,
+            floorFrames: ringFloorFrames(logWarnings: false)
+        )
+        for (_, group) in groups {
+            let pairCount = max(1, group.output.outputChannelCount / max(1, group.output.channelCount))
+            let offsets = LocalDelayTrimPlanner.offsetFrames(
+                pairCount: pairCount,
+                seedFrames: group.seeds,
+                userMs: group.user,
+                sampleRate: rate,
+                headroomFrames: headroom
+            )
+            var byPair: [Int: Int] = [:]
+            for (pair, frames) in offsets.enumerated() { byPair[pair] = frames }
+            group.output.setPairDelays(byPair)
         }
     }
 
@@ -2173,8 +2340,10 @@ public actor Router {
         // A rebuilt driver has fresh, flat AUHALs. Re-seed the user's curves
         // here — this is the one place that sees every open/close, so a
         // re-plugged monitor gets its tone control back without the menubar
-        // having to notice the transition.
+        // having to notice the transition. Same argument for the per-device
+        // delay: a rebuilt aggregate starts at 0 on every pair.
         applyEqualizers()
+        applyLocalPairDelays()
     }
 
     /// The producer the local outputs read from.
@@ -2333,6 +2502,12 @@ public actor Router {
     private func tearDownLocalDriver() {
         for (_, out) in localOutputs { out.stop() }
         localOutputs.removeAll()
+        // Force a re-probe on the next `applyLocalPairDelays`: CoreAudio
+        // AudioObjectIDs are re-minted when a device is re-plugged, and a
+        // rebuilt aggregate can carry different per-subdevice extra latency.
+        // The user's trims are untouched — those are keyed by UID and belong
+        // to the speaker, not to this driver instance.
+        localDelaySeedProbedUIDs = []
         if let agg = aggregateDevice {
             agg.destroy()
             aggregateDevice = nil
@@ -2711,6 +2886,7 @@ public actor Router {
         // do, and covers any path that reopens an AUHAL without going through
         // `reconcileLocalDriver`.
         applyEqualizers()
+        applyLocalPairDelays()
 
         // In aggregate mode, also apply per-device HARDWARE volume on
         // the underlying physical DACs. The single AUHAL atop the
