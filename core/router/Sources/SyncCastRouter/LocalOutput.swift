@@ -157,6 +157,10 @@ public final class LocalOutput {
     /// Smallest `writePosition − startFrame` seen. This is the headroom the
     /// ring floor actually bought; if it approaches 0 the floor is too low.
     private let minWaterLevelCounter: UnsafeMutablePointer<SCAtomicInt64>
+    /// Renders served as silence because the producer was not writing. Not a
+    /// glitch — but reported, because the counters above are only meaningful
+    /// against it (and because a large idle count during playback IS a fault).
+    private let idleBlockCounter: UnsafeMutablePointer<SCAtomicInt64>
     /// Sentinel for "no render has been observed yet".
     private static let waterLevelUnset: Int64 = Int64.max
     /// The bookkeeping itself. Owned by the render thread (and by `start()`
@@ -164,6 +168,10 @@ public final class LocalOutput {
     /// channel for every other thread. `GlitchTally` holds the rule so it can
     /// be tested without a CoreAudio device.
     private var tally = GlitchTally()
+    /// Cross-render producer-activity state. Owned by the render thread with
+    /// the tally; `RingReadSequencer` holds the rule that separates "the
+    /// producer stopped" from "we got ahead of it".
+    private var sequencer = RingReadSequencer()
 
     public init(
         deviceID: AudioObjectID,
@@ -193,6 +201,9 @@ public final class LocalOutput {
         let water = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
         sc_atomic_init(water, Self.waterLevelUnset)
         self.minWaterLevelCounter = water
+        let idle = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
+        sc_atomic_init(idle, 0)
+        self.idleBlockCounter = idle
         // outputChannelCount defaults to channelCount (individual mode);
         // aggregate mode passes a wider count. We round up to an even
         // multiple of channelCount because the splat path writes pairs
@@ -256,6 +267,7 @@ public final class LocalOutput {
         resyncCounter.deallocate()
         underrunCounter.deallocate()
         minWaterLevelCounter.deallocate()
+        idleBlockCounter.deallocate()
     }
 
     // MARK: - Ring floor
@@ -298,6 +310,9 @@ public final class LocalOutput {
         let value = sc_atomic_load_acquire(minWaterLevelCounter)
         return value == Self.waterLevelUnset ? nil : value
     }
+    /// Renders served as silence because nothing was rendering into the
+    /// captured device.
+    public var idleBlockCount: Int64 { sc_atomic_load_acquire(idleBlockCounter) }
 
     /// Zero the glitch counters. Called from `start()` so each session's
     /// numbers stand on their own. Also zeroes `renderTickCount`, which is
@@ -305,9 +320,11 @@ public final class LocalOutput {
     /// book its warm-up resync as a glitch.
     public func resetGlitchCounters() {
         tally.reset()
+        sequencer.reset()
         sc_atomic_store_release(resyncCounter, 0)
         sc_atomic_store_release(underrunCounter, 0)
         sc_atomic_store_release(minWaterLevelCounter, Self.waterLevelUnset)
+        sc_atomic_store_release(idleBlockCounter, 0)
         renderTickCount = 0
     }
 
@@ -317,6 +334,7 @@ public final class LocalOutput {
             String(format: "%.1fms", RingFloorPolicy.milliseconds(frames: Int($0), sampleRate: sampleRate))
         } ?? "-"
         return "resync:\(resyncCount) underrun:\(underrunCount) minWater:\(water)"
+            + " idle:\(idleBlockCount)"
     }
 
     // MARK: - Hardware latency probing
@@ -631,9 +649,11 @@ public final class LocalOutput {
         // "granularity"); a 16-sample gap drops audio (click). This
         // was the primary source of user-reported 毛刺感 + 啸叫.
         //
-        // `RingReadPlanner` owns the resync/underrun arithmetic — pure
-        // integer math, unit-tested in RingReadPlannerTests.
-        let plan = RingReadPlanner.plan(
+        // `RingReadSequencer` owns the resync/underrun arithmetic (through
+        // `RingReadPlanner`) plus the one thing a single render cannot see:
+        // whether the producer is producing at all. Pure integer math, no
+        // allocation, unit-tested in RingReadPolicyTests.
+        let plan = sequencer.plan(
             writePosition: writePos,
             cursor: snapshot.cursor,
             frames: frames,
@@ -675,6 +695,28 @@ public final class LocalOutput {
             sc_atomic_store_release(
                 minWaterLevelCounter, tally.minWaterLevelFrames ?? Self.waterLevelUnset
             )
+            sc_atomic_store_release(idleBlockCounter, tally.idleBlocks)
+        }
+
+        // Producer idle: nothing is rendering into the captured device, so
+        // there is no audio to serve and no cursor movement to make. Emit
+        // silence and leave the cursor exactly where it is — advancing it
+        // through a long silence would push it thousands of blocks past the
+        // write head, and the recovery from THAT would be a real resync.
+        //
+        // `ring.read` would also produce silence here (it zero-fills anything
+        // past the write cursor), but it would do so at the cost of a full
+        // staging read plus the splat; writing the output buffers directly is
+        // both cheaper and impossible to misread as "we played something".
+        if plan.producerIdle {
+            for ch in 0..<outputChannelCount {
+                let dst = outPtrs[ch]
+                var i = 0
+                while i < frames { dst[i] = 0; i += 1 }
+            }
+            renderTickCount &+= 1
+            lastRenderPeak = 0
+            return noErr
         }
 
         // Read source channels (always `channelCount`, typically 2)

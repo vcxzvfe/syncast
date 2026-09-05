@@ -169,7 +169,8 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
   的 30 ms floor，SCK / aggregate 路径维持 100 ms 不变。
 
   剩下的杠杆：① `SYNCAST_SINK_RING_FLOOR_MS`（拿 dropout 余量换延迟；调低之后
-  必须看 app 健康日志里的 `resync` / `underrun` / `minWater` 三个计数器）；
+  必须看 app 健康日志里的 `resync` / `underrun` / `minWater` / `idle` 四个计数器，
+  并且**只在 `idle` 不涨的那段时间里读前三个**——见 §5.2）；
   ② 让 `SyncCastAudio.driver` 在 `kAudioDevicePropertyLatency` 上申报这条链的
   延迟，视频播放器就会自己补偿、A/V 仍然对齐（未实现）。
 
@@ -247,7 +248,30 @@ transport `virt`），sink 是 BlackHole 2ch。结果：
 这个问题，它们能选的设备一个不减。aggregate（`kAudioDeviceTransportTypeAggregate`）
 **不算**虚拟设备——它是内核侧的真实端点组合，Direct Stereo 自己的输出就是一个。
 
-### 5.2 其它
+### 5.2 静音不是 glitch（计数器口径，2026-09-05 修）
+
+Process Tap 的 IOProc **只在有进程往 sink 里渲染时才触发**。没人放音的时候
+`writePos` 一动不动，而输出 AUHAL 照样按时来取数据——于是每一次 render 都被记成
+一次 `underrun` 加一次 `resync`。实测：约 35 秒的 run（其中真正有声音的只有约 4 秒）
+报出 `ticks 2808 / resync 2437 / underrun 2436 / minWater 0 ms`。这些数字描述的是
+一台闲着的机器，不是一台坏了的机器，而且它们把计数器唯一的用途（判断 30 ms ring
+floor 够不够）彻底废掉了。
+
+改法：`RingReadSequencer` 记住上一次 render 时生产者的写指针。写指针没动、并且
+已经没有一整块写好的音频可放 → 这一块判为 **producer idle**：直接输出静音、
+**不推进读游标**、只记进新的 `idleBlocks` 计数器，`resync` / `underrun` /
+`minWater` 一律不动。生产者恢复后的第一块**强制重锚**（把 silence 期间被抽干的
+floor 重新建起来），这次重锚同样不计——它是预期行为。
+
+健康行因此多一列：`resync:N underrun:N minWater:X idle:N`。
+
+**遗留盲点，明说**：生产者「卡了整整一个 render」和「本来就没声音」在环形缓冲区
+这一侧长得一模一样，所以一次一个 render 以上的停顿会落进 `idleBlocks` 而不是
+`underrun`。这正是 `idleBlocks` 要显示出来而不是藏起来的原因——**已知在放音的时段
+里 `idle` 却在涨，那才是故障信号**。floor 覆盖得住的短暂停顿（30 ms floor ≈ 2.8 块）
+不算 idle：那几块放的是真音频，照常计数。
+
+### 5.3 其它
 
 - 路径在**每次启动时解析一次**（`SystemSinkDevice.resolved`）。装完驱动要重启
   SyncCast——反正装驱动会重启 coreaudiod，音频本来就断一下。
