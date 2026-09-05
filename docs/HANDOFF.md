@@ -313,6 +313,19 @@ fec46d1 fix(audio): harden wake recovery with retry-backoff + observer dedup + A
 - Worktree-based agents created branches like `round12-fixer-X` then cherry-picked to `main`. The worktree branches stay around in the local clone (`git worktree list`) but are not pushed.
 
 ### Tag / release flow
+- `VERSION` is **0.2.0-alpha** (unreleased — no `v0.2.0-alpha` tag yet). Two
+  features landed on top of 0.1.0-alpha in the 2026-09-05 round:
+  - **System-volume Stereo path** (`docs/requirements_2026-09-05-system-sink.md`,
+    ADR-007): a virtual sink device becomes the macOS default output, so the
+    menu-bar slider / F11 / F12 / HUD / LinearMouse drive SyncCast natively and
+    the Accessibility event tap is no longer needed on that path. Ships its own
+    `SyncCastAudio.driver`, falls back to BlackHole 2ch, then to Direct Stereo.
+  - **Auto-connect** (`docs/requirements_2026-09-05-auto-connect.md`): profiles
+    that start routing on their own when a known output appears.
+  - Follow-up in the same round: the sink path's ring floor is now per-producer
+    (30 ms on the tap path vs 100 ms on ScreenCaptureKit), which corrects a
+    latency claim that was wrong — see the note in ADR-007. **Not yet verified
+    by listening.**
 - Latest tag: `v0.1.0-alpha` (`SyncCast.app.zip` 25 MB asset).
 - To cut a new release:
   ```bash
