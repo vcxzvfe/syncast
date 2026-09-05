@@ -560,6 +560,11 @@ public actor Router {
             _ = try? stopDirectStereoOutput()
             _ = try? stopWholeHomeSink()
             tearDownLocalDriver()
+            // LAN legs are opened by the same reconcile the local driver is,
+            // and they now count as a complete output set on their own — so a
+            // failed start must close them too, or a receiver would keep
+            // playing from a ring whose producer is about to be stopped.
+            tearDownLanReceivers()
             // The sink path can fail after the sink is already the default
             // output (e.g. the tap is refused). Unwinding it here is what
             // keeps a failed start from leaving macOS pointed at a silent
@@ -1888,11 +1893,20 @@ public actor Router {
         // the system default, so "no output opened" means macOS is rendering
         // into a silent device and nothing plays it. Throwing hands it to the
         // start() catch, which unwinds the sink and gives the default back.
-        guard !localOutputs.isEmpty else {
+        //
+        // A LAN receiver leg counts as an output. It reads the same tap ring
+        // the AUHALs read and ends in a loudspeaker on another machine, so a
+        // receiver on its own is a complete, legitimate output set — see
+        // `SystemSinkOutputPolicy`. Requiring a CoreAudio output here is what
+        // made "enable only the LAN receiver" fail with code 112 while the leg
+        // was open and healthy.
+        guard SystemSinkOutputPolicy.hasRenderableOutput(
+            localOutputCount: localOutputs.count,
+            lanReceiverLegCount: lanReceiverOutputs.count
+        ) else {
             throw NSError(domain: "SyncCastRouter", code: 112, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "system sink is the default output but no local output could be opened"
-                    + (lastError.map { ": \($0)" } ?? "")
+                    SystemSinkOutputPolicy.noOutputMessage(lastError: lastError)
             ])
         }
     }
