@@ -2947,7 +2947,24 @@ final class AppModel {
         guard isUserSelectableOutput(d) else { return false }
         switch mode {
         case .stereo:
-            return d.transport == .coreAudio
+            guard d.transport == .coreAudio else { return false }
+            // The system-sink path taps a userland audio plug-in. Rendering
+            // into a SECOND one wedges coreaudiod machine-wide (measured
+            // 2026-09-05 with ZoomAudioDevice as the only output: 108 s start,
+            // a teardown that never returns, every virtual device dead until
+            // `sudo killall coreaudiod`) — see `VirtualOutputPolicy`.
+            //
+            // A virtual device is not a speaker, so hiding it here removes
+            // nothing the user wanted. The rule is scoped to the sink path:
+            // Direct Stereo and the capture path do not tap a plug-in device
+            // and have never shown this, so they keep whatever they list
+            // today. `Router.startSystemSinkPath` re-checks independently.
+            if AppModel.selectedStereoOutputPath == .sink,
+               let uid = d.coreAudioUID,
+               VirtualOutputPolicy.isVirtualOutput(uid: uid) {
+                return false
+            }
+            return true
         case .wholeHome:
             // Direction B: this Mac's own AirPlay Receiver is NEVER a target.
             // The local speakers participate as an OwnTone fifo output, on

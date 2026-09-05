@@ -469,11 +469,11 @@ extension SCKCapture: SCStreamDelegate {
         // the new stream and silently lose capture.
         guard stream === self.stream else {
             let stale = "[SCKCapture] stale didStopWithError ignored (old stream after restart): \(error.localizedDescription)\n"
-            FileHandle.standardError.write(Data(stale.utf8))
+            RouterLog.write(stale)
             return
         }
         let msg = "[SCKCapture] stream stopped with error: \(error.localizedDescription) — notifying router\n"
-        FileHandle.standardError.write(Data(msg.utf8))
+        RouterLog.write(msg)
         self.stream = nil
         self.output = nil
         // Snapshot the closure before dispatch — protects against a racing

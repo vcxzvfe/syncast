@@ -240,9 +240,10 @@ final class SystemSinkCoordinator {
     /// keep working.
     func installDriver(scriptURL: URL?, engineIsRunning: Bool) {
         guard driverInstallState != .running else { return }
-        // Installing runs `launchctl kickstart -k system/com.apple.audio.coreaudiod`,
-        // which destroys the process tap, the tap aggregate and our own
-        // aggregate device out from under a running engine. TapCapture's
+        // Installing restarts coreaudiod (`killall coreaudiod`; launchd
+        // respawns it — `launchctl kickstart` is refused while SIP is
+        // engaged), which destroys the process tap, the tap aggregate and our
+        // own aggregate device out from under a running engine. TapCapture's
         // onUnexpectedStop only records the event, so the app would look
         // healthy and play nothing. Refuse rather than silently break.
         guard !engineIsRunning else {
@@ -262,6 +263,10 @@ final class SystemSinkCoordinator {
             let result = await Self.runPrivilegedInstall(scriptURL: scriptURL)
             guard let self else { return }
             self.driverInstallState = result
+            // Installing restarts coreaudiod, after which a UID can be served
+            // by a different AudioObjectID — drop the memoised transport-type
+            // verdicts rather than classify the new device from the old one.
+            VirtualOutputPolicy.resetCache()
             SyncCastLog.log("systemSink: driver install → \(result)")
         }
     }

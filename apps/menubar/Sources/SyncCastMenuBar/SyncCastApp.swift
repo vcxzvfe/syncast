@@ -123,6 +123,12 @@ struct SyncCastApp: App {
 
     init() {
         SyncCastLog.log("=== SyncCast process starting (pid \(getpid())) ===")
+        // The router package writes its diagnostics to stderr by default, and
+        // an `open`-launched .app has no stderr — which is why a 108 s stall
+        // inside `Router.start` on 2026-09-05 left nothing at all in
+        // launch.log. Point them at the same file the app logs to, tagged so
+        // the source is unambiguous.
+        RouterLog.sink = { line in SyncCastLog.log("[router] \(line)") }
         NSApp?.setActivationPolicy(.accessory)
 
         // Only ScreenCaptureKit needs Screen Recording. Tap mode, Direct

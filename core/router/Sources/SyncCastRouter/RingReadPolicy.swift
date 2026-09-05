@@ -117,12 +117,31 @@ public struct RingReadPlan: Equatable, Sendable {
     /// Written frames available ahead of `startFrame` at decision time. The
     /// running minimum of this is the headroom the floor actually bought.
     public let waterLevelFrames: Int64
+    /// The producer's write cursor did not move since the previous render AND
+    /// there is no full block of written audio left to serve. Nobody is
+    /// rendering into the tapped device: the block is silence by definition,
+    /// not a dropout, and none of the columns above mean anything for it.
+    public let producerIdle: Bool
+    /// This render re-anchored because the producer had been idle and has just
+    /// started writing again. The discontinuity is the price of rebuilding the
+    /// floor after a silence, which is expected — unlike a re-anchor that
+    /// happens while audio is flowing.
+    public let resumedFromIdle: Bool
 
-    public init(startFrame: Int64, didResync: Bool, underrunFrames: Int, waterLevelFrames: Int64) {
+    public init(
+        startFrame: Int64,
+        didResync: Bool,
+        underrunFrames: Int,
+        waterLevelFrames: Int64,
+        producerIdle: Bool = false,
+        resumedFromIdle: Bool = false
+    ) {
         self.startFrame = startFrame
         self.didResync = didResync
         self.underrunFrames = underrunFrames
         self.waterLevelFrames = waterLevelFrames
+        self.producerIdle = producerIdle
+        self.resumedFromIdle = resumedFromIdle
     }
 }
 
@@ -139,6 +158,27 @@ public struct RingReadPlan: Equatable, Sendable {
 /// that (the producer has not written `floor` frames yet) DO count — hiding
 /// them would hide a genuinely bad floor. The claim a run supports is
 /// therefore "these numbers stopped moving", not "these numbers are zero".
+///
+/// # Silence is not a glitch
+///
+/// The system-sink path's producer is a Process Tap IOProc, and it only fires
+/// while some process is rendering into the tapped device. During silence the
+/// ring's write cursor does not advance at all, while the output AUHAL keeps
+/// pulling — so every render found nothing to read and was booked as an
+/// underrun AND a resync. Measured on 2026-09-05 over ~35 s containing ~4 s of
+/// audio: ticks 2808, resync 2437, underrun 2436, minWater 0 ms. Those numbers
+/// describe an idle machine, not a broken one, and they made the counters
+/// useless for the thing they exist for (judging the 30 ms ring floor).
+///
+/// So a block the producer is not feeding is counted in `idleBlocks` and
+/// nowhere else, and the re-anchor on the first block after it resumes is
+/// exempt too — rebuilding the floor after a silence is expected.
+///
+/// The blind spot this leaves, stated plainly: a producer that freezes for a
+/// whole render is indistinguishable from a producer with nothing to say, so a
+/// stall of one or more renders lands in `idleBlocks` rather than in
+/// `underrunCount`. That is why `idleBlocks` is reported rather than hidden —
+/// a large idle count DURING known-active playback is the signal.
 public struct GlitchTally: Equatable, Sendable {
     /// Renders that re-anchored the cursor. Each one is an audible
     /// discontinuity.
@@ -149,14 +189,30 @@ public struct GlitchTally: Equatable, Sendable {
     /// Smallest water level seen, or nil before the first recorded render.
     public private(set) var minWaterLevelFrames: Int64?
     /// How many renders have been folded in (excludes the skipped first one).
+    /// `idleBlocks` is a subset of this, not a separate population.
     public private(set) var recordedRenders: UInt64 = 0
+    /// Renders served as silence because the producer was not writing. Neither
+    /// a glitch nor evidence of health — it is what the other columns were
+    /// silently absorbing before.
+    public private(set) var idleBlocks: Int64 = 0
 
     public init() {}
 
     public mutating func record(_ plan: RingReadPlan) {
         recordedRenders &+= 1
-        if plan.didResync { resyncCount &+= 1 }
-        if plan.underrunFrames > 0 { underrunCount &+= 1 }
+        if plan.producerIdle {
+            idleBlocks &+= 1
+            // No resync, no underrun, and no water-level sample: there is no
+            // producer to be behind, so "how much headroom did the floor buy"
+            // has no answer for this block.
+            return
+        }
+        // The re-anchor that ends an idle stretch is expected, and so is the
+        // short read it may come with while the floor refills. Counting either
+        // would put one glitch per silence back into the column.
+        if plan.didResync, !plan.resumedFromIdle { resyncCount &+= 1 }
+        if plan.underrunFrames > 0, !plan.resumedFromIdle { underrunCount &+= 1 }
+        guard !plan.resumedFromIdle else { return }
         if let current = minWaterLevelFrames {
             minWaterLevelFrames = Swift.min(current, plan.waterLevelFrames)
         } else {
@@ -213,6 +269,118 @@ public enum RingReadPlanner {
             didResync: needsResync,
             underrunFrames: Int(min(underrun, blockFrames)),
             waterLevelFrames: writePosition - startFrame
+        )
+    }
+}
+
+/// The cross-render half of the read plan: is the producer actually producing?
+///
+/// `RingReadPlanner.plan` is pure arithmetic over ONE render and therefore
+/// cannot tell "the producer stopped" from "the consumer got ahead" — both
+/// look like `cursor + block > writePosition`. This is the piece that
+/// remembers where the write cursor was last time, which is the only
+/// difference between the two.
+///
+/// A value type folded by the render thread, so it must not allocate: two
+/// integers and a bool. `LocalOutput` owns one; tests own one and drive it
+/// with a synthetic producer.
+///
+/// # The three regimes
+///
+///   * **active** — the producer advanced. Ordinary arithmetic, ordinary
+///     counting.
+///   * **idle** — the producer's cursor has not moved since the last render
+///     and there is no full block of written audio left to serve. The block is
+///     silence: the cursor is left exactly where it is (so it cannot run
+///     thousands of blocks past the write head during a long silence) and the
+///     plan says so.
+///   * **resuming** — the first render after an idle stretch. It re-anchors to
+///     the target on purpose, rebuilding the ring floor the silence drained,
+///     and flags that the re-anchor was expected.
+///
+/// Note that "no full block left to serve" is required for idle: a producer
+/// that pauses while the consumer still has `floor` frames of written audio
+/// ahead of it is not idle, it is exactly the case the floor was bought for,
+/// and those blocks play real audio and are counted normally.
+public struct RingReadSequencer: Equatable, Sendable {
+    /// Sentinel for "no render has been planned yet", distinct from a genuine
+    /// write position of 0 (which is what a producer that has never written
+    /// reports, and which must not be mistaken for "the producer stalled").
+    public static let noPreviousWrite: Int64 = -1
+
+    private var lastWritePosition: Int64 = RingReadSequencer.noPreviousWrite
+    private var idle = false
+
+    public init() {}
+
+    /// Discard the cross-render state. Called wherever the glitch counters are
+    /// zeroed, so a restarted output does not inherit the previous session's
+    /// idea of where the producer was.
+    public mutating func reset() { self = RingReadSequencer() }
+
+    /// True when the previous render was served as silence.
+    public var producerIsIdle: Bool { idle }
+
+    public mutating func plan(
+        writePosition: Int64,
+        cursor: Int64,
+        frames: Int,
+        floorFrames: Int64,
+        compensationFrames: Int64,
+        capacityFrames: Int,
+        driftLimitFrames: Int64
+    ) -> RingReadPlan {
+        let blockFrames = Int64(frames)
+        let producerAdvanced =
+            lastWritePosition == Self.noPreviousWrite || writePosition > lastWritePosition
+        // `cursor == 0` means "never rendered", which is never "a full block
+        // of audio is waiting" however large the write position is.
+        let hasFullBlock = cursor > 0 && cursor &+ blockFrames <= writePosition
+        let nowIdle = !producerAdvanced && !hasFullBlock
+
+        defer {
+            lastWritePosition = writePosition
+            idle = nowIdle
+        }
+
+        if nowIdle {
+            return RingReadPlan(
+                startFrame: cursor,
+                didResync: false,
+                underrunFrames: 0,
+                waterLevelFrames: writePosition - cursor,
+                producerIdle: true,
+                resumedFromIdle: false
+            )
+        }
+
+        let base = RingReadPlanner.plan(
+            writePosition: writePosition,
+            cursor: cursor,
+            frames: frames,
+            floorFrames: floorFrames,
+            compensationFrames: compensationFrames,
+            capacityFrames: capacityFrames,
+            driftLimitFrames: driftLimitFrames
+        )
+        guard idle else { return base }
+
+        // Resuming. Re-anchor unconditionally rather than trusting the generic
+        // arithmetic: after a silence the cursor is parked AT the old write
+        // head, so a producer that has written only a fraction of a block
+        // would otherwise be read from with no floor at all and starve again
+        // on the very next render.
+        let target = max(
+            0, writePosition - floorFrames - compensationFrames - blockFrames
+        )
+        let underrun = max(0, target &+ blockFrames - writePosition)
+        return RingReadPlan(
+            startFrame: target,
+            didResync: true,
+            underrunFrames: Int(min(underrun, blockFrames)),
+            waterLevelFrames: writePosition - target,
+            producerIdle: false,
+            resumedFromIdle: true
         )
     }
 }

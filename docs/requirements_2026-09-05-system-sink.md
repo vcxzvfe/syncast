@@ -118,7 +118,16 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 音量曲线照抄上面实测的 `[-63.5, 0] dB` dB 线性，所以滑杆手感和内建喇叭一致。
 `build.sh` 出 universal + ad-hoc（或 `SYNCAST_USE_SYNCCAST_DEV=1` 用 "SyncCast Dev"）
 签名的 bundle；`scripts/install-driver.sh` 装到 `/Library/Audio/Plug-Ins/HAL` 并
-`launchctl kickstart -k system/com.apple.audio.coreaudiod`。
+重启 coreaudiod（用 `killall coreaudiod`，launchd 会立刻把它拉回来）。
+
+> **2026-09-05 更正**：原来这里用的是
+> `launchctl kickstart -k system/com.apple.audio.coreaudiod`，**在本机跑不通**——
+> 以 root 身份执行也会被拒：
+> `Could not kickstart service: 150: Operation not permitted while System
+> Integrity Protection is engaged`。SIP 开着（出厂默认）就不允许 kickstart
+> 系统域的 Apple 服务。`killall coreaudiod` 效果完全一样：coreaudiod 归 launchd
+> 管，杀掉立刻重启，新起来的那个才会重新扫描 HAL 插件目录。脚本随后会等它回来
+> （最多 10 秒），免得调用方一转身就去探测新设备结果跟重启赛跑。
 
 ## 4. 验证
 
@@ -169,7 +178,8 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
   的 30 ms floor，SCK / aggregate 路径维持 100 ms 不变。
 
   剩下的杠杆：① `SYNCAST_SINK_RING_FLOOR_MS`（拿 dropout 余量换延迟；调低之后
-  必须看 app 健康日志里的 `resync` / `underrun` / `minWater` 三个计数器）；
+  必须看 app 健康日志里的 `resync` / `underrun` / `minWater` / `idle` 四个计数器，
+  并且**只在 `idle` 不涨的那段时间里读前三个**——见 §5.2）；
   ② 让 `SyncCastAudio.driver` 在 `kAudioDevicePropertyLatency` 上申报这条链的
   延迟，视频播放器就会自己补偿、A/V 仍然对齐（未实现）。
 
@@ -209,6 +219,68 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
     设备——与 `DirectStereoOutput` / `WholeHomeSinkOutput` 既有做法一致，本轮不单独改。
 
 ## 5. 已知限制
+
+### 5.1 虚拟设备不能当 sink 路径的输出（2026-09-05 真机实测）
+
+**现象**：唯一勾选的输出是 `ZoomAudioDevice`（用户态 `AudioServerPlugIn`，
+transport `virt`），sink 是 BlackHole 2ch。结果：
+
+- `Router.start` **108 秒**才返回；
+- 往 sink 放 `afplay` 直接报 `AudioQueueStart -66681`；
+- 退出 app **永久卡死**在 `TapCapture.stop()` → `AudioDeviceDestroyIOProcID`
+  → `HALC_ProxyIOContext::_TellServerAboutStreamUsage`（发给 coreaudiod 的
+  IPC 永远没回音）；
+- 事后**全机**所有用户态虚拟设备（BlackHole / Zoom / Teams）都不再有任何 IO
+  回调，直到 `sudo killall coreaudiod`。内建扬声器全程正常。
+
+**隔离表**（同一台机器、同一晚）：
+
+| 配置 | 结果 |
+|---|---|
+| 只把 BlackHole 改采样率（不 tap、不渲染） | 正常 |
+| 探针：tap BlackHole + 抢默认输出 | 正常 |
+| app：输出 = MacBook Pro 扬声器，sink = BlackHole | 正常（<1 s 启动，tap 有数据，音量法正确）|
+| app：输出 = ZoomAudioDevice，sink = BlackHole | **108 s 启动 / 退出卡死 / coreaudiod 废掉** |
+
+**结论**：一边 tap 一个用户态插件设备、一边往另一个用户态插件设备里渲染，会把
+两者共用的插件宿主（coreaudiod）锁死。这不是我们能修的；能做的是永远不构造这
+个组合。
+
+**处理**：`VirtualOutputPolicy`。
+`kAudioDevicePropertyTransportType == kAudioDeviceTransportTypeVirtual` 的设备，
+在 `selectedStereoOutputPath == .sink` 时从 `isSelectableInMode` 里隐藏（它本来
+也不是喇叭，用户没有任何损失），并且 `Router.startSystemSinkPath` 在**接管任何
+东西之前**独立复查一遍，命中就抛错并点名设备——失败发生在没装 sink、没改采样
+率、没有默认输出要还的时刻，代价为零。
+
+范围**只限 sink 路径**：Direct Stereo 和 capture 路径不 tap 插件设备，从没出过
+这个问题，它们能选的设备一个不减。aggregate（`kAudioDeviceTransportTypeAggregate`）
+**不算**虚拟设备——它是内核侧的真实端点组合，Direct Stereo 自己的输出就是一个。
+
+### 5.2 静音不是 glitch（计数器口径，2026-09-05 修）
+
+Process Tap 的 IOProc **只在有进程往 sink 里渲染时才触发**。没人放音的时候
+`writePos` 一动不动，而输出 AUHAL 照样按时来取数据——于是每一次 render 都被记成
+一次 `underrun` 加一次 `resync`。实测：约 35 秒的 run（其中真正有声音的只有约 4 秒）
+报出 `ticks 2808 / resync 2437 / underrun 2436 / minWater 0 ms`。这些数字描述的是
+一台闲着的机器，不是一台坏了的机器，而且它们把计数器唯一的用途（判断 30 ms ring
+floor 够不够）彻底废掉了。
+
+改法：`RingReadSequencer` 记住上一次 render 时生产者的写指针。写指针没动、并且
+已经没有一整块写好的音频可放 → 这一块判为 **producer idle**：直接输出静音、
+**不推进读游标**、只记进新的 `idleBlocks` 计数器，`resync` / `underrun` /
+`minWater` 一律不动。生产者恢复后的第一块**强制重锚**（把 silence 期间被抽干的
+floor 重新建起来），这次重锚同样不计——它是预期行为。
+
+健康行因此多一列：`resync:N underrun:N minWater:X idle:N`。
+
+**遗留盲点，明说**：生产者「卡了整整一个 render」和「本来就没声音」在环形缓冲区
+这一侧长得一模一样，所以一次一个 render 以上的停顿会落进 `idleBlocks` 而不是
+`underrun`。这正是 `idleBlocks` 要显示出来而不是藏起来的原因——**已知在放音的时段
+里 `idle` 却在涨，那才是故障信号**。floor 覆盖得住的短暂停顿（30 ms floor ≈ 2.8 块）
+不算 idle：那几块放的是真音频，照常计数。
+
+### 5.3 其它
 
 - 路径在**每次启动时解析一次**（`SystemSinkDevice.resolved`）。装完驱动要重启
   SyncCast——反正装驱动会重启 coreaudiod，音频本来就断一下。

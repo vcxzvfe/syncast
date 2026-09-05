@@ -244,6 +244,11 @@ public final class SystemSinkDevice {
     /// value we then push back to that device is the value it already had.
     public func start(seedVolume: Float? = nil) throws {
         if isActive { return }
+        // Sub-phases of the Router's "sink takeover" phase. The sample-rate
+        // settle below polls for up to a second and the seed retries for up to
+        // ~360 ms, so a slow takeover has three different plausible causes;
+        // these marks say which one it was rather than leaving it to guesswork.
+        var phases = PhaseTimer(scope: "[SystemSink] start")
         let id = try Self.deviceID(forUID: candidate.uid)
 
         let rawDefaultID = try Self.readDefault(Self.defaultOutputSelector)
@@ -263,6 +268,7 @@ public final class SystemSinkDevice {
         let systemSnapshot = rawSystemID.map { id in
             Self.restorablePrevious(id: id, uid: DirectStereoOutput.readDeviceUID(id))
         }
+        phases.mark("snapshot previous defaults")
 
         // Pin the sample rate BEFORE macOS starts rendering into the sink, so
         // no app opens it at the old rate and gets re-rated underneath.
@@ -280,14 +286,15 @@ public final class SystemSinkDevice {
                 if !Self.waitForSampleRate(id, rate: Self.requiredSampleRate) {
                     let observed = Self.nominalSampleRate(id).map { "\($0)" } ?? "?"
                     let message = "[SystemSink] \(candidate.uid) did not reach 48 kHz within \(Self.sampleRateSettleTimeoutMs) ms (still \(observed)); the process tap will refuse the format\n"
-                    FileHandle.standardError.write(Data(message.utf8))
+                    RouterLog.write(message)
                 }
             } else {
-                FileHandle.standardError.write(Data(
-                    "[SystemSink] could not set \(candidate.uid) to 48 kHz (currently \(originalRate)); the process tap will refuse a non-48 kHz format\n".utf8
-                ))
+                RouterLog.write(
+                    "[SystemSink] could not set \(candidate.uid) to 48 kHz (currently \(originalRate)); the process tap will refuse a non-48 kHz format\n"
+                )
             }
         }
+        phases.mark("sample-rate settle")
 
         do {
             try Self.setDefaultOrThrow(Self.defaultOutputSelector, id)
@@ -300,8 +307,10 @@ public final class SystemSinkDevice {
                 _ = Self.setNominalSampleRate(id, rate: rate)
                 previousNominalSampleRate = nil
             }
+            phases.mark("default-output write (failed)")
             throw error
         }
+        phases.mark("default-output write")
         // The system-output write is best effort: a machine that refuses it
         // still gets a working master volume from the main default output, and
         // failing the whole path over alert routing would be a bad trade.
@@ -311,16 +320,16 @@ public final class SystemSinkDevice {
             if systemStatus == noErr {
                 systemTakenOver = true
             } else {
-                FileHandle.standardError.write(Data(
-                    "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n".utf8
-                ))
+                RouterLog.write(
+                    "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n"
+                )
             }
             previousSystemOutputID = systemTakenOver ? systemSnapshot.0 : nil
             previousSystemOutputUID = systemTakenOver ? systemSnapshot.1 : nil
         } else {
-            FileHandle.standardError.write(Data(
-                "[SystemSink] could not read the previous default SYSTEM output; leaving it alone rather than restoring a guess later\n".utf8
-            ))
+            RouterLog.write(
+                "[SystemSink] could not read the previous default SYSTEM output; leaving it alone rather than restoring a guess later\n"
+            )
             previousSystemOutputID = nil
             previousSystemOutputUID = nil
         }
@@ -332,10 +341,12 @@ public final class SystemSinkDevice {
         // remembered level. Writing after (and verifying) is the only ordering
         // that holds. Nothing is audible during the gap: the sink discards
         // audio and our own outputs do not start until `start()` returns.
+        phases.mark("system-output write")
         if let seedVolume {
             Self.seedVolumeAfterTakeover(
                 uid: candidate.uid, target: max(0, min(1, seedVolume))
             )
+            phases.mark("volume seed")
         }
 
         deviceID = id
@@ -676,9 +687,9 @@ public final class SystemSinkDevice {
         }
         let observed = AggregateDevice.readHardwareVolume(uid: uid)
             .map { String(format: "%.4f", $0) } ?? "?"
-        FileHandle.standardError.write(Data(
-            "[SystemSink] could not seed \(uid) to \(target) (still \(observed)); the system volume may jump on takeover\n".utf8
-        ))
+        RouterLog.write(
+            "[SystemSink] could not seed \(uid) to \(target) (still \(observed)); the system volume may jump on takeover\n"
+        )
     }
 
     private static let seedAttempts = 6

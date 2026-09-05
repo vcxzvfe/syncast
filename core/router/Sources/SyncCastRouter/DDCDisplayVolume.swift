@@ -710,9 +710,9 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     private func logDemotionOnce(uid: String, displayName: String) {
         guard !loggedUnsupportedUIDs.contains(uid) else { return }
         loggedUnsupportedUIDs.insert(uid)
-        FileHandle.standardError.write(Data(
-            ("[DDC] display \"\(displayName)\" stopped acknowledging DDC volume writes for \(uid.prefix(20)) — demoting to unsupported (further failures silenced)\n").utf8
-        ))
+        RouterLog.write(
+            ("[DDC] display \"\(displayName)\" stopped acknowledging DDC volume writes for \(uid.prefix(20)) — demoting to unsupported (further failures silenced)\n")
+        )
     }
 
     // MARK: CoreAudio identity helpers
