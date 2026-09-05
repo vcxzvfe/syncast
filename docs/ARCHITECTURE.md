@@ -93,7 +93,7 @@
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
 4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, reads that pair at its own **delay offset** when one is dialled in (`PairDelayBank`, see §8c), applies that pair's **equalizer** (`EqualizerBank`, see §8b), then its **stereo image** (`StereoImageProcessor`, see §8b-2), then its **channel assignment** (`ChannelMatrixBank`, see §8d), then the per-device gain, and writes into AUHAL's output buffer. Everything sits before the gain stage so the volume slider stays the last attenuator; a pair with nothing dialled in takes a fast path at every stage that leaves the buffer byte-identical.
-5. **LAN receiver fan-out** (local Stereo only, see §8e): `LanReceiverOutput` is the same shape one stage further out — a 5 ms `DispatchSourceTimer` reads 240 frames from the same ring at a cursor held a constant distance behind the producer, runs the same equalizer → stereo image → channel matrix → balance chain, converts to Int16 and sends a 984-byte UDP packet stamped `play_at_ns = ringTime(frame) + target_ms`. The timestamp is derived from the RING frame number (`RingWriteClock`), not from the send timer, which is what rate-locks the receiver to the audio source rather than to a timer on either machine.
+5. **LAN receiver fan-out** (local Stereo only, see §8e): `LanReceiverOutput` is the same shape one stage further out — a 5 ms `DispatchSourceTimer` reads 240 frames from the same ring at a cursor held a constant distance behind the producer, runs the same equalizer → stereo image → channel matrix → balance chain, converts to Int16 and sends a 984-byte UDP packet stamped `play_at_ns = ringTime(frame) + target_ms`. The timestamp is derived from the RING frame number and, where the capture backend timestamps its blocks, from the capture hardware's own clock (`HostAnchoredRingClock`; `RingWriteClock` is the fallback) — never from the send timer, which is what rate-locks the receiver to the audio source rather than to a timer on either machine.
 6. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
 
 ## 5. Sync model
@@ -337,11 +337,19 @@ local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
 - **Wire format**: [`proto/lan-pcm-link.md`](../proto/lan-pcm-link.md) — TCP
   newline-JSON control, UDP audio, 240 frames of Int16 LE per 5 ms packet
   behind a 24-byte header.
-- **Timing**: `RingWriteClock` maps ring frames to sender monotonic ns with a
-  minimum-filtered, deadbanded PI loop; `LanSendPlanner` holds the cursor a
-  constant distance behind the producer and sends whole packets. The receiver
-  closes its own DAC-clock difference with a water-level PI loop and a
-  fractional resampler.
+- **Timing**: `play_at_ns` comes from the CAPTURE HARDWARE's clock wherever
+  the backend can say so. `TapCapture`'s IOProc publishes a
+  `CaptureAnchor` — (ring frame, host time of that block's first frame) —
+  through a lock-free seqlock (`CaptureAnchorPublisher`), and
+  `HostAnchoredRingClock` fits a rate to the last ten seconds of anchors by
+  least squares. No servo, no `now()` sampling: the device's own rate is read
+  rather than chased. `RingWriteClock` (minimum-filtered, deadbanded PI over
+  `(write cursor, now)` pairs) remains the fallback for a backend that
+  publishes no timestamps — `SCKCapture` — and the leg logs which one is
+  driving it (`clk:hal` / `clk:est` in the diagnostics line).
+  `LanSendPlanner` holds the cursor a constant distance behind the producer
+  and sends whole packets. The receiver closes its own DAC-clock difference
+  with a water-level PI loop and a fractional resampler.
 - **Alignment**: `LanAlignmentPlanner` computes how far the local CoreAudio
   legs must be held back to land with the receiver, and it is applied as
   `LocalDelayTrimPlanner`'s `extraHoldFrames` — after normalisation, because a
@@ -356,7 +364,10 @@ local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
 - **Scope**: local Stereo only, and not on Direct Stereo (no capture ring to
   read). Never whole-home.
 - Full rationale, timing model and honest latency expectations:
-  [requirements_2026-09-05-lan-receiver.md](requirements_2026-09-05-lan-receiver.md).
+  [requirements_2026-09-05-lan-receiver.md](requirements_2026-09-05-lan-receiver.md);
+  what the first two-machine run over Wi-Fi found and what was changed on both
+  sides because of it:
+  [requirements_2026-09-05-lan-timing.md](requirements_2026-09-05-lan-timing.md).
 
 ## 9. Build & distribution
 

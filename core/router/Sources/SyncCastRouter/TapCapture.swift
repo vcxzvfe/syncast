@@ -43,12 +43,23 @@ public final class TapCapture: @unchecked Sendable {
     public var onUnexpectedStop: (@Sendable () -> Void)?
     public private(set) var tickCount: UInt64 = 0
 
+    /// Hardware capture timestamps, published per delivered block.
+    ///
+    /// The IOProc is handed an `AudioTimeStamp` for every buffer; pairing it
+    /// with the ring position that buffer landed at gives the LAN link a
+    /// timeline it does not have to estimate. See `HostAnchoredRingClock`.
+    public let captureAnchors: CaptureAnchorPublisher?
+
     public private(set) var debugBuffersSeen: UInt64 = 0
     public private(set) var debugBuffersWritten: UInt64 = 0
     public private(set) var debugLastReason: String = "not_started"
     public private(set) var debugLastASBD: String = ""
     public private(set) var debugLastPeak: Float = 0
     public private(set) var debugMaxPeak: Float = 0
+    /// Blocks whose `AudioTimeStamp` carried no usable host time. Non-zero
+    /// means the LAN link is running on the fallback timeline for a device
+    /// that was supposed to have hardware stamps.
+    public private(set) var debugAnchorsMissing: UInt64 = 0
 
     private static let aggregateUIDPrefix = "io.syncast.tapaggregate.v1."
 
@@ -89,6 +100,7 @@ public final class TapCapture: @unchecked Sendable {
         tapDeviceUID: String? = nil
     ) {
         self.tapDeviceUID = tapDeviceUID
+        self.captureAnchors = CaptureAnchorPublisher(sampleRate: sampleRate)
         self.sampleRate = sampleRate
         self.channelCount = channelCount
         self.ringBuffer = RingBuffer(
@@ -230,12 +242,14 @@ public final class TapCapture: @unchecked Sendable {
         let ringRef = ringBuffer
         let chanCount = channelCount
         let chPtrs = channelPtrs
+        let anchors = captureAnchors
+        let rate = sampleRate
         var procID: AudioDeviceIOProcID?
         let status = AudioDeviceCreateIOProcIDWithBlock(
             &procID,
             deviceID,
             DispatchQueue.global(qos: .userInteractive),
-            { [weak self] _, inInputData, _, _, _ in
+            { [weak self] inNow, inInputData, inInputTime, _, _ in
                 guard let self else { return }
                 self.debugBuffersSeen &+= 1
                 let inputList = UnsafeMutableAudioBufferListPointer(
@@ -284,8 +298,21 @@ public final class TapCapture: @unchecked Sendable {
                     }
                 }
 
+                // Read the cursor BEFORE the write: the anchor names the ring
+                // position of this block's FIRST frame, which is the frame the
+                // timestamp belongs to.
+                let blockStartFrame = ringRef.writePosition
                 chPtrs.withMemoryRebound(to: UnsafePointer<Float>.self, capacity: chanCount) { rebound in
                     ringRef.write(channels: rebound, frames: frames)
+                }
+                if let anchors {
+                    if let hostNs = Self.captureHostNs(
+                        inputTime: inInputTime, now: inNow, frames: frames, sampleRate: rate
+                    ) {
+                        anchors.publish(frame: blockStartFrame, hostNs: hostNs)
+                    } else {
+                        self.debugAnchorsMissing &+= 1
+                    }
                 }
                 self.debugLastPeak = Self.peak(chPtrs[0], frames: frames)
                 self.debugMaxPeak = max(self.debugMaxPeak, self.debugLastPeak)
@@ -319,7 +346,37 @@ public final class TapCapture: @unchecked Sendable {
     }
 
     public func diagnosticReport() -> String {
-        "pin=\(tapDeviceUID ?? "global") backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) asbd={\(debugLastASBD)} last=\(debugLastReason)"
+        "pin=\(tapDeviceUID ?? "global") backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) stampless=\(debugAnchorsMissing) asbd={\(debugLastASBD)} last=\(debugLastReason)"
+    }
+
+    /// Host time of the first frame of a delivered block, in nanoseconds.
+    ///
+    /// For an input IOProc `inInputTime` IS the capture time of the block's
+    /// first frame, so it is used as-is. When a device does not fill it in,
+    /// `inNow` is the fallback: the block has just been captured, so its
+    /// first frame is one block duration in the past. Returning nil (rather
+    /// than substituting `mach_absolute_time`) is deliberate — a made-up
+    /// stamp would poison the rate fit, and the LAN link has a fallback
+    /// timeline for exactly this case.
+    static func captureHostNs(
+        inputTime: UnsafePointer<AudioTimeStamp>,
+        now: UnsafePointer<AudioTimeStamp>,
+        frames: Int,
+        sampleRate: Double
+    ) -> UInt64? {
+        let input = inputTime.pointee
+        if input.mFlags.contains(.hostTimeValid), input.mHostTime != 0 {
+            return Clock.hostTimeToNs(input.mHostTime)
+        }
+        let current = now.pointee
+        guard current.mFlags.contains(.hostTimeValid), current.mHostTime != 0,
+              sampleRate > 0, frames > 0 else {
+            return nil
+        }
+        let nowNs = Clock.hostTimeToNs(current.mHostTime)
+        let blockNs = UInt64((Double(frames) / sampleRate * 1_000_000_000).rounded())
+        guard nowNs > blockNs else { return nil }
+        return nowNs - blockNs
     }
 
     private static func currentProcessObjectID() throws -> AudioObjectID {

@@ -183,13 +183,17 @@ extension Router {
                 sampleRate: source.sampleRate,
                 channelCount: source.channelCount,
                 ringFloorFrames: ringFloorFrames(logWarnings: false),
-                link: link
+                link: link,
+                // Non-nil only for a backend that timestamps its blocks; the
+                // leg falls back to the write-cursor estimate otherwise.
+                captureAnchors: source.captureAnchors
             )
             output.start()
             lanReceiverOutputs[device.id] = output
             lanReceiverRevisionByDeviceID[device.id] = lanReceiverConfigurationRevision
             RouterLog.write(
-                "[Router] LAN leg opened for \(uid.prefix(24)) target=\(targetMs(forUID: uid))ms\n"
+                "[Router] LAN leg opened for \(uid.prefix(24)) target=\(targetMs(forUID: uid))ms"
+                + " clock=\(source.captureAnchors == nil ? "estimated" : "hardware")\n"
             )
         }
         for (deviceID, output) in lanReceiverOutputs where !wanted.contains(deviceID) {

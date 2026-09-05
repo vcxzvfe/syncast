@@ -33,6 +33,15 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// Extra ring lag on top of the capture floor, so a tick that runs 1–2 ms
     /// late still finds a whole packet written. One packet.
     public static let extraLagFrames: Int = LanPcmWire.framesPerPacket
+    /// How stale the newest hardware anchor may be before the packet timeline
+    /// falls back to the estimator.
+    ///
+    /// Anchors arrive every few milliseconds while capture is alive, so a
+    /// whole second without one means the capture backend has stopped
+    /// delivering. Extrapolating a timeline from a stamp that old would put
+    /// `play_at_ns` progressively further from the truth; the estimator, fed
+    /// from the write cursor, at least degrades honestly.
+    public static let anchorStaleLimitNs: UInt64 = 1_000_000_000
 
     public let receiverUID: String
     /// Friendly name, for logs and the diagnostics line.
@@ -64,6 +73,13 @@ public final class LanReceiverOutput: @unchecked Sendable {
 
     private var timer: DispatchSourceTimer?
     private var running = false
+    /// Hardware capture stamps, when the backend produces them. This is the
+    /// timeline the receiver is rate-locked to; `ringClock` is the fallback.
+    private let anchors: CaptureAnchorPublisher?
+    private var hostClock: HostAnchoredRingClock
+    private var lastAnchorFrame: Int64 = .min
+    private var lastAnchorSeenNs: UInt64 = 0
+    private var loggedClockSource: String?
     private var ringClock: RingWriteClock
     private var cursor: Int64?
     private var sequence: UInt32 = 0
@@ -83,7 +99,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
         sampleRate: Double,
         channelCount: Int,
         ringFloorFrames: Int,
-        link: LanReceiverLink
+        link: LanReceiverLink,
+        captureAnchors: CaptureAnchorPublisher? = nil
     ) {
         self.receiverUID = receiverUID
         self.displayName = displayName
@@ -94,6 +111,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
         self.lagFrames = Int64(max(0, ringFloorFrames) + Self.extraLagFrames)
         self.queue = DispatchQueue(label: "io.syncast.lan.producer", qos: .userInitiated)
         self.ringClock = RingWriteClock(sampleRate: self.sampleRate)
+        self.anchors = captureAnchors
+        self.hostClock = HostAnchoredRingClock(sampleRate: self.sampleRate)
         self.equalizer = EqualizerBank(
             pairCount: 1, channelsPerPair: self.channelCount, sampleRate: self.sampleRate
         )
@@ -146,6 +165,10 @@ public final class LanReceiverOutput: @unchecked Sendable {
             lastPlayAtNs = nil
             lastWritePosition = -1
             ringClock = RingWriteClock(sampleRate: sampleRate)
+            hostClock = HostAnchoredRingClock(sampleRate: sampleRate)
+            lastAnchorFrame = .min
+            lastAnchorSeenNs = 0
+            loggedClockSource = nil
         }
         link.start()
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -202,6 +225,9 @@ public final class LanReceiverOutput: @unchecked Sendable {
         public let encoderClipCount: Int64
         public let ringClockPpm: Double
         public let ringClockReanchors: Int
+        /// Which timeline `play_at_ns` is currently derived from: "hal" when
+        /// the capture backend stamps its blocks, "est" when it does not.
+        public let clockSource: String
     }
 
     public var counters: Counters {
@@ -211,17 +237,23 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let reanchors = _reanchorCount
         let clips = _encoderClipCount
         counterLock.unlock()
-        // `ringClock` is queue-confined; a torn read of two Doubles is not
+        // The clocks are queue-confined; a torn read of two Doubles is not
         // possible in practice here, but the diagnostic is read once a second
         // and a queue hop costs nothing.
-        let clock = queue.sync { ringClock }
+        let (ppm, clockReanchors, source) = queue.sync { () -> (Double, Int, String) in
+            if isHostAnchored(nowNs: Clock.nowNs()) {
+                return (hostClock.rateDeviationPpm, hostClock.reanchorCount, "hal")
+            }
+            return (ringClock.rateDeviationPpm, ringClock.reanchorCount, "est")
+        }
         return Counters(
             packetsSent: sent,
             silencePackets: silence,
             reanchorCount: reanchors,
             encoderClipCount: clips,
-            ringClockPpm: clock.rateDeviationPpm,
-            ringClockReanchors: clock.reanchorCount
+            ringClockPpm: ppm,
+            ringClockReanchors: clockReanchors,
+            clockSource: source
         )
     }
 
@@ -243,6 +275,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
             + " late:\(stats?.late ?? 0) lost:\(stats?.lost ?? 0)"
             + " underrun:\(stats?.underrun ?? 0)"
             + " pkts:\(counters.packetsSent) resync:\(counters.reanchorCount)"
+            + " clk:\(counters.clockSource)"
             + " ppm:\(String(format: "%.1f", counters.ringClockPpm))"
             + "\(clipInfo)\(silenceInfo)"
             + " link:\(snapshot.isAudioReady ? "up" : (snapshot.lastError ?? "connecting"))"
@@ -254,7 +287,11 @@ public final class LanReceiverOutput: @unchecked Sendable {
         guard running else { return }
         let writePosition = ring.writePosition
         let now = Clock.nowNs()
+        // The fallback estimator is fed on every tick whether or not it is
+        // the one in use: a backend whose stamps stop has to have something
+        // warm to fall back TO.
         ringClock.observe(writePosition: writePosition, nowNs: now)
+        observeAnchor(nowNs: now)
 
         guard link.isAudioReady else {
             // Nothing to send into. Drop the cursor so the link re-anchors on
@@ -362,8 +399,44 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// re-anchor that lands on an earlier ring time than the packet before it.
     /// A receiver that saw time run backwards would drop everything until it
     /// caught up.
+    /// Take the newest hardware anchor, if the backend has published one we
+    /// have not folded in yet.
+    private func observeAnchor(nowNs: UInt64) {
+        guard let anchors, let anchor = anchors.latest else { return }
+        guard anchor.frame != lastAnchorFrame else { return }
+        lastAnchorFrame = anchor.frame
+        lastAnchorSeenNs = nowNs
+        hostClock.observe(anchor)
+    }
+
+    /// Whether `play_at_ns` is currently coming off the capture hardware's
+    /// own clock.
+    private func isHostAnchored(nowNs: UInt64) -> Bool {
+        guard anchors != nil, hostClock.isAnchored, lastAnchorSeenNs > 0 else { return false }
+        return nowNs &- lastAnchorSeenNs <= Self.anchorStaleLimitNs
+    }
+
+    /// One line the first time the timeline comes from the hardware, and one
+    /// each time it changes hands. Which clock is driving the wire is the
+    /// first thing to know when a link sounds wrong.
+    private func logClockSource(_ source: String) {
+        guard loggedClockSource != source else { return }
+        loggedClockSource = source
+        let detail = source == "hal"
+            ? "capture hardware timestamps"
+            : "write-cursor estimate (backend publishes no timestamps)"
+        RouterLog.write(
+            "[LAN] \(displayName) packet timeline from \(detail)\n"
+        )
+    }
+
     private func playAtNs(forFrame frame: Int64) -> UInt64 {
-        let base = ringClock.timeNs(forFrame: frame) &+ targetNs
+        let now = Clock.nowNs()
+        let hostAnchored = isHostAnchored(nowNs: now)
+        logClockSource(hostAnchored ? "hal" : "est")
+        let base = (hostAnchored
+            ? hostClock.timeNs(forFrame: frame)
+            : ringClock.timeNs(forFrame: frame)) &+ targetNs
         if let last = lastPlayAtNs, base <= last {
             return last &+ LanPcmWire.packetDurationNs
         }

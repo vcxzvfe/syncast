@@ -14,6 +14,16 @@ public protocol SystemAudioCapture: AnyObject, Sendable {
     var onUnexpectedStop: (@Sendable () -> Void)? { get set }
     var tickCount: UInt64 { get }
 
+    /// Non-nil when this backend stamps every delivered block with the
+    /// capture hardware's own clock.
+    ///
+    /// The LAN link builds its packet timeline from these when they exist
+    /// (`HostAnchoredRingClock`) and falls back to inferring it from the
+    /// write cursor when they do not (`RingWriteClock`). Nothing else in the
+    /// router cares, which is why this is a defaulted requirement rather
+    /// than a change every backend has to answer.
+    var captureAnchors: CaptureAnchorPublisher? { get }
+
     func start() async throws
     func stop()
     func stopAndWait() async
@@ -24,6 +34,10 @@ public extension SystemAudioCapture {
     func stopAndWait() async {
         stop()
     }
+
+    /// Backends that cannot say when a block was captured get the fallback
+    /// timeline, not a wrong one.
+    var captureAnchors: CaptureAnchorPublisher? { nil }
 }
 
 public final class UnavailableSystemAudioCapture: @unchecked Sendable, SystemAudioCapture {
