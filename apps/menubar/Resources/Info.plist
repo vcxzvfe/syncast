@@ -34,12 +34,13 @@
     <!-- Required since macOS Sequoia for any app that browses mDNS / Bonjour
          services. Without this key the OS denies the browse silently. -->
     <key>NSLocalNetworkUsageDescription</key>
-    <string>SyncCast browses the local network for AirPlay 2 receivers (HomePod, Xiaomi Sound, other Macs) so you can choose them as audio outputs.</string>
+    <string>SyncCast browses the local network for AirPlay 2 receivers (HomePod, Xiaomi Sound, other Macs) so you can choose them as audio outputs, and for SyncCast LAN receivers (another Mac running synccast-receiver).</string>
     <!-- Bonjour service types we actively browse for -->
     <key>NSBonjourServices</key>
     <array>
         <string>_airplay._tcp</string>
         <string>_raop._tcp</string>
+        <string>_synccast-pcm._udp</string>
     </array>
     <!-- We start child processes (sidecar + OwnTone) and read/write under
          ~/Library/Application Support; no sandbox entitlements requested. -->
