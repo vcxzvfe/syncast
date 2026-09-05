@@ -1,6 +1,6 @@
 # Tahoe Screen Recording TCC stuck on `false` — root cause and fix
 
-**Subject app:** SyncCast (`io.syncast.menubar`), ad-hoc signed `.app`, run from `/Users/<you>/syncast/dist/SyncCast.app`
+**Subject app:** SyncCast (`io.syncast.menubar`), ad-hoc signed `.app`, run from `~/syncast/dist/SyncCast.app`
 **Symptom:** User toggles Screen Recording ON in System Settings → next process launch, `CGPreflightScreenCaptureAccess()` returns `false`. Repeats after every `tccutil reset All io.syncast.menubar`.
 **OS:** macOS 26.4.1 Tahoe.
 
@@ -62,13 +62,13 @@ A separate, well-known wart from Apple Developer Forums #732726: even after the 
 
 ## 7. Launchd / SIP / Gatekeeper / quarantine
 
-Gatekeeper's `com.apple.quarantine` xattr matters mainly for first-run and translocation. If the `.app` was moved through a browser/AirDrop/zip, Tahoe will *path-translocate* it on launch (run from a read-only `/private/var/folders/.../AppTranslocation/...` mount), which **changes the responsible path** and breaks any TCC grant tied to the original path. Verify with `xattr -l /Users/<you>/syncast/dist/SyncCast.app` and clear with `xattr -dr com.apple.quarantine`. Building locally with `codesign` should not set quarantine, but if SyncCast was ever zipped and unzipped during distribution testing, this is worth ruling out. SIP is not implicated for the user-domain Screen Recording grant (no SIP-protected paths involved).
+Gatekeeper's `com.apple.quarantine` xattr matters mainly for first-run and translocation. If the `.app` was moved through a browser/AirDrop/zip, Tahoe will *path-translocate* it on launch (run from a read-only `/private/var/folders/.../AppTranslocation/...` mount), which **changes the responsible path** and breaks any TCC grant tied to the original path. Verify with `xattr -l ~/syncast/dist/SyncCast.app` and clear with `xattr -dr com.apple.quarantine`. Building locally with `codesign` should not set quarantine, but if SyncCast was ever zipped and unzipped during distribution testing, this is worth ruling out. SIP is not implicated for the user-domain Screen Recording grant (no SIP-protected paths involved).
 
 ---
 
 ## Highest-confidence action
 
-**Stop ad-hoc signing. Create a self-signed "SyncCast Dev" Code Signing certificate in Keychain Access → Certificate Assistant, then re-sign with `codesign --force --deep --options runtime=no --sign "SyncCast Dev" --identifier io.syncast.menubar /Users/<you>/syncast/dist/SyncCast.app`, run `tccutil reset ScreenCapture io.syncast.menubar`, reboot, then launch and re-grant.** This is the only step that addresses the actual root cause (cdhash-pinned TCC grants invalidated on every rebuild); every other workaround unsticks the symptom for one launch and reverts on the next build.
+**Stop ad-hoc signing. Create a self-signed "SyncCast Dev" Code Signing certificate in Keychain Access → Certificate Assistant, then re-sign with `codesign --force --deep --options runtime=no --sign "SyncCast Dev" --identifier io.syncast.menubar ~/syncast/dist/SyncCast.app`, run `tccutil reset ScreenCapture io.syncast.menubar`, reboot, then launch and re-grant.** This is the only step that addresses the actual root cause (cdhash-pinned TCC grants invalidated on every rebuild); every other workaround unsticks the symptom for one launch and reverts on the next build.
 
 ---
 

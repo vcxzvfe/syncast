@@ -180,12 +180,12 @@ SCK 对照复测也失败在权限/DRM 风险链路：日志显示 `screen-recor
 
 本轮新增 safe-fail artifact：
 
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/readiness.json`
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/auto_start_capture_preflight.json`
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/control_report.json`
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/readiness.json`
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/auto_start_capture_preflight.json`
-- `/Users/<you>/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/control_report.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/readiness.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/auto_start_capture_preflight.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234331-tap-rerun/control_report.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/readiness.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/auto_start_capture_preflight.json`
+- `~/Library/Application Support/SyncCast/PassiveAutosync/sessions/passive-20260516-234815-sck-rerun/control_report.json`
 
 ## 8. 2026-05-19 Direct Stereo 系统音量需求
 
