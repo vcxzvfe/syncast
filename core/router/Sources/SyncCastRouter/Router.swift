@@ -242,7 +242,10 @@ public actor Router {
     /// Empty in stereo mode and after teardown. Fully replaces the
     /// `localOutputs` set while in whole-home mode — the two are never
     /// active at the same time on the same physical device.
-    private var localBridges: [String: LocalAirPlayBridge] = [:]
+    /// Internal (not private) so the per-device render-feature extensions
+    /// (`Router+ChannelMatrix.swift`) can push their maps onto the whole-home
+    /// legs without a second copy of the bridge registry.
+    var localBridges: [String: LocalAirPlayBridge] = [:]
     /// Cached path returned by `local_fifo.path` IPC — fetched once on
     /// the first whole-home transition and reused for all bridges.
     private var localFifoSocketPath: URL?
@@ -1380,6 +1383,7 @@ public actor Router {
         // user hears. Idempotent, so re-applying the whole map costs nothing.
         applyEqualizers()
         applyStereoImages()
+        applyChannelMatrices()
         scheduleMeasuredAirPlayOffsetPush()
     }
 
@@ -2147,7 +2151,7 @@ public actor Router {
     /// resolved is SKIPPED rather than defaulted to pair 0 — unlike a volume,
     /// applying the wrong speaker's tone curve (or delay) is silent and
     /// confusing, and the fallback would put device B's setting on device A.
-    private func localPairTargets() -> [(uid: String, output: LocalOutput, pair: Int)] {
+    func localPairTargets() -> [(uid: String, output: LocalOutput, pair: Int)] {
         guard mode == .stereo else { return [] }
         if let aggregate = aggregateDevice,
            let output = localOutputs[aggregate.aggregateUID] {
@@ -2208,6 +2212,13 @@ public actor Router {
 
     /// User settings keyed by CoreAudio UID. Absent means neutral.
     private var stereoImageSettingsByUID: [String: StereoImageSettings] = [:]
+
+    /// Channel-assignment settings keyed by CoreAudio UID. Absent means 立体声.
+    ///
+    /// Stored here rather than in `Router+ChannelMatrix.swift` only because a
+    /// Swift extension cannot add stored properties; every method that touches
+    /// it lives in that file.
+    var channelMatrixSettingsByUID: [String: ChannelMatrixSettings] = [:]
 
     /// Replace the whole UID → setting map. The menubar owns the persisted
     /// store and pushes it in full, which keeps "the user cleared a device's
@@ -2600,6 +2611,7 @@ public actor Router {
         // delay: a rebuilt aggregate starts at 0 on every pair.
         applyEqualizers()
         applyStereoImages()
+        applyChannelMatrices()
         applyLocalPairDelays()
     }
 
@@ -3203,6 +3215,7 @@ public actor Router {
         // `reconcileLocalDriver`.
         applyEqualizers()
         applyStereoImages()
+        applyChannelMatrices()
         applyLocalPairDelays()
 
         // In aggregate mode, also apply per-device HARDWARE volume on

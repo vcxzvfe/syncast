@@ -308,6 +308,16 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// speaker tuned in Stereo mode images the same in whole-home mode without
     /// the user re-entering anything.
     private let stereoImage: StereoImageProcessor
+    /// This device's channel assignment, applied in `render()` immediately
+    /// after the stereo imager and before the volume ramp — the same position,
+    /// and the same `ChannelMatrixBank`, that `LocalOutput.render()` uses on
+    /// the local Stereo path. One pair, because a bridge drives exactly one
+    /// physical stereo output.
+    ///
+    /// Keyed by CoreAudio UID upstream (`Router.setChannelMatrices`), so a
+    /// speaker set to "left channel only" in Stereo mode stays that way in
+    /// whole-home mode without the user re-entering anything.
+    private let channelMatrix: ChannelMatrixBank
 
     // MARK: - Per-device delay trim (user listening-position compensation)
     //
@@ -447,6 +457,11 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             sampleRate: equalizerRate
         )
         self.stereoImage = StereoImageProcessor(
+            pairCount: 1,
+            channelsPerPair: 2,
+            sampleRate: equalizerRate
+        )
+        self.channelMatrix = ChannelMatrixBank(
             pairCount: 1,
             channelsPerPair: 2,
             sampleRate: equalizerRate
@@ -631,6 +646,31 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
 
     /// True when this bridge holds imaging that changes the signal.
     public var stereoImageIsEngaged: Bool { stereoImage.isEngaged }
+
+    // MARK: - Channel matrix
+
+    /// Install this device's channel assignment.
+    ///
+    /// Idempotent, for the same reason `setEqualizer` is: the Router re-applies
+    /// its whole UID → setting map on every replan and every bridge rebuild.
+    ///
+    /// - Returns: whether anything was actually published.
+    @discardableResult
+    public func setChannelMatrix(_ settings: ChannelMatrixSettings) -> Bool {
+        channelMatrix.setSettings(settings, pair: 0)
+    }
+
+    /// Drop back to 立体声, so a repurposed bridge never inherits the previous
+    /// device's assignment.
+    public func resetChannelMatrix() {
+        channelMatrix.resetAll()
+    }
+
+    /// Samples the channel matrix's output limiter had to clamp this session.
+    public var channelMatrixClipCount: Int64 { channelMatrix.clipCount }
+
+    /// True when this bridge holds an assignment that changes the signal.
+    public var channelMatrixIsEngaged: Bool { channelMatrix.isEngaged }
 
     // MARK: - Delay trim
 
@@ -1581,6 +1621,18 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // gain stage. A neutral setting takes the processor's fast exit and
         // leaves the buffer byte-identical.
         stereoImage.process(
+            pair: 0,
+            channels: outPtrs,
+            channelOffset: 0,
+            channelCount: channelCount,
+            frames: frames
+        )
+
+        // Per-device channel assignment, in the same place on the signal as on
+        // the local Stereo path: straight after the imager, still ahead of the
+        // gain stage. A pair at 立体声 takes the bank's fast exit and leaves the
+        // buffer byte-identical.
+        channelMatrix.process(
             pair: 0,
             channels: outPtrs,
             channelOffset: 0,
