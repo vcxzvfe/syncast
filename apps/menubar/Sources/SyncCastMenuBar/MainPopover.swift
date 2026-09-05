@@ -537,6 +537,34 @@ struct MainPopover: View {
                         DeviceRow(deviceID: dev.id)
                     }
                 }
+                // Second Macs running the receiver daemon. A separate section
+                // rather than a badge in "Local", because the thing a reader
+                // needs to know at a glance is that these are on the network
+                // and carry their own latency budget — not that they happen
+                // to be reachable.
+                if !model.lanReceiverDevices.isEmpty {
+                    sectionHeader("LAN")
+                    if let hint = model.lanReceiverUnsupportedHint() {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 2)
+                    }
+                    if let lag = model.lanTotalLagHint {
+                        Text(lag)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 2)
+                            .accessibilityIdentifier("lanTotalLagHint")
+                    }
+                    ForEach(model.lanReceiverDevices) { dev in
+                        DeviceRow(deviceID: dev.id)
+                    }
+                }
                 // Only genuinely remote AirPlay receivers are targets. This
                 // Mac's own AirPlay Receiver is never listed: under direction
                 // B the local speakers are an OwnTone output (the "Local"
@@ -821,6 +849,12 @@ private struct DeviceRow: View {
                     // never loses a trim set while the device was on.
                     if model.mode == .wholeHome && routing.enabled {
                         delayTrimRow(for: device)
+                    }
+                    // A LAN receiver's own controls: the pairing prompt while
+                    // it has no token, and the target-latency slider plus the
+                    // link readout once it does.
+                    if device.transport == .lanReceiver {
+                        LanReceiverControls(deviceID: deviceID)
                     }
                     // Local Stereo's own delay compensation, for the latency a
                     // display's internal processing adds and never reports.

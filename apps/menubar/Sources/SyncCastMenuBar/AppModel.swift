@@ -83,6 +83,11 @@ final class AppModel {
     /// attempt, then reused. Not observed: it is UI plumbing, not state, and
     /// tracking it would make every view that reads the model depend on it.
     @ObservationIgnored var pairingWindowController: PairingWindowController?
+
+    /// Owns the key-capable window the LAN pairing token is typed into. Lazily
+    /// created on first use, for the same reason the pairing one is: an
+    /// `NSWindow` per launch that most users never open is waste.
+    @ObservationIgnored var lanTokenWindowController: LanTokenWindowController?
     /// Enabled-device memory per mode, keyed by the device's STABLE key
     /// rather than by its per-launch id.
     ///
@@ -672,6 +677,7 @@ final class AppModel {
                 await self.refreshEqualizerClipCounts()
                 await self.refreshStereoImageClipCounts()
                 await self.refreshChannelMatrixClipCounts()
+                await self.refreshLanReceiverStatuses()
                 await self.refreshPairingStates()
                 await self.logPeriodicHealthIfDue()
             }
@@ -1311,6 +1317,7 @@ final class AppModel {
                 await pushDeviceEqualizers()
                 await pushDeviceStereoImages()
                 await pushDeviceChannelMatrices()
+                await pushLanReceiverConfiguration()
                 await pushLocalDelayTrims()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
@@ -1358,6 +1365,7 @@ final class AppModel {
                 await pushDeviceEqualizers()
                 await pushDeviceStereoImages()
                 await pushDeviceChannelMatrices()
+                await pushLanReceiverConfiguration()
                 await pushLocalDelayTrims()
                 // The covered set may have changed (toggle / hot-plug /
                 // discovery republishing a UID under a new device id)
@@ -2368,6 +2376,34 @@ final class AppModel {
     /// Which channel-assignment panel is open, if any, by `Device.id`.
     var channelMatrixEditorDeviceID: String?
 
+    // MARK: - LAN receiver legs
+    //
+    // Behaviour lives in `AppModel+LanReceiver.swift`; only the state is here,
+    // because a Swift extension cannot declare stored properties.
+
+    /// Shared secrets, keyed by receiver UID. Loaded from the KEYCHAIN, not
+    /// from `UserDefaults` — see `LanReceiverTokenStore` for why. Held in
+    /// memory so the keychain is never touched on a reconcile.
+    var lanReceiverTokens: [String: String] = LanReceiverTokenStore.loadAll()
+
+    /// Per-receiver playout targets in milliseconds. Absent means the default.
+    var lanReceiverTargets: [String: Int] = LanReceiverTargetStore.load()
+
+    /// Live link state, sampled by the 1 Hz poll and keyed by `Device.id` —
+    /// link state belongs to this session, not to the cabinet.
+    var lanReceiverStatuses: [String: LanReceiverStatus] = [:]
+
+    /// End-to-end lag the aligned output set is running at, in milliseconds,
+    /// while a receiver is live.
+    var lanTotalLagMs: Double?
+
+    /// Non-nil when the last token save failed, so the entry window can say so
+    /// instead of pretending it worked.
+    var lanTokenSaveError: String?
+
+    /// Which receiver's token window is open, by `Device.id`.
+    var lanTokenEditorDeviceID: String?
+
     // MARK: - Per-device local delay compensation
     //
     // Behaviour lives in `AppModel+LocalDelayTrim.swift`; only the state is
@@ -3128,6 +3164,12 @@ final class AppModel {
         guard isUserSelectableOutput(d) else { return false }
         switch mode {
         case .stereo:
+            // A LAN receiver is a Stereo-only output: it reads the capture
+            // ring, which Direct Stereo does not have, and it is not an
+            // AirPlay target so whole-home has nothing to do with it.
+            if d.transport == .lanReceiver {
+                return AppModel.selectedStereoOutputPath != .direct
+            }
             guard d.transport == .coreAudio else { return false }
             // The system-sink path taps a userland audio plug-in. Rendering
             // into a SECOND one wedges coreaudiod machine-wide (measured
@@ -3147,6 +3189,10 @@ final class AppModel {
             }
             return true
         case .wholeHome:
+            // Whole-home fans OwnTone's single stream out to AirPlay
+            // receivers; the LAN link is a different protocol on a different
+            // clock model and has no place in it.
+            if d.transport == .lanReceiver { return false }
             // Direction B: this Mac's own AirPlay Receiver is NEVER a target.
             // The local speakers participate as an OwnTone fifo output, on
             // OwnTone's player clock — no self-target, no full-screen PIN.
