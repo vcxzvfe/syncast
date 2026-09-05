@@ -76,8 +76,9 @@ build_driver() {
     fi
     echo "==> building as $theBuildUser"
     # sudo scrubs the environment, so the one build-affecting variable is
-    # forwarded explicitly.
-    sudo -u "$theBuildUser" \
+    # forwarded explicitly — through env(1) rather than as a `sudo VAR=value`
+    # assignment, which a sudoers policy without SETENV would refuse.
+    sudo -u "$theBuildUser" /usr/bin/env \
         "SYNCAST_USE_SYNCCAST_DEV=${SYNCAST_USE_SYNCCAST_DEV:-0}" \
         bash "$DRIVER_SRC_DIR/build.sh"
 }
