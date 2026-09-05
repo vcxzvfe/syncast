@@ -197,6 +197,16 @@ OSStatus SyncCastAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver,
 // the output stream and the two controls. Split across two files only to keep
 // each one readable — the object graph is one unit.
 
+/// Write any volume/mute change that has not reached storage yet.
+///
+/// The volume setter is called once per scroll tick / arrow key, so it marks
+/// the value dirty and lets this coalesce the writes; `inForce` bypasses the
+/// rate limit and is what StopIO uses to make sure the final level is on disk.
+///
+/// Storage writes allocate and touch the filesystem: call this from the
+/// property/control path only, NEVER from the IO thread.
+void SyncCastAudio_FlushPersistentState(Boolean inForce);
+
 Boolean SyncCastAudio_StreamControl_HasProperty(AudioObjectID inObjectID,
                                                 const AudioObjectPropertyAddress* inAddress);
 

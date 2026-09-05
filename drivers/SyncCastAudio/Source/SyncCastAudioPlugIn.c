@@ -352,7 +352,16 @@ static OSStatus SyncCastAudio_StopIO(AudioServerPlugInDriverRef inDriver, AudioO
 
     pthread_mutex_lock(&gPlugIn_StateMutex);
     if(gDevice_IORunningCounter > 0) { --gDevice_IORunningCounter; }
+    Boolean theLastClient = (gDevice_IORunningCounter == 0);
     pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    // Last client out: make sure the level the user left the device at is on
+    // disk, since the property path only writes it at a coalesced rate. StopIO
+    // is a control-path call, not the IO thread, so the write is legal here.
+    if(theLastClient)
+    {
+        SyncCastAudio_FlushPersistentState(true);
+    }
 
     return 0;
 }
