@@ -8,21 +8,24 @@ import Foundation
 public actor DiscoveryService {
     private let coreAudio: CoreAudioDiscovery
     private let airplay: AirPlayDiscovery
+    private let lanReceivers: LanReceiverDiscovery
     private var registry: [String: Device] = [:]
     private var subscribers: [UUID: AsyncStream<DiscoveryEvent>.Continuation] = [:]
     private var pumpTask: Task<Void, Never>?
 
     public init(
         coreAudio: CoreAudioDiscovery = .init(),
-        airplay: AirPlayDiscovery = .init()
+        airplay: AirPlayDiscovery = .init(),
+        lanReceivers: LanReceiverDiscovery = .init()
     ) {
         self.coreAudio = coreAudio
         self.airplay = airplay
+        self.lanReceivers = lanReceivers
     }
 
     public func start() {
         guard pumpTask == nil else { return }
-        pumpTask = Task { [coreAudio, airplay] in
+        pumpTask = Task { [coreAudio, airplay, lanReceivers] in
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {
                     for await event in coreAudio.events() {
@@ -31,6 +34,11 @@ public actor DiscoveryService {
                 }
                 group.addTask {
                     for await event in airplay.events() {
+                        await self.ingest(event)
+                    }
+                }
+                group.addTask {
+                    for await event in lanReceivers.events() {
                         await self.ingest(event)
                     }
                 }
@@ -48,6 +56,7 @@ public actor DiscoveryService {
         guard pumpTask != nil else { return }
         coreAudio.refreshNow()
         airplay.rescan()
+        lanReceivers.rescan()
     }
 
     public func stop() {

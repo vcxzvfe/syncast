@@ -70,7 +70,7 @@ extension Router {
         if mode == .wholeHome {
             return localBridges.values.map(\.deviceUID)
         }
-        return localPairTargets().map(\.uid)
+        return localPairTargets().map(\.uid) + lanReceiverOutputUIDs()
     }
 
     /// Per-device limiter counts, keyed by UID. Non-zero means that device's
@@ -82,6 +82,9 @@ extension Router {
         }
         for bridge in localBridges.values {
             result[bridge.deviceUID] = bridge.channelMatrixClipCount
+        }
+        for (uid, count) in lanReceiverChannelMatrixClipCounts() {
+            result[uid] = count
         }
         return result
     }
@@ -100,5 +103,6 @@ extension Router {
         for bridge in localBridges.values {
             bridge.setChannelMatrix(channelMatrixSettingsByUID[bridge.deviceUID] ?? .stereo)
         }
+        applyLanReceiverChannelMatrices()
     }
 }

@@ -142,11 +142,11 @@ public actor Router {
     /// The system volume, as last read from (or written to) the sink's
     /// `kAudioDevicePropertyVolumeScalar`. 0…1 on the HAL's perceptual scale,
     /// NOT a linear amplitude — `SystemSinkVolumeLaw` does that conversion.
-    private var sinkMasterVolume: Float = 1
-    private var sinkMasterMuted: Bool = false
+    var sinkMasterVolume: Float = 1
+    var sinkMasterMuted: Bool = false
     /// The sink's own scalar↔dB law, read once per start. Used for the
     /// software-gain backend and for composing per-device balance.
-    private var sinkVolumeLaw = SystemSinkVolumeLaw.appleBuiltInLaw
+    var sinkVolumeLaw = SystemSinkVolumeLaw.appleBuiltInLaw
     /// Per-UID backend verdicts for the sink path, refreshed on each apply so
     /// a device that starts rejecting writes is demoted mid-session.
     private var sinkVolumeBackends: [String: SystemSinkVolumeLaw.Backend] = [:]
@@ -171,7 +171,9 @@ public actor Router {
     private var wholeHomeSinkMasterMuted = false
     /// The whole-home sink's own scalar↔dB law, read once per start.
     private var wholeHomeSinkLaw = SystemSinkVolumeLaw.appleBuiltInLaw
-    private var routing: [String: DeviceRouting] = [:]
+    /// Internal (not private) so the per-leg extensions can read the same
+    /// routing snapshot the local outputs are configured from.
+    var routing: [String: DeviceRouting] = [:]
     /// Monotonic route/context epoch. Incremented for user/app-driven route,
     /// mode, AirPlay active-set, connection, and measured-latency changes.
     /// Active calibration snapshots this value so it can fail closed instead
@@ -575,6 +577,11 @@ public actor Router {
         //    the local driver shutdown sequence.
         for (_, b) in localBridges { b.stop() }
         localBridges.removeAll()
+        // 0a. LAN legs. Independent of everything below (their own timer,
+        //     their own sockets), so order relative to the rest does not
+        //     matter — but they must be stopped, or their producer would keep
+        //     reading a ring whose capture is about to go away.
+        tearDownLanReceivers()
         // 1. Stop the audio writer's send loop, but DO NOT nil it. The
         //    instance holds the ring + socket-path; .start() can reconnect
         //    cleanly on the next reconcile. Nilling this and `ipc` below
@@ -818,7 +825,8 @@ public actor Router {
         } else {
             captureInfo = activeCapture.diagnosticReport()
         }
-        return "\(captureInfo)\(driverInfo)\(directInfo)\(sinkInfo)\(systemSinkInfo)\(streamInfo)\(renderInfo)\(awInfo)\(masterInfo)\(bridgeInfo)\(hwVolInfo)"
+        let lanInfo = lanDiagnosticSegments()
+        return "\(captureInfo)\(driverInfo)\(directInfo)\(sinkInfo)\(systemSinkInfo)\(streamInfo)\(renderInfo)\(awInfo)\(masterInfo)\(bridgeInfo)\(lanInfo)\(hwVolInfo)"
     }
 
     /// Backward-compatible wrapper for older diagnostic call sites.
@@ -839,6 +847,7 @@ public actor Router {
         } else {
             reconcileLocalDriver(devices: devices)
         }
+        reconcileLanReceivers(devices: devices)
         replan()
     }
 
@@ -1593,7 +1602,7 @@ public actor Router {
     /// The sink path is not merely SELECTED but actually running. Everything
     /// that changes audio behaviour keys on this, so the volume stage and the
     /// gain stage can never disagree about which regime is in force.
-    private var systemSinkPathIsLive: Bool {
+    var systemSinkPathIsLive: Bool {
         mode == .stereo && stereoOutputPath == .sink
             && (systemSink?.isActive ?? false)
     }
@@ -2104,6 +2113,12 @@ public actor Router {
     /// The curves the Router currently holds. Mostly for tests and reports.
     public func equalizers() -> [String: EqualizerSettings] { equalizerSettingsByUID }
 
+    /// One device's curve, or flat. Internal accessor for the sibling
+    /// extensions, which cannot see the private storage.
+    func equalizerSettings(forUID uid: String) -> EqualizerSettings {
+        equalizerSettingsByUID[uid] ?? .flat
+    }
+
     /// CoreAudio UIDs whose samples this process renders itself, and can
     /// therefore equalise: the local Stereo pairs in stereo mode, the local
     /// bridges in whole-home mode. Empty on Direct Stereo — which is exactly
@@ -2115,7 +2130,7 @@ public actor Router {
         if mode == .wholeHome {
             return localBridges.values.map(\.deviceUID)
         }
-        return localPairTargets().map(\.uid)
+        return localPairTargets().map(\.uid) + lanReceiverOutputUIDs()
     }
 
     /// Per-device limiter counts, keyed by UID. Non-zero means that device's
@@ -2131,6 +2146,9 @@ public actor Router {
         }
         for bridge in localBridges.values {
             result[bridge.deviceUID] = bridge.equalizerClipCount
+        }
+        for output in lanReceiverOutputs.values {
+            result[output.receiverUID] = output.equalizerClipCount
         }
         if let writer = audioWriter {
             result[Self.airPlayGroupEqualizerUID] = writer.equalizerClipCount
@@ -2182,6 +2200,10 @@ public actor Router {
         for bridge in localBridges.values {
             bridge.setEqualizer(equalizerSettingsByUID[bridge.deviceUID] ?? .flat)
         }
+        // The LAN legs, keyed by their own `lan:` UID.
+        for output in lanReceiverOutputs.values {
+            output.setEqualizer(equalizerSettingsByUID[output.receiverUID] ?? .flat)
+        }
         // Whole-home AirPlay leg: one curve for all receivers, applied
         // upstream of OwnTone's fan-out.
         audioWriter?.setEqualizer(airPlayGroupEqualizer)
@@ -2212,6 +2234,32 @@ public actor Router {
 
     /// User settings keyed by CoreAudio UID. Absent means neutral.
     private var stereoImageSettingsByUID: [String: StereoImageSettings] = [:]
+
+    // MARK: LAN receiver legs
+    //
+    // Stored here rather than in `Router+LanReceiver.swift` only because a
+    // Swift extension cannot add stored properties; every method that touches
+    // them lives in that file.
+
+    /// Open LAN legs, keyed by SyncCast device id (the same key
+    /// `localOutputs` uses in individual mode).
+    var lanReceiverOutputs: [String: LanReceiverOutput] = [:]
+    /// Shared secrets, keyed by receiver UID (`lan:<instance name>`). Pushed
+    /// by the menubar, which owns keychain storage. NEVER logged.
+    var lanReceiverTokensByUID: [String: String] = [:]
+    /// Playout targets in milliseconds, keyed by receiver UID. Absent means
+    /// `LanPcmWire.defaultTargetMs`.
+    var lanReceiverTargetMsByUID: [String: Int] = [:]
+    /// Bumped whenever a change requires a link to be REBUILT rather than
+    /// nudged — today that is a token change, because `hello` carries it and
+    /// is sent exactly once per session.
+    var lanReceiverConfigurationRevision: UInt64 = 0
+    /// The revision each open leg was built at, so the reconcile can tell a
+    /// leg that is still current from one whose token moved under it.
+    var lanReceiverRevisionByDeviceID: [String: UInt64] = [:]
+    /// This process's stream id, echoed in every audio packet header so a
+    /// receiver can tell our packets from a previous session's stragglers.
+    let lanStreamID: UInt32 = UInt32.random(in: 1...UInt32.max)
 
     /// Channel-assignment settings keyed by CoreAudio UID. Absent means 立体声.
     ///
@@ -2253,6 +2301,12 @@ public actor Router {
     /// The settings the Router currently holds. Mostly for tests and reports.
     public func stereoImages() -> [String: StereoImageSettings] { stereoImageSettingsByUID }
 
+    /// One device's imaging, or neutral. Internal accessor for the sibling
+    /// extensions.
+    func stereoImageSettings(forUID uid: String) -> StereoImageSettings {
+        stereoImageSettingsByUID[uid] ?? .neutral
+    }
+
     /// CoreAudio UIDs whose samples this process renders itself, and can
     /// therefore image. Same set as `equalizableOutputUIDs()` minus the
     /// AirPlay group, which is not offered here at all.
@@ -2270,6 +2324,9 @@ public actor Router {
         for bridge in localBridges.values {
             result[bridge.deviceUID] = bridge.stereoImageClipCount
         }
+        for output in lanReceiverOutputs.values {
+            result[output.receiverUID] = output.stereoImageClipCount
+        }
         return result
     }
 
@@ -2286,6 +2343,9 @@ public actor Router {
         }
         for bridge in localBridges.values {
             bridge.setStereoImage(stereoImageSettingsByUID[bridge.deviceUID] ?? .neutral)
+        }
+        for output in lanReceiverOutputs.values {
+            output.setStereoImage(stereoImageSettingsByUID[output.receiverUID] ?? .neutral)
         }
     }
 
@@ -2353,6 +2413,11 @@ public actor Router {
     /// The trims the Router currently holds. Mostly for tests and reports.
     public func localDelayTrims() -> [String: Int] { localDelayTrimMsByUID }
 
+    /// The automatic seeds in force, in frames (negative of each device's
+    /// reported latency). Internal accessor for `Router+LanReceiver`, which
+    /// derives the worst local latency from them.
+    func localDelaySeedFrames() -> [String: Int] { localDelaySeedFramesByUID }
+
     /// CoreAudio UIDs whose samples this process renders itself, and which can
     /// therefore be delayed. Empty on Direct Stereo and in whole-home mode —
     /// the same question the UI asks before offering the control.
@@ -2415,7 +2480,7 @@ public actor Router {
     /// this rides along with every reconcile and replan the way the equalizer
     /// does. Distinct from the whole-home `applyLocalDelayTrims(_:)` above it,
     /// which pushes `DeviceDelayTrim` values to `localBridges`.
-    private func applyLocalPairDelays() {
+    func applyLocalPairDelays() {
         let targets = localPairTargets()
         guard !targets.isEmpty else { return }
         refreshLocalDelaySeeds(uids: Set(targets.map(\.uid)))
@@ -2436,6 +2501,11 @@ public actor Router {
             capacityFrames: activeCapture.ringBuffer.capacityFrames,
             floorFrames: ringFloorFrames(logWarnings: false)
         )
+        // When a LAN receiver leg is live the whole local set moves later
+        // together, so it lands on the same ring frame the receiver is playing
+        // — see `LanAlignmentPlanner`. Zero when no leg is up, which is what
+        // keeps the pre-LAN arithmetic bit for bit.
+        let lanHold = lanAlignmentHoldFrames()
         for (_, group) in groups {
             let pairCount = max(1, group.output.outputChannelCount / max(1, group.output.channelCount))
             let offsets = LocalDelayTrimPlanner.offsetFrames(
@@ -2443,7 +2513,8 @@ public actor Router {
                 seedFrames: group.seeds,
                 userMs: group.user,
                 sampleRate: rate,
-                headroomFrames: headroom
+                headroomFrames: headroom,
+                extraHoldFrames: lanHold
             )
             var byPair: [Int: Int] = [:]
             for (pair, frames) in offsets.enumerated() { byPair[pair] = frames }
@@ -2621,7 +2692,7 @@ public actor Router {
     /// Tap pinned to the sink device, so every consumer must resolve the ring
     /// through here rather than reaching for `capture` directly — an AUHAL
     /// opened on the wrong ring is silent with no error anywhere.
-    private var activeCapture: any SystemAudioCapture {
+    var activeCapture: any SystemAudioCapture {
         sinkCapture ?? capture
     }
 
@@ -2640,7 +2711,7 @@ public actor Router {
 
     /// `logWarnings: false` is for read-only callers (the diagnostic line), so
     /// polling a report never emits log lines.
-    private func ringFloorFrames(logWarnings: Bool) -> Int {
+    func ringFloorFrames(logWarnings: Bool) -> Int {
         let source = activeCapture
         guard sinkCapture != nil else {
             return RingFloorPolicy.frames(
@@ -3209,6 +3280,9 @@ public actor Router {
             )
         }
         applySystemSinkVolumes()
+        // The LAN legs' master level and per-device balance, from the same
+        // routing snapshot the local outputs just took.
+        applyLanReceiverSettings()
         // Cheap and idempotent (an unchanged curve takes the bank's no-op
         // path), so it rides along with every replan the way the delay trims
         // do, and covers any path that reopens an AUHAL without going through
