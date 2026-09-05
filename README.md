@@ -35,11 +35,14 @@ Neither gives you a dependable Local + AirPlay mix with per-device control. Sync
 - Captures the **system audio stream** on macOS for AirPlay/capture-dependent paths. Local Stereo now defaults to a Direct Stereo CoreAudio output path so local video playback does not need ScreenCaptureKit or Screen Recording.
 - Routes the captured stream to **multiple destinations simultaneously**:
   - Local CoreAudio outputs (built-in speakers, USB / HDMI / Thunderbolt DACs)
-  - AirPlay 2 receivers (HomePod, Apple TV, Xiaomi Sound, third-party speakers, other Macs running AirPlay Receiver)
+  - AirPlay 2 receivers (HomePod, Apple TV, third-party speakers, other Macs running AirPlay Receiver)
+  - **A second Mac on the LAN**, over SyncCast's own low-latency PCM link — not AirPlay
 - Two mutually-exclusive modes, swapped in one click:
   - **AirPlay experimental mode** — local + AirPlay routing through the OwnTone-backed AirPlay pipeline. Multiple AirPlay receivers are handled by AirPlay's own timing domain; the local leg is slaved to that same clock domain by a ring-level control loop, with a per-output millisecond trim for listening-position differences.
   - **Stereo mode** — local CoreAudio outputs only, defaulting to Direct Stereo. This is the currently stable path and is suitable for video.
 - Acoustic (microphone) measurement was retired on 2026-08-09. SyncCast never opens the microphone and never plays calibration tones; alignment comes from the OwnTone clock domain instead.
+- **Per-device channel assignment (声道分配)** — a 2×2 gain matrix per output, with presets for 立体声 / 左 / 右 / 单声道 and four decibel sliders for anything else. A speaker sitting alone on the left of the desk plays the left channel, on both of its drivers; a mono-ish bedside speaker gets L+R summed at −6 dB so correlated full scale does not clip. Applied after the EQ and the stereo image and before the volume, remembered per output, and restored on every connect. `立体声` is a bit-identical pass-through, so a panel nobody opens costs nothing.
+- **A second Mac as one leg of the pair** — run `synccast-receiver` on another Mac and it shows up as an output alongside the local ones, playing in time with them rather than ~1.8 s behind. It is SyncCast's own link, not AirPlay: 48 kHz Int16 in 5 ms UDP packets, each stamped with the instant it must leave the receiver's DAC, derived from the capture ring's own clock so the receiver stays rate-locked to the source. Target latency is a slider (30…300 ms, default 90); the local outputs are automatically held back to land with it, and the popover states the resulting A/V lag rather than leaving it to be discovered. LAN only, authenticated with a shared token stored in the keychain. Wire format: [`proto/lan-pcm-link.md`](proto/lan-pcm-link.md).
 - **Auto-connect profiles** — pick one output as a trigger (a specific monitor, dock or DAC, matched on its CoreAudio UID so a different display at a different desk changes nothing) and SyncCast switches to local Stereo with your chosen outputs the moment it appears. Optionally, when it goes away: stop, fall back to the built-in speakers, and force their level — 0 % is genuinely silent, so unplugging in public does not turn the laptop into a speaker.
 - Lives quietly in the menubar. Pure user-space Swift + a small Python sidecar.
 
@@ -263,7 +266,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's next.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased plan and current status.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records (one per cross-cutting choice).
 - [`docs/HANDOFF.md`](docs/HANDOFF.md) — current state and open threads.
-- [`proto/`](proto/) — IPC schemas between the Swift router and the Python sidecar.
+- [`proto/`](proto/) — IPC schemas between the Swift router and the Python sidecar, and the LAN PCM link's wire format.
 - [`sidecar/README.md`](sidecar/README.md) — sidecar internals and protocol.
 
 ## Contributing

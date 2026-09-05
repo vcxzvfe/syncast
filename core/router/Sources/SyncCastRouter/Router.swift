@@ -532,6 +532,7 @@ public actor Router {
                 try stopDirectStereoOutput()
                 try stopWholeHomeSink()
                 reconcileLocalDriver(devices: devices)
+                reconcileLanReceivers(devices: devices)
             } else {
                 // Whole-home never runs on the sink path: its own named sink
                 // is the default output and OwnTone owns the clock domain.
@@ -1146,6 +1147,7 @@ public actor Router {
         //    correctly wired and the next wake-handler retry can attempt
         //    capture restart again without re-tearing the driver.
         reconcileLocalDriver(devices: devices)
+        reconcileLanReceivers(devices: devices)
         replan()
         return captureOK
     }
@@ -1228,6 +1230,9 @@ public actor Router {
             // report — `driver=wholeHome(2)` AND `render[agg:…]`
             // ticking concurrently).
             tearDownLocalDriver()
+            // The LAN legs go with it: they read the capture ring, which
+            // whole-home does not feed, and they are not AirPlay targets.
+            tearDownLanReceivers()
             do {
                 try stopDirectStereoOutput()
             } catch {
@@ -1876,6 +1881,7 @@ public actor Router {
             "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n"
         )
         reconcileLocalDriver(devices: devices)
+        reconcileLanReceivers(devices: devices)
         phases.mark("output open")
         // `reconcileLocalDriver` reports failures by setting `lastError` and
         // returning — fine on the other paths, fatal here: the sink is already
