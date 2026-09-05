@@ -5,8 +5,9 @@ Thanks for your interest. SyncCast is at the early scaffolding stage; contributi
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-fork>/syncast.git
+git clone --recurse-submodules https://github.com/<your-fork>/syncast.git
 cd syncast
+# (existing clone: git submodule update --init drivers/SyncCastAudio)
 ./scripts/bootstrap.sh   # installs a silent sink (BlackHole only if needed), OwnTone, Python deps
 ./scripts/build.sh       # builds all Swift packages + runs tests
 ./scripts/dev-run.sh     # runs the menubar app + sidecar

@@ -2,6 +2,8 @@
 
 # SyncCast
 
+> The virtual output device lives in its own repository, [SyncCastAudio](https://github.com/vcxzvfe/SyncCastAudio), included here as the git submodule `drivers/SyncCastAudio` — clone with `--recurse-submodules` or run `git submodule update --init`.
+
 **Open-source macOS menubar app for experimental multi-device audio routing.**
 
 Local Stereo is the stable path today. Local + AirPlay sync is active R&D.

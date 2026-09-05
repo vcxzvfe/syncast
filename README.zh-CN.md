@@ -1,5 +1,7 @@
 # SyncCast
 
+> 虚拟输出设备驱动独立成仓库 [SyncCastAudio](https://github.com/vcxzvfe/SyncCastAudio)，以 git submodule 形式挂在 `drivers/SyncCastAudio`；克隆时加 `--recurse-submodules`，已有仓库执行 `git submodule update --init`。
+
 [English](README.md) / 中文
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
