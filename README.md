@@ -38,6 +38,7 @@ Neither gives you a dependable Local + AirPlay mix with per-device control. Sync
   - **AirPlay experimental mode** — local + AirPlay routing through the OwnTone-backed AirPlay pipeline. Multiple AirPlay receivers are handled by AirPlay's own timing domain; the local leg is slaved to that same clock domain by a ring-level control loop, with a per-output millisecond trim for listening-position differences.
   - **Stereo mode** — local CoreAudio outputs only, defaulting to Direct Stereo. This is the currently stable path and is suitable for video.
 - Acoustic (microphone) measurement was retired on 2026-08-09. SyncCast never opens the microphone and never plays calibration tones; alignment comes from the OwnTone clock domain instead.
+- **Auto-connect profiles** — pick one output as a trigger (a specific monitor, dock or DAC, matched on its CoreAudio UID so a different display at a different desk changes nothing) and SyncCast switches to local Stereo with your chosen outputs the moment it appears. Optionally, when it goes away: stop, fall back to the built-in speakers, and force their level — 0 % is genuinely silent, so unplugging in public does not turn the laptop into a speaker.
 - Lives quietly in the menubar. Pure user-space Swift + a small Python sidecar.
 
 ## Architecture
@@ -186,6 +187,7 @@ media-key event tap) when neither is. Force a path with
 4. **Tick the devices you want.** Discovery runs continuously; new AirPlay receivers and audio devices appear within a few seconds.
 5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the system sink (or the Direct Stereo output when no sink is installed); capture-dependent modes use the selected capture backend.
 6. **Use the normal volume controls.** On the sink path the system slider is the master and each device row is a balance on top of it. See [System volume](#system-volume).
+7. **Set up auto-connect (optional).** With the devices you want ticked, open 自动连接 under the device list, pick the trigger device and press 「用当前选择创建规则」. From then on that selection is restored whenever the trigger appears — unless you have changed the selection yourself, in which case the rule stands down until the trigger is unplugged and reconnected, or you press 「重新应用规则」.
 
 ## Project status
 

@@ -414,6 +414,29 @@ final class AppModel {
     /// is how that gets answered with a number instead of a guess.
     private var discoveryRescanLatencyProbeStartedAt: Date?
 
+    // MARK: - Auto-connect (2026-09-05)
+    //
+    // Only the storage lives here; every decision and every side effect is in
+    // `AutoConnectCoordinator` and `AppModel+AutoConnect.swift`.
+
+    /// User-defined "when this output appears, switch these on" rules,
+    /// restored from `UserDefaults` at launch. Observed: the popover section
+    /// renders straight off it.
+    var autoConnectProfiles: [AutoConnectProfile] = AutoConnectProfileStore.load()
+    /// Pure decision engine. Not observed — it holds debounce/episode
+    /// bookkeeping, not anything a view should redraw for.
+    @ObservationIgnored var autoConnectCoordinator = AutoConnectCoordinator()
+    /// True while auto-connect is driving `setMode` / `setDeviceEnabled`, so
+    /// its own writes are not mistaken for the user overriding the rule.
+    @ObservationIgnored var autoConnectApplying = false
+    /// Pending re-evaluation (debounce deadline, launch settle, post-wake).
+    @ObservationIgnored var autoConnectRecheckTask: Task<Void, Never>?
+    /// The delayed second half of a disconnect (point macOS back at the
+    /// built-in speakers, force their level). Held so a second disconnect
+    /// cancels and replaces the first rather than racing it, and so the
+    /// pending write can be dropped if the trigger comes straight back.
+    @ObservationIgnored var autoConnectDeactivateTask: Task<Void, Never>?
+
     /// Minimum spacing between accepted manual rescans.
     static let discoveryRescanCooldownSeconds: Double = 3.0
 
@@ -651,6 +674,11 @@ final class AppModel {
                 await self.refreshPairingStates()
             }
         }
+        // 4. Arm auto-connect. Deliberately after discovery has been started
+        //    and subscribed: the first evaluation has to see the outputs that
+        //    are already plugged in, which is the "launch at login with the
+        //    monitor already there" case.
+        autoConnectBootstrap()
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
 
         // SYNCAST_INITIAL_MODE=wholehome|stereo flips the engine into the
@@ -821,6 +849,11 @@ final class AppModel {
                 if applyPersistedDeviceVolumes() {
                     reconcileEngine()
                 }
+                // Auto-connect watches the same edges. Placed in the defer so
+                // the early-return migration paths above still report the
+                // change: a monitor coming back under a fresh `Device.id` is
+                // exactly the event the rule exists for.
+                autoConnectNoteDeviceChange()
             }
             switch event {
             case .appeared(let dev):
@@ -1447,6 +1480,9 @@ final class AppModel {
             return
         }
         SyncCastLog.log("setMode: \(mode.rawValue) → \(newMode.rawValue)")
+        // A mode switch the user made is an override; one auto-connect made
+        // itself is filtered out inside `autoConnectNoteUserIntent`.
+        autoConnectNoteUserIntent("mode → \(newMode.rawValue)")
         let oldMode = mode
         mode = newMode
         if newMode != .wholeHome {
@@ -1580,6 +1616,10 @@ final class AppModel {
            device.transport == .coreAudio {
             persistWholeHomeLocalOutputSelection()
         }
+        // The user picked something themselves: auto-connect stands down until
+        // the trigger leaves and comes back, or until 「重新应用规则」. Our own
+        // writes are filtered out inside `autoConnectNoteUserIntent`.
+        autoConnectNoteUserIntent("toggle \(name)")
         reconcileEngine()
     }
 
@@ -3054,6 +3094,11 @@ final class AppModel {
             return
         }
         lastWakeRebuildAt = now
+        // Display wake yanks and re-adds DisplayPort audio devices, which is
+        // both the reason auto-connect debounces and the moment it is most
+        // likely to be needed. `applyEvent` will report those edges anyway;
+        // this is the backstop for a wake that produces no device delta.
+        autoConnectNoteWake()
 
         // Single-flight: cancel any in-flight recovery from a prior
         // wake event and replace with a fresh task. Codex caught this

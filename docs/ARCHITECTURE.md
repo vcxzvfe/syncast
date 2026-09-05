@@ -77,7 +77,7 @@
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
-| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls. |
+| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls, and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`). |
 
 ## 4. Audio data path
 
@@ -135,8 +135,37 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 | Per-device volume / balance | `UserDefaults` key `syncast.deviceVolumes`, a `[deviceID: percent]` map. On the sink path this value is a BALANCE composed with the system volume in the dB domain, not an absolute level. |
 | Sink device level | Owned by macOS (the sink's own `VolumeScalar`), and by the driver's own storage for `SyncCastAudio.driver`. SyncCast never writes it. |
 | Per-speaker delay trim | `UserDefaults` key `syncast.deviceDelayTrimMs`, a `[persistenceKey: rawMs]` map | Keyed by `Device.persistenceKey` (`ca:<UID>` / `ap:<hex deviceid>`), never by `Device.id`, which is re-minted every process. Stores RAW signed intent, never the normalised output — normalisation depends on which devices are present, so persisting it would drift each session. A device that is absent keeps its entry, same rule as the member store. |
+| Auto-connect rules | `UserDefaults` key `syncast.autoConnect.profiles.v1`, JSON-encoded array of `AutoConnectProfile` | Keyed by CoreAudio UID for the same reason as the member store: the office display must never trigger the home rule. Validated on load (`AutoConnectProfileStore.decode`) — absent, unreadable and nonsensical all collapse to "no rules", because a half-applied rule would move the user's audio somewhere they never asked for. |
 
 Note: earlier revisions of this document described a `~/Library/Application Support/SyncCast/devices.json` routing store. No such file exists or has ever been written; per-device routing is rebuilt from discovery on each launch, and only the keys above are persisted.
+
+## 8a. Auto-connect (2026-09-05)
+
+"When the home monitor shows up, play on the laptop speakers AND the monitor,
+in local Stereo" — expressed as a user-editable rule rather than as a hard-coded
+behaviour, because other people have other monitors and this laptop also meets
+an office display that must trigger nothing.
+
+- **Identity**: a rule stores a `triggerUID` and `memberUIDs`, all CoreAudio
+  device UIDs. Never `Device.id` (re-minted per process) and never names (not
+  unique across two panels from the same vendor).
+- **Decision** (`AutoConnectCoordinator`, pure + clock-injected): presence is
+  debounced 1.5 s, because a DisplayPort monitor waking from DPMS adds and
+  removes its audio device several times inside a second. It fires at most once
+  per "trigger presence episode", and any manual toggle or mode change while the
+  trigger is present suppresses the rule until the trigger leaves and returns
+  (or until 「重新应用规则」). Launching into the already-correct state claims the
+  episode silently.
+- **Effects** (`AppModel+AutoConnect`): activation is `setMode(.stereo)` plus
+  `setDeviceEnabled` on exactly the member UIDs — no new audio path. Disconnect
+  stops the engine, then optionally points the macOS default output back at the
+  built-in speakers and forces their hardware level. That level is a LINEAR
+  scalar (`percent / 100`, the macOS slider position), deliberately not
+  `VolumeCurve`, whose 0 % is -30 dB rather than silence.
+- **Evaluation points**: every discovery event, 3 s after launch, and after
+  wake. `SYNCAST_AUTOCONNECT_SIMULATE_ABSENT=<uid>[,<uid>]` hides a UID from the
+  coordinator only, so the disconnect branch is reachable without unplugging.
+- Full rationale: [requirements_2026-09-05-auto-connect.md](requirements_2026-09-05-auto-connect.md).
 
 ## 9. Build & distribution
 
