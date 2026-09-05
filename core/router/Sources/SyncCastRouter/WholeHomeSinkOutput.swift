@@ -2,8 +2,14 @@ import Foundation
 import CoreAudio
 import Darwin
 
-/// The whole-home mode's *system sink*: a public CoreAudio aggregate device
-/// named "AirPlay 全屋" whose only subdevice is a silent virtual output.
+/// Whole-home mode's **fallback** system sink: a public CoreAudio aggregate
+/// device named "AirPlay 全屋" whose only subdevice is a silent virtual output.
+///
+/// Only used when the installed silent sink is BlackHole. With SyncCast's own
+/// driver present, whole-home makes THAT device the default output directly
+/// (`WholeHomeSinkSelection.direct`), which is what gives the mode a native
+/// macOS system volume — see the "Why the aggregate wrapper survives the
+/// driver" section below, which no longer applies to that case.
 ///
 /// Why this exists
 /// ---------------
@@ -29,8 +35,8 @@ import Darwin
 /// audio path. That is why the preference order can be shared verbatim with
 /// the stereo sink path, which *does* tap its device.
 ///
-/// Why the aggregate wrapper survives the driver
-/// ---------------------------------------------
+/// Why the aggregate wrapper is still needed for BlackHole
+/// -------------------------------------------------------
 /// Renaming BlackHole is not an option: `kAudioObjectPropertyName` is not
 /// settable on it (`AudioObjectIsPropertySettable` returns false), and the only
 /// other route is editing `/Library/Audio/Plug-Ins/HAL/BlackHole.driver`'s
@@ -42,24 +48,26 @@ import Darwin
 /// displacement banner key off. The aggregate inherits the subdevice's
 /// silence, so there is no double playback.
 ///
-/// Known trade-off (deliberate, see `enabled`)
-/// -------------------------------------------
+/// Known trade-off, and why the direct path exists
+/// -----------------------------------------------
 /// The aggregate does NOT forward `kAudioDevicePropertyVolumeScalar` to its
-/// main subdevice — measured on this machine: after a 1.5 s settle the
-/// property reports `has=false` (`kAudioHardwareUnknownPropertyError`) even
-/// with `kAudioAggregateDeviceMainSubDeviceKey` set to BlackHole. So while
-/// this sink is the default output, the macOS volume slider goes grey. That is
-/// arguably more honest than today's behaviour (BlackHole exposes a settable
-/// volume that does nothing to the samples, so the slider moves and is
-/// inaudible), but it is a visible change. `enabled` is the single-constant
-/// escape hatch back to the old "user picks the silent device by hand"
-/// behaviour.
+/// main subdevice — measured: after a 1.5 s settle the property reports
+/// `has=false` (`kAudioHardwareUnknownPropertyError`) even with
+/// `kAudioAggregateDeviceMainSubDeviceKey` set. So while this sink is the
+/// default output, the macOS volume slider goes grey, F11/F12 raise the
+/// "forbidden" HUD, and the panel's own master fader plus the media-key
+/// `CGEventTap` are the only volume controls left. That is the price of the
+/// friendly name, and it is exactly why SyncCast's own driver — which needs no
+/// wrapper to be named sensibly — is put in as the default output directly.
+/// `enabled` is the single-constant escape hatch back to the old "user picks
+/// the silent device by hand" behaviour.
 ///
 /// A greyed-out system slider is also exactly what sends a user into System
 /// Settings → Sound to pick their real speakers again — which silently breaks
 /// whole-home into double playback. `isSystemDefaultOutput` exists so that
 /// condition is visible in the panel (and in `diagnostic`) instead of being
-/// discovered by ear; `reassertDefaultOutput()` is the one-click way back.
+/// discovered by ear; the app treats it as intent and stops routing
+/// (`Router.systemSinkDisplaced`), the same policy the stereo sink path uses.
 ///
 /// Relationship to the other two aggregate flavours in this module
 /// --------------------------------------------------------------
@@ -68,7 +76,9 @@ import Darwin
 ///   - `DirectStereoOutput`   — PUBLIC, becomes the default output, fans out
 ///                              to the user's real speakers.
 ///   - `WholeHomeSinkOutput`  — PUBLIC, becomes the default output, wraps the
-///                              silent sink device.
+///                              silent sink device. Fallback only; with the
+///                              SyncCast driver installed whole-home uses
+///                              `SystemSinkDevice` directly instead.
 /// Each has its own UID namespace because their orphan sweeps need different
 /// protections; this one and `DirectStereoOutput` can be the live system
 /// default, so their sweeps must move the default away before destroying.
@@ -219,20 +229,6 @@ public final class WholeHomeSinkOutput {
     ) -> Bool {
         if currentID == activeID { return true }
         return !activeUID.isEmpty && currentUID == activeUID
-    }
-
-    /// Put the sink back as the default output after the user (or macOS, on a
-    /// headphone plug) moved it away.
-    ///
-    /// Explicitly NOT automatic. Whole-home cannot re-assert itself on a timer
-    /// without fighting a deliberate choice — plugging in headphones while
-    /// whole-home runs is a legitimate thing to do, and a self-healing sink
-    /// would yank the default back every second. The app surfaces the
-    /// condition and this is the button behind it.
-    @discardableResult
-    public func reassertDefaultOutput() -> Bool {
-        guard isActive else { return false }
-        return Self.setDefaultOutput(aggregateID) == noErr
     }
 
     public var diagnostic: String {

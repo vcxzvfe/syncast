@@ -188,6 +188,37 @@ public enum SystemSinkVolumeLaw {
         }
     }
 
+    // MARK: - Whole-home master
+
+    /// The whole-home MASTER amplitude for a sink scalar.
+    ///
+    /// Whole-home's master is a multiply on the samples entering OwnTone
+    /// (`AudioSocketWriter.setMasterGain`), so it can attenuate by any amount
+    /// the sink's own law asks for — which is why the scalar is converted
+    /// through THAT law, not through `VolumeCurve`.
+    ///
+    /// `VolumeCurve`'s −30 dB floor is not a bug to work around here: it
+    /// exists because OwnTone's PER-OUTPUT volume cannot go below −30 dB, so
+    /// the two legs have to agree on that floor to stay matched. The master
+    /// stage sits upstream of OwnTone entirely and has no such floor. Pushing
+    /// the system volume through the −30 dB curve would compress macOS's
+    /// ~64 dB of travel into 30 dB — the bottom half of the system slider
+    /// would barely change anything, and its zero would still be audible.
+    ///
+    /// Two endpoints are exact by construction:
+    ///   * `muted` → `0`. Muting the system must be silence everywhere,
+    ///     including on AirPlay receivers whose own volume floors at −30 dB.
+    ///   * `scalar == 0` → `0` (via `amplitude(forScalar:)`), for the same
+    ///     reason macOS's own slider is silent at the bottom.
+    public static func wholeHomeMasterAmplitude(
+        scalar: Float,
+        muted: Bool,
+        law: ScalarDecibelLaw = appleBuiltInLaw
+    ) -> Float {
+        guard !muted else { return 0 }
+        return law.amplitude(forScalar: scalar)
+    }
+
     // MARK: - Reading a device's own law
 
     /// Read a device's real scalar↔dB mapping, falling back to Apple's
