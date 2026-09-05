@@ -192,7 +192,12 @@ sudo bash scripts/install-driver.sh --uninstall
 路径（那条路依然靠媒体键 event tap）。可用 `SYNCAST_STEREO_PATH=sink|direct|capture`
 强制指定。
 
-全屋模式藏在「AirPlay 全屋」后面的那台静音设备走的是同一套优先级，所以
+全屋模式走的是同一套优先级；装了 `SyncCastAudio.driver` 之后它会**直接把这台
+设备设成系统默认输出**——于是**菜单栏音量滑杆、F11/F12、音量 HUD、滚轮调音工具
+在全屋模式下都能直接控制总音量**，不再需要媒体键 event tap。只有 BlackHole 兜底
+那条路还藏在「AirPlay 全屋」这个 aggregate 后面：aggregate 没有音量控制，所以那
+条路继续用面板上的总音量滑杆加媒体键 tap。
+
 **BlackHole 在任何模式下都只是兜底、可以不装**。装好 `SyncCastAudio.driver`
 之后可以直接卸掉它：
 

@@ -202,9 +202,15 @@ that is present, and to the legacy Direct Stereo path (which still uses the
 media-key event tap) when neither is. Force a path with
 `SYNCAST_STEREO_PATH=sink|direct|capture`.
 
-Whole-home mode uses the same preference order for the silent device it hides
-behind 「AirPlay 全屋」, so **BlackHole is optional in every mode**. Once
-`SyncCastAudio.driver` is installed you can remove it:
+Whole-home mode uses the same preference order, and with `SyncCastAudio.driver`
+installed it puts that device in as the default output directly — so **the
+macOS volume slider, F11/F12, the HUD and scroll-wheel volume utilities all
+control the whole-home master natively**, with no event tap. Only the BlackHole
+fallback still hides behind the 「AirPlay 全屋」 aggregate, which has no volume
+control and therefore keeps the panel fader and the media-key tap.
+
+**BlackHole is optional in every mode.** Once `SyncCastAudio.driver` is
+installed you can remove it:
 
 ```bash
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver
