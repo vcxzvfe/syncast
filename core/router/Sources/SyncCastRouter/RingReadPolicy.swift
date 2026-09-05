@@ -238,6 +238,15 @@ public enum RingReadPlanner {
     ///     overwritten.
     ///   - driftLimitFrames: how far the cursor may wander from the target
     ///     before we re-anchor.
+    ///   - readWindowFrames: extra span the consumer reads ABOVE the cursor.
+    ///     `LocalOutput`'s per-device delay compensation gives each channel
+    ///     pair its own read offset (`PairDelayBank`), with the cursor pinned
+    ///     to the MOST delayed pair; the least delayed one then reads up to
+    ///     `readWindowFrames` further ahead. So the floor has to be that much
+    ///     deeper, and "did this block underrun" is a question about the pair
+    ///     reading highest, not about the cursor. 0 (the default, and the
+    ///     value whenever no trim is dialled in) reproduces the original
+    ///     arithmetic exactly.
     ///
     /// Resync triggers, in order: first render, cursor overwritten by the
     /// producer, cursor reading past the write head (underrun), and drift
@@ -251,24 +260,30 @@ public enum RingReadPlanner {
         floorFrames: Int64,
         compensationFrames: Int64,
         capacityFrames: Int,
-        driftLimitFrames: Int64
+        driftLimitFrames: Int64,
+        readWindowFrames: Int64 = 0
     ) -> RingReadPlan {
         let blockFrames = Int64(frames)
-        let target = max(0, writePosition - floorFrames - compensationFrames - blockFrames)
-        // Oldest frame still backed by the ring for a full block.
+        let window = max(0, readWindowFrames)
+        let target = max(
+            0, writePosition - floorFrames - compensationFrames - blockFrames - window
+        )
+        // Oldest frame still backed by the ring for a full block. The cursor is
+        // the LOWEST read point (the most-delayed pair), so the window does not
+        // enter here — it is the upper bound the window moves.
         let lowerValid = max(0, writePosition - Int64(capacityFrames) + blockFrames)
         let needsResync =
             cursor == 0 ||
             cursor < lowerValid ||
-            cursor &+ blockFrames > writePosition ||
+            cursor &+ window &+ blockFrames > writePosition ||
             abs(cursor - target) > driftLimitFrames
         let startFrame = needsResync ? target : cursor
-        let underrun = max(0, startFrame &+ blockFrames - writePosition)
+        let underrun = max(0, startFrame &+ window &+ blockFrames - writePosition)
         return RingReadPlan(
             startFrame: startFrame,
             didResync: needsResync,
             underrunFrames: Int(min(underrun, blockFrames)),
-            waterLevelFrames: writePosition - startFrame
+            waterLevelFrames: writePosition - startFrame - window
         )
     }
 }
@@ -328,14 +343,20 @@ public struct RingReadSequencer: Equatable, Sendable {
         floorFrames: Int64,
         compensationFrames: Int64,
         capacityFrames: Int,
-        driftLimitFrames: Int64
+        driftLimitFrames: Int64,
+        readWindowFrames: Int64 = 0
     ) -> RingReadPlan {
         let blockFrames = Int64(frames)
+        let window = max(0, readWindowFrames)
         let producerAdvanced =
             lastWritePosition == Self.noPreviousWrite || writePosition > lastWritePosition
         // `cursor == 0` means "never rendered", which is never "a full block
-        // of audio is waiting" however large the write position is.
-        let hasFullBlock = cursor > 0 && cursor &+ blockFrames <= writePosition
+        // of audio is waiting" however large the write position is. With
+        // per-pair delay offsets the block the consumer needs spans
+        // `window + blockFrames`, because the least-delayed pair reads at the
+        // top of the window — a producer that has stopped `window` frames
+        // short of that is idle, not merely behind.
+        let hasFullBlock = cursor > 0 && cursor &+ window &+ blockFrames <= writePosition
         let nowIdle = !producerAdvanced && !hasFullBlock
 
         defer {
@@ -348,7 +369,7 @@ public struct RingReadSequencer: Equatable, Sendable {
                 startFrame: cursor,
                 didResync: false,
                 underrunFrames: 0,
-                waterLevelFrames: writePosition - cursor,
+                waterLevelFrames: writePosition - cursor - window,
                 producerIdle: true,
                 resumedFromIdle: false
             )
@@ -361,7 +382,8 @@ public struct RingReadSequencer: Equatable, Sendable {
             floorFrames: floorFrames,
             compensationFrames: compensationFrames,
             capacityFrames: capacityFrames,
-            driftLimitFrames: driftLimitFrames
+            driftLimitFrames: driftLimitFrames,
+            readWindowFrames: window
         )
         guard idle else { return base }
 
@@ -371,14 +393,14 @@ public struct RingReadSequencer: Equatable, Sendable {
         // would otherwise be read from with no floor at all and starve again
         // on the very next render.
         let target = max(
-            0, writePosition - floorFrames - compensationFrames - blockFrames
+            0, writePosition - floorFrames - compensationFrames - blockFrames - window
         )
-        let underrun = max(0, target &+ blockFrames - writePosition)
+        let underrun = max(0, target &+ window &+ blockFrames - writePosition)
         return RingReadPlan(
             startFrame: target,
             didResync: true,
             underrunFrames: Int(min(underrun, blockFrames)),
-            waterLevelFrames: writePosition - target,
+            waterLevelFrames: writePosition - target - window,
             producerIdle: false,
             resumedFromIdle: true
         )
