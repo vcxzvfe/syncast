@@ -23,17 +23,23 @@ extension AppModel {
 
     // MARK: - Availability
 
-    /// Whether the current audio path renders the samples itself, and can
-    /// therefore equalise them.
+    /// Whether the current audio path renders a local output's samples itself,
+    /// and can therefore equalise them.
     ///
     /// - Local Stereo on the **system-sink** or **capture** legs: yes. The
     ///   samples pass through `LocalOutput.render()`.
     /// - Local Stereo on **Direct Stereo**: no. The HAL renders straight into
     ///   the public aggregate; we never touch a buffer.
-    /// - **Whole-home**: no. Audio flows OwnTone → `LocalAirPlayBridge`, a
-    ///   different render path that this feature deliberately does not touch.
+    /// - **Whole-home**: yes. Each local output has its own
+    ///   `LocalAirPlayBridge`, whose render callback runs the same
+    ///   `EqualizerBank` on the same UID-keyed curve — so a speaker tuned in
+    ///   Stereo keeps its curve here without being re-entered. (AirPlay
+    ///   receivers are a different question: see `AppModel+GroupEqualizer`.)
     var equalizerIsSupportedOnCurrentPath: Bool {
-        mode == .stereo && AppModel.selectedStereoOutputPath != .direct
+        switch mode {
+        case .stereo: return AppModel.selectedStereoOutputPath != .direct
+        case .wholeHome: return true
+        }
     }
 
     /// Whether THIS row should offer an EQ button.
@@ -52,10 +58,7 @@ extension AppModel {
         else {
             return nil
         }
-        if mode != .stereo {
-            return "调音器在「AirPlay 全屋」模式下不生效 · equalizer is Local Stereo only"
-        }
-        if AppModel.selectedStereoOutputPath == .direct {
+        if mode == .stereo, AppModel.selectedStereoOutputPath == .direct {
             return "调音器在 Direct Stereo 路径下不生效（音频不经过本程序）"
                 + " · not applied on the Direct Stereo path"
         }
@@ -85,6 +88,12 @@ extension AppModel {
         return equalizerSettings(forUID: uid)
     }
 
+    /// The curve behind one editor target, whichever kind it is.
+    func equalizerSettings(target: EqualizerTarget) -> EqualizerSettings {
+        guard let uid = equalizerUID(for: target) else { return .graphicFlat }
+        return equalizerSettings(forUID: uid)
+    }
+
     func equalizerSettings(forUID uid: String) -> EqualizerSettings {
         guard let stored = deviceEqualizers[uid]?.settings, !stored.bands.isEmpty else {
             return .graphicFlat
@@ -108,7 +117,12 @@ extension AppModel {
     /// curve is loaded and roughly how strong it is.
     func equalizerSummary(for deviceID: String) -> String? {
         guard hasEqualizerCurve(for: deviceID) else { return nil }
-        let settings = equalizerSettings(for: deviceID)
+        return AppModel.equalizerSummary(of: equalizerSettings(for: deviceID))
+    }
+
+    /// Pure form, so the group row and the unit tests get the same string
+    /// without going through a device lookup.
+    static func equalizerSummary(of settings: EqualizerSettings) -> String? {
         let strongest = settings.bands
             .max { abs($0.gainDb) < abs($1.gainDb) }
         var parts: [String] = []
@@ -199,16 +213,31 @@ extension AppModel {
         _ transform: (inout EqualizerSettings) -> Void
     ) {
         guard let uid = coreAudioUID(forDeviceID: deviceID) else {
-            // A device with no CoreAudio UID cannot be keyed, and this feature
-            // is CoreAudio-only, so there is nothing to edit. The UI never
-            // offers the control on such a row; this is the backstop.
+            // A device with no CoreAudio UID cannot be keyed, and a device
+            // curve is CoreAudio-only, so there is nothing to edit. The UI
+            // never offers the control on such a row; this is the backstop.
             SyncCastLog.log("equalizer: ignoring edit for un-keyable device \(deviceID)")
             return
         }
+        updateEqualizer(
+            uid: uid,
+            displayName: devices.first { $0.id == deviceID }?.name,
+            transform
+        )
+    }
+
+    /// UID-keyed core of every edit, device or group. Kept separate from the
+    /// row-keyed wrapper above because the AirPlay group's key is not a device
+    /// at all — see `AppModel+GroupEqualizer`.
+    func updateEqualizer(
+        uid: String,
+        displayName: String?,
+        _ transform: (inout EqualizerSettings) -> Void
+    ) {
         var settings = equalizerSettings(forUID: uid)
         transform(&settings)
         let normalized = DeviceEqualizerStore.normalize(settings)
-        let name = devices.first { $0.id == deviceID }?.name
+        let name = displayName
 
         if normalized.hasUserCurve {
             deviceEqualizers[uid] = DeviceEqualizerProfile(

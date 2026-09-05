@@ -2327,13 +2327,15 @@ final class AppModel {
     /// slider costs one actor hop per settle rather than one per pixel.
     var localDelayTrimCommitTask: Task<Void, Never>?
 
-    /// Which row currently has its equalizer panel open, if any.
+    /// Which equalizer panel is open, if any — a device row or the whole-home
+    /// AirPlay group.
     ///
     /// Model state rather than `@State` on the row for two reasons: SwiftUI
     /// recycles `DeviceRow` views (which is exactly why the row binds by
     /// `deviceID` and never by a captured `Device`), and a 340 pt popover has
-    /// room for one ten-band panel, not several.
-    var equalizerEditorDeviceID: String?
+    /// room for one ten-band panel, not several — which one target rather than
+    /// a set also enforces.
+    var equalizerEditorTarget: EqualizerTarget?
 
     private static func loadPersistedDeviceVolumes() -> [String: Int] {
         guard let raw = UserDefaults.standard
