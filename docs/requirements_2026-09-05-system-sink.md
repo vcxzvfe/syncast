@@ -147,24 +147,35 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
   在此之前 BlackHole 回退路径已经完全可用（上面的 PASS 就是走它跑的）。
 - 完整听感链路（真的从两只喇叭出声 + 拖系统滑杆）：需要在真机上跑 app 本体，
   由 supervisor 做。
-- **延迟：预算 ~71 ms，没达到 ≤30 ms 的目标**（`swift run SyncCastSystemSinkProbe
-  --latency`，本机实测设备属性 + Scheduler 常数，不是声学测量）：
+- **延迟：预算 ~51 ms（默认 30 ms floor），仍未达到 ≤30 ms 的目标**
+  （`swift run SyncCastSystemSinkProbe --latency`，本机实测设备属性 +
+  `RingFloorPolicy` 常数，不是声学测量）：
 
   | 项 | 帧 | 毫秒 | 说明 |
   |---|---|---|---|
   | sink IO buffer | 512 | 10.67 | app 渲染进 sink，tap 隔一个块才看到 |
+  | ring floor | 1440 | **30.00** | `LocalOutput` 读取位置落后写指针的量；sink 路径默认值，`SYNCAST_SINK_RING_FLOOR_MS` 可调 10…500 |
   | output IO buffer | 512 | 10.67 | MBP 扬声器 AUHAL 块 |
-  | ring backoff | 2400 | **50.00** | `Scheduler.plan(safetyMarginMs:)`，纯本地会话也照收 |
   | （output hardware） | 798 | 16.62 | 设备自身呈现延迟，任何路径都要付，不算我们加的 |
 
-  50 ms 那项是**既有常数**，SCK 采集路径今天付的是同一笔；Direct Stereo 之所以
-  是 ~0，是因为它根本没有环形缓冲（app 直接渲染进 aggregate）。两个可用杠杆：
-  ① 把 `safetyMarginMs` 调小（拿余量换 dropout 风险，必须配听感测试，本轮
-  **不盲调**——没验证过就改参数只是把数字凑到目标上）；② 让
-  `SyncCastAudio.driver` 在 `kAudioDevicePropertyLatency` 上申报这条链的延迟，
-  视频播放器就会自己补偿、A/V 仍然对齐（未实现）。
+  **更正（2026-09-05）：之前写的 “~71 ms，其中 50 ms 是
+  `Scheduler.plan(safetyMarginMs:)`” 是错的，两半都错。**
+  `LocalOutput.render()` 只是把 Scheduler 的 `readBackoffFrames` 拷进状态快照，
+  然后**从来没用过**；真正的读取目标是
+  `writePosition − ringFloor − 硬件延迟补偿 − block`，而 `ringFloor` 是写死的
+  4800 帧（100 ms）。所以这条路径真实代价是 ~121 ms，而且怎么调 Scheduler 都
+  不会动这个数。那 100 ms 是当年为 ScreenCaptureKit 的 1024 帧抖动块选的；
+  sink 路径的生产者是 Process Tap 的 IOProc，稳定给 512 帧块，所以现在它有自己
+  的 30 ms floor，SCK / aggregate 路径维持 100 ms 不变。
+
+  剩下的杠杆：① `SYNCAST_SINK_RING_FLOOR_MS`（拿 dropout 余量换延迟；调低之后
+  必须看 app 健康日志里的 `resync` / `underrun` / `minWater` 三个计数器）；
+  ② 让 `SyncCastAudio.driver` 在 `kAudioDevicePropertyLatency` 上申报这条链的
+  延迟，视频播放器就会自己补偿、A/V 仍然对齐（未实现）。
+
+  **30 ms floor 还没有做听感验证**（本轮只有算术 + 计数器，没有真机听）。
   **看视频的场景请 supervisor 用耳朵judge一下**：目前 app 以为音频在 sink 的
-  呈现时刻出声，我们下游多出来的 ~60 ms 它并不知道，画面会领先声音。
+  呈现时刻出声，我们下游多出来的 ~40 ms 它并不知道，画面会领先声音。
 
 ### 代码审查
 
@@ -211,7 +222,7 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 - DDC 写是异步的（几十 ms 落地），且显示器 OSD 的改动不会反向同步（DDC 没有变更
   通知）。与 2026-06-12 那轮的限制相同。
 - macOS < 14.2 没有 Process Tap，sink 路径整体不可用，自动回落到 Direct Stereo。
-- **延迟比 Direct Stereo 高**（见 §4 的 71 ms 预算）。要低延迟看视频，
+- **延迟比 Direct Stereo 高**（见 §4 的 ~51 ms 预算）。要低延迟看视频，
   `SYNCAST_STEREO_PATH=direct` 仍然可用，代价是回到事件 tap 那套音量方案。
 - 单测会在 `~/Library/Preferences` 留下空的 `io.syncast.tests.*.plist`（tearDown
   已清内容，文件壳由 cfprefsd 创建）。这是本仓库既有测试就有的脚印，不是本轮新增
