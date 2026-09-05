@@ -15,11 +15,15 @@
 #pragma mark - State
 
 pthread_mutex_t             gPlugIn_StateMutex          = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t             gDevice_IOMutex             = PTHREAD_MUTEX_INITIALIZER;
 AudioServerPlugInHostRef    gPlugIn_Host                = NULL;
 UInt32                      gPlugIn_RefCount            = 0;
 
+// gPlugIn_StateMutex
 Float64                     gDevice_SampleRate          = kDevice_DefaultSampleRate;
 UInt64                      gDevice_IORunningCounter    = 0;
+
+// gDevice_IOMutex
 Float64                     gDevice_HostTicksPerFrame   = 0.0;
 UInt64                      gDevice_NumberTimeStamps    = 0;
 Float64                     gDevice_AnchorSampleTime    = 0.0;
@@ -52,6 +56,26 @@ Float32 SyncCastAudio_DecibelsToScalar(Float32 inDecibels)
     if(theDecibels < kVolume_MinDB) { theDecibels = kVolume_MinDB; }
     if(theDecibels > kVolume_MaxDB) { theDecibels = kVolume_MaxDB; }
     return SyncCastAudio_ClampScalar(1.0f + (theDecibels / (-kVolume_MinDB)));
+}
+
+#pragma mark - Timeline
+
+// The timeline is entirely derived from the host clock: no hardware, so a
+// "zero timestamp" is just the anchor plus a whole number of ring-buffer
+// periods. Re-derived on every rate change and re-anchored whenever IO starts.
+void SyncCastAudio_ResetTimeline(Float64 inSampleRate)
+{
+    struct mach_timebase_info theTimeBaseInfo;
+    mach_timebase_info(&theTimeBaseInfo);
+    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
+    theHostClockFrequency *= 1000000000.0;
+
+    pthread_mutex_lock(&gDevice_IOMutex);
+    gDevice_HostTicksPerFrame = theHostClockFrequency / inSampleRate;
+    gDevice_NumberTimeStamps = 0;
+    gDevice_AnchorSampleTime = 0.0;
+    gDevice_AnchorHostTime = mach_absolute_time();
+    pthread_mutex_unlock(&gDevice_IOMutex);
 }
 
 #pragma mark - Prototypes
@@ -180,11 +204,7 @@ static OSStatus SyncCastAudio_Initialize(AudioServerPlugInDriverRef inDriver, Au
 
     // Host ticks per frame — the whole timeline is derived from this, so it is
     // recomputed on every sample-rate change too.
-    struct mach_timebase_info theTimeBaseInfo;
-    mach_timebase_info(&theTimeBaseInfo);
-    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
-    theHostClockFrequency *= 1000000000.0;
-    gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+    SyncCastAudio_ResetTimeline(gDevice_SampleRate);
 
     // Restore the user's last level, the way a real device would. A settings
     // read that fails simply leaves full scale.
@@ -271,20 +291,15 @@ static OSStatus SyncCastAudio_PerformDeviceConfigurationChange(AudioServerPlugIn
         return kAudioHardwareBadObjectError;
     }
 
+    // Rate first, under the state mutex (the property getters read it there),
+    // then the derived timeline under the IO mutex. Taken one after the other,
+    // never nested — see the lock order note in SyncCastAudio.h.
     pthread_mutex_lock(&gPlugIn_StateMutex);
     gDevice_SampleRate = theNewSampleRate;
-
-    struct mach_timebase_info theTimeBaseInfo;
-    mach_timebase_info(&theTimeBaseInfo);
-    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
-    theHostClockFrequency *= 1000000000.0;
-    gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
 
     // The timeline must restart at the new rate, or the HAL sees a jump.
-    gDevice_NumberTimeStamps = 0;
-    gDevice_AnchorSampleTime = 0.0;
-    gDevice_AnchorHostTime = mach_absolute_time();
-    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    SyncCastAudio_ResetTimeline(theNewSampleRate);
 
     return 0;
 }
@@ -310,14 +325,21 @@ static OSStatus SyncCastAudio_StartIO(AudioServerPlugInDriverRef inDriver, Audio
     if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
 
     pthread_mutex_lock(&gPlugIn_StateMutex);
-    if(gDevice_IORunningCounter == 0)
-    {
-        gDevice_NumberTimeStamps = 0;
-        gDevice_AnchorSampleTime = 0.0;
-        gDevice_AnchorHostTime = mach_absolute_time();
-    }
-    ++gDevice_IORunningCounter;
+    Boolean theFirstClient = (gDevice_IORunningCounter == 0);
+    if(gDevice_IORunningCounter < UINT64_MAX) { ++gDevice_IORunningCounter; }
     pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    // Re-anchor outside the state mutex: the timeline belongs to the IO mutex.
+    // Safe to do after the counter has been bumped because the HAL does not
+    // start the IO thread — and so cannot call GetZeroTimeStamp — until this
+    // call returns for the first client.
+    if(theFirstClient)
+    {
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        Float64 theRate = gDevice_SampleRate;
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        SyncCastAudio_ResetTimeline(theRate);
+    }
 
     return 0;
 }
@@ -341,7 +363,10 @@ static OSStatus SyncCastAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriv
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
     if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
 
-    pthread_mutex_lock(&gPlugIn_StateMutex);
+    // IO mutex only: this runs on the real-time IO thread, and the property
+    // paths (which can block on storage writes and CF allocation) must never
+    // be able to make it wait.
+    pthread_mutex_lock(&gDevice_IOMutex);
 
     UInt64 theCurrentHostTime = mach_absolute_time();
     Float64 theHostTicksPerRingBuffer = gDevice_HostTicksPerFrame * ((Float64)kDevice_RingBufferSize);
@@ -358,7 +383,7 @@ static OSStatus SyncCastAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriv
     *outHostTime = gDevice_AnchorHostTime + (UInt64)(((Float64)gDevice_NumberTimeStamps) * theHostTicksPerRingBuffer);
     *outSeed = 1;
 
-    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    pthread_mutex_unlock(&gDevice_IOMutex);
 
     return 0;
 }
