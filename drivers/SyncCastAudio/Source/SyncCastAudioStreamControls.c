@@ -478,6 +478,15 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
             if((theFormat->mFormatFlags & kAudioFormatFlagIsFloat) == 0) { return kAudioDeviceUnsupportedFormatError; }
             if(theFormat->mBitsPerChannel != kDevice_BitsPerChannel) { return kAudioDeviceUnsupportedFormatError; }
             if(theFormat->mChannelsPerFrame != kDevice_ChannelCount) { return kAudioDeviceUnsupportedFormatError; }
+            // The layout fields matter as much as the sample size: the stream
+            // advertises one interleaved packed frame per packet, and a client
+            // that gets a "yes" for a non-interleaved or differently-strided
+            // format would lay its buffers out to match a format this device
+            // never agreed to. Check everything FillFormat sets.
+            if((theFormat->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mFramesPerPacket != 1) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mBytesPerFrame != kDevice_BytesPerFrame) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mBytesPerPacket != kDevice_BytesPerFrame) { return kAudioDeviceUnsupportedFormatError; }
             if((theFormat->mSampleRate != kDevice_SampleRate_44100) &&
                (theFormat->mSampleRate != kDevice_DefaultSampleRate) &&
                (theFormat->mSampleRate != kDevice_SampleRate_96000))
