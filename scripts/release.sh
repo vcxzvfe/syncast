@@ -48,7 +48,7 @@ Options:
   -h, --help       Show this help and exit.
 
 What it does (in order):
-  1. Sanity-check working tree (must be clean).
+  1. Sanity-check working tree (must be clean) and run scripts/pii_scan.sh.
   2. Optionally bump VERSION and commit.
   3. Sync CFBundleShortVersionString in Info.plist (commit if changed).
   4. Tag vX.Y.Z and push tag + main.
@@ -102,6 +102,13 @@ GIT_TOPLEVEL="$(git rev-parse --show-toplevel)"
 if ! git diff --quiet || ! git diff --cached --quiet; then
   fail "working tree is dirty — commit or stash first"
 fi
+
+# This repository is public: refuse to cut a release that carries personal
+# information in a tracked file. Hard failure, never a warning — a release is
+# exactly the moment the tree becomes hard to un-publish.
+log "Scanning tracked files for personal information…"
+bash "$REPO_ROOT/scripts/pii_scan.sh" \
+  || fail "pii_scan failed — see the hits above; nothing was tagged or pushed"
 
 # gh CLI present + authed.
 command -v gh >/dev/null 2>&1 || fail "gh CLI not installed (https://cli.github.com)"

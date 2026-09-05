@@ -197,7 +197,7 @@ crossfade is what makes the change audible without a click.
 
 ## 3. Verified
 
-Offline, on this machine, 2026-09-05.
+Offline, 2026-09-05.
 
 `core/router`: `swift build` clean, `swift test` **216 tests, 0 failures**
 (25 of them new `EqualizerBankTests`).
@@ -254,7 +254,7 @@ Other measured properties, all through `process()`:
 - Interaction with the sink path's per-device software gain when a display has
   no hardware volume: both stages are in the same render callback (EQ first,
   gain second) and were reasoned about, not measured together.
-- Whether a stored curve survives an actual replug of the ExternalDisplay. The code
+- Whether a stored curve survives an actual replug of the display. The code
   path (`reconcileLocalDriver` → `applyEqualizers`) is exercised by unit tests
   at the model level only.
 

@@ -710,12 +710,13 @@ final class AppModel {
             }
         }
 
-        // SYNCAST_AUTO_TEST=mbp triggers an automated toggle of the MBP
-        // built-in speaker 4 seconds after bootstrap. Used for shell-driven
-        // end-to-end audio verification — strictly dev only.
+        // SYNCAST_AUTO_TEST triggers an automated toggle of the named outputs
+        // 4 seconds after bootstrap. Used for shell-driven end-to-end audio
+        // verification — strictly dev only.
         if let env = ProcessInfo.processInfo.environment["SYNCAST_AUTO_TEST"] {
-            // Comma-separated list. e.g.  mbp,xiaomi,display
-            // Each token is matched case-insensitively against device.name.
+            // Comma-separated list of device-name substrings.
+            // Each token is matched case-insensitively against device.name;
+            // there are no aliases, so pass part of the real output name.
             let targets = env.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
@@ -747,12 +748,17 @@ final class AppModel {
         }
     }
 
+    /// Resolve a `SYNCAST_AUTO_TEST` / `SYNCAST_AUTO_TEST_ACTIONS` token to a
+    /// device by case-insensitive substring match on the device name.
+    ///
+    /// This is a plain name match with no aliases. Earlier revisions carried
+    /// hardcoded shortcuts (`mbp`, `display`) that matched specific hardware
+    /// model and localized-device-name strings; those are gone, because a
+    /// shipped binary must not embed one particular machine's device names.
+    /// Harnesses pass a substring of the real device name instead — e.g.
+    /// `SYNCAST_AUTO_TEST="$(…the output name you want…)"`.
     private func autoTestDevice(matching token: String) -> Device? {
-        devices.first { d in
-            d.name.localizedCaseInsensitiveContains(token) ||
-            (token == "mbp" && d.name.contains("MacBook Pro扬声器")) ||
-            (token == "display" && d.name.contains("PG27"))
-        }
+        devices.first { $0.name.localizedCaseInsensitiveContains(token) }
     }
 
     private func scheduleAutoTestAction(_ spec: String) {

@@ -198,7 +198,7 @@ Read `docs/GOAL.md`, `docs/requirements_2026-05-16.md`, and `docs/goal_completio
 - App-owned Passive Check (2026-05-16): `MainPopover` now exposes a real `Passive Check` button in Whole-home mode. If microphone permission is still `notDetermined`, the same control appears as `Grant Mic`, requests the OS permission from a user gesture, then continues into the same passive check after grant. `AppModel.runPassiveAutosyncOnce()` launches `passive_autosync_controller.py --execute --max-steps 4` from the desktop app process, using state under `~/Library/Application Support/SyncCast/PassiveAutosync`, and only when Whole-home is running with at least one local output, one AirPlay output, AirPlay not known failed/disconnected, and unlocked delay. If the hidden `SYNCAST_PASSIVE_AUTOSYNC_ALLOW_DELAY_APPLY=1` flag is set, the controller still stops at same-run `dry_run_ready` and waits for AppModel to promote the accepted candidate; explicit accepted apply is a later separate run after readiness reports `manual_validation_required`. AppModel also schedules the same controller automatically after suspect sync-context events, but automatic scheduling requires already-authorized microphone permission and never prompts. Scheduled runs capture the expected sync context and abort if it is stale after settle/cooldown. Each run carries a UUID runID and writes unique `autosync-<time>-<pid>-<uuid>` artifacts; stale/canceled tasks check runID before launching, cleanup, or UI updates. Cancel requests move the UI to `Stopping`, block retries while the child exits, and force-kill the same child after 5s only if the runID and Process identity still match. Passive baseline-mark and non-dry-run apply callbacks now re-check request sync context/current delay/route immediately before mutating app state. It clears inherited `SYNCAST_PASSIVE_*` variables, unsets active-probe flags, sets `PYTHONPATH=scripts`, and uses the bundled `Contents/Resources/passive-tools` copy when packaged, falling back to `~/syncast` for development. This is intended to bypass the Codex child-process CoreAudio/Bonjour visibility boundary by letting the real app process own the passive corpus. It still does not emit probes or write delay by default; automatic apply remains dry-run / guarded.
 - App-owned Passive Check observability (2026-05-16): when a passive controller exits, AppModel now reads both the controller JSON and the session `control_report.json`. The UI status and `launch.log` include `blockingStage` / `phase` / `readinessStage`, `readinessRecommendedWorkflow`, `nextAction`, mic/audio/delay safety flags, plus hidden opt-in `acceptedApply` and `rollback` summaries when present. `acceptedApply` / `rollback` are treated as essential details so they are not truncated behind long reason/next-action text. This keeps the next real Logitech run self-diagnosing: after one click, inspect `~/Library/Application Support/SyncCast/PassiveAutosync` or the `passiveAutosync: finished ... stage=... next=...` launch-log line to see the exact blocker.
 - App-owned Passive Check hardening (2026-05-16): follow-up Codex review found stale-run and shutdown risks. AppModel now keeps safety flags in the visible status even when stage/workflow/reason/next-action are long, terminates any passive child during app quit, token-binds the first microphone permission continuation, refuses Passive Check while lab active diagnostics are enabled/running, and marks a completed run `stale_context` if route signature, mode, delay lock, AirPlay availability, or non-allowed sync-context revision changed during the run.
-- External review status (2026-05-15 local time): Codex reviewer found the false-ready issues above, and a second pass after fixes reported no blockers. Claude Code CLI is installed at `/Users/<you>/.local/bin/claude`, but a non-interactive review attempt failed with `Not logged in`; do not claim Claude review coverage unless it is authenticated and run successfully later.
+- External review status (2026-05-15 local time): Codex reviewer found the false-ready issues above, and a second pass after fixes reported no blockers. Claude Code CLI is installed at `~/.local/bin/claude`, but a non-interactive review attempt failed with `Not logged in`; do not claim Claude review coverage unless it is authenticated and run successfully later.
 - Harness cleanup (2026-05-11): event, Tap, and Direct smoke scripts now kill bundled sidecar and OwnTone children after quitting the app. This was added after a run restored defaults but left orphaned sidecar/OwnTone processes.
 - Hardware setup rule for future tests: Whole-home / Local + AirPlay calibration should not be judged while macOS is manually set to a separate Multi-Output device. Let SyncCast own the selected local outputs and AirPlay receivers, otherwise an uncontrolled second playback timeline can pollute mic measurements. A user-session CoreAudio probe on 2026-05-11 reported the current default output as `多输出设备`. `scripts/coreaudio_default_output_guard.sh` now enforces this for `event_resync_test.sh`, `event_mutation_test.sh`, and `calibration_interrupt_test.sh` by temporarily switching to an ordinary target-matching output and restoring the previous default during cleanup. Latest live proof: the route-interrupt harness started with `多输出设备`, switched to `ExternalDisplay`, restored `多输出设备`, and passed with stale-measurement fail-closed plus recovery apply. Set `SYNCAST_ACOUSTIC_AUTO_DEFAULT=0` only when intentionally testing the fail-fast guard. Direct Stereo tests are different: the hidden `SYNCAST_STEREO_PATH=direct` path intentionally switches the system default output to `SyncCast Direct Stereo Output` and restores it on stop/quit; do not change System Settings output by hand during that test unless validating the user-change safety guard.
 - Acoustic cleanup hardening (2026-05-11): event harnesses now quit any running SyncCast before changing the CoreAudio default output, refuse to continue if SyncCast cannot quit cleanly, restore launchd test environment variables, fail an otherwise passing run with exit `6` if restoring the previous default output fails, compile the CoreAudio helper to a per-process temp path instead of reusing a shared `/tmp` binary, structurally reject CoreAudio aggregate devices via `class=aagg` / active subdevice metadata, and reject invalid/no-match scripted mutation actions.
@@ -350,10 +350,10 @@ fec46d1 fix(audio): harden wake recovery with retry-backoff + observer dedup + A
 # 1. Edit code in apps/menubar/ or core/
 
 # 2. Build (release config; SwiftPM CLI; takes ~10 s incremental, 50 s clean)
-cd /Users/<you>/syncast/apps/menubar && swift build -c release
+cd ~/syncast/apps/menubar && swift build -c release
 
 # 3. Package + install
-cd /Users/<you>/syncast
+cd ~/syncast
 bash scripts/package-app.sh
 bash scripts/install-app.sh
 
@@ -365,12 +365,12 @@ tail -f ~/Library/Logs/SyncCast/launch.log
 ```
 
 ### Worktree convention
-- Long-running agents work in `/Users/<you>/syncast/.claude/worktrees/agent-<id>/`.
+- Long-running agents work in `~/syncast/.claude/worktrees/agent-<id>/`.
 - After cherry-picking their commit to `main` the worktree directory can be left in place or removed via `git worktree remove`.
 - `.claude/worktrees/` is gitignored (added in commit `9466d6f`).
 
 ### Sidecar venv
-- `sidecar/.venv/` lives only in the main checkout — fresh worktrees lack it. `package-app.sh` requires it to PyInstaller-bundle the sidecar. If a worktree-spawned agent tries to package, it'll fail; package from `/Users/<you>/syncast` instead.
+- `sidecar/.venv/` lives only in the main checkout — fresh worktrees lack it. `package-app.sh` requires it to PyInstaller-bundle the sidecar. If a worktree-spawned agent tries to package, it'll fail; package from `~/syncast` instead.
 
 ### Useful one-liners
 ```bash
@@ -397,7 +397,7 @@ log show --predicate 'process == "SyncCastMenuBar"' --info --last 5m | grep -iE 
 Copy-paste the block below into a new Codex Desktop session. Codex Desktop has full repo read access on this machine; the prompt assumes that.
 
 ```
-You're picking up SyncCast (https://github.com/vcxzvfe/syncast — local clone at /Users/<you>/syncast). Read /Users/<you>/syncast/docs/HANDOFF.md FIRST — it's an authoritative briefing.
+You're picking up SyncCast (https://github.com/vcxzvfe/syncast — local clone at ~/syncast). Read ~/syncast/docs/HANDOFF.md FIRST — it's an authoritative briefing.
 
 Current Git HEAD on main / origin/main: inspect `git log -1 --oneline` and `git status --short`; this handoff intentionally avoids a hard-coded commit hash because origin/main was rewritten once on 2026-05-16. Read docs/GOAL.md and docs/requirements_2026-05-16.md too — they supersede older optimistic assumptions about AirPlay reliability.
 
@@ -427,10 +427,10 @@ When you write code: small commits, descriptive messages following the existing 
 
 ```bash
 # Where main is
-cd /Users/<you>/syncast && git log --oneline -5 main
+cd ~/syncast && git log --oneline -5 main
 
 # Whether install matches main
-git -C /Users/<you>/syncast rev-parse HEAD ; \
+git -C ~/syncast rev-parse HEAD ; \
   ls -la /Applications/SyncCast.app/Contents/MacOS/SyncCastMenuBar | awk '{print $6, $7, $8}'
 
 # Latest log activity

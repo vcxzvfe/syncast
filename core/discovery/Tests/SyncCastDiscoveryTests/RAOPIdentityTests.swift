@@ -26,7 +26,7 @@ final class RAOPIdentityTests: XCTestCase {
         let fromRAOP = AirPlayDiscovery.raopIdentity(
             instanceName: "02AB00CD00EF@<AirPlay receiver B>"
         ).deviceID
-        let fromAirPlay = Device.normalizedAirplayDeviceID("02:ab:00:cd:00:ef")
+        let fromAirPlay = Device.normalizedAirplayDeviceID("02ab00cd00ef")
         XCTAssertEqual(fromRAOP, fromAirPlay)
     }
 

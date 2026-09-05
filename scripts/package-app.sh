@@ -9,6 +9,9 @@
 #      rewriting their install names to @executable_path/../Frameworks/
 #   5) ad-hoc codesign so Gatekeeper at least opens it on the build machine
 #
+# Stage 0 is scripts/pii_scan.sh: this repository is public, so packaging
+# stops outright if a tracked file carries personal information.
+#
 # Output: dist/SyncCast.app
 #
 # Limitations of v0.1: not notarized, not universal2 (host arch only),
@@ -76,6 +79,12 @@ sign_bundle() {
 [[ -d "$REPO_ROOT/sidecar/.venv" ]] || fail "Python venv missing. Run scripts/bootstrap.sh first."
 
 # ---- 1) build Swift binary ------------------------------------------------
+# This repository is public and the .app is what gets handed to other people.
+# Refuse to package a tree that carries personal information. Hard failure.
+log "Scanning tracked files for personal information…"
+bash "$REPO_ROOT/scripts/pii_scan.sh" \
+  || fail "pii_scan failed — see the hits above; nothing was packaged"
+
 log "Building Swift menubar binary (release)…"
 ( cd apps/menubar && swift build -c release )
 SWIFT_BIN="$REPO_ROOT/apps/menubar/.build/release/SyncCastMenuBar"

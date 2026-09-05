@@ -6,10 +6,12 @@
 # for proof that SyncCast used Process Tap instead of ScreenCaptureKit.
 #
 # Usage:
-#   bash scripts/tap_capture_smoke_test.sh [auto_test_targets] [timeout_sec]
+#   bash scripts/tap_capture_smoke_test.sh <auto_test_targets> [timeout_sec]
 #
 # Defaults:
-#   auto_test_targets = display,mbp
+#   auto_test_targets = REQUIRED. Comma-separated substrings of the local
+#                       output names to toggle, as they appear in the
+#                       device list (there are no aliases).
 #   timeout_sec       = 80
 #
 # Exit codes:
@@ -28,7 +30,12 @@
 
 set -euo pipefail
 
-TARGETS="${1:-display,mbp}"
+TARGETS="${1:-}"
+if [[ -z "$TARGETS" ]]; then
+    echo "ERROR: auto_test_targets is required — pass comma-separated" >&2
+    echo "       substrings of the output names you want toggled." >&2
+    exit 4
+fi
 TIMEOUT="${2:-80}"
 TAP_AUDIO_PROBE="${SYNCAST_TAP_SMOKE_PROBE:-0}"
 AUDIBLE_PROBE_CONFIRM="${SYNCAST_CONFIRM_AUDIBLE_PROBE_TEST:-0}"

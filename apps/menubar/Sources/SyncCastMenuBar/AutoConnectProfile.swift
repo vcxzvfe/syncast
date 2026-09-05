@@ -95,9 +95,11 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
 
 /// Shared constants and small pure helpers for the auto-connect feature.
 enum AutoConnect {
-    /// The stable UID Apple gives the internal speakers. Verified on this
-    /// machine (2026-09-05) alongside the ExternalDisplay's
-    /// `00000000-0000-0000-0000-000000000001`.
+    /// The stable UID Apple gives the internal speakers.
+    ///
+    /// Unlike an external display's UID (a per-panel UUID such as
+    /// `00000000-0000-0000-0000-000000000001`), this one is a fixed string
+    /// and is the same on every Mac, which is why it can be a constant.
     static let builtInSpeakerUID = "BuiltInSpeakerDevice"
 
     /// Prefix every internal Apple audio device UID starts with, used as the

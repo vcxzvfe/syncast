@@ -2896,7 +2896,7 @@ public actor Router {
         // CoreAudio driver actually exposes
         // `kAudioDevicePropertyVolumeScalar` as writable.
         //
-        // DP / HDMI display speakers (the user's ExternalDisplay is the
+        // DP / HDMI display speakers (an ASUS ExternalDisplay is the
         // canonical example) DO NOT — there's no hardware path to
         // control their output level, the user must use the OSD.
         // For those, we fall back to per-channel-pair software gain

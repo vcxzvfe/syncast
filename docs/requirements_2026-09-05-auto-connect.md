@@ -2,15 +2,15 @@
 
 ## Problem
 
-Every time the laptop reaches the desk at home and the ASUS ExternalDisplay comes up,
-the user opens SyncCast and ticks the same two boxes: MacBook Pro扬声器 and
-ExternalDisplay, in local Stereo. The app already remembers *what* was selected inside
-a session, but nothing acts on "the monitor is here again".
+When a laptop reaches a desk with a known external display attached, the same
+outputs get ticked by hand every time: the built-in speakers plus the display's
+speakers, in local Stereo. The app already remembers *what* was selected inside
+a session, but nothing acts on "that display is here again".
 
-The mirror-image problem was raised earlier (2026-07-30): when the monitor goes
-away, the useful behaviour is to fall back to the built-in speakers, and this
-user wants their level forced to 0 % so that unplugging in a café does not turn
-the laptop into a speaker.
+The mirror-image problem was raised earlier (2026-07-30): when the display goes
+away, the useful behaviour is to fall back to the built-in speakers, optionally
+with their level forced to 0 %, so that unplugging in a public place does not
+turn the laptop into a speaker.
 
 Neither behaviour can be keyed on "an external display appeared": the office
 display must never trigger any of it. The only identity that separates the two
@@ -90,8 +90,8 @@ would simply be undone by the teardown.
 **Defaults for a new rule are conservative**: `restoreBuiltIn = false`,
 `builtInVolumePercent = nil`. Silently re-pointing someone's system output, or
 dropping their speaker level to a number they never chose, is not a reasonable
-thing to do to a user who only asked for auto-connect. This machine's owner
-turns both on and sets 0.
+thing to do to a user who only asked for auto-connect. A user who wants the
+silent-on-unplug behaviour turns both on and sets 0.
 
 **Stored as an array under one versioned key** (`syncast.autoConnect.profiles.v1`,
 JSON). v1's UI edits a single rule and the coordinator resolves ties as
@@ -140,9 +140,9 @@ executing the verdict.
 
 **A rule may only undo what it did.** The teardown was
 `for device in devices where routing[…].enabled`, i.e. *everything currently
-switched on*. Scenario: the rule fires (built-in + ExternalDisplay, local stereo), the
-user then switches to whole-home and enables the Mac mini and the Xiaomi, and
-only then unplugs the monitor. The old code switched off both AirPlay
+switched on*. Scenario: the rule fires (built-in + display speakers, local
+stereo), the user then switches to whole-home and enables two AirPlay
+receivers, and only then unplugs the display. The old code switched off both AirPlay
 receivers, re-pointed the default output and zeroed the built-in — silencing a
 room the rule never set up. `Action.deactivate` now carries `memberUIDs` and the
 teardown walks only local CoreAudio devices in that set. **AirPlay routing is
@@ -213,8 +213,8 @@ laptop must not be audible", and a rule that verified the state was already what
 it wanted is as entitled to that as one that built it. What the claim must not
 do is skip the built-in level a previous disconnect forced down — on that path
 no `.activate` will ever arrive to hand it back. So the coordinator now reports
-`.claimSatisfied` rather than `.none`, and the owner runs the restore step and
-nothing else. Both halves are tested.
+`.claimSatisfied` rather than `.none`, so the restore step runs and nothing
+else. Both halves are tested.
 
 **Cleanliness.** `autoConnectApplying` is released with `defer`.
 `SystemDefaultOutput.setDefaultOutput` now requires the matched device to have
@@ -255,19 +255,19 @@ while the real speakers sit right behind it in the list.
   rule that has already been deleted.
 - **Not verified on hardware by this track**: the supervisor owns real-machine
   validation and the app was not reinstalled. Specifically unproven here:
-  the actual DisplayPort flap pattern on ExternalDisplay wake against the 1.5 s
+  the actual DisplayPort flap pattern on display wake against the 1.5 s
   window, whether 0.8 s is enough for the teardown to release the default
   output before the built-in write lands, whether a stopped engine leaves
   any `HardwareVolumeObserver` echo behind the forced built-in level, whether
   `AggregateDevice.readHardwareVolume` returns the pre-force level reliably at
   the moment of teardown (the snapshot is only as good as that read).
-- **Verified against real CoreAudio on this machine**: the new output-scope
-  channel test in `SystemDefaultOutput`. A standalone probe running the shipped
-  `hasOutputChannels` over the live device list confirms it still resolves
-  `BuiltInSpeakerDevice` (id 82) and passes ExternalDisplay, BlackHole and the stacked
-  aggregate, while rejecting the input-only `BuiltInMicrophoneDevice` and the
-  Logitech BRIO — i.e. it filters exactly what it was added to filter and does
-  not break the default-output write it guards. Nothing was installed and the
+- **Verified against real CoreAudio**: the new output-scope channel test in
+  `SystemDefaultOutput`. A standalone probe running the shipped
+  `hasOutputChannels` over a live device list confirms it still resolves
+  `BuiltInSpeakerDevice`, and passes a DisplayPort display, BlackHole and a
+  stacked aggregate, while rejecting an input-only `BuiltInMicrophoneDevice`
+  and a USB webcam — i.e. it filters exactly what it was added to filter and
+  does not break the default-output write it guards. Nothing was installed and the
   running app was not touched.
 
 ## Known limits

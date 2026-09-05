@@ -6,10 +6,12 @@
 # Direct Stereo instead of ScreenCaptureKit.
 #
 # Usage:
-#   bash scripts/direct_stereo_smoke_test.sh [--default-path] [auto_test_targets] [timeout_sec]
+#   bash scripts/direct_stereo_smoke_test.sh [--default-path] <auto_test_targets> [timeout_sec]
 #
 # Defaults:
-#   auto_test_targets = display,mbp
+#   auto_test_targets = REQUIRED. Comma-separated substrings of the local
+#                       output names to toggle, as they appear in the
+#                       device list (there are no aliases).
 #   timeout_sec       = 80
 #
 # Modes:
@@ -32,11 +34,16 @@ if [[ "${1:-}" == "--default-path" ]]; then
     shift
 fi
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -gt 2 ]]; then
-    sed -n '1,26p' "$0"
+    sed -n '1,28p' "$0"
     exit 4
 fi
 
-TARGETS="${1:-display,mbp}"
+TARGETS="${1:-}"
+if [[ -z "$TARGETS" ]]; then
+    echo "ERROR: auto_test_targets is required — pass comma-separated" >&2
+    echo "       substrings of the output names you want toggled." >&2
+    exit 4
+fi
 TIMEOUT="${2:-80}"
 
 if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || (( TIMEOUT < 20 )); then
