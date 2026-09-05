@@ -378,6 +378,22 @@ static void SyncCastAudio_PersistVolume(Float32 inScalar)
     }
 }
 
+/// Mute persists for the same reason the level does — and it matters MORE:
+/// installing this driver restarts coreaudiod, so without this a user who was
+/// muted comes back unmuted at their previous level, which is the loud
+/// surprise the seeding logic on the SyncCast side exists to prevent.
+static void SyncCastAudio_PersistMute(bool inMuted)
+{
+    if(gPlugIn_Host == NULL) { return; }
+    SInt32 theRaw = inMuted ? 1 : 0;
+    CFNumberRef theValue = CFNumberCreate(NULL, kCFNumberSInt32Type, &theRaw);
+    if(theValue != NULL)
+    {
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("muted"), theValue);
+        CFRelease(theValue);
+    }
+}
+
 OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, const void* inData, UInt32* outNumberPropertiesChanged, AudioObjectPropertyAddress outChangedAddresses[2])
 {
     if(!SyncCastAudio_StreamControl_HasProperty(inObjectID, inAddress))
@@ -468,6 +484,7 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
                 outChangedAddresses[0].mSelector = kAudioBooleanControlPropertyValue;
                 outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
                 outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
+                SyncCastAudio_PersistMute(theNewValue);
             }
             return 0;
         }

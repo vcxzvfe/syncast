@@ -77,13 +77,27 @@ final class SystemSinkCoordinator {
     /// already fires on every mode / streaming-state transition) and from the
     /// once-a-second health poll.
     func refresh(router: Router, eligible: Bool, reason: String) {
+        // Every refresh opens a new episode. The status read below is a
+        // suspension point, and `refresh` fires on EVERY mode / streaming
+        // transition, so a `refresh(eligible: true)` can suspend, a
+        // `refresh(eligible: false)` can tear down, and the first task can
+        // then resume and re-attach a HAL listener to a path that is no longer
+        // running — which also poisons `watchedUID`, so the next legitimate
+        // start short-circuits and the system volume silently stops working
+        // until the app is restarted. The episode counter plus the post-await
+        // re-check close that; the task is also cancelled on teardown.
+        refreshEpisode &+= 1
+        let episode = refreshEpisode
+        refreshTask?.cancel()
         guard eligible else {
             teardown()
             return
         }
-        Task { [weak self] in
+        refreshTask = Task { [weak self] in
             let snapshot = await router.systemSinkStatus()
-            guard let self else { return }
+            guard let self, !Task.isCancelled, episode == self.refreshEpisode else {
+                return
+            }
             self.status = snapshot
             guard snapshot.active, let uid = snapshot.uid else {
                 self.teardown()
@@ -93,6 +107,11 @@ final class SystemSinkCoordinator {
             self.refreshCapabilities(router: router)
         }
     }
+
+    /// Monotonic episode counter pairing each in-flight `refresh` with the
+    /// state that started it.
+    private var refreshEpisode: UInt64 = 0
+    private var refreshTask: Task<Void, Never>?
 
     /// Once-a-second displacement check. `false` for `isSystemDefaultOutput`
     /// while active means the user picked another output in the Sound menu.
@@ -126,6 +145,8 @@ final class SystemSinkCoordinator {
     }
 
     private func teardown() {
+        refreshTask?.cancel()
+        refreshTask = nil
         capabilityTask?.cancel()
         capabilityTask = nil
         guard observer != nil || watchedUID != nil else { return }
@@ -134,6 +155,16 @@ final class SystemSinkCoordinator {
         backendsByDeviceID = [:]
         backendsByUID = [:]
         uidByDeviceID = [:]
+        // Otherwise the popover keeps showing a live "系统音量 NN%" line for a
+        // path that is no longer running.
+        status = Router.SystemSinkStatus(
+            active: false,
+            uid: status.uid,
+            displayName: status.displayName,
+            isSystemDefaultOutput: false,
+            masterVolume: status.masterVolume,
+            masterMuted: status.masterMuted
+        )
         SyncCastLog.log("systemSink: stopped watching the system volume")
     }
 
@@ -207,8 +238,19 @@ final class SystemSinkCoordinator {
     /// The install script is the same one a developer runs by hand
     /// (`scripts/install-driver.sh`), so there is exactly one install path to
     /// keep working.
-    func installDriver(scriptURL: URL?) {
+    func installDriver(scriptURL: URL?, engineIsRunning: Bool) {
         guard driverInstallState != .running else { return }
+        // Installing runs `launchctl kickstart -k system/com.apple.audio.coreaudiod`,
+        // which destroys the process tap, the tap aggregate and our own
+        // aggregate device out from under a running engine. TapCapture's
+        // onUnexpectedStop only records the event, so the app would look
+        // healthy and play nothing. Refuse rather than silently break.
+        guard !engineIsRunning else {
+            driverInstallState = .failed(
+                "安装会重启 coreaudiod：请先取消勾选输出设备（停止播放）再安装 · stop playback first"
+            )
+            return
+        }
         guard let scriptURL, FileManager.default.fileExists(atPath: scriptURL.path) else {
             driverInstallState = .failed(
                 "找不到安装脚本 install-driver.sh · installer script not found"
@@ -330,7 +372,10 @@ extension AppModel {
     }
 
     func installSystemSinkDriver() {
-        systemSink.installDriver(scriptURL: AppModel.driverInstallScriptURL)
+        systemSink.installDriver(
+            scriptURL: AppModel.driverInstallScriptURL,
+            engineIsRunning: streamingState == .running
+        )
     }
 
     /// The install script.

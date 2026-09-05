@@ -97,7 +97,11 @@ rm -rf "$INSTALLED_DRIVER"
 # to load it.
 cp -R "$BUILT_DRIVER" "$INSTALLED_DRIVER"
 chown -R root:wheel "$INSTALLED_DRIVER"
-chmod -R 755 "$INSTALLED_DRIVER"
+# Directories traversable, files readable; only the Mach-O needs the exec bit.
+# `chmod -R 755` would make Info.plist and _CodeSignature world-executable.
+find "$INSTALLED_DRIVER" -type d -exec chmod 755 {} +
+find "$INSTALLED_DRIVER" -type f -exec chmod 644 {} +
+chmod 755 "$INSTALLED_DRIVER/Contents/MacOS/SyncCastAudio"
 
 restart_coreaudiod
 

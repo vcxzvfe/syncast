@@ -33,7 +33,10 @@ SOURCES=(
 )
 
 echo "==> cleaning $BUILD_DIR"
-rm -rf "$BUNDLE"
+# The whole directory, not just the bundle: a stale object file or an old
+# Info.plist left in build/ would otherwise survive a "clean" and could be
+# picked up by packaging.
+rm -rf "$BUILD_DIR"
 mkdir -p "$BUNDLE/Contents/MacOS"
 
 echo "==> compiling"

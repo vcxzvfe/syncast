@@ -219,7 +219,11 @@ static OSStatus SyncCastAudio_GetDevicePropertyDataSize(const AudioObjectPropert
                 : 3 * sizeof(AudioObjectID);
             return 0;
         case kAudioObjectPropertyControlList:
-            *outDataSize = 2 * sizeof(AudioObjectID);
+            // Both controls are output-scoped, so an input-scope query must
+            // report none — same rule as OwnedObjects just above.
+            *outDataSize = (inAddress->mScope == kAudioObjectPropertyScopeInput)
+                ? 0
+                : 2 * sizeof(AudioObjectID);
             return 0;
         case kAudioDevicePropertyStreams:
             *outDataSize = SyncCastAudio_ScopeIsOutputOrGlobal(inAddress->mScope)
@@ -319,6 +323,11 @@ static OSStatus SyncCastAudio_GetDevicePropertyData(const AudioObjectPropertyAdd
 
         case kAudioObjectPropertyControlList:
         {
+            if(inAddress->mScope == kAudioObjectPropertyScopeInput)
+            {
+                *outDataSize = 0;
+                return 0;
+            }
             const AudioObjectID theControls[2] = { kObjectID_Volume_Output, kObjectID_Mute_Output };
             UInt32 theRequested = inDataSize / sizeof(AudioObjectID);
             if(theRequested > 2) { theRequested = 2; }

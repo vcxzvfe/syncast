@@ -253,32 +253,60 @@ func smoke() -> Int32 {
     }
 
     // --- take the default output ---
+    // Seeded exactly the way the Router seeds it: the system volume must ADOPT
+    // the level the outgoing default output already has, never jump to the
+    // sink's own — which is 1.0 on a fresh driver, i.e. full scale into
+    // whatever the user is wearing.
+    let seed = originalDefaultUID
+        .flatMap { AggregateDevice.readHardwareVolume(uid: $0) }
     let sink = SystemSinkDevice(candidate: candidate)
     do {
-        try sink.start()
+        try sink.start(seedVolume: seed)
     } catch {
         AudioObjectRemovePropertyListenerBlock(sinkID, &scalarAddress, queue, listener)
         print("FAIL: sink.start() threw: \(error)")
         return 1
     }
     print("sink active: \(sink.diagnostic)")
+    let seededTo = AggregateDevice.readHardwareVolume(uid: candidate.uid)
+    print("seed: previousDefault=\(seed.map { String(format: "%.4f", $0) } ?? "-") sinkNow=\(seededTo.map { String(format: "%.4f", $0) } ?? "-")")
+    if let seed, let seededTo, abs(seed - seededTo) > 0.02 {
+        failures.append(
+            "the sink did not adopt the previous output's level (\(seededTo) != \(seed)) — the system volume would jump on takeover"
+        )
+    }
 
     // --- pinned process tap + a tone rendered into the sink ---
     // The sink discards audio, so the tone is inaudible; the tap proves the
     // capture leg works on real frames rather than on silence.
     let capture = TapCapture(tapDeviceUID: candidate.uid)
-    var tapStarted = false
+    // The Task's result crosses a thread boundary, so it goes through a box
+    // whose only writes happen-before the semaphore signal, and it is read
+    // ONLY on the signalled path. Reading it after a timeout would be a plain
+    // data race (the Task may still be writing) — the timeout is its own
+    // failure instead.
+    final class TapStartResult: @unchecked Sendable {
+        var started = false
+        var error: String?
+    }
+    let tapResult = TapStartResult()
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
             try await capture.start()
-            tapStarted = true
+            tapResult.started = true
         } catch {
-            failures.append("tap on the sink failed to start: \(error)")
+            tapResult.error = "tap on the sink failed to start: \(error)"
         }
         semaphore.signal()
     }
-    _ = semaphore.wait(timeout: .now() + 5)
+    var tapStarted = false
+    if semaphore.wait(timeout: .now() + 5) == .success {
+        tapStarted = tapResult.started
+        if let error = tapResult.error { failures.append(error) }
+    } else {
+        failures.append("tap on the sink did not start within 5 s")
+    }
 
     if tapStarted {
         // The tone MUST come from another process: `TapCapture` builds a

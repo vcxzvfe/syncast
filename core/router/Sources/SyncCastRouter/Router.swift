@@ -581,23 +581,20 @@ public actor Router {
         //    versions (per AggregateDevice.swift docstring + BlackHole
         //    issue tracker).
         tearDownLocalDriver()
-        do {
-            try stopDirectStereoOutput()
-        } catch {
-            lastError = "direct stereo stop failed: \(error)"
-            state = .error
-            return
-        }
         // 3a-bis. The system sink: stop its pinned tap and hand the default
         //     output back. Ordered after the AUHAL teardown (the outputs read
         //     from the tap's ring) and before the whole-home sink so only one
         //     default-output owner is ever mid-restore.
+        var teardownFailures: [String] = []
+        do {
+            try stopDirectStereoOutput()
+        } catch {
+            teardownFailures.append("direct stereo stop failed: \(error)")
+        }
         do {
             try stopSystemSinkPath()
         } catch {
-            lastError = "system sink stop failed: \(error)"
-            state = .error
-            return
+            teardownFailures.append("system sink stop failed: \(error)")
         }
         // 3b. Give the user's default output back. Same fail-loud contract as
         //     Direct Stereo: if we cannot restore it we must NOT let the app
@@ -605,7 +602,14 @@ public actor Router {
         do {
             try stopWholeHomeSink()
         } catch {
-            lastError = "whole-home sink stop failed: \(error)"
+            teardownFailures.append("whole-home sink stop failed: \(error)")
+        }
+        // EVERY default-output owner gets its teardown attempted, and the
+        // failures are aggregated. Short-circuiting on the first one made one
+        // owner's fail-loud contract depend on an unrelated owner succeeding —
+        // the second owner would silently keep the system default.
+        if !teardownFailures.isEmpty {
+            lastError = teardownFailures.joined(separator: "; ")
             state = .error
             return
         }
@@ -987,14 +991,27 @@ public actor Router {
                 "[Router] forceLocalDriverRebuild: rebuilding system sink path\n".utf8
             ))
             tearDownLocalDriver()
+            let stopStatus: String?
             do {
-                try stopSystemSinkPath()
+                stopStatus = try stopSystemSinkPath()
             } catch {
                 lastError = "system sink rebuild failed to stop cleanly: \(error)"
                 FileHandle.standardError.write(Data(
                     "[Router] forceLocalDriverRebuild: system sink stop failed — \(error)\n".utf8
                 ))
                 return false
+            }
+            // Same rule as the Direct Stereo branch: if the user moved the
+            // default output away (before sleep, or while we were down),
+            // restarting would grab it back out from under them. Wake recovery
+            // is not consent — the AppModel's displacement policy owns the
+            // decision to resume.
+            if stopStatus?.contains("user changed default") == true {
+                FileHandle.standardError.write(Data(
+                    "[Router] forceLocalDriverRebuild: system sink rebuild skipped because the user changed the default output\n".utf8
+                ))
+                replan()
+                return true
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
             do {
@@ -1009,6 +1026,10 @@ public actor Router {
                 FileHandle.standardError.write(Data(
                     "[Router] forceLocalDriverRebuild: system sink rebuild failed — \(error)\n".utf8
                 ))
+                // Same unwind `start()` performs: a half-built sink path can
+                // leave macOS pointed at a silent device, and nothing else
+                // runs after a failed rebuild to notice.
+                await stopSystemSinkPathIgnoringErrors()
                 return false
             }
         }
@@ -1471,6 +1492,14 @@ public actor Router {
         )
     }
 
+    /// The sink path is not merely SELECTED but actually running. Everything
+    /// that changes audio behaviour keys on this, so the volume stage and the
+    /// gain stage can never disagree about which regime is in force.
+    private var systemSinkPathIsLive: Bool {
+        mode == .stereo && stereoOutputPath == .sink
+            && (systemSink?.isActive ?? false)
+    }
+
     /// True when the sink path is running but macOS is rendering somewhere
     /// else — the user picked another output in the Sound menu. Treated as
     /// intent by the AppModel (stop routing), never fought with a re-assert.
@@ -1486,6 +1515,16 @@ public actor Router {
     /// user moves the system slider, presses a volume key, scrolls
     /// LinearMouse, or asks Siri. Nil arguments leave that half unchanged.
     public func setSystemSinkMaster(volume: Float?, muted: Bool?) {
+        // The payload is a HINT that something changed, not the value. Two
+        // unstructured Task hops separate the HAL callback from this actor and
+        // neither guarantees ordering, so with a 20 ms debounce and a held
+        // volume key repeating every ~33 ms a STALE value could be the last to
+        // land and stick. Re-reading the device makes ordering irrelevant: the
+        // sink is the authority on its own scalar.
+        let authoritative: (volume: Float?, muted: Bool?) =
+            systemSink?.readMaster() ?? (volume: nil, muted: nil)
+        let volume = authoritative.volume ?? volume
+        let muted = authoritative.muted ?? muted
         var changed = false
         if let volume {
             let clamped = max(0, min(1, volume))
@@ -1514,8 +1553,14 @@ public actor Router {
             return [:]
         }
         let uids = sinkOutputUIDs()
+        // Each of these drives real I2C traffic to the display, and neither
+        // checks cancellation itself, so a burst of eligibility transitions
+        // would queue up probes whose results are all discarded but which all
+        // still run. Check the task's own cancellation around them.
+        if Task.isCancelled { return [:] }
         DDCDisplayVolumeController.shared.probeCapabilities(uids: uids)
         await DDCDisplayVolumeController.shared.waitForSettledCapabilities(uids: uids)
+        if Task.isCancelled { return [:] }
         guard mode == .stereo, stereoOutputPath == .sink,
               let settled = systemSink, settled.isActive
         else {
@@ -1565,6 +1610,43 @@ public actor Router {
         }
     }
 
+    /// The level the system volume should ADOPT when the sink takes over the
+    /// default output — never a jump.
+    ///
+    /// This is a hearing-safety decision, not a nicety. The master is copied
+    /// straight onto each physical device's hardware volume, and a sink's own
+    /// scalar is 1.0 on a first activation (fresh driver, or a BlackHole
+    /// nobody has touched). Seeding from the level the user is ALREADY
+    /// listening at makes the takeover silent-running: the first write to the
+    /// speakers is the value they already had.
+    ///
+    /// Order of evidence:
+    ///   1. the outgoing default output's own scalar — that IS "how loud
+    ///      things are right now";
+    ///   2. failing that (an aggregate has no volume), the loudest of the
+    ///      physical outputs we are about to drive, so nothing gets turned UP;
+    ///   3. failing that, nil — leave the sink's stored level alone rather
+    ///      than inventing a number.
+    private func systemSinkSeedVolume(devices: [Device]) -> Float? {
+        if let currentDefault = try? DirectStereoOutput.readDefaultOutput(),
+           let uid = DirectStereoOutput.readDeviceUID(currentDefault),
+           !SystemSinkDevice.isSinkUID(uid),
+           let level = AggregateDevice.readHardwareVolume(uid: uid) {
+            return level
+        }
+        let targetLevels = devices.compactMap { device -> Float? in
+            guard device.transport == .coreAudio,
+                  routing[device.id]?.enabled ?? false,
+                  let uid = device.coreAudioUID,
+                  !SystemSinkDevice.isSinkUID(uid)
+            else {
+                return nil
+            }
+            return AggregateDevice.readHardwareVolume(uid: uid)
+        }
+        return targetLevels.max()
+    }
+
     /// Bring the sink path up: install the sink as default output, pin a
     /// Process Tap to it, then open the ordinary local driver on top of the
     /// tap's ring.
@@ -1587,7 +1669,7 @@ public actor Router {
             ])
         }
         let sink = systemSink ?? SystemSinkDevice(candidate: candidate)
-        try sink.start()
+        try sink.start(seedVolume: systemSinkSeedVolume(devices: devices))
         systemSink = sink
         sinkVolumeLaw = SystemSinkVolumeLaw.law(forDeviceUID: candidate.uid)
         // Seed the master from the device so the first replan reproduces the
@@ -1626,6 +1708,18 @@ public actor Router {
             "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n".utf8
         ))
         reconcileLocalDriver(devices: devices)
+        // `reconcileLocalDriver` reports failures by setting `lastError` and
+        // returning — fine on the other paths, fatal here: the sink is already
+        // the system default, so "no output opened" means macOS is rendering
+        // into a silent device and nothing plays it. Throwing hands it to the
+        // start() catch, which unwinds the sink and gives the default back.
+        guard !localOutputs.isEmpty else {
+            throw NSError(domain: "SyncCastRouter", code: 112, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "system sink is the default output but no local output could be opened"
+                    + (lastError.map { ": \($0)" } ?? "")
+            ])
+        }
     }
 
     /// Tear the sink path down. Returns the sink's stop status (nil when the
@@ -1672,11 +1766,7 @@ public actor Router {
     /// answers it, and software gain — converted through the sink's dB law —
     /// for everything else. The per-device slider rides on top as a balance.
     private func applySystemSinkVolumes() {
-        guard mode == .stereo, stereoOutputPath == .sink,
-              let sink = systemSink, sink.isActive
-        else {
-            return
-        }
+        guard systemSinkPathIsLive else { return }
         if let agg = aggregateDevice, let aggOut = localOutputs[agg.aggregateUID] {
             for (devID, uid) in aggregateUIDByDeviceID {
                 let route = routing[devID] ?? DeviceRouting(deviceID: devID)
@@ -1751,9 +1841,21 @@ public actor Router {
                 uid: uid, route: route, output: output, pair: pair
             )
         case .softwareGain:
-            guard let pair else { return }
+            // Software gain is the LAST attenuator on this path — the whole-
+            // output gain is pinned to unity and both hardware backends have
+            // already refused. A nil pair (the aggregate's subdevice map and
+            // ours disagreeing mid-rebuild) would mean this device ignores the
+            // system volume AND its own mute, at full scale. Fall back to the
+            // first pair and say so once.
+            let resolvedPair = pair ?? 0
+            if pair == nil, !loggedHwVolumeRejectionUIDs.contains(uid) {
+                loggedHwVolumeRejectionUIDs.insert(uid)
+                FileHandle.standardError.write(Data(
+                    "[Router] system sink: no channel-pair offset for \(uid.prefix(20)); applying software gain to pair 0 (further reports silenced)\n".utf8
+                ))
+            }
             output.setSoftwareGain(
-                pair: pair, gain: plan.softwareAmplitude ?? 0
+                pair: resolvedPair, gain: plan.softwareAmplitude ?? 0
             )
         }
     }
@@ -2370,7 +2472,13 @@ public actor Router {
         // scalar / DDC / per-pair software gain), and applying `route.volume`
         // here as well would attenuate twice — once as a balance, once as a
         // master — which is the classic "slider at 50 % is inaudible" bug.
-        let sinkPath = (mode == .stereo && stereoOutputPath == .sink)
+        // MUST be the same predicate `applySystemSinkVolumes()` guards on —
+        // an ACTIVITY check, not a configuration check. If they disagree (sink
+        // selected but not running: after a displacement stop, a failed start,
+        // or a stop that threw), this loop would pin every output to unity and
+        // un-mute it while `applySystemSinkVolumes()` returned early, silently
+        // discarding both the per-device balance AND the per-device mute.
+        let sinkPath = systemSinkPathIsLive
         for plan in plans {
             guard let out = localOutputs[plan.deviceID] else { continue }
             let r = routing[plan.deviceID] ?? DeviceRouting(deviceID: plan.deviceID)

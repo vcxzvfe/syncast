@@ -1342,6 +1342,13 @@ final class AppModel {
                     refreshDirectStereoVolumeState(
                         reason: "reconcile covered set changed"
                     )
+                    // The sink path needs the same trigger for a different
+                    // reason: enabling a DIFFERENT output mid-run changes
+                    // neither `mode` nor `streamingState`, so the transition
+                    // hook never fires, and the Router would keep the
+                    // "no DDC probe has landed yet" verdict (.softwareGain)
+                    // cached for the new display forever.
+                    refreshSystemSinkPath(reason: "reconcile covered set changed")
                 }
             case .wholeHome:
                 await router.startWholeHome(devices: devices)

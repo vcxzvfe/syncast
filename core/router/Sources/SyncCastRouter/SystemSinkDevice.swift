@@ -233,7 +233,16 @@ public final class SystemSinkDevice {
     /// fan-out at a random volume) and can leave the HUD pointed elsewhere.
     ///
     /// Idempotent: a second call while active is a no-op.
-    public func start() throws {
+    ///
+    /// `seedVolume` is the level the system volume should ADOPT as we take
+    /// over — normally the level the outgoing default output is sitting at.
+    /// It is not a nicety: the sink's own scalar is 1.0 on a first activation
+    /// (a fresh driver, or a BlackHole nobody has touched), and the Router
+    /// copies the master straight onto the physical devices' hardware volume.
+    /// Without seeding, a user listening at 10 % on headphones gets full scale
+    /// the instant the path starts. Seeding makes the switch continuous: the
+    /// value we then push back to that device is the value it already had.
+    public func start(seedVolume: Float? = nil) throws {
         if isActive { return }
         let id = try Self.deviceID(forUID: candidate.uid)
 
@@ -242,18 +251,37 @@ public final class SystemSinkDevice {
         let (defaultID, defaultUID) = Self.restorablePrevious(
             id: rawDefaultID, uid: rawDefaultUID
         )
-        let rawSystemID = (try? Self.readDefault(Self.systemOutputSelector)) ?? rawDefaultID
-        let rawSystemUID = DirectStereoOutput.readDeviceUID(rawSystemID)
-        let (systemID, systemUID) = Self.restorablePrevious(
-            id: rawSystemID, uid: rawSystemUID
-        )
+        // The SYSTEM output is a separate property that legitimately points at
+        // a different device (measured on this machine: default output =
+        // built-in speakers, system output = the user's multi-output device).
+        // If we cannot read its current value we must NOT take it over:
+        // substituting the ordinary default as "the previous system output"
+        // would have teardown restore a fabricated value over the user's real
+        // sound-effects destination. Failing to read it costs us alert routing,
+        // which is the cheaper loss.
+        let rawSystemID = try? Self.readDefault(Self.systemOutputSelector)
+        let systemSnapshot = rawSystemID.map { id in
+            Self.restorablePrevious(id: id, uid: DirectStereoOutput.readDeviceUID(id))
+        }
 
         // Pin the sample rate BEFORE macOS starts rendering into the sink, so
         // no app opens it at the old rate and gets re-rated underneath.
+        //
+        // A successful WRITE is not a rate change: the HAL turns it into a
+        // device configuration change that the driver applies asynchronously
+        // (our own driver does it in PerformDeviceConfigurationChange, and the
+        // host may defer it). Tapping before it lands hands `TapCapture` the
+        // old ASBD, which it rejects — a start failure that looks like a bug in
+        // the tap. So we wait for the readback, bounded.
         let originalRate = Self.nominalSampleRate(id)
         if let originalRate, originalRate != Self.requiredSampleRate {
             if Self.setNominalSampleRate(id, rate: Self.requiredSampleRate) {
                 previousNominalSampleRate = originalRate
+                if !Self.waitForSampleRate(id, rate: Self.requiredSampleRate) {
+                    let observed = Self.nominalSampleRate(id).map { "\($0)" } ?? "?"
+                    let message = "[SystemSink] \(candidate.uid) did not reach 48 kHz within \(Self.sampleRateSettleTimeoutMs) ms (still \(observed)); the process tap will refuse the format\n"
+                    FileHandle.standardError.write(Data(message.utf8))
+                }
             } else {
                 FileHandle.standardError.write(Data(
                     "[SystemSink] could not set \(candidate.uid) to 48 kHz (currently \(originalRate)); the process tap will refuse a non-48 kHz format\n".utf8
@@ -277,18 +305,42 @@ public final class SystemSinkDevice {
         // The system-output write is best effort: a machine that refuses it
         // still gets a working master volume from the main default output, and
         // failing the whole path over alert routing would be a bad trade.
-        let systemStatus = Self.setDefault(Self.systemOutputSelector, id)
-        if systemStatus != noErr {
+        var systemTakenOver = false
+        if let systemSnapshot {
+            let systemStatus = Self.setDefault(Self.systemOutputSelector, id)
+            if systemStatus == noErr {
+                systemTakenOver = true
+            } else {
+                FileHandle.standardError.write(Data(
+                    "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n".utf8
+                ))
+            }
+            previousSystemOutputID = systemTakenOver ? systemSnapshot.0 : nil
+            previousSystemOutputUID = systemTakenOver ? systemSnapshot.1 : nil
+        } else {
             FileHandle.standardError.write(Data(
-                "[SystemSink] default SYSTEM output write failed OSStatus=\(systemStatus); alerts stay on the previous device\n".utf8
+                "[SystemSink] could not read the previous default SYSTEM output; leaving it alone rather than restoring a guess later\n".utf8
             ))
+            previousSystemOutputID = nil
+            previousSystemOutputUID = nil
+        }
+
+        // Seed AFTER the takeover, not before. macOS re-applies its own
+        // remembered level for a device at the moment that device becomes the
+        // default output, so a seed written first is simply overwritten —
+        // measured on this machine: seed 0.125 -> read back 0.4375, the sink's
+        // remembered level. Writing after (and verifying) is the only ordering
+        // that holds. Nothing is audible during the gap: the sink discards
+        // audio and our own outputs do not start until `start()` returns.
+        if let seedVolume {
+            Self.seedVolumeAfterTakeover(
+                uid: candidate.uid, target: max(0, min(1, seedVolume))
+            )
         }
 
         deviceID = id
         previousDefaultOutputID = defaultID
         previousDefaultOutputUID = defaultUID
-        previousSystemOutputID = systemStatus == noErr ? systemID : nil
-        previousSystemOutputUID = systemStatus == noErr ? systemUID : nil
         lastStopStatus = nil
         // From here on, a crash leaves the default output on a silent device.
         // The claim is what lets the NEXT launch prove that and fix it.
@@ -520,16 +572,27 @@ public final class SystemSinkDevice {
     ///   * the current default output really is that same sink,
     ///   * an ordinary output exists to move to.
     /// Anything less and we leave the user's chosen output alone.
+    /// The claim is the ONLY evidence a later launch has. It is retired in
+    /// exactly two cases: the recovery worked, or the default output is
+    /// provably not the claimed sink any more (someone already fixed it). Every
+    /// other path — HAL unreadable, no fallback device, a refused write —
+    /// leaves it standing so the next launch retries. Clearing it there would
+    /// silently retire the machine's only chance of getting its audio back.
     @discardableResult
     public static func sweepStaleDefault(defaults: UserDefaults = .standard) -> String? {
         guard let claimedUID = staleOwnershipClaimUID(defaults: defaults) else {
             return nil
         }
-        defer { clearOwnershipClaim(defaults: defaults) }
-        guard let current = try? readDefault(defaultOutputSelector),
-              let uid = DirectStereoOutput.readDeviceUID(current),
+        guard let current = try? readDefault(defaultOutputSelector) else {
+            // Cannot read the default at all: prove nothing, retire nothing.
+            return nil
+        }
+        guard let uid = DirectStereoOutput.readDeviceUID(current),
               uid == claimedUID
         else {
+            // The default is something else — either the user fixed it or the
+            // previous run did after all. Nothing to recover; retire the claim.
+            clearOwnershipClaim(defaults: defaults)
             return nil
         }
         guard let fallback = DirectStereoOutput.fallbackDefaultOutputID(
@@ -541,6 +604,7 @@ public final class SystemSinkDevice {
             return nil
         }
         _ = setDefault(systemOutputSelector, fallback)
+        clearOwnershipClaim(defaults: defaults)
         return "moved stale default output off \(uid) to \(fallback) (claim left by a dead SyncCast)"
     }
 
@@ -591,6 +655,55 @@ public final class SystemSinkDevice {
             return nil
         }
         return value
+    }
+
+    /// Write the seed level onto the sink once macOS has finished installing
+    /// it as the default output, retrying while the switch settles.
+    ///
+    /// The retry is not defensive padding: a write issued while CoreAudio is
+    /// mid-switch is accepted and then discarded (the same effect that made a
+    /// pre-takeover seed useless, and that the probe hit when restoring the
+    /// sink's level before handing the default back).
+    private static func seedVolumeAfterTakeover(uid: String, target: Float) {
+        for attempt in 0..<seedAttempts {
+            usleep(seedRetryIntervalMs * 1000)
+            _ = AggregateDevice.applyHardwareVolume(uid: uid, volume: target)
+            if let now = AggregateDevice.readHardwareVolume(uid: uid),
+               abs(now - target) <= seedTolerance {
+                return
+            }
+            _ = attempt
+        }
+        let observed = AggregateDevice.readHardwareVolume(uid: uid)
+            .map { String(format: "%.4f", $0) } ?? "?"
+        FileHandle.standardError.write(Data(
+            "[SystemSink] could not seed \(uid) to \(target) (still \(observed)); the system volume may jump on takeover\n".utf8
+        ))
+    }
+
+    private static let seedAttempts = 6
+    private static let seedRetryIntervalMs: UInt32 = 60
+    /// A scalar grid is quantised (the built-in speakers step in 1/16), so an
+    /// exact match is not a fair test of "did the write land".
+    private static let seedTolerance: Float = 0.02
+
+    /// How long to let a requested sample-rate change land. Generous enough
+    /// for a driver that routes it through a configuration change, short
+    /// enough that a refusing device does not stall app start.
+    static let sampleRateSettleTimeoutMs = 1_000
+    private static let sampleRatePollIntervalMs: UInt32 = 25
+
+    /// Poll the nominal rate until it matches, or the timeout expires.
+    /// Returns whether it landed.
+    static func waitForSampleRate(_ id: AudioObjectID, rate: Float64) -> Bool {
+        let deadline = Date().addingTimeInterval(
+            Double(sampleRateSettleTimeoutMs) / 1000
+        )
+        repeat {
+            if let current = nominalSampleRate(id), current == rate { return true }
+            usleep(sampleRatePollIntervalMs * 1000)
+        } while Date() < deadline
+        return nominalSampleRate(id) == rate
     }
 
     @discardableResult

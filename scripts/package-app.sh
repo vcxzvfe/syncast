@@ -120,10 +120,12 @@ fi
 # .app, with no source checkout anywhere. install-driver.sh detects a driver
 # sitting next to it and installs that instead of building.
 DRIVER_BUILD="$REPO_ROOT/drivers/SyncCastAudio/build/SyncCastAudio.driver"
-if [[ ! -d "$DRIVER_BUILD" ]]; then
-  log "Building SyncCastAudio.driver"
-  bash "$REPO_ROOT/drivers/SyncCastAudio/build.sh" || log "WARNING: driver build failed; the .app will ship without it"
-fi
+# ALWAYS rebuild. A stale build/ directory from an earlier edit would otherwise
+# be shipped and then installed into /Library by the in-app installer, which is
+# the worst possible place to discover you packaged an obsolete driver. The
+# build is a few seconds of clang.
+log "Building SyncCastAudio.driver"
+bash "$REPO_ROOT/drivers/SyncCastAudio/build.sh" || log "WARNING: driver build failed; the .app will ship without it"
 if [[ -d "$DRIVER_BUILD" ]]; then
   cp -R "$DRIVER_BUILD" "$RES_DIR/SyncCastAudio.driver"
   cp "$REPO_ROOT/scripts/install-driver.sh" "$RES_DIR/install-driver.sh"

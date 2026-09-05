@@ -202,6 +202,21 @@ static OSStatus SyncCastAudio_Initialize(AudioServerPlugInDriverRef inDriver, Au
             }
             CFRelease(theValue);
         }
+        // Mute too: installing the driver restarts coreaudiod, and coming back
+        // unmuted at the previous level is exactly the loud surprise this
+        // whole path is careful to avoid.
+        CFPropertyListRef theMute = NULL;
+        gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("muted"), &theMute);
+        if(theMute != NULL)
+        {
+            if(CFGetTypeID(theMute) == CFNumberGetTypeID())
+            {
+                SInt32 theRaw = 0;
+                CFNumberGetValue((CFNumberRef)theMute, kCFNumberSInt32Type, &theRaw);
+                gMute_Output_Value = (theRaw != 0);
+            }
+            CFRelease(theMute);
+        }
     }
 
     return 0;
@@ -389,14 +404,15 @@ static OSStatus SyncCastAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver,
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
     if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
 
-    // The mix is discarded. Deliberately NOT scaled by the volume control:
-    // this device carries no audio anywhere, and SyncCast applies the volume
-    // on the real outputs. Scaling here would attenuate twice for anyone who
-    // ever did read from us.
-    if((inOperationID == kAudioServerPlugInIOOperationWriteMix) && (ioMainBuffer != NULL))
-    {
-        memset(ioMainBuffer, 0, (size_t)inIOBufferFrameSize * kDevice_BytesPerFrame);
-    }
+    // The mix is discarded — nothing reads this device, so there is nothing to
+    // write and nothing to clear. Deliberately NOT scaled by the volume
+    // control either: SyncCast applies the level on the real outputs, and
+    // scaling here would attenuate twice. (Apple's NullAudio does nothing here
+    // for the same reason; zeroing the buffer would be pointless work on a
+    // real-time thread.)
+    (void)inOperationID;
+    (void)inIOBufferFrameSize;
+    (void)ioMainBuffer;
 
     return 0;
 }
