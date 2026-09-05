@@ -154,12 +154,23 @@ public actor Router {
     /// path can build its pinned tap with the same contract as `capture`.
     private let sampleRate: Double
     private let channelCount: Int
-    /// Whole-home mode's named system sink ("AirPlay 全屋"): a public
-    /// aggregate wrapping BlackHole 2ch that we install as the macOS default
-    /// output for the duration of whole-home mode. Nil in stereo mode and
-    /// after teardown. See `WholeHomeSinkOutput` for why the rename cannot be
-    /// done on BlackHole itself.
-    private var wholeHomeSink: WholeHomeSinkOutput?
+    /// Whole-home mode's default-output owner: SyncCast's own sink device
+    /// directly when it is installed (so the macOS volume UI works natively),
+    /// otherwise the named public aggregate 「AirPlay 全屋」 wrapping
+    /// BlackHole. Nil in stereo mode and after teardown. See
+    /// `WholeHomeSinkSelection` for which one is picked and why.
+    private var wholeHomeSink: WholeHomeSinkOwner?
+    /// The system volume, while whole-home's default output is a device that
+    /// HAS one. `nil` means the panel's own percent fader
+    /// (`masterVolumePercent`) is the master instead — the wrapped-aggregate
+    /// fallback, and every non-whole-home mode.
+    ///
+    /// 0…1 on the HAL's perceptual scale, NOT a linear amplitude;
+    /// `wholeHomeSinkLaw` converts it.
+    private var wholeHomeSinkMasterScalar: Float?
+    private var wholeHomeSinkMasterMuted = false
+    /// The whole-home sink's own scalar↔dB law, read once per start.
+    private var wholeHomeSinkLaw = SystemSinkVolumeLaw.appleBuiltInLaw
     private var routing: [String: DeviceRouting] = [:]
     /// Monotonic route/context epoch. Incremented for user/app-driven route,
     /// mode, AirPlay active-set, connection, and measured-latency changes.
@@ -439,9 +450,7 @@ public actor Router {
         // reconnect would start at full scale and ramp DOWN to the user's
         // level, i.e. ~10 ms of full-volume audio out of a system they had
         // turned down or muted.
-        writer.seedMasterGain(
-            VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)
-        )
+        writer.seedMasterGain(wholeHomeMasterAmplitude)
         // Same reasoning for the AirPlay group curve: a brand-new writer
         // starts flat and would drop the user's tone setting on the floor at
         // every sidecar reconnect.
@@ -535,7 +544,7 @@ public actor Router {
                 // below, sets state = .error, and surfaces `lastError` — which
                 // is exactly what a missing BlackHole must do instead of
                 // silently double-playing every track.
-                try startWholeHomeSink()
+                try startWholeHomeSink(devices: devices)
             }
             replan()
             state = .running
@@ -764,9 +773,11 @@ public actor Router {
             let eqClip = b.equalizerClipCount
             bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) gain:\(String(format: "%.3f", b.lastRenderGain))\(eqClip > 0 ? " eqClip:\(eqClip)" : "") err:\(b.lastError.isEmpty ? "none" : b.lastError)"
         }
-        let masterInfo =
-            " master=\(masterVolumePercent)%"
-            + "/\(String(format: "%.3f", VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)))"
+        // Names the SOURCE as well as the value: with the whole-home sink
+        // driving the master, `master=fader 100%` and `master=systemVolume …`
+        // are the difference between "the panel fader is inert" being expected
+        // and being a bug.
+        let masterInfo = " master=\(wholeHomeMasterSourceLabel)"
         // Per-subdevice hardware-volume rejection counters. Surfaced
         // here because the stderr log emits ONCE per UID per session;
         // a support ticket needs to see total rejection counts for
@@ -1486,6 +1497,16 @@ public actor Router {
         /// System volume, on the HAL's 0…1 perceptual scale.
         public let masterVolume: Float
         public let masterMuted: Bool
+        /// True when the watched device's own `VolumeScalar` IS the level in
+        /// force — the stereo sink path, or whole-home on the direct sink.
+        ///
+        /// False for whole-home's wrapped-aggregate fallback: it holds the
+        /// default output (so `active` and `isSystemDefaultOutput` still mean
+        /// something) but exposes no volume control, so `uid` is nil, the
+        /// panel's own fader is the master and the media-key event tap stays
+        /// on. Every "is the system volume ours?" decision keys on THIS, never
+        /// on `active` alone.
+        public let drivesSystemVolume: Bool
 
         public init(
             active: Bool,
@@ -1493,7 +1514,8 @@ public actor Router {
             displayName: String?,
             isSystemDefaultOutput: Bool,
             masterVolume: Float,
-            masterMuted: Bool
+            masterMuted: Bool,
+            drivesSystemVolume: Bool = false
         ) {
             self.active = active
             self.uid = uid
@@ -1501,6 +1523,7 @@ public actor Router {
             self.isSystemDefaultOutput = isSystemDefaultOutput
             self.masterVolume = masterVolume
             self.masterMuted = masterMuted
+            self.drivesSystemVolume = drivesSystemVolume
         }
     }
 
@@ -1508,6 +1531,9 @@ public actor Router {
     public var stereoPath: StereoOutputPathPolicy.Path { stereoOutputPath }
 
     public func systemSinkStatus() -> SystemSinkStatus {
+        if mode == .wholeHome {
+            return wholeHomeSinkStatus()
+        }
         guard let sink = systemSink, sink.isActive else {
             return SystemSinkStatus(
                 active: false,
@@ -1524,7 +1550,38 @@ public actor Router {
             displayName: sink.displayName,
             isSystemDefaultOutput: sink.isSystemDefaultOutput,
             masterVolume: sinkMasterVolume,
-            masterMuted: sinkMasterMuted
+            masterMuted: sinkMasterMuted,
+            drivesSystemVolume: true
+        )
+    }
+
+    /// Whole-home's half of `systemSinkStatus()`.
+    ///
+    /// The same struct, deliberately: the app-side coordinator that watches
+    /// the device and mirrors it into the popover is ONE object, and giving it
+    /// a second shape per mode would mean two of everything downstream. The
+    /// wrapped fallback reports `uid: nil` + `drivesSystemVolume: false`,
+    /// which is what tells the coordinator to attach no listener and the panel
+    /// to keep its own fader.
+    private func wholeHomeSinkStatus() -> SystemSinkStatus {
+        guard let sink = wholeHomeSink, sink.isActive else {
+            return SystemSinkStatus(
+                active: false,
+                uid: nil,
+                displayName: nil,
+                isSystemDefaultOutput: false,
+                masterVolume: wholeHomeSinkMasterScalar ?? 1,
+                masterMuted: wholeHomeSinkMasterMuted
+            )
+        }
+        return SystemSinkStatus(
+            active: true,
+            uid: sink.systemVolumeUID,
+            displayName: sink.displayName,
+            isSystemDefaultOutput: sink.isSystemDefaultOutput,
+            masterVolume: wholeHomeSinkMasterScalar ?? 1,
+            masterMuted: wholeHomeSinkMasterMuted,
+            drivesSystemVolume: sink.drivesSystemVolume
         )
     }
 
@@ -1536,12 +1593,28 @@ public actor Router {
             && (systemSink?.isActive ?? false)
     }
 
-    /// True when the sink path is running but macOS is rendering somewhere
-    /// else — the user picked another output in the Sound menu. Treated as
-    /// intent by the AppModel (stop routing), never fought with a re-assert.
+    /// True when SyncCast owns the macOS default output but macOS is rendering
+    /// somewhere else — the user picked another output in the Sound menu.
+    ///
+    /// ONE property for every path that takes the default output over: the
+    /// stereo sink path and both whole-home flavours. They all fail the same
+    /// way (SyncCast receives nothing, and in whole-home every track also
+    /// plays twice) and they all get the same answer — treat it as INTENT,
+    /// stop routing, never re-assert. Two properties meant two banners and two
+    /// policies for one condition.
+    ///
+    /// Polled by the app's 1 Hz health loop rather than observed: a HAL
+    /// listener would fire on an arbitrary dispatch queue into actor-owned
+    /// state, for sub-second detection of something whose only consequence is
+    /// a banner.
     public var systemSinkDisplaced: Bool {
-        guard let sink = systemSink, sink.isActive else { return false }
-        return !sink.isSystemDefaultOutput
+        if let sink = systemSink, sink.isActive {
+            return !sink.isSystemDefaultOutput
+        }
+        if let sink = wholeHomeSink, sink.isActive {
+            return !sink.isSystemDefaultOutput
+        }
+        return false
     }
 
     /// Push a new system volume (the sink's scalar) into the output stage.
@@ -1550,7 +1623,16 @@ public actor Router {
     /// `kAudioDevicePropertyVolumeScalar` / `Mute` changes — i.e. whenever the
     /// user moves the system slider, presses a volume key, scrolls
     /// LinearMouse, or asks Siri. Nil arguments leave that half unchanged.
+    ///
+    /// One entry point for both paths that watch a sink device, because the
+    /// coordinator on the app side is one object watching one device: in
+    /// whole-home the scalar becomes the master gain on the samples entering
+    /// OwnTone; in stereo it becomes a per-output level on the real speakers.
     public func setSystemSinkMaster(volume: Float?, muted: Bool?) {
+        if mode == .wholeHome {
+            applyWholeHomeSinkMaster(volume: volume, muted: muted)
+            return
+        }
         // The payload is a HINT that something changed, not the value. Two
         // unstructured Task hops separate the HAL callback from this actor and
         // neither guarantees ordering, so with a 20 ms debounce and a held
@@ -2264,19 +2346,51 @@ public actor Router {
 
     // MARK: - Whole-home system sink ("AirPlay 全屋")
 
-    /// Install the named silent sink as the macOS default output.
-    /// Idempotent — safe to call from every whole-home start path.
+    /// Install whole-home's silent default output.
+    ///
+    /// Two shapes, chosen by `WholeHomeSinkSelection`: SyncCast's own sink
+    /// device directly (it has a real volume control, so macOS's volume UI
+    /// works natively) or the named aggregate wrapping BlackHole. Idempotent —
+    /// safe to call from every whole-home start path.
+    ///
     /// Throws `WholeHomeSinkOutput.WholeHomeSinkError.noSilentSinkInstalled`
     /// when neither SyncCast's own driver nor BlackHole 2ch is installed,
     /// which is the one condition that used to fail silently into
     /// double-played audio.
-    private func startWholeHomeSink() throws {
+    private func startWholeHomeSink(devices: [Device]) throws {
         guard WholeHomeSinkOutput.enabled else { return }
-        let sink = wholeHomeSink ?? WholeHomeSinkOutput()
-        try sink.start()
+        let selection = WholeHomeSinkSelection.choose(
+            resolved: SystemSinkDevice.resolved,
+            exposesVolumeControl: { SystemSinkDevice.exposesVolumeControl(uid: $0) }
+        )
+        let sink = wholeHomeSink ?? WholeHomeSinkOwner(selection: selection)
+        // The seed is the hearing-safety rule the stereo sink path learned the
+        // hard way: the device's scalar becomes the system volume, and a fresh
+        // driver sits at 1.0. Adopt whatever the outgoing default output was
+        // at instead of jumping to full scale.
+        try sink.start(
+            seedVolume: sink.drivesSystemVolume
+                ? systemSinkSeedVolume(devices: devices)
+                : nil
+        )
         wholeHomeSink = sink
+        if sink.drivesSystemVolume, let uid = sink.systemVolumeUID {
+            wholeHomeSinkLaw = SystemSinkVolumeLaw.law(forDeviceUID: uid)
+            let master = sink.readMaster()
+            wholeHomeSinkMasterScalar = master.volume.map { max(0, min(1, $0)) }
+            wholeHomeSinkMasterMuted = master.muted ?? false
+            // `seedMasterGain`, not `setMasterGain`: the latter only moves the
+            // ramp target, so a writer that has not yet sent a packet would
+            // start at unity and ramp DOWN — ~10 ms of full-scale audio out of
+            // a system the user had turned down.
+            audioWriter?.seedMasterGain(wholeHomeMasterAmplitude)
+        } else {
+            wholeHomeSinkMasterScalar = nil
+            wholeHomeSinkMasterMuted = false
+        }
         RouterLog.write(
-            "[Router] whole-home sink active: \(sink.diagnostic)\n"
+            "[Router] whole-home sink active: \(sink.diagnostic)"
+            + " master=\(wholeHomeMasterSourceLabel)\n"
         )
     }
 
@@ -2299,38 +2413,16 @@ public actor Router {
             "[Router] whole-home sink stopped: \(status ?? "unknown")\n"
         )
         wholeHomeSink = nil
+        // Hand the master back to the panel's percent fader, and put the
+        // writer's gain where that fader says. Leaving the sink's amplitude in
+        // force would make the popover slider read one level while the audio
+        // played at another.
+        if wholeHomeSinkMasterScalar != nil {
+            wholeHomeSinkMasterScalar = nil
+            wholeHomeSinkMasterMuted = false
+            audioWriter?.setMasterGain(wholeHomeMasterAmplitude)
+        }
         return status
-    }
-
-    /// True when whole-home is running but macOS is no longer sending system
-    /// audio into our sink — i.e. the user (or a headphone plug) moved the
-    /// default output away and every track is now playing twice: once out of
-    /// the new default directly, once through the SCK tap → OwnTone → outputs.
-    ///
-    /// Polled by the app's 1 Hz health loop. See
-    /// `WholeHomeSinkOutput.isSystemDefaultOutput` for why this is a poll
-    /// rather than a CoreAudio property listener.
-    public var wholeHomeSinkDisplaced: Bool {
-        guard mode == .wholeHome, let sink = wholeHomeSink, sink.isActive else {
-            return false
-        }
-        return !sink.isSystemDefaultOutput
-    }
-
-    /// Put the named sink back as the macOS default output. Driven only by an
-    /// explicit user action — see `WholeHomeSinkOutput.reassertDefaultOutput`
-    /// for why this must never be automatic.
-    @discardableResult
-    public func reassertWholeHomeSink() -> Bool {
-        guard let sink = wholeHomeSink else { return false }
-        let ok = sink.reassertDefaultOutput()
-        if !ok {
-            lastError = "whole-home sink: could not reclaim the default output"
-        }
-        RouterLog.write(
-            "[Router] whole-home sink reassert: \(ok ? "ok" : "failed") \(sink.diagnostic)\n"
-        )
-        return ok
     }
 
     /// The CoreAudio devices this Router would actually open AUHALs on: every
@@ -2745,16 +2837,75 @@ public actor Router {
     /// Idempotent, and safe to call when no writer exists (stereo mode, or
     /// before the sidecar has connected): the value is remembered and applied
     /// to the next writer that is built.
+    /// Ignored while the whole-home sink drives the master (the popover writes
+    /// the sink's scalar instead, so macOS's own UI stays the single source of
+    /// truth). The percent is still remembered, so the panel fader picks up
+    /// where it left off if the path falls back to the wrapped aggregate.
     public func setMasterVolume(percent: Int) {
         let clamped = VolumeCurve.clampPercent(percent)
         masterVolumePercent = clamped
-        audioWriter?.setMasterGain(
-            VolumeCurve.masterAmplitude(forPercent: clamped)
-        )
+        guard wholeHomeSinkMasterScalar == nil else { return }
+        audioWriter?.setMasterGain(wholeHomeMasterAmplitude)
     }
 
     /// Current master fader position, for UI re-sync and tests.
     public var currentMasterVolumePercent: Int { masterVolumePercent }
+
+    /// The linear amplitude the master stage should be at right now.
+    ///
+    /// Two sources, never both: the whole-home sink's own volume scalar (when
+    /// the default output is a device that has one) or the panel's percent
+    /// fader. `SystemSinkVolumeLaw.wholeHomeMasterAmplitude` documents why the
+    /// scalar goes through the SINK's dB law rather than `VolumeCurve`'s
+    /// −30 dB OwnTone curve.
+    var wholeHomeMasterAmplitude: Float {
+        guard let scalar = wholeHomeSinkMasterScalar else {
+            return VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)
+        }
+        return SystemSinkVolumeLaw.wholeHomeMasterAmplitude(
+            scalar: scalar, muted: wholeHomeSinkMasterMuted, law: wholeHomeSinkLaw
+        )
+    }
+
+    /// For logs and the diagnostic string: which of the two master sources is
+    /// in force, and at what value.
+    private var wholeHomeMasterSourceLabel: String {
+        guard let scalar = wholeHomeSinkMasterScalar else {
+            return "fader \(masterVolumePercent)%"
+                + "/\(String(format: "%.3f", wholeHomeMasterAmplitude))"
+        }
+        return "systemVolume \(String(format: "%.3f", scalar))"
+            + (wholeHomeSinkMasterMuted ? "(muted)" : "")
+            + "/\(String(format: "%.3f", wholeHomeMasterAmplitude))"
+    }
+
+    /// Push a new system volume (the whole-home sink's scalar) into the master
+    /// stage. Same authority rule as the stereo path: the payload is a HINT
+    /// that something changed and the device is re-read for the value, so two
+    /// unordered hops from the HAL callback cannot leave a stale value stuck.
+    private func applyWholeHomeSinkMaster(volume: Float?, muted: Bool?) {
+        guard let sink = wholeHomeSink, sink.isActive, sink.drivesSystemVolume
+        else {
+            return
+        }
+        let authoritative = sink.readMaster()
+        let volume = authoritative.volume ?? volume
+        let muted = authoritative.muted ?? muted
+        var changed = false
+        if let volume {
+            let clamped = max(0, min(1, volume))
+            if clamped != wholeHomeSinkMasterScalar {
+                wholeHomeSinkMasterScalar = clamped
+                changed = true
+            }
+        }
+        if let muted, muted != wholeHomeSinkMasterMuted {
+            wholeHomeSinkMasterMuted = muted
+            changed = true
+        }
+        guard changed else { return }
+        audioWriter?.setMasterGain(wholeHomeMasterAmplitude)
+    }
 
     /// Linear gain one whole-home local bridge should apply for a routing
     /// entry.

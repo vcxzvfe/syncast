@@ -17,12 +17,10 @@ struct MainPopover: View {
                 volumeKeyPermissionHint
                 Divider().padding(.horizontal, 12)
             }
-            // Above the master fader on purpose: while this is showing, every
-            // control below it is describing only half of what the user hears.
-            if model.wholeHomeSinkDisplaced {
-                wholeHomeSinkDisplacedBanner
-                Divider().padding(.horizontal, 12)
-            }
+            // Displacement (the user moved the default output away) is shown
+            // by the system-sink status row below, in every mode — one
+            // condition, one line, one action. See
+            // `AppModel.pollSystemSinkStatus`.
             if let line = model.systemSinkStatusLine {
                 systemSinkStatusRow(line)
                 Divider().padding(.horizontal, 12)
@@ -77,31 +75,6 @@ struct MainPopover: View {
                 .buttonStyle(.borderless)
                 .font(.system(size: 10))
                 .accessibilityIdentifier("volumeKeyPermissionButton")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 4)
-    }
-
-    /// Shown only while whole-home is running and macOS has stopped pointing
-    /// at the 「AirPlay 全屋」 sink. That state is silent-but-wrong: system
-    /// audio reaches the newly-selected output directly AND still goes through
-    /// the capture → OwnTone path, so everything plays twice at two different
-    /// latencies. Recovery is one click, and deliberately a click rather than
-    /// automatic — see `AppModel.wholeHomeSinkDisplaced`.
-    private var wholeHomeSinkDisplacedBanner: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(.orange)
-            Text("系统输出已不是「\(WholeHomeSinkOutput.displayName)」— 声音会播两遍")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            Button("切回") { model.reclaimWholeHomeSinkAsDefault() }
-                .buttonStyle(.borderless)
-                .font(.system(size: 10))
-                .accessibilityIdentifier("wholeHomeSinkReclaimButton")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
@@ -170,14 +143,19 @@ struct MainPopover: View {
     // has per-device hardware volume plus the media keys.
     //
     // Placed ABOVE the device rows: it is the total, they are the balance.
+    //
+    // With SyncCast's own sink as the default output the master IS the macOS
+    // system volume, so this control becomes a two-way view of it: it reads
+    // the device's scalar and writes it back. Everything below goes through
+    // `AppModel.masterSlider*`, which is the one place that knows which of the
+    // two authorities is in force.
     private var masterVolumeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("总音量")
                     .font(.system(size: 11, weight: .semibold))
                 Spacer()
-                if model.masterVolumePercent != VolumeCurve.defaultPercent
-                    || model.masterMuted {
+                if model.showsMasterVolumeReset {
                     Button("Reset") { model.resetMasterVolume() }
                         .buttonStyle(.borderless)
                         .font(.system(size: 10))
@@ -185,41 +163,52 @@ struct MainPopover: View {
                 }
             }
             HStack(spacing: 8) {
-                Image(systemName: model.masterMuted
+                Image(systemName: model.masterSliderMuted
                       ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .font(.system(size: 11))
-                    .foregroundStyle(model.masterMuted ? .orange : .secondary)
+                    .foregroundStyle(model.masterSliderMuted ? .orange : .secondary)
                     .frame(width: 14)
-                    .onTapGesture { model.toggleMasterMute() }
+                    .onTapGesture { model.toggleMasterSliderMute() }
                     .accessibilityIdentifier("masterVolumeMuteButton")
                 Slider(value: Binding(
-                    get: { Double(model.masterVolumePercent) },
-                    set: { model.setMasterVolumePercent(Int($0.rounded())) }
+                    get: { Double(model.masterSliderPercent) },
+                    set: { model.setMasterSliderPercent(Int($0.rounded())) }
                 ), in: volumePercentSliderRange, step: 1)
                     .controlSize(.small)
-                    .disabled(model.masterMuted)
+                    .disabled(model.masterSliderMuted)
                     .accessibilityIdentifier("masterVolumeSlider")
                     .accessibilityValue(
-                        Text(VolumeCurve.percentLabel(model.masterVolumePercent))
+                        Text(VolumeCurve.percentLabel(model.masterSliderPercent))
                     )
-                Text(VolumeCurve.percentLabel(model.masterVolumePercent))
+                Text(VolumeCurve.percentLabel(model.masterSliderPercent))
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(model.masterMuted
+                    .foregroundStyle(model.masterSliderMuted
                                      ? AnyShapeStyle(HierarchicalShapeStyle.secondary)
                                      : AnyShapeStyle(.primary))
                     .frame(width: 38, alignment: .trailing)
             }
-            // The one thing about this control that is not self-evident: it
-            // is applied before OwnTone, so it is the only fader that can
-            // truly silence an AirPlay receiver — and, being upstream of the
-            // 16-bit conversion, the one worth leaving high.
-            Text("作用于所有音箱（在 OwnTone 之前）。保持高位、用每个音箱的滑块配平音量更好。")
+            Text(masterVolumeCaption)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+    }
+
+    /// The one thing about this control that is not self-evident, and it
+    /// differs by authority:
+    ///
+    ///   * sink-driven — this slider and the menu-bar one are the same knob,
+    ///     which is worth saying before the user goes looking for the
+    ///     difference;
+    ///   * fader — it is applied before OwnTone, so it is the only stage that
+    ///     can truly silence an AirPlay receiver, and being upstream of the
+    ///     16-bit conversion it is the one worth leaving high.
+    private var masterVolumeCaption: String {
+        model.wholeHomeMasterFollowsSystemVolume
+            ? "就是系统音量：菜单栏滑杆、F11/F12、音量 HUD 调的都是这一个。用每个音箱的滑块配平。"
+            : "作用于所有音箱（在 OwnTone 之前）。保持高位、用每个音箱的滑块配平音量更好。"
     }
 
     // MARK: - Sync section (manual)

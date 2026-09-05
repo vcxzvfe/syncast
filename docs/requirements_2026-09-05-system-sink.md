@@ -302,12 +302,14 @@ floor 重新建起来），这次重锚同样不计——它是预期行为。
 
 ## 6. 没做（明确划界）
 
-- **whole-home 的音量保持原样**（设备选择这条轴见 §7）：它的默认输出是自己的
-  「AirPlay 全屋」aggregate（无音量
-  控制），主音量在 `AudioSocketWriter` 里、走 OwnTone 的 −30 dB 曲线，跟 sink 的
-  scalar 不是一个量纲；`wholeHomeVolumeKeyEligible` 因此保留事件 tap。把它接到同
-  一个 sink 观察器上并不便宜（要么让 whole-home 也用可调音量的 sink 当默认输出，
-  要么在两条音量曲线之间做映射），本轮不做。
+- ~~**whole-home 的音量保持原样**~~ —— **2026-09-05 已推翻，见 §8。** 原文如下：
+  「它的默认输出是自己的「AirPlay 全屋」aggregate（无音量控制），主音量在
+  `AudioSocketWriter` 里、走 OwnTone 的 −30 dB 曲线，跟 sink 的 scalar 不是一个
+  量纲；`wholeHomeVolumeKeyEligible` 因此保留事件 tap。把它接到同一个 sink 观察器
+  上并不便宜（要么让 whole-home 也用可调音量的 sink 当默认输出，要么在两条音量
+  曲线之间做映射），本轮不做。」§8 两件都做了：装了自家驱动就直接拿它当默认输出，
+  并且在 sink 的 dB 律和写入器的线性振幅之间做映射（而不是去套 OwnTone 那条
+  −30 dB 曲线）。
 - 自动连接 profile（Track B，`feat/auto-connect` 并行）。
 - Sidecar / Python 侧无改动。
 
@@ -407,3 +409,107 @@ sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver && sudo killall core
 whole-home 以 `SyncCastAudio_UID` 作 sink 的**真实播放**（AirPlay 接收端 +
 本地喇叭同时出声、无双播、退出后默认输出正确还原）只能人工验证——本轮的自动化
 只覆盖到纯逻辑（优先级、错误文案、还原白名单）。
+
+---
+
+## 8. whole-home 也用系统音量（2026-09-05 补，分支 `feat/wholehome-system-volume`）
+
+推翻 §6 第一条。**装了 `SyncCastAudio.driver` 的机器，whole-home 模式下 macOS
+自己的音量 UI（菜单栏滑杆 / F11-F12 / 音量 HUD / 滚轮调音工具）直接控制总音量**，
+事件 tap 在这条路上退场。
+
+### 8.1 默认输出：不再无脑套 aggregate
+
+`WholeHomeSinkSelection.choose` 二选一：
+
+| 装了什么 | owner | 系统音量 | 事件 tap |
+|---|---|---|---|
+| SyncCast 自家驱动 | `.direct` —— 复用 `SystemSinkDevice` | **原生**（设备自己的 VolumeScalar）| 退场 |
+| 只有 BlackHole | `.wrapped` —— `WholeHomeSinkOutput`（「AirPlay 全屋」）| 滑杆置灰 | 保留 |
+
+aggregate 包装层当年只为一件事存在：BlackHole 改不了名（`kAudioObjectPropertyName`
+不可写，改驱动 Info.plist 要 sudo + App Management），不包起来「声音」菜单里就写着
+"BlackHole 2ch"，看着像配错了。自家驱动本来就叫 "SyncCast"，这个理由不成立；而包装
+层是有代价的——**aggregate 不转发 `kAudioDevicePropertyVolumeScalar`**（本轮之前
+已实测 `has=false`），滑杆置灰、音量键出「禁止」HUD，只能靠 CGEventTap 抢键。
+
+`.direct` 直接复用 stereo sink 路径的 `SystemSinkDevice`，所以**接管 / 还原 /
+ownership claim / stale-default 清扫只有一份实现**，不会两边跑偏。两处刻意的差别：
+
+- **不钉 48 kHz**（`start(pinSampleRate: false)`）。whole-home 的捕获是
+  ScreenCaptureKit，在 HAL 之上抓，从不打开这台设备——sink 的标称采样率根本不在
+  信号通路上，钉住它只会把一台**共享**设备的采样率替全系统改掉。stereo sink 路径
+  必须钉，是因为它拿 Process Tap 去 tap 这台设备本身，格式不对直接报错。
+- **播种照旧**：接管时采纳「即将被换下的那台默认输出」当前的音量（`start` 的
+  `seedVolume`），而且**写在接管之后**——macOS 会在设备成为默认输出的瞬间重新
+  施加它自己记住的音量，先写会被覆盖。这是上一轮 CRITICAL 那条听力安全教训，
+  一字未改地沿用。
+
+### 8.2 主音量：sink 的 dB 律 → 线性振幅，**不要**过 OwnTone 那条曲线
+
+`AudioSocketWriter.setMasterGain` 本来就收线性振幅，所以映射只有一步：
+
+```
+amplitude = 10^(dB(scalar)/20)，dB(s) = minDb·(1−s)，minDb 由
+SystemSinkVolumeLaw.law(forDeviceUID:) 从设备读（自家驱动申报 [-63.5, 0]）
+scalar == 0 → 精确 0；静音 → 精确 0
+```
+
+**为什么不套 `VolumeCurve`（−30 dB 地板）**：那条地板的存在理由是 OwnTone 的
+**每输出**音量下不了 −30 dB，两条腿必须约定同一个地板才不会错位。master 这一级
+在 OwnTone 之前，根本没有这个限制。硬套的话，macOS 那 ~64 dB 的滑杆行程会被压进
+30 dB——滑杆下半程几乎不起作用，而且拉到零还有声音。单测里专门有一条把这个回归
+钉住（`testTheSinkLawIsNotVolumeCurvesMinusThirtyDbFloor`）。
+
+面板上的「总音量」滑杆随之变成那个 scalar 的**双向视图**：读设备、也写设备
+（`SystemSinkCoordinator.writeSystemVolume` / `writeSystemMute`）。做成双向而不是
+只读，是因为唯一显示它的面板里有个拖不动的滑杆看着就是坏的；而写的是 macOS
+自己那个控件，所以真相只有一个数——拖面板滑杆，菜单栏跟着动，反之亦然。写之前
+先 `noteAppInitiatedWrite`，Router 收到通知后仍然回读设备取权威值，自写回声因此
+落到同一个数上、什么都不改。Reset 按钮在这条路上**不显示**：reset 是「把我自己的
+衰减归零」，第三方面板上一个把用户 Mac 顶到 100% 的按钮不叫 reset。
+
+### 8.3 事件 tap 的去留
+
+`SystemVolumeKeyEligibility`（纯函数，带矩阵单测）：
+
+| 模式 | 路径 / sink | 运行中 | 抢媒体键 |
+|---|---|---|---|
+| whole-home | `.direct`（自家驱动）| 是 | **否** —— macOS 自己管 |
+| whole-home | `.wrapped`（BlackHole）| 是 | 是 |
+| whole-home | 任意 | 否 | 否 |
+| stereo | direct（旧路径）| 是 | 是 |
+| stereo | sink | 是 | 否（上一轮已如此）|
+
+在 `.direct` 上抢键会严格更差：把一个本来能用的 HUD 吞掉，再自己拙劣地重做一遍。
+
+### 8.4 「输出被切走」：一个条件，一套处理
+
+原来 whole-home 有自己的一套：`wholeHomeSinkDisplaced` + 一条带「切回」按钮的横幅，
+点了就把默认输出抢回来。stereo sink 路径对**同一个条件**的判断正好相反：那是用户的
+意图，停掉路由、什么都不还原、给一个「继续」。两套答案的下场是用户对着自己刚插上的
+耳机点「切回」。
+
+现在只有 `Router.systemSinkDisplaced` 一个属性（覆盖 stereo sink 路径和 whole-home
+两种 owner）、一条横幅、一套策略：停、不还原、不抢回、给「继续」。暂停会记住是在
+哪个模式下发生的，切模式（一个重新建立默认输出的显式动作）自动作废。
+`WholeHomeSinkOutput.reassertDefaultOutput` 与 `Router.reassertWholeHomeSink` 一并删除。
+
+### 8.5 验证
+
+- `core/router`：`swift build` OK，`swift test` **288 tests / 0 failures**
+  （新增 14 条：owner 选择四种情形、scalar→振幅在 0/0.25/0.5/0.75/1.0 与静音、
+  越界钳制、与 `VolumeCurve` 地板的分离、owner facade 的非活动态）。
+- `apps/menubar`：`swift build` OK，`swift test` **274 tests / 0 failures**
+  （新增 18 条：事件 tap 的模式×sink×路径矩阵、总音量滑杆归谁管、状态行四态、
+  暂停跨模式作废）。
+- `bash scripts/pii_scan.sh` 通过。
+
+### 8.6 未验证（需要真机 / 用户）
+
+- **真的听**：whole-home 跑起来、拖菜单栏滑杆、按 F11/F12，两只本地喇叭 + AirPlay
+  接收端一起跟着变。本轮全部是单测与算术，没有听感验证。
+- 装了驱动的机器上「声音」里显示的是 **"SyncCast"** 而不是「AirPlay 全屋」——
+  这是设计的一部分（面板那行状态就是为了说清楚），但它是用户可见的变化。
+- 只装 BlackHole 的机器保持原样（aggregate + 面板滑杆 + 事件 tap），也没有回归验证。
+- LinearMouse 一类滚轮调音工具在 whole-home 下是否如预期地直接生效。

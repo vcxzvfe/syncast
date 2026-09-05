@@ -472,6 +472,5 @@ final class WholeHomeSinkOutputTests: XCTestCase {
         let sink = WholeHomeSinkOutput()
         XCTAssertFalse(sink.isActive)
         XCTAssertFalse(sink.isSystemDefaultOutput)
-        XCTAssertFalse(sink.reassertDefaultOutput())
     }
 }

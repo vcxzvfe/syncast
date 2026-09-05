@@ -243,7 +243,20 @@ public final class SystemSinkDevice {
     /// Without seeding, a user listening at 10 % on headphones gets full scale
     /// the instant the path starts. Seeding makes the switch continuous: the
     /// value we then push back to that device is the value it already had.
-    public func start(seedVolume: Float? = nil) throws {
+    ///
+    /// `pinSampleRate` is what tells the two callers apart:
+    ///
+    ///   * the **stereo sink path** runs a Core Audio Process Tap ON this
+    ///     device, and `TapCapture` refuses any format that is not 48 kHz
+    ///     rather than silently resampling — so the rate must be pinned
+    ///     (`true`, the default);
+    ///   * **whole-home** captures with ScreenCaptureKit, which taps system
+    ///     audio ABOVE the HAL and never opens this device at all. The sink's
+    ///     nominal rate is not in the signal path, so pinning it would only
+    ///     re-rate a device system-wide for every other app that uses it —
+    ///     exactly the reason `WholeHomeSinkOutput.inheritsSubdeviceSampleRate`
+    ///     exists. Whole-home passes `false`.
+    public func start(seedVolume: Float? = nil, pinSampleRate: Bool = true) throws {
         if isActive { return }
         // Sub-phases of the Router's "sink takeover" phase. The sample-rate
         // settle below polls for up to a second and the seed retries for up to
@@ -280,7 +293,7 @@ public final class SystemSinkDevice {
         // host may defer it). Tapping before it lands hands `TapCapture` the
         // old ASBD, which it rejects — a start failure that looks like a bug in
         // the tap. So we wait for the readback, bounded.
-        let originalRate = Self.nominalSampleRate(id)
+        let originalRate = pinSampleRate ? Self.nominalSampleRate(id) : nil
         if let originalRate, originalRate != Self.requiredSampleRate {
             if Self.setNominalSampleRate(id, rate: Self.requiredSampleRate) {
                 previousNominalSampleRate = originalRate
