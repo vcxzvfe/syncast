@@ -31,6 +31,14 @@ startup. `--uninstall` removes `/Library/Audio/Plug-Ins/HAL/SyncCastAudio.driver
 and restarts coreaudiod again; SyncCast then falls back to BlackHole if it is
 installed, or to the legacy Direct Stereo path.
 
+The restart is `killall coreaudiod`, not `launchctl kickstart -k
+system/com.apple.audio.coreaudiod`. The kickstart form is refused on a stock
+machine even as root — "Could not kickstart service: 150: Operation not
+permitted while System Integrity Protection is engaged" (measured 2026-09-05,
+macOS 26.6.2) — while killing the process works, because launchd owns
+coreaudiod and respawns it immediately. The installer then waits for it to come
+back, so a probe for the new device is not racing the respawn.
+
 `build.sh` refuses to run as root (set `SYNCAST_ALLOW_ROOT_BUILD=1` to override,
 for a CI image that genuinely is root) so a `sudo` install can never leave
 root-owned artefacts in a developer checkout. `install-driver.sh` drops to

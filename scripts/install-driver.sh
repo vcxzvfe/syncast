@@ -37,6 +37,8 @@ fi
 HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 INSTALLED_DRIVER="$HAL_DIR/SyncCastAudio.driver"
 UNINSTALL=0
+# How long to wait for launchd to respawn coreaudiod after we kill it.
+COREAUDIOD_RESPAWN_TIMEOUT_S=10
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     UNINSTALL=1
@@ -85,7 +87,37 @@ build_driver() {
 
 restart_coreaudiod() {
     echo "==> restarting coreaudiod (all audio briefly stops)"
-    launchctl kickstart -k system/com.apple.audio.coreaudiod
+    # `launchctl kickstart -k system/com.apple.audio.coreaudiod` is the tidy
+    # way to do this and it does NOT work on a stock machine: with System
+    # Integrity Protection engaged, launchd refuses to kickstart a
+    # system-domain Apple service. Measured 2026-09-05 on macOS 26.6.2, as
+    # root:
+    #
+    #   Could not kickstart service: 150: Operation not permitted while
+    #   System Integrity Protection is engaged
+    #
+    # Signalling the process has exactly the effect we need instead: launchd
+    # owns coreaudiod and respawns it immediately, and the fresh instance is
+    # what rescans /Library/Audio/Plug-Ins/HAL. (If SIP is ever disabled the
+    # kickstart form works again, but there is no reason to prefer it.)
+    if ! killall coreaudiod 2>/dev/null; then
+        echo "WARNING: could not signal coreaudiod (is it running?)." >&2
+        echo "         The driver IS installed; log out and back in, or reboot," >&2
+        echo "         and macOS will pick it up." >&2
+        return 0
+    fi
+    # Wait for launchd to bring it back, so a caller that immediately probes
+    # for the new device is not just racing the respawn.
+    local waited=0
+    while [[ "$waited" -lt "$COREAUDIOD_RESPAWN_TIMEOUT_S" ]]; do
+        if pgrep -x coreaudiod >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "WARNING: coreaudiod has not come back after ${COREAUDIOD_RESPAWN_TIMEOUT_S}s." >&2
+    echo "         The driver IS installed; if audio stays dead, reboot." >&2
 }
 
 if [[ "$UNINSTALL" == "1" ]]; then

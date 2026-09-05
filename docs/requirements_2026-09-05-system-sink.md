@@ -118,7 +118,16 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 音量曲线照抄上面实测的 `[-63.5, 0] dB` dB 线性，所以滑杆手感和内建喇叭一致。
 `build.sh` 出 universal + ad-hoc（或 `SYNCAST_USE_SYNCCAST_DEV=1` 用 "SyncCast Dev"）
 签名的 bundle；`scripts/install-driver.sh` 装到 `/Library/Audio/Plug-Ins/HAL` 并
-`launchctl kickstart -k system/com.apple.audio.coreaudiod`。
+重启 coreaudiod（用 `killall coreaudiod`，launchd 会立刻把它拉回来）。
+
+> **2026-09-05 更正**：原来这里用的是
+> `launchctl kickstart -k system/com.apple.audio.coreaudiod`，**在本机跑不通**——
+> 以 root 身份执行也会被拒：
+> `Could not kickstart service: 150: Operation not permitted while System
+> Integrity Protection is engaged`。SIP 开着（出厂默认）就不允许 kickstart
+> 系统域的 Apple 服务。`killall coreaudiod` 效果完全一样：coreaudiod 归 launchd
+> 管，杀掉立刻重启，新起来的那个才会重新扫描 HAL 插件目录。脚本随后会等它回来
+> （最多 10 秒），免得调用方一转身就去探测新设备结果跟重启赛跑。
 
 ## 4. 验证
 
