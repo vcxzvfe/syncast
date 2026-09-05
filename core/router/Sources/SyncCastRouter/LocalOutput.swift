@@ -40,7 +40,27 @@ public final class LocalOutput {
     private let ring: RingBuffer
     private var unit: AudioUnit?
     private let stateLock = OSAllocatedUnfairLock()
+    /// The Scheduler's per-device read backoff, as pushed in by
+    /// `Router.replan()`.
+    ///
+    /// DIAGNOSTIC ONLY — it does NOT move this AUHAL's read cursor and never
+    /// has. The render target is `writePosition − ringFloorFrames −
+    /// hardwareLatencyCompensation − block`, and inter-device alignment comes
+    /// from `deviceLatencyFramesByDevID` (measured hardware latency), not from
+    /// the Scheduler. `Scheduler.plan` is meaningful for the AirPlay/whole-home
+    /// path, whose master clock is ~1.8 s away; on the local path its
+    /// `safetyMarginMs` would be pure added latency on top of the ring floor.
+    ///
+    /// Kept (rather than deleted) because `Router.replan()` pushes it for every
+    /// path and a field report wants to see what the Scheduler decided; it is
+    /// surfaced through `readBackoffFramesDiagnostic`. Wiring it into the
+    /// target would ADD its value to the budget — do not do that without
+    /// removing the floor first.
     private var _readBackoffFrames: Int = 0
+    /// Steady-state lag behind the producer, in frames. See `RingFloorPolicy`:
+    /// 100 ms for the ScreenCaptureKit paths, 30 ms (env-overridable) for the
+    /// Process-Tap-fed system-sink path.
+    private var _ringFloorFrames: Int64
     private var _gain: Float = 1.0
     private var _muted: Bool = false
     private var _readCursor: Int64 = 0
@@ -116,19 +136,33 @@ public final class LocalOutput {
     /// This output's measured hardware latency in frames.
     private var deviceLatencyFrames: Int64 = 0
 
+    /// How far the read cursor may wander from the target before we discard it
+    /// and re-anchor. 250 ms is a safety net for clock divergence, not a jitter
+    /// filter: normal jitter moves the cursor by ONE producer block (10.67 ms
+    /// at 512 frames / 48 kHz), so this sits ~23 blocks above the noise and
+    /// still makes sense against the 30 ms sink floor — a resync there means
+    /// the producer stalled for a quarter second, which is a real event.
+    public static let driftResyncLimitMs: Int = 250
+
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
         ring: RingBuffer,
         sampleRate: Double = 48_000,
         channelCount: Int = 2,
-        outputChannelCount: Int? = nil
+        outputChannelCount: Int? = nil,
+        ringFloorFrames: Int? = nil
     ) {
         self.deviceID = deviceID
         self.deviceUID = deviceUID
         self.ring = ring
         self.sampleRate = sampleRate
         self.channelCount = channelCount
+        self._ringFloorFrames = Self.clampRingFloorFrames(
+            ringFloorFrames
+                ?? RingFloorPolicy.frames(ms: RingFloorPolicy.legacyFloorMs, sampleRate: sampleRate),
+            capacityFrames: ring.capacityFrames
+        )
         // outputChannelCount defaults to channelCount (individual mode);
         // aggregate mode passes a wider count. We round up to an even
         // multiple of channelCount because the splat path writes pairs
@@ -189,6 +223,34 @@ public final class LocalOutput {
         _softwareGains.deallocate()
         _softwareGainsScratch.deinitialize(count: _softwareGainsCount)
         _softwareGainsScratch.deallocate()
+    }
+
+    // MARK: - Ring floor
+
+    /// Keep the floor inside something the ring can actually serve. A floor
+    /// larger than half the ring leaves no room for the block itself plus
+    /// producer overrun, and a negative one is meaningless.
+    static func clampRingFloorFrames(_ frames: Int, capacityFrames: Int) -> Int64 {
+        Int64(max(0, min(frames, capacityFrames / 2)))
+    }
+
+    /// Current steady-state lag behind the producer, in frames.
+    public var ringFloorFrames: Int {
+        Int(stateLock.withLock { _ringFloorFrames })
+    }
+
+    /// Change the floor on a live output. Guarded by the same lock the render
+    /// callback snapshots under, so a render either sees the old value or the
+    /// new one — never a torn read.
+    public func setRingFloorFrames(_ frames: Int) {
+        let clamped = Self.clampRingFloorFrames(frames, capacityFrames: ring.capacityFrames)
+        stateLock.withLock { _ringFloorFrames = clamped }
+    }
+
+    /// The Scheduler backoff the Router last pushed in. Reported in
+    /// diagnostics; NOT used by the render target — see `_readBackoffFrames`.
+    public var readBackoffFramesDiagnostic: Int {
+        stateLock.withLock { _readBackoffFrames }
     }
 
     // MARK: - Hardware latency probing
@@ -426,9 +488,12 @@ public final class LocalOutput {
         Self.latencyLock.withLock {
             Self.deviceLatencyFramesByDevID[deviceUID] = latencyFrames
         }
-        // Initialize read cursor to lag the writer by a sane default (will be
-        // re-set on first scheduler plan).
-        stateLock.withLock { self._readCursor = max(0, ring.writePosition - 4_800) }
+        // Initialize read cursor to lag the writer by this output's own floor.
+        // The first render resyncs anyway (cursor == 0 is the trigger); this
+        // only matters for anyone inspecting the cursor before then.
+        stateLock.withLock {
+            self._readCursor = max(0, ring.writePosition - self._ringFloorFrames)
+        }
     }
 
     public func stop() {
@@ -470,7 +535,7 @@ public final class LocalOutput {
         let snapshot = stateLock.withLock {
             (gain: _gain,
              muted: _muted,
-             backoff: _readBackoffFrames,
+             floor: _ringFloorFrames,
              cursor: _readCursor,
              swGainsAllOnes: _softwareGainsAllOnes)
         }
@@ -479,14 +544,13 @@ public final class LocalOutput {
         // Compensation target — the position the next read SHOULD land at
         // for inter-device sync. compensation = (peerMaxLat − myLat) makes
         // a fast device wait long enough to play the same captured frame
-        // at the same wall-clock instant as the slowest peer. Floor base
-        // 100 ms so we never underrun under SCK callback jitter.
+        // at the same wall-clock instant as the slowest peer. On top of that
+        // sits the ring floor, sized to the PRODUCER's jitter: 100 ms for
+        // ScreenCaptureKit, 30 ms for the system sink's Process Tap.
         let maxLatencyFrames: Int64 = Self.latencyLock.withLock {
             Self.deviceLatencyFramesByDevID.values.max() ?? deviceLatencyFrames
         }
-        let baselineFrames: Int64 = 4800  // 100 ms floor at 48 kHz
         let compensation = max(0, maxLatencyFrames - deviceLatencyFrames)
-        let target: Int64 = max(0, writePos - baselineFrames - compensation - Int64(frames))
 
         // CRITICAL: anchor reads on the previous render's end position.
         // Recomputing startFrame from `writePos` every render meant
@@ -497,18 +561,18 @@ public final class LocalOutput {
         // "granularity"); a 16-sample gap drops audio (click). This
         // was the primary source of user-reported 毛刺感 + 啸叫.
         //
-        // Resync to `target` only on first call, on out-of-window
-        // (ring overwrote our cursor — only happens after a long stall),
-        // or on > 250 ms drift (safety net for clock divergence).
-        let cursor = snapshot.cursor
-        let driftLimitFrames: Int64 = Int64(sampleRate) / 4   // 250 ms
-        let lowerValid = max(0, writePos - Int64(ring.capacityFrames) + Int64(frames))
-        let needsResync =
-            cursor == 0 ||
-            cursor < lowerValid ||
-            cursor > writePos ||
-            abs(cursor - target) > driftLimitFrames
-        let startFrame: Int64 = needsResync ? target : cursor
+        // `RingReadPlanner` owns the resync/underrun arithmetic — pure
+        // integer math, unit-tested in RingReadPlannerTests.
+        let plan = RingReadPlanner.plan(
+            writePosition: writePos,
+            cursor: snapshot.cursor,
+            frames: frames,
+            floorFrames: snapshot.floor,
+            compensationFrames: compensation,
+            capacityFrames: ring.capacityFrames,
+            driftLimitFrames: Int64(Self.driftResyncLimitMs) * Int64(sampleRate) / 1000
+        )
+        let startFrame: Int64 = plan.startFrame
 
         // Capture the AUHAL output pointers (non-interleaved, one per
         // output channel). Used for the splat write below.
@@ -525,6 +589,12 @@ public final class LocalOutput {
 
         // Read source channels (always `channelCount`, typically 2)
         // into the pre-allocated staging slabs.
+        //
+        // On an underrun (`plan.underrunFrames > 0`) we deliberately do NOT
+        // substitute anything: `RingBuffer.read` already zero-fills every
+        // frame outside [writePos − capacity, writePos), so the tail of the
+        // block is silence, not stale ring content from a lap ago. A short
+        // silence is the least-bad dropout.
         ring.read(at: startFrame, frames: frames, into: stagingChannels)
 
         // Splat: write the source stereo into every output channel
