@@ -26,9 +26,24 @@ final class FakeLanReceiver: @unchecked Sendable {
         var rejectedPackets: Int = 0
     }
 
+    /// How the fake behaves once a sender connects.
+    enum Behaviour {
+        /// Speak the protocol: check the token, answer `hello_ack` and `ping`.
+        case normal
+        /// Accept the TCP connection and then say nothing at all.
+        ///
+        /// This is the shape of the real-hardware failure this fake exists to
+        /// reproduce: the second Mac's Application Firewall let the kernel
+        /// finish the handshake and then dropped the connection before the
+        /// daemon ever saw it, so the sender's connect "succeeded" and the
+        /// link sat waiting for a `hello_ack` that could not come.
+        case silent
+    }
+
     /// The token this receiver will accept. Anything else gets an `error` and
     /// a closed connection, like the real daemon.
     let expectedToken: String
+    let behaviour: Behaviour
     private(set) var controlPort: UInt16 = 0
     private(set) var audioPort: UInt16 = 0
 
@@ -41,8 +56,9 @@ final class FakeLanReceiver: @unchecked Sendable {
     private var audioConnections: [NWConnection] = []
     private var controlBuffer = Data()
 
-    init(expectedToken: String = "cafef00d") {
+    init(expectedToken: String = "cafef00d", behaviour: Behaviour = .normal) {
         self.expectedToken = expectedToken
+        self.behaviour = behaviour
     }
 
     // MARK: - Lifecycle
@@ -150,6 +166,17 @@ final class FakeLanReceiver: @unchecked Sendable {
               let json = object as? [String: Any],
               let type = json["type"] as? String
         else { return }
+        // A silent receiver still RECORDS what it was sent — the tests assert
+        // the sender got as far as `hello` — but answers nothing.
+        if behaviour == .silent {
+            if type == "hello" {
+                mutate {
+                    $0.helloToken = json["token"] as? String
+                    $0.helloStreamID = (json["stream_id"] as? NSNumber)?.uint32Value
+                }
+            }
+            return
+        }
         switch type {
         case "hello":
             let token = json["token"] as? String
