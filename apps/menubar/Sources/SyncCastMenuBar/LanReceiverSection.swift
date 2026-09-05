@@ -130,6 +130,12 @@ struct LanReceiverControls: View {
 /// the reason `PairingWindowController` documents: the `MenuBarExtra(.window)`
 /// panel is non-activating, so a text field inside it can never receive a
 /// keystroke, and the click that tries to focus it tears the panel down.
+///
+/// `deviceID` is optional because the hosting window outlives any one
+/// receiver: between the editor being cleared and the window actually closing
+/// there is no device to edit. That state renders this same form, disabled,
+/// rather than an empty placeholder of a different size — see
+/// `LanTokenWindowRootView` for why the size has to stay put.
 struct LanTokenEntryView: View {
     static let contentWidth: CGFloat = 360
 
@@ -137,11 +143,26 @@ struct LanTokenEntryView: View {
     @FocusState private var fieldFocused: Bool
     @State private var typed: String = ""
 
-    let deviceID: String
+    let deviceID: String?
     let onFinished: () -> Void
 
     private var deviceName: String {
-        model.devices.first { $0.id == deviceID }?.name ?? "receiver"
+        guard let deviceID else { return "receiver" }
+        return model.devices.first { $0.id == deviceID }?.name ?? "receiver"
+    }
+
+    /// No device means nothing to save a token against, so every control is
+    /// inert. Stated once here rather than per control.
+    private var isInert: Bool { deviceID == nil }
+
+    private var advertisedHint: String? {
+        guard let deviceID else { return nil }
+        return model.lanTokenHint(for: deviceID)
+    }
+
+    private var hasStoredToken: Bool {
+        guard let deviceID else { return false }
+        return model.hasLanToken(for: deviceID)
     }
 
     var body: some View {
@@ -166,11 +187,13 @@ struct LanTokenEntryView: View {
                 .focused($fieldFocused)
                 .onAppear {
                     typed = ""
-                    fieldFocused = true
+                    // Never steal the field editor for a form nobody can
+                    // submit: with no device the window is on its way out.
+                    fieldFocused = !isInert
                 }
                 .onSubmit(save)
 
-            if let hint = model.lanTokenHint(for: deviceID) {
+            if let hint = advertisedHint {
                 Text("这台接收端广播的开头是 \(hint) · this receiver advertises a hint of \(hint)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -191,7 +214,7 @@ struct LanTokenEntryView: View {
             }
 
             HStack {
-                if model.hasLanToken(for: deviceID) {
+                if hasStoredToken, let deviceID {
                     Button("清除") {
                         model.setLanToken("", for: deviceID)
                         onFinished()
@@ -209,9 +232,11 @@ struct LanTokenEntryView: View {
         }
         .padding(20)
         .frame(width: Self.contentWidth)
+        .disabled(isInert)
     }
 
     private func save() {
+        guard let deviceID else { return }
         guard LanReceiverTokenStore.sanitize(typed) != nil else { return }
         model.setLanToken(typed, for: deviceID)
         // Clear the field before the window goes away, so the string does not
