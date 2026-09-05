@@ -262,6 +262,10 @@ final class SystemSinkCoordinator {
             let result = await Self.runPrivilegedInstall(scriptURL: scriptURL)
             guard let self else { return }
             self.driverInstallState = result
+            // Installing restarts coreaudiod, after which a UID can be served
+            // by a different AudioObjectID — drop the memoised transport-type
+            // verdicts rather than classify the new device from the old one.
+            VirtualOutputPolicy.resetCache()
             SyncCastLog.log("systemSink: driver install → \(result)")
         }
     }

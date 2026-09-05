@@ -210,6 +210,45 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 
 ## 5. 已知限制
 
+### 5.1 虚拟设备不能当 sink 路径的输出（2026-09-05 真机实测）
+
+**现象**：唯一勾选的输出是 `ZoomAudioDevice`（用户态 `AudioServerPlugIn`，
+transport `virt`），sink 是 BlackHole 2ch。结果：
+
+- `Router.start` **108 秒**才返回；
+- 往 sink 放 `afplay` 直接报 `AudioQueueStart -66681`；
+- 退出 app **永久卡死**在 `TapCapture.stop()` → `AudioDeviceDestroyIOProcID`
+  → `HALC_ProxyIOContext::_TellServerAboutStreamUsage`（发给 coreaudiod 的
+  IPC 永远没回音）；
+- 事后**全机**所有用户态虚拟设备（BlackHole / Zoom / Teams）都不再有任何 IO
+  回调，直到 `sudo killall coreaudiod`。内建扬声器全程正常。
+
+**隔离表**（同一台机器、同一晚）：
+
+| 配置 | 结果 |
+|---|---|
+| 只把 BlackHole 改采样率（不 tap、不渲染） | 正常 |
+| 探针：tap BlackHole + 抢默认输出 | 正常 |
+| app：输出 = MacBook Pro 扬声器，sink = BlackHole | 正常（<1 s 启动，tap 有数据，音量法正确）|
+| app：输出 = ZoomAudioDevice，sink = BlackHole | **108 s 启动 / 退出卡死 / coreaudiod 废掉** |
+
+**结论**：一边 tap 一个用户态插件设备、一边往另一个用户态插件设备里渲染，会把
+两者共用的插件宿主（coreaudiod）锁死。这不是我们能修的；能做的是永远不构造这
+个组合。
+
+**处理**：`VirtualOutputPolicy`。
+`kAudioDevicePropertyTransportType == kAudioDeviceTransportTypeVirtual` 的设备，
+在 `selectedStereoOutputPath == .sink` 时从 `isSelectableInMode` 里隐藏（它本来
+也不是喇叭，用户没有任何损失），并且 `Router.startSystemSinkPath` 在**接管任何
+东西之前**独立复查一遍，命中就抛错并点名设备——失败发生在没装 sink、没改采样
+率、没有默认输出要还的时刻，代价为零。
+
+范围**只限 sink 路径**：Direct Stereo 和 capture 路径不 tap 插件设备，从没出过
+这个问题，它们能选的设备一个不减。aggregate（`kAudioDeviceTransportTypeAggregate`）
+**不算**虚拟设备——它是内核侧的真实端点组合，Direct Stereo 自己的输出就是一个。
+
+### 5.2 其它
+
 - 路径在**每次启动时解析一次**（`SystemSinkDevice.resolved`）。装完驱动要重启
   SyncCast——反正装驱动会重启 coreaudiod，音频本来就断一下。
 - sink 一旦成为默认输出，「声音」菜单里显示的就是 "SyncCast"（或 "BlackHole 2ch"）

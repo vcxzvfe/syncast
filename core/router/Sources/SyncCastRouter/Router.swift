@@ -1674,6 +1674,29 @@ public actor Router {
                     "the system-volume Stereo path needs macOS 14.2+ (Core Audio Process Tap)"
             ])
         }
+        // Refuse virtual devices as OUTPUTS before anything is taken over.
+        //
+        // Rendering into a userland audio plug-in while tapping another one
+        // wedges coreaudiod on this machine — see `VirtualOutputPolicy` for
+        // the measured failure (108 s start, a teardown that never returns,
+        // every virtual device dead machine-wide until coreaudiod is killed).
+        // The AppModel hides these from the picker on the sink path; this is
+        // the backstop for a selection that arrives some other way (persisted
+        // routing, a device that appears mid-session, an API caller).
+        //
+        // Placed FIRST, so the failure costs nothing: no sink installed, no
+        // sample rate changed, no default output to give back.
+        let virtualTargets = enabledLocalOutputs(devices: devices)
+            .filter { VirtualOutputPolicy.isVirtualOutput(uid: $0.uid) }
+        if !virtualTargets.isEmpty {
+            let message = VirtualOutputPolicy.rejectionMessage(
+                names: virtualTargets.map { "\($0.name) (\($0.uid))" }
+            )
+            RouterLog.write("[Router] system sink refused: \(message)")
+            throw NSError(domain: "SyncCastRouter", code: 113, userInfo: [
+                NSLocalizedDescriptionKey: message
+            ])
+        }
         guard let candidate = SystemSinkDevice.resolved else {
             throw SystemSinkDevice.SystemSinkError.noSinkInstalled
         }
@@ -1947,25 +1970,24 @@ public actor Router {
         return ok
     }
 
-    private func reconcileLocalDriver(devices: [Device]) {
-        // Index name lookups so master picker can score by device name.
-        var nameByUID: [String: String] = [:]
-        for dev in devices {
-            if let u = dev.coreAudioUID { nameByUID[u] = dev.name }
-        }
-
-        // Compute the target enabled set: every CoreAudio device that the
-        // user has toggled on, minus a few classes that are unsafe to
-        // route into:
-        //   - BlackHole (it's a virtual sink that may be the system source
-        //     for SCK capture; routing audio TO it could feedback)
-        //   - any of OUR previously-spawned aggregates (UID prefix match)
-        //
-        // We deliberately DO NOT exclude user-created aggregates from
-        // Audio MIDI Setup any more. With our own private aggregate now
-        // a first-class concept, blanket-filtering aggregates would
-        // surprise users who set one up themselves.
-        let enabled: [EnabledLocalOutput] = devices.compactMap { dev in
+    /// The CoreAudio devices this Router would actually open AUHALs on: every
+    /// device the user has toggled on, minus a few classes that are unsafe to
+    /// route into:
+    ///   - BlackHole (it's a virtual sink that may be the system source
+    ///     for SCK capture; routing audio TO it could feedback)
+    ///   - any of OUR previously-spawned aggregates (UID prefix match)
+    ///
+    /// We deliberately DO NOT exclude user-created aggregates from
+    /// Audio MIDI Setup any more. With our own private aggregate now
+    /// a first-class concept, blanket-filtering aggregates would
+    /// surprise users who set one up themselves.
+    ///
+    /// Factored out of `reconcileLocalDriver` so `startSystemSinkPath` can ask
+    /// the SAME question ("what will we render into?") before it takes the
+    /// default output over. Two copies of this filter would be two chances for
+    /// the pre-flight check and the thing it checks to disagree.
+    private func enabledLocalOutputs(devices: [Device]) -> [EnabledLocalOutput] {
+        devices.compactMap { dev in
             guard dev.transport == .coreAudio else { return nil }
             guard routing[dev.id]?.enabled ?? false else { return nil }
             guard let uid = dev.coreAudioUID else { return nil }
@@ -1982,6 +2004,16 @@ public actor Router {
             if lower.contains("blackhole") { return nil }
             return EnabledLocalOutput(deviceID: dev.id, uid: uid, name: dev.name)
         }
+    }
+
+    private func reconcileLocalDriver(devices: [Device]) {
+        // Index name lookups so master picker can score by device name.
+        var nameByUID: [String: String] = [:]
+        for dev in devices {
+            if let u = dev.coreAudioUID { nameByUID[u] = dev.name }
+        }
+
+        let enabled = enabledLocalOutputs(devices: devices)
         let targetUIDs = Set(enabled.map { $0.uid })
 
         switch enabled.count {
