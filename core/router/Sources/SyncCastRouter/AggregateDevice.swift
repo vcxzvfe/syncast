@@ -344,6 +344,40 @@ public final class AggregateDevice {
         return result
     }
 
+    /// Per-subdevice extra latency, in frames, keyed by subdevice UID.
+    ///
+    /// `kAudioSubDevicePropertyExtraLatency` is the aggregate's own idea of
+    /// how much later a subdevice presents than its physical latency alone
+    /// suggests. SyncCast never writes it, so it is 0 on every aggregate we
+    /// build today — it is read anyway because a subdevice that DOES carry one
+    /// (set by another process, or by a future version of this code) is
+    /// latency the per-device delay seed must not double-count.
+    ///
+    /// Read from the SUBDEVICE object for the same reason
+    /// `verifyDriftCorrection` does: the property does not exist on the
+    /// underlying physical device.
+    public func subdeviceExtraLatencyFrames() -> [String: Int] {
+        var result: [String: Int] = [:]
+        for subID in Self.aggregateOwnedSubDeviceIDs(aggregateID: deviceID) {
+            guard let uid = Self.readSubDeviceUID(subID) else { continue }
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioSubDevicePropertyExtraLatency,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var value: Float64 = 0
+            var size = UInt32(MemoryLayout<Float64>.size)
+            guard AudioObjectGetPropertyData(subID, &addr, 0, nil, &size, &value) == noErr
+            else { continue }
+            // A NaN or a wild value from a third-party driver must not reach
+            // the read cursor; the planner clamps too, but a non-finite value
+            // would survive an Int conversion trap-free only by accident.
+            guard value.isFinite, value >= 0, value < Double(Int32.max) else { continue }
+            result[uid] = Int(value.rounded())
+        }
+        return result
+    }
+
     // MARK: - Stream-format diagnostic
     //
     // Why this exists
