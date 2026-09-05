@@ -114,10 +114,16 @@ OSStatus SyncCastAudio_StreamControl_IsPropertySettable(AudioObjectID inObjectID
 
     switch(inAddress->mSelector)
     {
-        // The three writable properties. The volume pair is the point of the
-        // whole driver: macOS greys the system slider out for any device
-        // whose level is not settable.
-        case kAudioStreamPropertyIsActive:
+        // The writable properties. The volume pair is the point of the whole
+        // driver: macOS greys the system slider out for any device whose level
+        // is not settable.
+        //
+        // kAudioStreamPropertyIsActive is deliberately NOT here. The stream is
+        // permanently active, so claiming it is settable and then ignoring the
+        // write tells clients a lie they cannot detect — a client that
+        // deactivates the stream and reads back 1 has no way to know whether it
+        // failed or raced. Reporting false, and failing the set, is the honest
+        // answer and the one clients already handle.
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat:
         case kAudioLevelControlPropertyScalarValue:
@@ -457,10 +463,11 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
     switch(inAddress->mSelector)
     {
         case kAudioStreamPropertyIsActive:
-            // Accepted and ignored: the stream is always active. Refusing
-            // would make ordinary clients log errors for no benefit.
-            if(inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-            return 0;
+            // The stream cannot be deactivated — the device has exactly one
+            // stream and it exists to make the device a legal output. Say so,
+            // rather than swallowing the write and continuing to report 1.
+            // IsPropertySettable reports false for the same reason.
+            return kAudioHardwareUnsupportedOperationError;
 
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat:
