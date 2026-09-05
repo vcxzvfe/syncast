@@ -72,12 +72,12 @@
 | Module | Language | Responsibility |
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, the per-device equalizer (`EqualizerSettings` + `EqualizerBank`), the per-device local delay compensation (`LocalDelayTrim` + `PairDelayBank`), IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, the per-device equalizer (`EqualizerSettings` + `EqualizerBank`), the per-device stereo image (`StereoImageSettings` + `StereoImageProcessor`), the per-device local delay compensation (`LocalDelayTrim` + `PairDelayBank`), IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
 | `drivers/SyncCastAudio` | C (AudioServerPlugIn) | Output-only virtual HAL device named "SyncCast" with volume + mute controls. Discards audio; exists so macOS has something volume-controllable to make the default output. Installed to `/Library/Audio/Plug-Ins/HAL` by `scripts/install-driver.sh`. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
-| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls (volume, delay trim, equalizer, local delay compensation), and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`) and the per-device equalizer store (`DeviceEqualizerStore` / `AppModel+Equalizer` / `EqualizerSection`). |
+| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls (volume, delay trim, equalizer, stereo image, local delay compensation), and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`), the per-device equalizer store (`DeviceEqualizerStore` / `AppModel+Equalizer` / `EqualizerSection`) and the per-device stereo-image store (`DeviceStereoImageStore` / `AppModel+StereoImage` / `StereoImageSection`). |
 
 ## 4. Audio data path
 
@@ -92,7 +92,7 @@
      Displacement — the user picking another output in the Sound menu — is ONE condition with one policy across every default-output owner (`Router.systemSinkDisplaced`): stop routing, restore nothing, offer 「继续」. SyncCast never re-asserts the default output on a timer.
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
-4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, reads that pair at its own **delay offset** when one is dialled in (`PairDelayBank`, see §8c), applies that pair's **equalizer** (`EqualizerBank`, see §8b), then the per-device gain, and writes into AUHAL's output buffer. The equalizer sits before the gain stage so the volume slider stays the last attenuator; a pair with no curve takes a fast path that leaves the buffer byte-identical.
+4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, reads that pair at its own **delay offset** when one is dialled in (`PairDelayBank`, see §8c), applies that pair's **equalizer** (`EqualizerBank`, see §8b) and then its **stereo image** (`StereoImageProcessor`, see §8b-2), then the per-device gain, and writes into AUHAL's output buffer. The equalizer sits before the gain stage so the volume slider stays the last attenuator; a pair with no curve takes a fast path that leaves the buffer byte-identical.
 5. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
 
 ## 5. Sync model
@@ -141,6 +141,7 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 | Sink device level | Owned by macOS (the sink's own `VolumeScalar`), and by the driver's own storage for `SyncCastAudio.driver`. SyncCast never writes it. |
 | Per-speaker delay trim | `UserDefaults` key `syncast.deviceDelayTrimMs`, a `[persistenceKey: rawMs]` map | Keyed by `Device.persistenceKey` (`ca:<UID>` / `ap:<hex deviceid>`), never by `Device.id`, which is re-minted every process. Stores RAW signed intent, never the normalised output — normalisation depends on which devices are present, so persisting it would drift each session. A device that is absent keeps its entry, same rule as the member store. |
 | Per-device equalizer curve | `UserDefaults` key `syncast.deviceEqualizer.v1`, JSON-encoded array of `DeviceEqualizerProfile` | Keyed by CoreAudio UID (never `Device.id`, never the name) so the curve belongs to the speaker and comes back on every connect. Validated on load: gains and trim clamped, non-finite bands dropped, chain capped at 16 sections, unreadable data collapses to "no curves". A bypassed record keeps its curve. |
+| Per-device stereo image | `UserDefaults` key `syncast.deviceStereoImage.v1`, JSON-encoded array of `DeviceStereoImageProfile` | Keyed by CoreAudio UID, like the equalizer curve, because the setting describes a cabinet and the seat in front of it. Validated on load: width, corner, attenuation, strength, geometry and band edges clamped and snapped to the UI grid, non-finite values replaced by their defaults, an inverted band re-ordered, unreadable data collapses to "no settings". The feedback coefficient is clamped below 1 here as well as in the processor — a value of 1 or more would be a runaway, not merely a wrong setting. A bypassed record keeps its setting. |
 | Per-device local delay | `UserDefaults` key `syncast.localDelayTrimMs.v1`, JSON-encoded array of `LocalDelayTrimProfile` | Keyed by CoreAudio UID so the value belongs to the speaker (a display's panel adds its latency every time it is plugged in). Separate from `syncast.deviceDelayTrimMs` above: same unit, different correction, different leg, half the range — see §8c. Validated on load: UIDs trimmed, duplicates and zeros dropped, values clamped to ±100 ms. |
 | Auto-connect rules | `UserDefaults` key `syncast.autoConnect.profiles.v1`, JSON-encoded array of `AutoConnectProfile` | Keyed by CoreAudio UID for the same reason as the member store: the office display must never trigger the home rule. Validated on load (`AutoConnectProfileStore.decode`) — absent, unreadable and nonsensical all collapse to "no rules", because a half-applied rule would move the user's audio somewhere they never asked for. |
 
@@ -210,6 +211,48 @@ the device and re-applied on every connect.
   replug or an aggregate rebuild.
 - Full rationale and the measured ten-band response table:
   [requirements_2026-09-05-equalizer.md](requirements_2026-09-05-equalizer.md).
+
+## 8b-2. Per-device stereo image (2026-09-05)
+
+Better left/right separation on a compact stereo speaker whose two tweeters sit
+a few centimetres apart above a shared mono woofer. Two stages, each
+individually switchable, plus one A/B bypass for the module.
+
+- **Where**: `StereoImageProcessor`, immediately after `EqualizerBank` and
+  before the gain stage, in both `LocalOutput.render()` (per channel pair) and
+  `LocalAirPlayBridge.render()` (one pair).
+- **Stage 1 — mid/side width**: `S' = S + (width−1)·HP(S)` with a second-order
+  Butterworth high-pass on the side signal (default corner 1500 Hz), plus an
+  optional −1…0 dB mid trim. Mono-compatible by construction: `L'+R'` is
+  independent of `width`. Width applies only above the corner, because below
+  the cabinet's own crossover there is no side signal to widen.
+- **Stage 2 — recursive crosstalk cancellation (RACE)**: `L' = L − a·z^(−τ)·R'`,
+  `R' = R − a·z^(−τ)·L'`, band-limited to `[lowHz, highHz]` (default
+  1500–7000 Hz) by splitting `band = LP(HP(x))` and carrying `rest = x − band`
+  around the stage, so the split sums back exactly. τ is derived from geometry
+  (`span·0.15/distance/343`, ≈114 µs ≈ 5.5 samples at 48 kHz for the defaults)
+  and read through a **linear fractional-delay interpolator** — chosen because
+  its magnitude is ≤ 1, so loop stability needs no argument beyond `|a| < 1`;
+  the cost is ≈0.95 dB of HF loss at 7 kHz on the crosstalk path.
+- **Stability**: `a` is clamped below 1 at the load boundary, τ to at least one
+  whole sample (the recursion reads its own past output), and the feedback path
+  carries a per-sample finite check, denormal flush and magnitude ceiling.
+- **Colouration**: the recursion inherently boosts centred content by `1/(1−a)`
+  at `1/(2τ)` (+12 dB at full strength, hence the 60 % default). Printed in the
+  panel next to the sliders rather than left to be discovered by ear.
+- **RT safety / smoothing / clip protection**: identical to the equalizer's —
+  no allocation, generation-counted publish, two parameter banks with a 20 ms
+  crossfade (delay line and filter state carried over), hard clamp to ±1 with a
+  lock-free count surfaced as `imgClip:<n>` in the diagnostic line.
+- **Scope**: the `localOutputs` pairs in Local Stereo and each
+  `LocalAirPlayBridge` in whole-home, under the same CoreAudio UID key. NOT the
+  AirPlay group (crosstalk cancellation describes one cabinet and one seat, so
+  there is nothing sensible to share across receivers) and NOT Direct Stereo.
+- **Re-application**: `Router.applyStereoImages()` alongside `applyEqualizers()`
+  in every `reconcileLocalDriver` and `replan()`; store is
+  `syncast.deviceStereoImage.v1`.
+- Full rationale, the fractional-delay error analysis and the sweet-spot
+  caveats: [requirements_2026-09-05-stereo-image.md](requirements_2026-09-05-stereo-image.md).
 
 ## 8c. Per-device delay compensation, local Stereo (2026-09-05)
 

@@ -298,6 +298,16 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// Costs nothing while the curve is flat: `EqualizerBank.process` exits on
     /// two atomic loads and leaves the buffer byte-identical.
     private let equalizer: EqualizerBank
+    /// This device's stereo imaging, applied in `render()` immediately after
+    /// the tone curve and before the volume ramp — the same position, and the
+    /// same `StereoImageProcessor`, that `LocalOutput.render()` uses on the
+    /// local Stereo path. One pair, because a bridge drives exactly one
+    /// physical stereo output.
+    ///
+    /// Keyed by CoreAudio UID upstream (`Router.setStereoImages`), so a
+    /// speaker tuned in Stereo mode images the same in whole-home mode without
+    /// the user re-entering anything.
+    private let stereoImage: StereoImageProcessor
 
     // MARK: - Per-device delay trim (user listening-position compensation)
     //
@@ -432,6 +442,11 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
             ?? Self.nominalSampleRate(of: deviceID)
             ?? 44_100
         self.equalizer = EqualizerBank(
+            pairCount: 1,
+            channelsPerPair: 2,
+            sampleRate: equalizerRate
+        )
+        self.stereoImage = StereoImageProcessor(
             pairCount: 1,
             channelsPerPair: 2,
             sampleRate: equalizerRate
@@ -591,6 +606,31 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// Rate the equalizer's coefficients were computed for. Compared against
     /// the live device rate in `openAudioUnit`.
     public var equalizerSampleRate: Double { equalizer.sampleRate }
+
+    // MARK: - Stereo image
+
+    /// Install this device's stereo-image setting.
+    ///
+    /// Idempotent, for the same reason `setEqualizer` is: the Router re-applies
+    /// its whole UID → setting map on every replan and every bridge rebuild.
+    ///
+    /// - Returns: whether anything was actually published.
+    @discardableResult
+    public func setStereoImage(_ settings: StereoImageSettings) -> Bool {
+        stereoImage.setSettings(settings, pair: 0)
+    }
+
+    /// Drop back to neutral, so a repurposed bridge never inherits the
+    /// previous device's imaging.
+    public func resetStereoImage() {
+        stereoImage.resetAll()
+    }
+
+    /// Samples the stereo imager's output limiter had to clamp this session.
+    public var stereoImageClipCount: Int64 { stereoImage.clipCount }
+
+    /// True when this bridge holds imaging that changes the signal.
+    public var stereoImageIsEngaged: Bool { stereoImage.isEngaged }
 
     // MARK: - Delay trim
 
@@ -1529,6 +1569,18 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // alternative (an allocation on the RT thread) is worse than an
         // unshaped block.
         equalizer.process(
+            pair: 0,
+            channels: outPtrs,
+            channelOffset: 0,
+            channelCount: channelCount,
+            frames: frames
+        )
+
+        // Per-device stereo imaging, in the same place on the signal as on the
+        // local Stereo path: straight after the tone curve, still ahead of the
+        // gain stage. A neutral setting takes the processor's fast exit and
+        // leaves the buffer byte-identical.
+        stereoImage.process(
             pair: 0,
             channels: outPtrs,
             channelOffset: 0,

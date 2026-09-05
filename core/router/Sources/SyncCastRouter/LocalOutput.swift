@@ -106,6 +106,15 @@ public final class LocalOutput {
     /// Costs nothing while every pair is flat: `EqualizerBank.process` exits on
     /// two atomic loads and leaves the buffer byte-identical.
     private let equalizer: EqualizerBank
+    /// Per-channel-pair stereo imaging (mid/side width + recursive crosstalk
+    /// cancellation). Same `pairCount` and the same pair→physical-device
+    /// mapping as `equalizer`, applied in `render()` immediately AFTER the
+    /// equalizer and BEFORE the gain stage: the tone curve shapes what the
+    /// imager then works on, and the volume slider stays the last attenuator.
+    ///
+    /// Costs nothing while every pair is neutral: `StereoImageProcessor.process`
+    /// exits on one atomic load and leaves the buffer byte-identical.
+    private let stereoImage: StereoImageProcessor
     /// Per-channel-pair read offset — the local Stereo path's delay
     /// compensation. Sized to the same `pairCount` as `_softwareGains`, so in
     /// aggregate mode pair `p` is physical device `p` and each speaker can be
@@ -289,6 +298,11 @@ public final class LocalOutput {
             channelsPerPair: channelCount,
             sampleRate: sampleRate
         )
+        self.stereoImage = StereoImageProcessor(
+            pairCount: pairCount,
+            channelsPerPair: channelCount,
+            sampleRate: sampleRate
+        )
         self.pairDelays = PairDelayBank(pairCount: pairCount, sampleRate: sampleRate)
         // We deliberately leak the placeholder; deinit deallocates outPtrs
         // and the staging slabs. The actual outPtrs used per-render are
@@ -375,6 +389,7 @@ public final class LocalOutput {
         sc_atomic_store_release(minWaterLevelCounter, Self.waterLevelUnset)
         sc_atomic_store_release(idleBlockCounter, 0)
         equalizer.resetClipCount()
+        stereoImage.resetClipCount()
         renderTickCount = 0
     }
 
@@ -389,8 +404,11 @@ public final class LocalOutput {
         // the column it is supposed to notice.
         let clips = equalizerClipCount
         let clipInfo = clips > 0 ? " eqClip:\(clips)" : ""
+        // Same rule for the imager's limiter: reported only once it fires.
+        let imageClips = stereoImageClipCount
+        let imageClipInfo = imageClips > 0 ? " imgClip:\(imageClips)" : ""
         return "resync:\(resyncCount) underrun:\(underrunCount) minWater:\(water)"
-            + " idle:\(idleBlockCount)\(clipInfo)"
+            + " idle:\(idleBlockCount)\(clipInfo)\(imageClipInfo)"
     }
 
     // MARK: - Hardware latency probing
@@ -527,6 +545,34 @@ public final class LocalOutput {
 
     /// True when at least one pair has a curve that changes the signal.
     public var equalizerIsEngaged: Bool { equalizer.isEngaged }
+
+    // MARK: - Stereo image
+
+    /// Install one channel pair's stereo-image setting.
+    ///
+    /// `pair` follows the same convention as `setEqualizer`. Idempotent:
+    /// re-installing an unchanged setting returns false without touching the
+    /// render thread, which is what lets the Router re-apply its whole
+    /// UID → setting map on every replan.
+    @discardableResult
+    public func setStereoImage(pair: Int, settings: StereoImageSettings) -> Bool {
+        stereoImage.setSettings(settings, pair: pair)
+    }
+
+    /// Drop every pair back to neutral. Used when an output is being
+    /// repurposed so a rebuilt aggregate never inherits the previous device's
+    /// imaging.
+    public func resetStereoImages() {
+        stereoImage.resetAll()
+    }
+
+    /// Samples the stereo imager's output limiter had to clamp this session.
+    /// Non-zero means the width or the crosstalk recursion is driving the
+    /// output past full scale.
+    public var stereoImageClipCount: Int64 { stereoImage.clipCount }
+
+    /// True when at least one pair has imaging that changes the signal.
+    public var stereoImageIsEngaged: Bool { stereoImage.isEngaged }
 
     // MARK: - Per-device delay compensation
 
@@ -980,6 +1026,25 @@ public final class LocalOutput {
         // bit unchanged when nobody has dialled anything in.
         for p in 0..<pairCount {
             equalizer.process(
+                pair: p,
+                channels: outPtrs,
+                channelOffset: p * channelCount,
+                channelCount: channelCount,
+                frames: frames
+            )
+        }
+
+        // Per-device stereo imaging, immediately after the tone curve and
+        // still before the gain stage. Order matters both ways round: the
+        // imager's mid/side split works on the equalised signal (so a bass cut
+        // is not re-widened into the side channel), and the volume slider
+        // remains the last thing on the signal.
+        //
+        // A neutral pair takes the processor's fast exit and leaves the
+        // buffers exactly as the equalizer left them, so a user who never
+        // opens the panel gets the pre-feature render path bit for bit.
+        for p in 0..<pairCount {
+            stereoImage.process(
                 pair: p,
                 channels: outPtrs,
                 channelOffset: p * channelCount,

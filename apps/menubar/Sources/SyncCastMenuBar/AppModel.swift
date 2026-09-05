@@ -670,6 +670,7 @@ final class AppModel {
                 await self.refreshLocalFifoLag()
                 await self.pollSystemSinkStatus()
                 await self.refreshEqualizerClipCounts()
+                await self.refreshStereoImageClipCounts()
                 await self.refreshPairingStates()
                 await self.logPeriodicHealthIfDue()
             }
@@ -1300,6 +1301,7 @@ final class AppModel {
                 // delay. The Router re-applies on its own reconciles too, but
                 // the engine start is the one transition it cannot see coming.
                 await pushDeviceEqualizers()
+                await pushDeviceStereoImages()
                 await pushLocalDelayTrims()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
@@ -1345,6 +1347,7 @@ final class AppModel {
                 // speaker that was just switched back on comes up equalised
                 // and delay-compensated.
                 await pushDeviceEqualizers()
+                await pushDeviceStereoImages()
                 await pushLocalDelayTrims()
                 // The covered set may have changed (toggle / hot-plug /
                 // discovery republishing a UID under a new device id)
@@ -2313,6 +2316,27 @@ final class AppModel {
     /// Router limiter counts, keyed by CoreAudio UID, sampled by the same 1 Hz
     /// poll as the connection states. Drives the editor's clip indicator.
     var equalizerClipCounts: [String: Int64] = [:]
+
+    // MARK: - Per-device stereo image
+    //
+    // Behaviour lives in `AppModel+StereoImage.swift`; only the state is here,
+    // because a Swift extension cannot declare stored properties.
+
+    /// Remembered mid/side width + crosstalk settings, keyed by CoreAudio UID.
+    /// Kept in its own store rather than folded into `deviceEqualizers`: the
+    /// two are edited, reset and bypassed independently.
+    var deviceStereoImages: [String: DeviceStereoImageProfile] = DeviceStereoImageStore.load()
+
+    /// Debounced push of `deviceStereoImages` to the Router.
+    var stereoImageCommitTask: Task<Void, Never>?
+
+    /// Router limiter counts for the imager, keyed by CoreAudio UID.
+    var stereoImageClipCounts: [String: Int64] = [:]
+
+    /// Which stereo-image panel is open, if any, by `Device.id`. One at a
+    /// time, for the same reason the equalizer allows one: a 340 pt popover
+    /// has room for one panel.
+    var stereoImageEditorDeviceID: String?
 
     // MARK: - Per-device local delay compensation
     //

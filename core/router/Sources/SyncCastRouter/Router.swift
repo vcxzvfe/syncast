@@ -1379,6 +1379,7 @@ public actor Router {
         // that UID has to be pushed onto it before it renders anything the
         // user hears. Idempotent, so re-applying the whole map costs nothing.
         applyEqualizers()
+        applyStereoImages()
         scheduleMeasuredAirPlayOffsetPush()
     }
 
@@ -2182,6 +2183,101 @@ public actor Router {
         audioWriter?.setEqualizer(airPlayGroupEqualizer)
     }
 
+    // MARK: - Per-device stereo image
+    //
+    // Mid/side width plus recursive crosstalk cancellation per physical
+    // output, keyed by CoreAudio UID and applied inside the same render
+    // callbacks as the equalizer, one stage later on the signal. The Router
+    // keeps the whole map for the same reason it keeps the whole curve map: a
+    // device that is re-plugged, re-enabled, or lands in a rebuilt aggregate
+    // picks its setting straight back up.
+    //
+    // SCOPE is deliberately NARROWER than the equalizer's by one leg:
+    //
+    //   * Local Stereo on the system-sink / capture legs — yes.
+    //   * Whole-home local outputs (`localBridges`) — yes, same UID key.
+    //   * Whole-home AirPlay receivers — NO. There is no group setting.
+    //     Crosstalk cancellation is a statement about ONE listener's geometry
+    //     in front of ONE cabinet; applying a single one upstream of OwnTone's
+    //     fan-out would impose one room's numbers on every receiver in the
+    //     house. The equalizer's group curve is defensible because "less bass"
+    //     survives being shared; "cancel the path from the left driver to my
+    //     right ear" does not.
+    //   * Direct Stereo — no, the HAL renders straight into the public
+    //     aggregate and we never see the samples.
+
+    /// User settings keyed by CoreAudio UID. Absent means neutral.
+    private var stereoImageSettingsByUID: [String: StereoImageSettings] = [:]
+
+    /// Replace the whole UID → setting map. The menubar owns the persisted
+    /// store and pushes it in full, which keeps "the user cleared a device's
+    /// imaging" and "the user changed it" on the same path.
+    public func setStereoImages(_ settingsByUID: [String: StereoImageSettings]) {
+        var sanitized: [String: StereoImageSettings] = [:]
+        for (uid, settings) in settingsByUID where !uid.isEmpty {
+            let clean = settings.sanitized()
+            // Storing neutral settings would make `applyStereoImages` push
+            // identical no-ops forever; absent already means neutral.
+            guard !clean.isNeutral || clean.hasUserSetting else { continue }
+            sanitized[uid] = clean
+        }
+        guard sanitized != stereoImageSettingsByUID else { return }
+        stereoImageSettingsByUID = sanitized
+        applyStereoImages()
+    }
+
+    /// Set (or clear, with `.neutral`) one device's stereo image.
+    public func setStereoImage(uid: String, settings: StereoImageSettings) {
+        guard !uid.isEmpty else { return }
+        var next = stereoImageSettingsByUID
+        let clean = settings.sanitized()
+        if clean.isNeutral && !clean.hasUserSetting {
+            next.removeValue(forKey: uid)
+        } else {
+            next[uid] = clean
+        }
+        setStereoImages(next)
+    }
+
+    /// The settings the Router currently holds. Mostly for tests and reports.
+    public func stereoImages() -> [String: StereoImageSettings] { stereoImageSettingsByUID }
+
+    /// CoreAudio UIDs whose samples this process renders itself, and can
+    /// therefore image. Same set as `equalizableOutputUIDs()` minus the
+    /// AirPlay group, which is not offered here at all.
+    public func stereoImageableOutputUIDs() -> [String] {
+        equalizableOutputUIDs()
+    }
+
+    /// Per-device limiter counts, keyed by UID. Non-zero means that device's
+    /// width or crosstalk setting is pushing the signal past full scale.
+    public func stereoImageClipCounts() -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for target in localPairTargets() {
+            result[target.uid] = target.output.stereoImageClipCount
+        }
+        for bridge in localBridges.values {
+            result[bridge.deviceUID] = bridge.stereoImageClipCount
+        }
+        return result
+    }
+
+    /// Push the stored settings onto the live outputs. Idempotent — a pair
+    /// already holding a setting takes `LocalOutput.setStereoImage`'s no-op
+    /// path — so this rides along with every reconcile and replan rather than
+    /// needing its own trigger.
+    private func applyStereoImages() {
+        for target in localPairTargets() {
+            target.output.setStereoImage(
+                pair: target.pair,
+                settings: stereoImageSettingsByUID[target.uid] ?? .neutral
+            )
+        }
+        for bridge in localBridges.values {
+            bridge.setStereoImage(stereoImageSettingsByUID[bridge.deviceUID] ?? .neutral)
+        }
+    }
+
     // MARK: - Per-device delay compensation (local Stereo)
     //
     // A millisecond hold per physical output, applied inside
@@ -2503,6 +2599,7 @@ public actor Router {
         // having to notice the transition. Same argument for the per-device
         // delay: a rebuilt aggregate starts at 0 on every pair.
         applyEqualizers()
+        applyStereoImages()
         applyLocalPairDelays()
     }
 
@@ -3105,6 +3202,7 @@ public actor Router {
         // do, and covers any path that reopens an AUHAL without going through
         // `reconcileLocalDriver`.
         applyEqualizers()
+        applyStereoImages()
         applyLocalPairDelays()
 
         // In aggregate mode, also apply per-device HARDWARE volume on

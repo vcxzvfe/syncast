@@ -742,6 +742,11 @@ private struct DeviceRow: View {
                         if model.equalizerIsAvailable(for: deviceID) {
                             EqualizerToggleButton(target: .device(deviceID))
                         }
+                        // Per-speaker stereo imaging, on the same paths and
+                        // under the same rule as the EQ button beside it.
+                        if model.stereoImageIsAvailable(for: deviceID) {
+                            StereoImageToggleButton(deviceID: deviceID)
+                        }
                         // Per-row reset appears only when there is something
                         // to reset, so an untouched row gains no chrome —
                         // same rule the delay trim row follows.
@@ -821,9 +826,22 @@ private struct DeviceRow: View {
                        model.equalizerIsAvailable(for: deviceID) {
                         EqualizerEditor(target: .device(deviceID))
                     }
+                    // Inline stereo-image panel for the one row the user
+                    // opened.
+                    if model.stereoImageEditorDeviceID == deviceID,
+                       model.stereoImageIsAvailable(for: deviceID) {
+                        StereoImageEditor(deviceID: deviceID)
+                    }
                     // A remembered curve that the current path cannot apply
                     // says so, rather than looking as if it were in effect.
                     if let hint = model.equalizerInactiveHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    // Same for a remembered stereo image.
+                    if let hint = model.stereoImageInactiveHint(for: deviceID) {
                         Text(hint)
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
@@ -888,6 +906,9 @@ private struct DeviceRow: View {
         }
         if let summary = model.equalizerSummary(for: deviceID) {
             parts.append("equalizer \(summary)")
+        }
+        if let summary = model.stereoImageSummary(for: deviceID) {
+            parts.append("stereo image \(summary)")
         }
         return parts.joined(separator: ", ")
     }
