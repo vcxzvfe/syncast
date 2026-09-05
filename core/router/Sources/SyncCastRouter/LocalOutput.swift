@@ -97,6 +97,15 @@ public final class LocalOutput {
     private let _softwareGainsCount: Int
     private var _softwareGainsAllOnes: Bool = true
     private let _softwareGainsScratch: UnsafeMutablePointer<Float>
+    /// Per-channel-pair tone control. Sized to the same `pairCount` as
+    /// `_softwareGains`, so in aggregate mode pair `p` is physical device `p`
+    /// and each speaker carries its own curve. Applied in `render()` after the
+    /// splat and BEFORE the gain stage, so the user's volume slider still ends
+    /// up as the last attenuator on the signal.
+    ///
+    /// Costs nothing while every pair is flat: `EqualizerBank.process` exits on
+    /// two atomic loads and leaves the buffer byte-identical.
+    private let equalizer: EqualizerBank
     /// Pre-allocated channel pointer slot for the render callback so we
     /// don't allocate a Swift Array on every render tick. Sized to
     /// `outputChannelCount`, NOT `channelCount`.
@@ -247,6 +256,11 @@ public final class LocalOutput {
         let scratchBuf = UnsafeMutablePointer<Float>.allocate(capacity: pairCount)
         scratchBuf.initialize(repeating: 1.0, count: pairCount)
         self._softwareGainsScratch = scratchBuf
+        self.equalizer = EqualizerBank(
+            pairCount: pairCount,
+            channelsPerPair: channelCount,
+            sampleRate: sampleRate
+        )
         // We deliberately leak the placeholder; deinit deallocates outPtrs
         // and the staging slabs. The actual outPtrs used per-render are
         // owned by CoreAudio.
@@ -325,6 +339,7 @@ public final class LocalOutput {
         sc_atomic_store_release(underrunCounter, 0)
         sc_atomic_store_release(minWaterLevelCounter, Self.waterLevelUnset)
         sc_atomic_store_release(idleBlockCounter, 0)
+        equalizer.resetClipCount()
         renderTickCount = 0
     }
 
@@ -333,8 +348,14 @@ public final class LocalOutput {
         let water = minWaterLevelFrames.map {
             String(format: "%.1fms", RingFloorPolicy.milliseconds(frames: Int($0), sampleRate: sampleRate))
         } ?? "-"
+        // `eqClip` is reported only once it is non-zero: it is a fault signal
+        // ("your boost is driving the output past full scale"), and a
+        // permanent `eqClip:0` in every line would train the reader to skip
+        // the column it is supposed to notice.
+        let clips = equalizerClipCount
+        let clipInfo = clips > 0 ? " eqClip:\(clips)" : ""
         return "resync:\(resyncCount) underrun:\(underrunCount) minWater:\(water)"
-            + " idle:\(idleBlockCount)"
+            + " idle:\(idleBlockCount)\(clipInfo)"
     }
 
     // MARK: - Hardware latency probing
@@ -439,6 +460,38 @@ public final class LocalOutput {
             _softwareGainsAllOnes = allOnes
         }
     }
+
+    // MARK: - Equalizer
+
+    /// Install one channel pair's tone curve.
+    ///
+    /// `pair` follows the same convention as `setSoftwareGain`: 0 is the first
+    /// output pair, which in aggregate mode is the first physical subdevice.
+    /// Out-of-range indices are ignored rather than fatal, for the same reason
+    /// they are there — a subdevice-ordering disagreement mid-rebuild must not
+    /// take the render thread down with it.
+    ///
+    /// Idempotent: re-installing an unchanged curve returns false without
+    /// touching the render thread, which is what lets the Router re-apply its
+    /// whole UID→curve map on every replan.
+    @discardableResult
+    public func setEqualizer(pair: Int, settings: EqualizerSettings) -> Bool {
+        equalizer.setSettings(settings, pair: pair)
+    }
+
+    /// Drop every pair back to flat. Used when an output is being repurposed
+    /// so a rebuilt aggregate never inherits the previous device's curve.
+    public func resetEqualizers() {
+        equalizer.resetAll()
+    }
+
+    /// Samples the equalizer's output limiter had to clamp this session.
+    /// Non-zero means a boosted band is driving the output past full scale and
+    /// the user wants negative trim.
+    public var equalizerClipCount: Int64 { equalizer.clipCount }
+
+    /// True when at least one pair has a curve that changes the signal.
+    public var equalizerIsEngaged: Bool { equalizer.isEngaged }
 
     /// Reset every pair's software gain back to 1.0. Called by the
     /// Router when a device's hardware-volume probe succeeds (we no
@@ -775,6 +828,28 @@ public final class LocalOutput {
         let p0 = stage[0]
         for i in 0..<n { pk = max(pk, abs(p0[i])) }
         lastRenderPeak = pk
+
+        // Per-device tone control, applied to each pair's own channels.
+        //
+        // Placed HERE deliberately: after the splat (so each physical device
+        // has its own copy of the source to shape) and before the gain stage
+        // (so the volume slider stays the last attenuator, and a boosted curve
+        // that would clip at unity does not clip once the user turns down).
+        // The bank's own limiter still catches full-scale material plus a
+        // boost, and counts it.
+        //
+        // Flat outputs take the bank's fast exit and leave the buffers exactly
+        // as the splat wrote them — the pre-equalizer render path is bit-for-
+        // bit unchanged when nobody has dialled anything in.
+        for p in 0..<pairCount {
+            equalizer.process(
+                pair: p,
+                channels: outPtrs,
+                channelOffset: p * channelCount,
+                channelCount: channelCount,
+                frames: frames
+            )
+        }
 
         // Apply gain / mute. Two paths:
         //

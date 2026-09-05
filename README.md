@@ -219,7 +219,8 @@ sudo killall coreaudiod
 4. **Tick the devices you want.** Discovery runs continuously; new AirPlay receivers and audio devices appear within a few seconds.
 5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the system sink (or the Direct Stereo output when no sink is installed); capture-dependent modes use the selected capture backend.
 6. **Use the normal volume controls.** On the sink path the system slider is the master and each device row is a balance on top of it. See [System volume](#system-volume).
-7. **Set up auto-connect (optional).** With the devices you want ticked, open 自动连接 under the device list, pick the trigger device and press 「用当前选择创建规则」. From then on that selection is restored whenever the trigger appears — unless you have changed the selection yourself, in which case the rule stands down until the trigger is unplugged and reconnected, or you press 「重新应用规则」.
+7. **Tune a speaker (optional).** On a Local Stereo path that renders the audio itself (the system sink or a capture backend), each enabled output row gets a slider-icon button that opens a ten-band graphic equalizer for that speaker alone: 31.5 Hz … 16 kHz, ±12 dB in 0.5 dB steps, plus an overall trim and a bypass switch. Handy when one speaker's bass is overpowering. The curve is stored against that device's CoreAudio UID, so it is re-applied every time the device connects, and it never leaks onto a different display. Not available on the Direct Stereo path or in AirPlay experimental mode — SyncCast does not render those samples, and the row says so if you have a curve saved.
+8. **Set up auto-connect (optional).** With the devices you want ticked, open 自动连接 under the device list, pick the trigger device and press 「用当前选择创建规则」. From then on that selection is restored whenever the trigger appears — unless you have changed the selection yourself, in which case the rule stands down until the trigger is unplugged and reconnected, or you press 「重新应用规则」.
 
 ## Project status
 
@@ -231,6 +232,7 @@ What works:
 - Local Stereo routing through an Aggregate Device
 - AirPlay 2 multi-target streaming via the OwnTone-backed sidecar
 - Mode switching, device discovery, per-device volume
+- Per-device ten-band equalizer on the Local Stereo render paths, remembered by CoreAudio UID
 - Local `.app` bundling with self-signed codesigning
 
 What's still rough:

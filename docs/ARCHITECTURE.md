@@ -72,12 +72,12 @@
 | Module | Language | Responsibility |
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, the per-device equalizer (`EqualizerSettings` + `EqualizerBank`), IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
 | `drivers/SyncCastAudio` | C (AudioServerPlugIn) | Output-only virtual HAL device named "SyncCast" with volume + mute controls. Discards audio; exists so macOS has something volume-controllable to make the default output. Installed to `/Library/Audio/Plug-Ins/HAL` by `scripts/install-driver.sh`. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
-| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls, and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`). |
+| `apps/menubar` | SwiftUI app | Menubar UI. Wraps the router, exposes Stereo and AirPlay experimental modes plus per-device controls (volume, delay trim, equalizer), and owns the auto-connect rule engine (`AutoConnectProfile` / `AutoConnectCoordinator` / `AppModel+AutoConnect`) and the per-device equalizer store (`DeviceEqualizerStore` / `AppModel+Equalizer` / `EqualizerSection`). |
 
 ## 4. Audio data path
 
@@ -88,7 +88,7 @@
    - **Whole-home sink**: whole-home mode makes a public aggregate named 「AirPlay 全屋」 (`WholeHomeSinkOutput`) the default output so system audio lands somewhere silent while ScreenCaptureKit feeds OwnTone. Its single subdevice is resolved through the SAME `SystemSinkDevice.candidates` preference order as the stereo sink path — `SyncCastAudio_UID` first, `BlackHole2ch_UID` as fallback — so **BlackHole is optional in every mode**. Unlike the stereo sink path, whole-home never opens the device: SCK taps system audio above the HAL, so the subdevice's own sample rate and attenuation are not in the signal path and the aggregate deliberately inherits the subdevice's rate instead of forcing 48 kHz.
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
-4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, applies the per-device gain, writes into AUHAL's output buffer.
+4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, splats the source stereo into every output channel pair, applies that pair's **equalizer** (`EqualizerBank`, see §8b), then the per-device gain, and writes into AUHAL's output buffer. The equalizer sits before the gain stage so the volume slider stays the last attenuator; a pair with no curve takes a fast path that leaves the buffer byte-identical.
 5. **AirPlay fan-out**: `AudioSocketWriter` streams PCM packets (480 frames × 2 ch × s16le, ≈10 ms each) to the sidecar over a SOCK_SEQPACKET audio socket. The sidecar's `AudioSocketReader` thread forwards each packet straight into OwnTone's FIFO pipe. OwnTone owns the PTP-synced multi-target AirPlay 2 emission.
 
 ## 5. Sync model
@@ -136,6 +136,7 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 | Per-device volume / balance | `UserDefaults` key `syncast.deviceVolumes`, a `[deviceID: percent]` map. On the sink path this value is a BALANCE composed with the system volume in the dB domain, not an absolute level. |
 | Sink device level | Owned by macOS (the sink's own `VolumeScalar`), and by the driver's own storage for `SyncCastAudio.driver`. SyncCast never writes it. |
 | Per-speaker delay trim | `UserDefaults` key `syncast.deviceDelayTrimMs`, a `[persistenceKey: rawMs]` map | Keyed by `Device.persistenceKey` (`ca:<UID>` / `ap:<hex deviceid>`), never by `Device.id`, which is re-minted every process. Stores RAW signed intent, never the normalised output — normalisation depends on which devices are present, so persisting it would drift each session. A device that is absent keeps its entry, same rule as the member store. |
+| Per-device equalizer curve | `UserDefaults` key `syncast.deviceEqualizer.v1`, JSON-encoded array of `DeviceEqualizerProfile` | Keyed by CoreAudio UID (never `Device.id`, never the name) so the curve belongs to the speaker and comes back on every connect. Validated on load: gains and trim clamped, non-finite bands dropped, chain capped at 16 sections, unreadable data collapses to "no curves". A bypassed record keeps its curve. |
 | Auto-connect rules | `UserDefaults` key `syncast.autoConnect.profiles.v1`, JSON-encoded array of `AutoConnectProfile` | Keyed by CoreAudio UID for the same reason as the member store: the office display must never trigger the home rule. Validated on load (`AutoConnectProfileStore.decode`) — absent, unreadable and nonsensical all collapse to "no rules", because a half-applied rule would move the user's audio somewhere they never asked for. |
 
 Note: earlier revisions of this document described a `~/Library/Application Support/SyncCast/devices.json` routing store. No such file exists or has ever been written; per-device routing is rebuilt from discovery on each launch, and only the keys above are persisted.
@@ -167,6 +168,41 @@ an office display that must trigger nothing.
   wake. `SYNCAST_AUTOCONNECT_SIMULATE_ABSENT=<uid>[,<uid>]` hides a UID from the
   coordinator only, so the disconnect branch is reachable without unplugging.
 - Full rationale: [requirements_2026-09-05-auto-connect.md](requirements_2026-09-05-auto-connect.md).
+
+## 8b. Per-device equalizer (2026-09-05)
+
+"这个音响的低音太厉害" — a per-speaker tone control in dB that is remembered on
+the device and re-applied on every connect.
+
+- **Where**: `EqualizerBank` inside `LocalOutput.render()`, one independent
+  chain per output channel pair (= per physical subdevice in aggregate mode),
+  after the splat and before the gain stage.
+- **Filters**: RBJ Audio EQ Cookbook biquads. Default layout is a ten-band ISO
+  graphic EQ (31.5 Hz … 16 kHz, peaking, Q = 1.41, ±12 dB in 0.5 dB steps) plus
+  a ±12 dB pre-gain trim. The band record is fully parametric, so a parametric
+  editor would need no store migration.
+- **RT safety**: no allocation on the render thread; coefficients are computed
+  on the app thread and published through a staging buffer plus a
+  generation-counted atomic, so the render thread takes a lock only on the
+  block that adopts a change. A flat pair returns after two atomic loads.
+- **Smoothing**: two coefficient banks per pair with a 20 ms linear crossfade,
+  rather than interpolating coefficients (which has no stability guarantee).
+  Filter state carries over when the chain shape is unchanged, so moving one
+  slider does not restart the other nine sections.
+- **Clip protection**: hard clamp to ±1.0 with a lock-free count, surfaced as
+  `eqClip:<n>` in the diagnostic line (only when non-zero) and as a live
+  warning in the editor.
+- **Scope**: the `localOutputs` render path only — Local Stereo on the
+  system-sink or capture legs. NOT Direct Stereo (the HAL renders straight into
+  the public aggregate) and NOT whole-home (audio flows through OwnTone into
+  `LocalAirPlayBridge`). The UI hides the control there and annotates a stored
+  curve that is not being applied.
+- **Re-application**: the Router holds the whole UID → curve map and re-applies
+  it at the end of every `reconcileLocalDriver` and every `replan()`, both
+  idempotent. That, not the UI, is what makes "每次连接都默认这样" true across a
+  replug or an aggregate rebuild.
+- Full rationale and the measured ten-band response table:
+  [requirements_2026-09-05-equalizer.md](requirements_2026-09-05-equalizer.md).
 
 ## 9. Build & distribution
 

@@ -742,6 +742,12 @@ private struct DeviceRow: View {
                                     : AnyShapeStyle(.primary)
                             )
                             .frame(width: 34, alignment: .trailing)
+                        // Per-speaker tone control. Rendered only where the
+                        // curve would actually be applied — see
+                        // `AppModel.equalizerIsAvailable(for:)`.
+                        if model.equalizerIsAvailable(for: deviceID) {
+                            EqualizerToggleButton(deviceID: deviceID)
+                        }
                         // Per-row reset appears only when there is something
                         // to reset, so an untouched row gains no chrome —
                         // same rule the delay trim row follows.
@@ -809,6 +815,19 @@ private struct DeviceRow: View {
                     if model.mode == .wholeHome && routing.enabled {
                         delayTrimRow(for: device)
                     }
+                    // Inline equalizer panel for the one row the user opened.
+                    if model.equalizerEditorDeviceID == deviceID,
+                       model.equalizerIsAvailable(for: deviceID) {
+                        EqualizerEditor(deviceID: deviceID)
+                    }
+                    // A remembered curve that the current path cannot apply
+                    // says so, rather than looking as if it were in effect.
+                    if let hint = model.equalizerInactiveHint(for: deviceID) {
+                        Text(hint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 // One-line failure breadcrumb. Only shown when the
                 // sidecar has reported `failed` for this device, so a
@@ -854,6 +873,9 @@ private struct DeviceRow: View {
         let trim = model.deviceTrimMs(for: deviceID)
         if model.mode == .wholeHome && routing.enabled && trim != 0 {
             parts.append("delay \(trim > 0 ? "+" : "")\(trim) milliseconds")
+        }
+        if let summary = model.equalizerSummary(for: deviceID) {
+            parts.append("equalizer \(summary)")
         }
         return parts.joined(separator: ", ")
     }

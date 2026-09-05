@@ -674,6 +674,7 @@ final class AppModel {
                 await self.refreshLocalFifoLag()
                 await self.refreshWholeHomeSinkState()
                 await self.pollSystemSinkStatus()
+                await self.refreshEqualizerClipCounts()
                 await self.refreshPairingStates()
                 await self.logPeriodicHealthIfDue()
             }
@@ -1321,6 +1322,10 @@ final class AppModel {
                     await router.setRouting(r)
                 }
                 await pushAirplayState()
+                // Seed every open AUHAL with its remembered tone curve. The
+                // Router re-applies on its own reconciles too, but the engine
+                // start is the one transition it cannot see coming.
+                await pushDeviceEqualizers()
                 streamingState = .running
                 SyncCastLog.log("reconcile: state=running")
                 if mode == .wholeHome {
@@ -1360,6 +1365,10 @@ final class AppModel {
             switch mode {
             case .stereo:
                 await router.syncLocalOutputs(devices: devices)
+                // The enabled set may have changed, which means the driver may
+                // have been rebuilt with fresh (flat) AUHALs. Re-push so a
+                // speaker that was just switched back on comes up equalised.
+                await pushDeviceEqualizers()
                 // The covered set may have changed (toggle / hot-plug /
                 // discovery republishing a UID under a new device id)
                 // without a streamingState transition, so the didSet hook
@@ -2274,6 +2283,33 @@ final class AppModel {
     /// and the user has no reason to suspect a setting they last touched days
     /// ago. The fader position IS persisted, so nothing they dialled is lost.
     private(set) var masterMuted: Bool = false
+
+    // MARK: - Per-device equalizer
+    //
+    // Behaviour lives in `AppModel+Equalizer.swift`; only the state is here,
+    // because a Swift extension cannot declare stored properties.
+
+    /// Remembered tone curves, keyed by CoreAudio UID (never by `Device.id`,
+    /// which is minted per process). Loaded once at launch and pushed to the
+    /// Router in full, so a device that is re-plugged or re-enabled picks its
+    /// curve back up without the UI having to notice the transition.
+    var deviceEqualizers: [String: DeviceEqualizerProfile] = DeviceEqualizerStore.load()
+
+    /// Debounced push of `deviceEqualizers` to the Router, so dragging a
+    /// slider costs one actor hop per settle rather than one per pixel.
+    var equalizerCommitTask: Task<Void, Never>?
+
+    /// Router limiter counts, keyed by CoreAudio UID, sampled by the same 1 Hz
+    /// poll as the connection states. Drives the editor's clip indicator.
+    var equalizerClipCounts: [String: Int64] = [:]
+
+    /// Which row currently has its equalizer panel open, if any.
+    ///
+    /// Model state rather than `@State` on the row for two reasons: SwiftUI
+    /// recycles `DeviceRow` views (which is exactly why the row binds by
+    /// `deviceID` and never by a captured `Device`), and a 340 pt popover has
+    /// room for one ten-band panel, not several.
+    var equalizerEditorDeviceID: String?
 
     private static func loadPersistedDeviceVolumes() -> [String: Int] {
         guard let raw = UserDefaults.standard
