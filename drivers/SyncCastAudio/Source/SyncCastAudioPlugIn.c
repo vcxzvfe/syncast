@@ -139,6 +139,9 @@ void* SyncCastAudio_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedType
 {
     #pragma unused(inAllocator)
     void* theAnswer = NULL;
+    // CFEqual(NULL, ...) crashes; a factory can be called by anything that
+    // dlopens this bundle, not only by a well-behaved HAL.
+    if(inRequestedTypeUUID == NULL) { return NULL; }
     if(CFEqual(inRequestedTypeUUID, kAudioServerPlugInTypeUUID))
     {
         theAnswer = gAudioServerPlugInDriverRef;
@@ -288,7 +291,9 @@ static OSStatus SyncCastAudio_PerformDeviceConfigurationChange(AudioServerPlugIn
        (theNewSampleRate != kDevice_DefaultSampleRate) &&
        (theNewSampleRate != kDevice_SampleRate_96000))
     {
-        return kAudioHardwareBadObjectError;
+        // Bad VALUE, not a bad object: the device id was fine, the rate the
+        // host carried back is not one this device advertises.
+        return kAudioHardwareIllegalOperationError;
     }
 
     // Rate first, under the state mutex (the property getters read it there),

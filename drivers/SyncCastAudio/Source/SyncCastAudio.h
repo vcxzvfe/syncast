@@ -33,7 +33,6 @@
 #define SyncCastAudio_h
 
 #include <CoreAudio/AudioServerPlugIn.h>
-#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdbool.h>
