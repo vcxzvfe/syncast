@@ -62,6 +62,84 @@ final class WholeHomeSinkOutputTests: XCTestCase {
         )
     }
 
+    // MARK: - Silent-sink preference order
+
+    /// The point of the whole change: once SyncCast's own driver is installed,
+    /// whole-home wraps THAT and BlackHole can be uninstalled.
+    func testPrefersSyncCastDriverWhenBothAreInstalled() {
+        XCTAssertEqual(
+            WholeHomeSinkOutput.preferredSinkUID(installedUIDs: [
+                SystemSinkDevice.blackHole2chUID,
+                SystemSinkDevice.syncCastDriverUID,
+            ]),
+            SystemSinkDevice.syncCastDriverUID
+        )
+    }
+
+    func testUsesSyncCastDriverWhenItIsTheOnlySinkInstalled() {
+        XCTAssertEqual(
+            WholeHomeSinkOutput.preferredSinkUID(
+                installedUIDs: [SystemSinkDevice.syncCastDriverUID]
+            ),
+            SystemSinkDevice.syncCastDriverUID
+        )
+    }
+
+    /// The fallback has to keep working: machines that never ran the
+    /// sudo-requiring driver install still have BlackHole and nothing else.
+    func testFallsBackToBlackHoleWhenTheDriverIsAbsent() {
+        XCTAssertEqual(
+            WholeHomeSinkOutput.preferredSinkUID(
+                installedUIDs: [SystemSinkDevice.blackHole2chUID]
+            ),
+            SystemSinkDevice.blackHole2chUID
+        )
+    }
+
+    /// The error path. `resolveSilentSinkUID` still has a name-based scan
+    /// behind this decision, but with no candidate installed and no
+    /// BlackHole-shaped device on the machine it must throw rather than let
+    /// whole-home come up with the real speakers as default output — the
+    /// silent double-playback failure this error exists to prevent.
+    func testNoPreferenceWhenNoKnownSinkIsInstalled() {
+        XCTAssertNil(WholeHomeSinkOutput.preferredSinkUID(installedUIDs: []))
+        XCTAssertNil(
+            WholeHomeSinkOutput.preferredSinkUID(
+                installedUIDs: ["ZoomAudioDevice", "BuiltInSpeakerDevice"]
+            ),
+            "an unrelated virtual device is not a sink we know is silent"
+        )
+    }
+
+    /// Whole-home and the stereo sink path must never disagree about which
+    /// device is preferred: one list, one rule.
+    func testCandidateListIsSharedWithTheStereoSinkPath() {
+        XCTAssertEqual(
+            WholeHomeSinkOutput.sinkCandidates.map(\.uid),
+            SystemSinkDevice.candidates.map(\.uid)
+        )
+        XCTAssertEqual(
+            WholeHomeSinkOutput.sinkCandidates.first?.uid,
+            SystemSinkDevice.syncCastDriverUID,
+            "SyncCast's own driver must rank first in both paths"
+        )
+    }
+
+    /// The error message is the only instruction the user gets when nothing is
+    /// installed, so it has to name BOTH options — naming only BlackHole is
+    /// what this change exists to undo.
+    func testNoSilentSinkErrorNamesBothInstallOptions() {
+        let text = String(
+            describing: WholeHomeSinkOutput.WholeHomeSinkError.noSilentSinkInstalled
+        )
+        XCTAssertTrue(text.contains("SyncCast"), "must offer our own driver")
+        XCTAssertTrue(text.contains("BlackHole 2ch"), "must still offer the fallback")
+        XCTAssertTrue(
+            text.contains("install-driver.sh") || text.contains("安装 SyncCast 音频驱动"),
+            "must say HOW to install the driver"
+        )
+    }
+
     // MARK: - BlackHole fallback matching
 
     func testMatchesBlackHoleAcceptsStereoLoopbackByName() {
@@ -262,6 +340,39 @@ final class WholeHomeSinkOutputTests: XCTestCase {
         XCTAssertFalse(
             WholeHomeSinkOutput.isRestorableDefault(
                 uid: "BlackHole16ch_UID", name: "BlackHole 16ch"
+            )
+        )
+    }
+
+    /// Same rule for our own driver, and it can ONLY be caught by UID: the
+    /// device is named "SyncCast", which the BlackHole name needle does not
+    /// match. Restoring it as "the user's previous default" would leave every
+    /// other app rendering into a silent device with nothing to explain it.
+    func testRestorableDefaultRejectsRawSyncCastDriver() {
+        XCTAssertFalse(
+            WholeHomeSinkOutput.isRestorableDefault(
+                uid: SystemSinkDevice.syncCastDriverUID,
+                name: SystemSinkDevice.syncCastDriverName
+            )
+        )
+        XCTAssertFalse(
+            SystemSinkDevice.syncCastDriverName.lowercased()
+                .contains(WholeHomeSinkOutput.blackHoleNameNeedle),
+            "guards the reason this needs its own UID check"
+        )
+    }
+
+    /// The rejection must not over-reach: a user-created multi-output device
+    /// (Audio MIDI Setup's 多输出设备) is a legitimate destination.
+    func testRestorableDefaultStillAcceptsOrdinaryAndUserAggregateOutputs() {
+        XCTAssertTrue(
+            WholeHomeSinkOutput.isRestorableDefault(
+                uid: "BuiltInSpeakerDevice", name: "MacBook Pro扬声器"
+            )
+        )
+        XCTAssertTrue(
+            WholeHomeSinkOutput.isRestorableDefault(
+                uid: "~:AMS2_StackedOutput:0", name: "多输出设备"
             )
         )
     }

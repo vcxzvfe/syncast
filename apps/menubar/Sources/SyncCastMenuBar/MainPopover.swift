@@ -112,7 +112,7 @@ struct MainPopover: View {
     /// One line saying which device currently owns the macOS system volume,
     /// plus the two actions that line can imply: resume after the user moved
     /// the output away, and install SyncCast's own driver when the fallback
-    /// sink (BlackHole) is carrying the path.
+    /// sink (BlackHole 2ch) is carrying the path.
     @ViewBuilder
     private func systemSinkStatusRow(_ line: String) -> some View {
         HStack(spacing: 6) {

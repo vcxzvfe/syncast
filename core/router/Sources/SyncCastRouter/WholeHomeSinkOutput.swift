@@ -3,7 +3,7 @@ import CoreAudio
 import Darwin
 
 /// The whole-home mode's *system sink*: a public CoreAudio aggregate device
-/// named "AirPlay 全屋" whose only subdevice is BlackHole 2ch.
+/// named "AirPlay 全屋" whose only subdevice is a silent virtual output.
 ///
 /// Why this exists
 /// ---------------
@@ -12,19 +12,35 @@ import Darwin
 /// (the single clock domain) to both the AirPlay receivers and — via the
 /// local FIFO bridge — the physical speakers. If the default output were a
 /// real speaker, the same audio would play twice at two different latencies.
-/// BlackHole 2ch is that silent device, and until now the user had to select
-/// it by hand in System Settings → Sound, where it shows up under its driver
-/// name ("BlackHole 2ch") with no hint that it is SyncCast's whole-home input.
 ///
-/// Renaming BlackHole itself is not an option: `kAudioObjectPropertyName` is
-/// not settable on it (`AudioObjectIsPropertySettable` returns false), and the
-/// only other route is editing `/Library/Audio/Plug-Ins/HAL/BlackHole.driver`'s
-/// Info.plist, which needs sudo plus App Management permission. So instead we
-/// wrap BlackHole in an aggregate device we own, which we DO get to name, and
-/// make that the default output. ScreenCaptureKit captures at the system
-/// level and is indifferent to which device is default, so capture is
-/// unaffected; the aggregate inherits BlackHole's loopback silence, so there
-/// is no double playback.
+/// Which silent device
+/// -------------------
+/// The same two candidates the stereo sink path uses, in the same preference
+/// order — the list lives once, in `SystemSinkDevice.candidates`:
+///
+///   1. `SyncCastAudio_UID` — SyncCast's own driver (`drivers/SyncCastAudio`),
+///      output-only, 2 ch, 48 kHz native, named "SyncCast".
+///   2. `BlackHole2ch_UID` — the BlackHole 2ch loopback, kept as a fallback so
+///      the feature still works on machines that never installed our driver.
+///
+/// Whole-home reads NOTHING out of this device: ScreenCaptureKit captures at
+/// the system level, before the HAL, so any silent output-only device works as
+/// the sink and neither candidate's own attenuation or sample rate reaches the
+/// audio path. That is why the preference order can be shared verbatim with
+/// the stereo sink path, which *does* tap its device.
+///
+/// Why the aggregate wrapper survives the driver
+/// ---------------------------------------------
+/// Renaming BlackHole is not an option: `kAudioObjectPropertyName` is not
+/// settable on it (`AudioObjectIsPropertySettable` returns false), and the only
+/// other route is editing `/Library/Audio/Plug-Ins/HAL/BlackHole.driver`'s
+/// Info.plist, which needs sudo plus App Management permission. So we wrap the
+/// silent device in an aggregate we own, which we DO get to name, and make that
+/// the default output. The wrapper is kept even with our own driver installed:
+/// "SyncCast" in the Sound menu says who owns the device but not what mode is
+/// running, and the same aggregate is what `sweepOrphans()` and the
+/// displacement banner key off. The aggregate inherits the subdevice's
+/// silence, so there is no double playback.
 ///
 /// Known trade-off (deliberate, see `enabled`)
 /// -------------------------------------------
@@ -36,7 +52,8 @@ import Darwin
 /// arguably more honest than today's behaviour (BlackHole exposes a settable
 /// volume that does nothing to the samples, so the slider moves and is
 /// inaudible), but it is a visible change. `enabled` is the single-constant
-/// escape hatch back to the old "user picks BlackHole by hand" behaviour.
+/// escape hatch back to the old "user picks the silent device by hand"
+/// behaviour.
 ///
 /// A greyed-out system slider is also exactly what sends a user into System
 /// Settings → Sound to pick their real speakers again — which silently breaks
@@ -51,13 +68,13 @@ import Darwin
 ///   - `DirectStereoOutput`   — PUBLIC, becomes the default output, fans out
 ///                              to the user's real speakers.
 ///   - `WholeHomeSinkOutput`  — PUBLIC, becomes the default output, wraps the
-///                              silent BlackHole loopback.
+///                              silent sink device.
 /// Each has its own UID namespace because their orphan sweeps need different
 /// protections; this one and `DirectStereoOutput` can be the live system
 /// default, so their sweeps must move the default away before destroying.
 public final class WholeHomeSinkOutput {
     public enum WholeHomeSinkError: Error, CustomStringConvertible {
-        case blackHoleNotInstalled
+        case noSilentSinkInstalled
         case readDefaultFailed(OSStatus)
         case setDefaultFailed(OSStatus)
         case createAggregateFailed(OSStatus)
@@ -66,11 +83,12 @@ public final class WholeHomeSinkOutput {
 
         public var description: String {
             switch self {
-            case .blackHoleNotInstalled:
+            case .noSilentSinkInstalled:
                 return """
-                whole-home mode needs the BlackHole 2ch virtual audio driver, \
-                which is not installed. Install it with \
-                `brew install --cask blackhole-2ch` (or run scripts/bootstrap.sh) \
+                whole-home mode needs a silent virtual audio device, and none \
+                is installed. Install SyncCast's own driver (推荐; menu: \
+                安装 SyncCast 音频驱动, or `sudo bash scripts/install-driver.sh`), \
+                or install BlackHole 2ch (`brew install --cask blackhole-2ch`), \
                 and try again.
                 """
             case .readDefaultFailed(let status):
@@ -89,7 +107,7 @@ public final class WholeHomeSinkOutput {
 
     /// Master switch for the rename behaviour. `false` restores the previous
     /// contract exactly: SyncCast never touches the default output in
-    /// whole-home mode and the user selects "BlackHole 2ch" by hand.
+    /// whole-home mode and the user selects the silent device by hand.
     /// Flip this rather than reverting the feature if the greyed-out system
     /// volume slider (see the type docs) turns out to be unacceptable.
     public static let enabled = true
@@ -106,9 +124,14 @@ public final class WholeHomeSinkOutput {
     /// localization bundle, so a single constant is the whole story.
     public static let displayName = "AirPlay 全屋"
 
-    /// Canonical UID of the BlackHole 2ch driver (verified on this machine:
-    /// `id=60 out=2 name=BlackHole 2ch uid=BlackHole2ch_UID`).
-    public static let blackHole2chUID = "BlackHole2ch_UID"
+    /// The silent devices this sink accepts, best first. Deliberately the
+    /// SAME list object the stereo sink path resolves through — a second copy
+    /// would let the two paths disagree about which device is preferred after
+    /// a driver install, and the user would see one mode move to "SyncCast"
+    /// while the other silently stayed on BlackHole.
+    public static var sinkCandidates: [SystemSinkDevice.Candidate] {
+        SystemSinkDevice.candidates
+    }
 
     /// Lower-cased needle for the fallback scan, for installs that only have
     /// a differently-packaged BlackHole (16ch build, renamed driver bundle).
@@ -126,18 +149,28 @@ public final class WholeHomeSinkOutput {
 
     /// Why this is NOT forced to 48 kHz the way `AggregateDevice` forces its
     /// private aggregate: setting the aggregate's nominal rate propagates to
-    /// its main subdevice, which would silently re-rate BlackHole system-wide
-    /// for every other app using it. This sink carries no samples we ever
-    /// read — it exists to be a named, silent default output — so it simply
-    /// inherits whatever rate BlackHole is already at (96 kHz on this
-    /// machine).
+    /// its main subdevice, which would silently re-rate a SHARED device
+    /// system-wide for every other app using it (BlackHole in particular is
+    /// shared with whatever else the user set up). This sink carries no samples
+    /// we ever read — it exists to be a named, silent default output — so it
+    /// simply inherits whatever rate the subdevice is already at (BlackHole:
+    /// 96 kHz on this machine; `SyncCastAudio`: 48 kHz native, see
+    /// `kDevice_DefaultSampleRate`).
+    ///
+    /// No re-rate is needed either way. Whole-home's capture is `SCKCapture`
+    /// at a fixed 48 kHz, and ScreenCaptureKit taps system audio ABOVE the
+    /// HAL: it never opens this aggregate or its subdevice, so the sink's
+    /// nominal rate is not in the signal path at all. (Contrast
+    /// `SystemSinkDevice.requiredSampleRate`, which DOES pin its device to
+    /// 48 kHz — that path runs a Core Audio Process Tap on the device itself,
+    /// and the tap refuses a non-48 kHz format.)
     public static let inheritsSubdeviceSampleRate = true
 
     private var previousDefaultOutputID: AudioObjectID?
     private var previousDefaultOutputUID: String?
     private var aggregateID: AudioObjectID = 0
     private var aggregateUID: String = ""
-    private var blackHoleUID: String = ""
+    private var silentSinkUID: String = ""
     private var lastStopStatus: String?
 
     public var isActive: Bool { aggregateID != 0 }
@@ -211,7 +244,7 @@ public final class WholeHomeSinkOutput {
         }
         // `default=` is the double-playback tell: "no" means macOS is rendering
         // system audio somewhere else while the SCK tap still feeds OwnTone.
-        return "wholeHomeSink=active id=\(aggregateID) sub=\(blackHoleUID)"
+        return "wholeHomeSink=active id=\(aggregateID) sub=\(silentSinkUID)"
             + " previous=\(previousDefaultOutputUID ?? "?")"
             + " default=\(isSystemDefaultOutput ? "yes" : "no")"
     }
@@ -233,7 +266,7 @@ public final class WholeHomeSinkOutput {
         guard Self.enabled else { return }
         if isActive { return }
 
-        let blackHole = try Self.resolveBlackHoleUID()
+        let silentSink = try Self.resolveSilentSinkUID()
 
         // Snapshot the user's current default BEFORE we touch anything, by
         // both ID and UID: AudioObjectIDs are transient (a replug mints a new
@@ -245,7 +278,7 @@ public final class WholeHomeSinkOutput {
             uid: rawPreviousUID
         )
 
-        let aggregate = try Self.createPublicSinkAggregate(blackHoleUID: blackHole)
+        let aggregate = try Self.createPublicSinkAggregate(silentSinkUID: silentSink)
         do {
             try Self.setDefaultOutputOrThrow(aggregate.id)
         } catch {
@@ -261,7 +294,7 @@ public final class WholeHomeSinkOutput {
         previousDefaultOutputUID = previousUID
         aggregateID = aggregate.id
         aggregateUID = aggregate.uid
-        blackHoleUID = blackHole
+        silentSinkUID = silentSink
         lastStopStatus = nil
     }
 
@@ -329,7 +362,7 @@ public final class WholeHomeSinkOutput {
             }
         } else if let fallback = Self.fallbackDefaultOutputID(excluding: [active]) {
             // No usable snapshot (e.g. the previous default was itself a
-            // leaked SyncCast device, or a raw BlackHole). Anything ordinary
+            // leaked SyncCast device, or a raw silent sink). Anything ordinary
             // beats leaving the default pointed at a device we are about to
             // destroy.
             let fallbackStatus = Self.setDefaultOutput(fallback)
@@ -358,7 +391,7 @@ public final class WholeHomeSinkOutput {
             previousDefaultOutputUID = nil
             aggregateID = 0
             aggregateUID = ""
-            blackHoleUID = ""
+            silentSinkUID = ""
         }
         return fullyStopped
     }
@@ -433,7 +466,7 @@ public final class WholeHomeSinkOutput {
         return destroyed
     }
 
-    // MARK: - BlackHole resolution
+    // MARK: - Silent-sink resolution
 
     /// True when a device looks like a usable BlackHole loopback sink.
     /// Pure so the fallback rule is testable without CoreAudio.
@@ -443,17 +476,39 @@ public final class WholeHomeSinkOutput {
         return name.lowercased().contains(Self.blackHoleNameNeedle)
     }
 
-    /// Resolve the BlackHole UID: exact UID first (the overwhelmingly common
-    /// `brew install --cask blackhole-2ch` case), then a name+channel-count
-    /// scan for differently-packaged installs. Throws a user-actionable error
-    /// rather than failing silently — before this existed, a missing BlackHole
-    /// meant whole-home mode came up with the real speakers still as default
-    /// output, i.e. every track played twice at different latencies with no
-    /// message anywhere.
-    static func resolveBlackHoleUID() throws -> String {
-        if let id = try? DirectStereoOutput.deviceID(forUID: Self.blackHole2chUID),
-           id != AudioObjectID(kAudioObjectUnknown) {
-            return Self.blackHole2chUID
+    /// Which of the known silent sinks to wrap, given the set that is actually
+    /// installed. Pure, and deliberately delegating to the stereo path's
+    /// decision so "SyncCast driver beats BlackHole" is one rule with one test
+    /// surface rather than two implementations that drift apart.
+    static func preferredSinkUID(installedUIDs: Set<String>) -> String? {
+        SystemSinkDevice.preferredSink(
+            installedUIDs: installedUIDs,
+            candidates: Self.sinkCandidates
+        )?.uid
+    }
+
+    /// Resolve the silent sink's UID: the known candidates first, best rank
+    /// wins (`SyncCastAudio_UID`, then `BlackHole2ch_UID`), then a
+    /// name+channel-count scan for differently-packaged BlackHole installs.
+    /// Throws a user-actionable error rather than failing silently — before
+    /// this existed, a missing loopback meant whole-home mode came up with the
+    /// real speakers still as default output, i.e. every track played twice at
+    /// different latencies with no message anywhere.
+    ///
+    /// Resolved per `start()`, NOT cached in a `static let` the way
+    /// `SystemSinkDevice.resolved` is: whole-home can be started many times in
+    /// one session, and a driver installed mid-session should be picked up on
+    /// the next start rather than at the next app launch.
+    static func resolveSilentSinkUID() throws -> String {
+        var installed = Set<String>()
+        for candidate in Self.sinkCandidates {
+            if let id = try? DirectStereoOutput.deviceID(forUID: candidate.uid),
+               id != AudioObjectID(kAudioObjectUnknown) {
+                installed.insert(candidate.uid)
+            }
+        }
+        if let uid = preferredSinkUID(installedUIDs: installed) {
+            return uid
         }
         for id in DirectStereoOutput.enumerateAllDevices() {
             let (_, _, channels) = AggregateDevice.readStreamChannels(id)
@@ -463,7 +518,7 @@ public final class WholeHomeSinkOutput {
             }
             return uid
         }
-        throw WholeHomeSinkError.blackHoleNotInstalled
+        throw WholeHomeSinkError.noSilentSinkInstalled
     }
 
     // MARK: - Aggregate construction
@@ -488,17 +543,17 @@ public final class WholeHomeSinkOutput {
     }
 
     private static func createPublicSinkAggregate(
-        blackHoleUID: String
+        silentSinkUID: String
     ) throws -> (id: AudioObjectID, uid: String) {
         let uid = makeUID(
             pid: ProcessInfo.processInfo.processIdentifier,
             uuid: UUID().uuidString
         )
         let subdevices: [[String: Any]] = [[
-            kAudioSubDeviceUIDKey as String: blackHoleUID,
-            // 0 = no drift compensation. BlackHole is the main (and only)
-            // subdevice, so it IS the clock; correcting it against itself
-            // would just burn CPU in the kernel SRC.
+            kAudioSubDeviceUIDKey as String: silentSinkUID,
+            // 0 = no drift compensation. The silent sink is the main (and
+            // only) subdevice, so it IS the clock; correcting it against
+            // itself would just burn CPU in the kernel SRC.
             kAudioSubDeviceDriftCompensationKey as String: UInt32(0),
         ]]
         let composition: [String: Any] = [
@@ -510,7 +565,7 @@ public final class WholeHomeSinkOutput {
             // would be invisible there.
             kAudioAggregateDeviceIsPrivateKey as String: 0,
             kAudioAggregateDeviceIsStackedKey as String: 1,
-            kAudioAggregateDeviceMainSubDeviceKey as String: blackHoleUID,
+            kAudioAggregateDeviceMainSubDeviceKey as String: silentSinkUID,
             kAudioAggregateDeviceSubDeviceListKey as String: subdevices,
         ]
 
@@ -619,12 +674,15 @@ public final class WholeHomeSinkOutput {
     ///     still pointed at it, and a mode switch can briefly overlap two of
     ///     our paths. Restoring to one later points the system at a device
     ///     that no longer exists — total silence, no error anywhere.
-    ///   - Raw BlackHole. This is the common case for existing users: they
-    ///     already selected "BlackHole 2ch" by hand to make whole-home work,
-    ///     so that is what we would snapshot on the very first run with this
-    ///     feature — and "restoring" it on quit would leave their Mac silent
-    ///     for every other app. The whole point of the sink is that nobody has
-    ///     to live with a loopback as their default output.
+    ///   - A raw silent sink — BlackHole 2ch or SyncCast's own driver. This is
+    ///     the common case for existing users: they already selected
+    ///     "BlackHole 2ch" by hand to make whole-home work, so that is what we
+    ///     would snapshot on the very first run with this feature — and
+    ///     "restoring" it on quit would leave their Mac silent for every other
+    ///     app. Exactly the same is true of "SyncCast": the stereo sink path
+    ///     can be the thing that left it as the default, and it is just as
+    ///     silent to ordinary apps. The whole point of the sink is that nobody
+    ///     has to live with a loopback as their default output.
     ///
     /// A user-created aggregate (Audio MIDI Setup's "多输出设备" and friends)
     /// IS restorable: it is a legitimate destination we must not second-guess.
@@ -633,6 +691,12 @@ public final class WholeHomeSinkOutput {
            uid.hasPrefix(Self.uidPrefix)
             || uid.hasPrefix(DirectStereoOutput.uidPrefix)
             || uid.hasPrefix(AggregateDevice.uidPrefix) {
+            return false
+        }
+        // UID check, not a name check: the driver's name ("SyncCast") is a
+        // substring of nothing useful to match on, and a user could legitimately
+        // own a device with that word in it. The UID is the driver's contract.
+        if let uid, SystemSinkDevice.isSinkUID(uid) {
             return false
         }
         if let name, name.lowercased().contains(Self.blackHoleNameNeedle) {
