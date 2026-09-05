@@ -81,9 +81,12 @@ coreaudiod from a composition dictionary and we cannot add controls to one.
 (instead of tap → ring → separate AUHAL). Lower latency in principle, but it
 merges two clock domains into one callback and throws away the drift
 compensation and per-device delay machinery that already works. Rejected for
-this round: the ring-buffer chain is the same structure the SCK path has run
-for months, and the budget target (≤30 ms) is not the constraint that would
-justify rebuilding it.
+THIS round on reliability grounds — the ring-buffer chain is the same
+structure the SCK path has run for months — but the measured budget below
+(~71 ms added, target ≤30 ms) means latency is now a live argument for
+revisiting it. The cheaper levers come first: the 50 ms scheduler margin is
+the dominant term and a constant, and declaring the chain latency on the
+driver would restore A/V sync without touching the audio path at all.
 
 **Make whole-home share the sink observer.** Whole-home's default output is its
 own silent aggregate and its master fader lives in `AudioSocketWriter` on
