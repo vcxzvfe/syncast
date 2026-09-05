@@ -132,6 +132,8 @@ final class SystemSinkCoordinator {
         observer?.setWatchedDevices([])
         watchedUID = nil
         backendsByDeviceID = [:]
+        backendsByUID = [:]
+        uidByDeviceID = [:]
         SyncCastLog.log("systemSink: stopped watching the system volume")
     }
 
@@ -158,24 +160,30 @@ final class SystemSinkCoordinator {
 
     /// Refresh which mechanism carries each output's level. Keyed by SyncCast
     /// device id for the UI; the Router answers by CoreAudio UID.
+    ///
+    /// The mapping is REMEMBERED rather than passed through to the task. Two
+    /// callers exist — the status refresh (which has no mapping) and
+    /// `AppModel.refreshSystemSinkPath` (which does) — and they share one
+    /// cancellable task; a later mapping-less call used to cancel the mapped
+    /// one mid-DDC-probe and leave every per-row hint blank.
     func refreshCapabilities(router: Router, uidByDeviceID: [String: String] = [:]) {
+        if !uidByDeviceID.isEmpty {
+            self.uidByDeviceID = uidByDeviceID
+        }
         capabilityTask?.cancel()
+        let mapping = self.uidByDeviceID
         capabilityTask = Task { [weak self] in
             let byUID = await router.systemSinkVolumeCapabilities()
             guard let self, !Task.isCancelled else { return }
-            guard !uidByDeviceID.isEmpty else {
-                // No mapping supplied (the common refresh): keep the previous
-                // per-device map rather than blanking the UI, and stash the
-                // UID-keyed answer for the next mapped call.
-                self.backendsByUID = byUID
-                return
-            }
             self.backendsByUID = byUID
-            self.backendsByDeviceID = uidByDeviceID.compactMapValues { byUID[$0] }
+            guard !mapping.isEmpty else { return }
+            self.backendsByDeviceID = mapping.compactMapValues { byUID[$0] }
         }
     }
 
     private(set) var backendsByUID: [String: SystemSinkVolumeLaw.Backend] = [:]
+    /// Last known device id -> CoreAudio UID mapping for the enabled outputs.
+    private var uidByDeviceID: [String: String] = [:]
 
     /// Human-readable note for one output row, or nil when there is nothing
     /// worth saying (the level is carried by real hardware).
@@ -221,9 +229,22 @@ final class SystemSinkCoordinator {
     ) async -> DriverInstallState {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let quoted = scriptURL.path.replacingOccurrences(of: "\"", with: "\\\"")
+                // Two layers of quoting, and BOTH matter because this string
+                // ends up running as root.
+                //
+                //  1. AppleScript string literal: escape backslashes, then
+                //     double quotes.
+                //  2. Shell: `quoted form of` wraps the path in single quotes
+                //     the way AppleScript itself knows to. Escaping only the
+                //     double quotes (as a first cut did) leaves `$(...)`,
+                //     backticks and `;` live inside the command — a bundle
+                //     sitting in a path with shell metacharacters would then
+                //     execute them with administrator privileges.
+                let literal = scriptURL.path
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
                 let source = """
-                do shell script "/bin/bash \\"\(quoted)\\"" with administrator privileges
+                do shell script "/bin/bash " & quoted form of "\(literal)" with administrator privileges
                 """
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -312,13 +333,19 @@ extension AppModel {
         systemSink.installDriver(scriptURL: AppModel.driverInstallScriptURL)
     }
 
-    /// The install script, looked up in the app bundle first (shipped under
-    /// `Contents/Resources/scripts`) and then in the source tree, so a
-    /// developer running from a checkout gets the same path.
+    /// The install script.
+    ///
+    /// The bundled copy wins: `package-app.sh` puts it in `Contents/Resources`
+    /// NEXT TO a prebuilt `SyncCastAudio.driver`, and the script installs that
+    /// sibling rather than building from source — which is the only thing that
+    /// can work in a distributed .app, where no checkout exists. The source
+    /// path is the developer fallback.
     static var driverInstallScriptURL: URL? {
-        let bundled = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Resources/scripts/install-driver.sh")
-        if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+        if let bundled = Bundle.main.url(
+            forResource: "install-driver", withExtension: "sh"
+        ), FileManager.default.fileExists(atPath: bundled.path) {
+            return bundled
+        }
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()   // SyncCastMenuBar
             .deletingLastPathComponent()   // Sources

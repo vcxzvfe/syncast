@@ -26,6 +26,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DRIVER_SRC_DIR="$REPO_ROOT/drivers/SyncCastAudio"
 BUILT_DRIVER="$DRIVER_SRC_DIR/build/SyncCastAudio.driver"
+# Bundled mode: package-app.sh copies this script into the .app next to a
+# prebuilt SyncCastAudio.driver, so the in-app install action works with no
+# source checkout on the machine. Detected by the sibling driver, not by a
+# flag, so there is nothing for a caller to get wrong.
+if [[ -d "$SCRIPT_DIR/SyncCastAudio.driver" ]]; then
+    BUILT_DRIVER="$SCRIPT_DIR/SyncCastAudio.driver"
+    DRIVER_SRC_DIR=""
+fi
 HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 INSTALLED_DRIVER="$HAL_DIR/SyncCastAudio.driver"
 UNINSTALL=0
@@ -60,6 +68,10 @@ if [[ "$UNINSTALL" == "1" ]]; then
 fi
 
 if [[ ! -d "$BUILT_DRIVER" ]]; then
+    if [[ -z "$DRIVER_SRC_DIR" ]]; then
+        echo "ERROR: no driver bundled next to this script and no source tree to build from." >&2
+        exit 4
+    fi
     echo "==> driver not built yet; building"
     # Build as the invoking user when run under sudo, so build artefacts do not
     # end up owned by root in the developer's checkout.
@@ -90,5 +102,6 @@ chmod -R 755 "$INSTALLED_DRIVER"
 restart_coreaudiod
 
 echo
-echo "installed. Restart SyncCast so it picks the new sink up (the path is"
+echo "installed from: $BUILT_DRIVER"
+echo "Restart SyncCast so it picks the new sink up (the path is"
 echo "resolved once per launch), then check 系统设置 → 声音 for a \"SyncCast\" output."

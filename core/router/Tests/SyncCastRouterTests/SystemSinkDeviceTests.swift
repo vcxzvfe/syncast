@@ -152,6 +152,119 @@ final class SystemSinkDeviceTests: XCTestCase {
         )
     }
 
+    // MARK: - Ownership claim (crash-recovery gate)
+    //
+    // BlackHole is a SHARED device. Someone may deliberately have it selected
+    // as their default output for a recording setup, and SyncCast launching
+    // must never disturb that. The claim is the only evidence that lets the
+    // crash sweep act.
+
+    /// A throwaway suite per test, torn down in `tearDown` so the developer's
+    /// real preferences never accumulate test domains.
+    private var temporarySuites: [String] = []
+
+    override func tearDown() {
+        for suite in temporarySuites {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            UserDefaults.standard.removeSuite(named: suite)
+        }
+        temporarySuites = []
+        super.tearDown()
+    }
+
+    private func makeDefaults(_ name: String) -> UserDefaults {
+        let suite = "io.syncast.tests.\(name).\(UUID().uuidString)"
+        temporarySuites.append(suite)
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    func testNoClaimMeansNoSweep() {
+        let defaults = makeDefaults("noclaim")
+        XCTAssertNil(SystemSinkDevice.staleOwnershipClaimUID(defaults: defaults))
+    }
+
+    /// The exact scenario Codex flagged: the user picked BlackHole themselves,
+    /// SyncCast has never run. Nothing may move.
+    func testUserSelectedSinkWithoutAClaimIsNotStale() {
+        let defaults = makeDefaults("userselected")
+        XCTAssertNil(SystemSinkDevice.staleOwnershipClaimUID(
+            defaults: defaults, isProcessAlive: { _ in false }
+        ))
+    }
+
+    func testClaimFromADeadProcessIsStale() {
+        let defaults = makeDefaults("dead")
+        defaults.set(
+            ["pid": 424242, "uid": SystemSinkDevice.blackHole2chUID],
+            forKey: SystemSinkDevice.claimDefaultsKey
+        )
+        XCTAssertEqual(
+            SystemSinkDevice.staleOwnershipClaimUID(
+                defaults: defaults, isProcessAlive: { _ in false }
+            ),
+            SystemSinkDevice.blackHole2chUID
+        )
+    }
+
+    /// A second SyncCast instance is alive and owns the sink — leave it alone.
+    func testClaimFromALiveProcessIsNotStale() {
+        let defaults = makeDefaults("live")
+        defaults.set(
+            ["pid": 424242, "uid": SystemSinkDevice.syncCastDriverUID],
+            forKey: SystemSinkDevice.claimDefaultsKey
+        )
+        XCTAssertNil(SystemSinkDevice.staleOwnershipClaimUID(
+            defaults: defaults, isProcessAlive: { _ in true }
+        ))
+    }
+
+    func testOwnProcessClaimIsNotStale() {
+        let defaults = makeDefaults("self")
+        SystemSinkDevice.writeOwnershipClaim(
+            uid: SystemSinkDevice.blackHole2chUID, defaults: defaults
+        )
+        XCTAssertNil(SystemSinkDevice.staleOwnershipClaimUID(
+            defaults: defaults, isProcessAlive: { _ in false }
+        ))
+    }
+
+    /// UserDefaults is external input: a malformed or hand-edited entry must
+    /// read as "no claim", never as licence to move the default output.
+    func testMalformedClaimsAreIgnored() {
+        let cases: [Any] = [
+            "not a dictionary",
+            ["pid": "not an int", "uid": SystemSinkDevice.blackHole2chUID],
+            ["pid": 424242],
+            ["uid": SystemSinkDevice.blackHole2chUID],
+            ["pid": 0, "uid": SystemSinkDevice.blackHole2chUID],
+            ["pid": 424242, "uid": "SomeoneElsesDevice_UID"],
+        ]
+        for (index, value) in cases.enumerated() {
+            let defaults = makeDefaults("malformed\(index)")
+            defaults.set(value, forKey: SystemSinkDevice.claimDefaultsKey)
+            XCTAssertNil(
+                SystemSinkDevice.staleOwnershipClaimUID(
+                    defaults: defaults, isProcessAlive: { _ in false }
+                ),
+                "case \(index)"
+            )
+        }
+    }
+
+    func testClearingTheClaimRemovesIt() {
+        let defaults = makeDefaults("clear")
+        defaults.set(
+            ["pid": 424242, "uid": SystemSinkDevice.blackHole2chUID],
+            forKey: SystemSinkDevice.claimDefaultsKey
+        )
+        SystemSinkDevice.clearOwnershipClaim(defaults: defaults)
+        XCTAssertNil(SystemSinkDevice.staleOwnershipClaimUID(
+            defaults: defaults, isProcessAlive: { _ in false }
+        ))
+    }
+
     // MARK: - Sample rate contract
 
     func testPipelineSampleRateIs48k() {

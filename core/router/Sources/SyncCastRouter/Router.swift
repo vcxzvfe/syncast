@@ -266,18 +266,16 @@ public actor Router {
             FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
         }
         if let warning = StereoOutputPathPolicy.sinkFallbackWarning(
-            sinkAvailable: SystemSinkDevice.resolved != nil
+            sinkAvailable: StereoOutputPathPolicy.sinkPathUsable
         ) {
             FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
         }
         // A SIGKILLed previous run can leave the macOS default output pointed
         // at a silent sink: audio "works" everywhere in the UI and nothing is
-        // audible. Only swept when this run intends to own a sink, so a user
-        // who deliberately selected BlackHole for their own recording setup is
-        // left alone.
-        if let swept = SystemSinkDevice.sweepStaleDefault(
-            expectSinkOwnership: StereoOutputPathPolicy.resolvedPath() == .sink
-        ) {
+        // audible. Gated on an ownership claim left by a dead process, so a
+        // user who deliberately selected BlackHole for their own recording
+        // setup is never disturbed by SyncCast merely launching.
+        if let swept = SystemSinkDevice.sweepStaleDefault() {
             print("[Router] system sink recovery: \(swept)")
         }
 
@@ -1609,8 +1607,18 @@ public actor Router {
         do {
             try await tap.start()
         } catch {
-            _ = sink.stop()
-            systemSink = nil
+            // If the rollback ALSO fails to give the default output back, keep
+            // the sink: the outer unwind (`stopSystemSinkPathIgnoringErrors`)
+            // is the only thing left that can retry, and it needs an object to
+            // retry with. Dropping it here would leave macOS pointed at a
+            // silent device with nobody owning the restore.
+            if sink.stop() {
+                systemSink = nil
+            } else {
+                FileHandle.standardError.write(Data(
+                    "[Router] system sink rollback could not restore the default output (\(sink.lastStopStatusText ?? "unknown")); keeping ownership so teardown can retry\n".utf8
+                ))
+            }
             throw error
         }
         sinkCapture = tap

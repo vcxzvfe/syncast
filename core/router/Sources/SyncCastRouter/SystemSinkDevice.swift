@@ -261,7 +261,19 @@ public final class SystemSinkDevice {
             }
         }
 
-        try Self.setDefaultOrThrow(Self.defaultOutputSelector, id)
+        do {
+            try Self.setDefaultOrThrow(Self.defaultOutputSelector, id)
+        } catch {
+            // We never acquired the device, so nothing else will roll the rate
+            // back: `stop()` returns early while `deviceID` is still 0. Undo it
+            // here or a failed start leaves BlackHole (a SHARED device)
+            // globally re-rated behind the user's back.
+            if let rate = previousNominalSampleRate {
+                _ = Self.setNominalSampleRate(id, rate: rate)
+                previousNominalSampleRate = nil
+            }
+            throw error
+        }
         // The system-output write is best effort: a machine that refuses it
         // still gets a working master volume from the main default output, and
         // failing the whole path over alert routing would be a bad trade.
@@ -278,6 +290,9 @@ public final class SystemSinkDevice {
         previousSystemOutputID = systemStatus == noErr ? systemID : nil
         previousSystemOutputUID = systemStatus == noErr ? systemUID : nil
         lastStopStatus = nil
+        // From here on, a crash leaves the default output on a silent device.
+        // The claim is what lets the NEXT launch prove that and fix it.
+        Self.writeOwnershipClaim(uid: candidate.uid)
     }
 
     /// Restore both default-output properties.
@@ -318,6 +333,10 @@ public final class SystemSinkDevice {
         }
         lastStopStatus = outcome.status
         if outcome.fullyStopped {
+            // Only a clean stop retires the claim. A stop that could NOT give
+            // the default output back leaves it standing, so the next launch
+            // still recognises the situation.
+            Self.clearOwnershipClaim()
             previousNominalSampleRate = nil
             deviceID = 0
             previousDefaultOutputID = nil
@@ -440,23 +459,76 @@ public final class SystemSinkDevice {
         )
     }
 
-    /// Launch-time recovery: if a previous run was SIGKILLed while a sink was
-    /// the default output, macOS is left rendering into a silent device (the
-    /// user hears nothing and the Sound menu looks fine). Move the default to
-    /// an ordinary output.
+    // MARK: - Ownership claim
+    //
+    // BlackHole is a SHARED device. A user may deliberately have it selected
+    // as the system default for their own recording setup, and SyncCast
+    // launching must not disturb that. So the crash-recovery sweep below is
+    // not allowed to reason from "the default is a sink, and I am the kind of
+    // app that uses sinks" — it needs PROOF that a previous SyncCast session
+    // took that default and never gave it back.
+    //
+    // The proof is this claim: written when `start()` succeeds, removed on a
+    // clean `stop()`. A claim left behind by a dead process is exactly the
+    // SIGKILL case the sweep exists for.
+
+    static let claimDefaultsKey = "syncast.systemSink.ownershipClaim"
+    private static let claimPIDKey = "pid"
+    private static let claimUIDKey = "uid"
+
+    static func writeOwnershipClaim(uid: String, defaults: UserDefaults = .standard) {
+        defaults.set(
+            [
+                claimPIDKey: Int(ProcessInfo.processInfo.processIdentifier),
+                claimUIDKey: uid,
+            ],
+            forKey: claimDefaultsKey
+        )
+    }
+
+    static func clearOwnershipClaim(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: claimDefaultsKey)
+    }
+
+    /// A stale claim: one written by a process that is no longer alive.
     ///
-    /// Only fires when the current default IS one of our sinks and no other
-    /// live SyncCast process is running, because a user may legitimately have
-    /// selected BlackHole by hand for their own recording setup — so the sweep
-    /// is gated on `expectSinkOwnership` (true only when this process is about
-    /// to use the sink path but has not started it yet, and no sibling
-    /// SyncCast owns it).
+    /// Validated at the boundary — UserDefaults is external input, so a
+    /// hand-edited or half-written plist entry reads as "no claim" rather than
+    /// as licence to move the user's default output.
+    static func staleOwnershipClaimUID(
+        defaults: UserDefaults = .standard,
+        isProcessAlive: (pid_t) -> Bool = { DirectStereoOutput.processIsAlive($0) }
+    ) -> String? {
+        guard let raw = defaults.dictionary(forKey: claimDefaultsKey),
+              let pid = raw[claimPIDKey] as? Int,
+              pid > 0,
+              let uid = raw[claimUIDKey] as? String,
+              isSinkUID(uid)
+        else {
+            return nil
+        }
+        if pid == Int(ProcessInfo.processInfo.processIdentifier) { return nil }
+        return isProcessAlive(pid_t(pid)) ? nil : uid
+    }
+
+    /// Launch-time recovery: if a previous run was SIGKILLed while a sink was
+    /// the default output, macOS is left rendering into a silent device — the
+    /// user hears nothing and the Sound menu looks perfectly fine.
+    ///
+    /// Fires ONLY when all of these hold:
+    ///   * a claim from a dead process names a sink (see above),
+    ///   * the current default output really is that same sink,
+    ///   * an ordinary output exists to move to.
+    /// Anything less and we leave the user's chosen output alone.
     @discardableResult
-    public static func sweepStaleDefault(expectSinkOwnership: Bool) -> String? {
-        guard expectSinkOwnership else { return nil }
+    public static func sweepStaleDefault(defaults: UserDefaults = .standard) -> String? {
+        guard let claimedUID = staleOwnershipClaimUID(defaults: defaults) else {
+            return nil
+        }
+        defer { clearOwnershipClaim(defaults: defaults) }
         guard let current = try? readDefault(defaultOutputSelector),
               let uid = DirectStereoOutput.readDeviceUID(current),
-              isSinkUID(uid)
+              uid == claimedUID
         else {
             return nil
         }
@@ -469,7 +541,7 @@ public final class SystemSinkDevice {
             return nil
         }
         _ = setDefault(systemOutputSelector, fallback)
-        return "moved stale default output off \(uid) to \(fallback)"
+        return "moved stale default output off \(uid) to \(fallback) (claim left by a dead SyncCast)"
     }
 
     // MARK: - HAL helpers

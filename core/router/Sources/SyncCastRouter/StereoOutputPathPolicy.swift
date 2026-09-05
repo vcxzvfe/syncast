@@ -26,8 +26,12 @@ public enum StereoOutputPathPolicy {
     /// installed; `capture`/`sck` forces the ScreenCaptureKit path.
     ///
     /// `sinkAvailable` is injected rather than probed here so the decision is
-    /// unit-testable; production callers pass
-    /// `SystemSinkDevice.detect() != nil`.
+    /// unit-testable; production callers use `resolvedPath()`, which folds in
+    /// BOTH the installed sink AND the OS capability. Both are required: the
+    /// path's capture leg is a Core Audio Process Tap, which is macOS 14.2+,
+    /// while the package deploys to 14.0. Selecting `.sink` on 14.0/14.1 with
+    /// BlackHole installed would make every local Stereo start throw instead
+    /// of quietly using the legacy path.
     public static func selectedPath(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         sinkAvailable: Bool
@@ -68,8 +72,16 @@ public enum StereoOutputPathPolicy {
     ) -> Path {
         selectedPath(
             environment: environment,
-            sinkAvailable: SystemSinkDevice.resolved != nil
+            sinkAvailable: sinkPathUsable
         )
+    }
+
+    /// Can this machine actually RUN the sink path — a sink device installed
+    /// and an OS that has Core Audio Process Tap?
+    public static var sinkPathUsable: Bool {
+        guard SystemSinkDevice.resolved != nil else { return false }
+        if #available(macOS 14.2, *) { return true }
+        return false
     }
 
     /// Non-nil when `SYNCAST_STEREO_PATH=sink` was requested but no sink
@@ -83,7 +95,7 @@ public enum StereoOutputPathPolicy {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard raw == "sink", !sinkAvailable else { return nil }
-        return "SYNCAST_STEREO_PATH=sink requested but no virtual sink device is installed; using direct stereo"
+        return "SYNCAST_STEREO_PATH=sink requested but the sink path is unavailable (no virtual sink device installed, or macOS < 14.2 for Process Tap); using direct stereo"
     }
 
     public static func warningForUnknownValue(

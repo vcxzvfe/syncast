@@ -91,6 +91,27 @@ final class StereoOutputPathPolicyTests: XCTestCase {
         ))
     }
 
+    /// `sinkAvailable` means "the sink path can actually RUN here", which is
+    /// an installed sink AND macOS 14.2+ (the Process Tap floor) — the package
+    /// deploys to 14.0. Selecting `.sink` without the OS support would make
+    /// every local Stereo start throw instead of quietly using the legacy path.
+    func testSinkPathUsableRequiresBothSinkAndProcessTap() {
+        if #available(macOS 14.2, *) {
+            XCTAssertEqual(
+                StereoOutputPathPolicy.sinkPathUsable,
+                SystemSinkDevice.resolved != nil
+            )
+        } else {
+            XCTAssertFalse(StereoOutputPathPolicy.sinkPathUsable)
+        }
+        // And the resolved path never claims `.sink` when it is not usable.
+        if !StereoOutputPathPolicy.sinkPathUsable {
+            XCTAssertNotEqual(
+                StereoOutputPathPolicy.resolvedPath(environment: [:]), .sink
+            )
+        }
+    }
+
     // MARK: - Unknown values
 
     func testUnknownValueFallsBackToTheDefaultPathAndWarns() {
