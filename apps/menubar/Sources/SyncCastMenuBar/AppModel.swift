@@ -738,6 +738,12 @@ final class AppModel {
             }
         }
 
+        // SYNCAST_UI_SMOKE=token opens the LAN token window a few seconds
+        // after launch, so the window-presentation path can be exercised
+        // without a human clicking through the popover. See
+        // `AppModel+UiSmoke.swift`.
+        scheduleUiSmokeIfRequested()
+
         // Optional extra scripted actions for long-running hardware tests.
         // Format: comma-separated `verb:target:value:delaySec`, e.g.
         // `volume:xiaomi:0.70:260` or `mute:xiaomi:1:260`.
