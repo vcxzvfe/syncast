@@ -45,8 +45,9 @@ import Darwin
 ///
 ///   - `DirectStereoOutput`  — PUBLIC aggregate of the real speakers, legacy
 ///     Stereo path. Needs the event tap for volume.
-///   - `WholeHomeSinkOutput` — PUBLIC aggregate wrapping BlackHole, whole-home
-///     mode's silent default output.
+///   - `WholeHomeSinkOutput` — PUBLIC aggregate wrapping one of the
+///     `candidates` below (same preference order), whole-home mode's silent
+///     default output.
 ///   - `SystemSinkDevice`    — an EXISTING HAL device (we create nothing), made
 ///     default output *and* default system output for the sink Stereo path.
 ///
