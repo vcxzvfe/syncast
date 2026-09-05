@@ -67,19 +67,17 @@ if [[ "$UNINSTALL" == "1" ]]; then
     exit 0
 fi
 
-if [[ ! -d "$BUILT_DRIVER" ]]; then
-    if [[ -z "$DRIVER_SRC_DIR" ]]; then
-        echo "ERROR: no driver bundled next to this script and no source tree to build from." >&2
-        exit 4
-    fi
-    echo "==> driver not built yet; building"
-    # Build as the invoking user when run under sudo, so build artefacts do not
-    # end up owned by root in the developer's checkout.
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        sudo -u "$SUDO_USER" bash "$DRIVER_SRC_DIR/build.sh"
-    else
-        bash "$DRIVER_SRC_DIR/build.sh"
-    fi
+if [[ -n "$DRIVER_SRC_DIR" ]]; then
+    # Source checkout present: ALWAYS rebuild. A build/ left over from an
+    # earlier edit looks exactly like a fresh one, so "build only if missing"
+    # silently installs stale code — the single worst failure mode here,
+    # because the symptom (an old bug still present after a fix) points
+    # everywhere except at the installer.
+    echo "==> rebuilding from source"
+    bash "$DRIVER_SRC_DIR/build.sh"
+elif [[ ! -d "$BUILT_DRIVER" ]]; then
+    echo "ERROR: no driver bundled next to this script and no source tree to build from." >&2
+    exit 4
 fi
 
 if [[ ! -x "$BUILT_DRIVER/Contents/MacOS/SyncCastAudio" ]]; then
