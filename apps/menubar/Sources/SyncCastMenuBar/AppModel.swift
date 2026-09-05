@@ -131,15 +131,6 @@ final class AppModel {
     /// sample or outside whole-home. Drives the slider's caption.
     var measuredLagMs: Int? = nil
 
-    /// Whole-home is running but macOS no longer points at the 「AirPlay 全屋」
-    /// sink, so system audio is playing twice — once straight out of whatever
-    /// the user selected, once through the capture → OwnTone path. Sampled by
-    /// the 1 Hz health poller; drives the warning banner in the popover.
-    ///
-    /// Nothing fixes this on its own: re-asserting the default automatically
-    /// would fight a deliberate choice (plugging in headphones is a legitimate
-    /// thing to do mid-session), so the user gets a banner and a button.
-    private(set) var wholeHomeSinkDisplaced: Bool = false
     /// Ticks of the 1 Hz poller since the last periodic health line. See
     /// `AppModel+Health.swift`.
     var healthLogTicks: Int = 0
@@ -292,10 +283,15 @@ final class AppModel {
     /// System-sink path state + the system-volume listener. All of its logic
     /// lives in `AppModel+SystemSink.swift`.
     let systemSink = SystemSinkCoordinator()
-    /// Set when the user moved the default output away from the sink while the
-    /// sink path was running; cleared by `resumeAfterSystemSinkDisplacement()`
-    /// or by a mode change. Gates `reconcileEngineAsync`'s `shouldRun`.
+    /// Set when the user moved the default output away while SyncCast owned
+    /// it — the stereo sink path or either whole-home flavour; cleared by
+    /// `resumeAfterSystemSinkDisplacement()` or by a mode change. Gates
+    /// `reconcileEngineAsync`'s `shouldRun`.
     var systemSinkPausedByDisplacement = false
+    /// Which mode the pause was taken in, so a mode switch (an explicit user
+    /// action that re-establishes the default output) retires it. Nil whenever
+    /// `systemSinkPausedByDisplacement` is false.
+    var systemSinkPauseMode: AppModel.Mode?
 
     /// How media volume keys are currently captured (event tap / monitor
     /// fallback / permission missing). Mirrored from the controller so
@@ -672,7 +668,6 @@ final class AppModel {
                 guard let self else { return }
                 await self.refreshConnectionStates()
                 await self.refreshLocalFifoLag()
-                await self.refreshWholeHomeSinkState()
                 await self.pollSystemSinkStatus()
                 await self.refreshEqualizerClipCounts()
                 await self.refreshPairingStates()
@@ -1050,33 +1045,6 @@ final class AppModel {
         }
         lastLocalBridgeResyncCounts = bridgeTiming.mapValues {
             $0.driftResyncCount
-        }
-    }
-
-    /// Sample whether the whole-home sink is still the macOS default output.
-    ///
-    /// Cheap enough for the 1 Hz loop (one CoreAudio property read plus a UID
-    /// read) and only ever true in whole-home mode, so stereo pays nothing.
-    /// The Router owns the comparison; this just mirrors it for the view.
-    private func refreshWholeHomeSinkState() async {
-        let displaced = await router.wholeHomeSinkDisplaced
-        await MainActor.run {
-            guard self.wholeHomeSinkDisplaced != displaced else { return }
-            self.wholeHomeSinkDisplaced = displaced
-            SyncCastLog.log(
-                displaced
-                    ? "whole-home sink displaced: system default output is no longer 「\(WholeHomeSinkOutput.displayName)」 — audio is playing twice"
-                    : "whole-home sink is the system default output again"
-            )
-        }
-    }
-
-    /// User-driven recovery from `wholeHomeSinkDisplaced`. Deliberately manual
-    /// — see the property's documentation.
-    func reclaimWholeHomeSinkAsDefault() {
-        Task { [router] in
-            await router.reassertWholeHomeSink()
-            await self.refreshWholeHomeSinkState()
         }
     }
 
@@ -1654,9 +1622,11 @@ final class AppModel {
     }
 
     private var directStereoVolumeKeyEligible: Bool {
-        mode == .stereo
-            && Self.selectedStereoOutputPath == .direct
-            && streamingState == .running
+        SystemVolumeKeyEligibility.directStereo(
+            modeIsStereo: mode == .stereo,
+            pathIsDirect: Self.selectedStereoOutputPath == .direct,
+            running: streamingState == .running
+        )
     }
 
     private func enabledDirectStereoVolumeTargets() -> [DirectVolumeTarget] {
@@ -1674,11 +1644,16 @@ final class AppModel {
 
     /// Whole-home's counterpart to `directStereoVolumeKeyEligible`.
     ///
-    /// Worth capturing the keys here specifically BECAUSE of the named sink:
-    /// the system default output is then a SyncCast aggregate that exposes no
+    /// Capturing the keys is worth it ONLY on the wrapped-aggregate fallback:
+    /// there the default output is an aggregate with no
     /// `kAudioDevicePropertyVolumeScalar`, so an uncaptured volume key gets
-    /// the "forbidden" OSD and does nothing. Capturing it turns that dead key
-    /// into the master fader.
+    /// the "forbidden" OSD and does nothing, and capturing it turns that dead
+    /// key into the master fader.
+    ///
+    /// With SyncCast's own sink device as the default output, macOS handles
+    /// the keys itself and every change reaches the master through the
+    /// device's scalar — so the tap stands down. See
+    /// `SystemVolumeKeyEligibility`.
     ///
     /// Only ever active with Accessibility granted — without it the controller
     /// falls back to an NSEvent monitor that sees keys only while SyncCast is
@@ -1687,7 +1662,25 @@ final class AppModel {
     /// panel's own faders remain the primary, always-available control, and
     /// nothing here ever raises a permission prompt.
     private var wholeHomeVolumeKeyEligible: Bool {
-        mode == .wholeHome && streamingState == .running
+        SystemVolumeKeyEligibility.wholeHome(
+            modeIsWholeHome: mode == .wholeHome,
+            running: streamingState == .running,
+            sinkDrivesSystemVolume: wholeHomeMasterFollowsSystemVolume
+        )
+    }
+
+    /// True when whole-home's master IS the macOS system volume: the default
+    /// output is SyncCast's own sink device and its scalar drives the master
+    /// gain. The panel mirrors it instead of its own fader, and the media-key
+    /// tap stands down.
+    ///
+    /// Resolved by the Router and mirrored through `SystemSinkCoordinator`, so
+    /// it can lag a start by one status refresh (or, worst case, one second of
+    /// the health poll). Both consumers degrade safely across that window: the
+    /// tap is still gated by `handleSystemVolumeKey`'s own re-check, and the
+    /// panel briefly shows its own fader position.
+    var wholeHomeMasterFollowsSystemVolume: Bool {
+        mode == .wholeHome && systemSink.drivesSystemVolume
     }
 
     /// Either mode's gate — what the key controller is actually told.
@@ -1891,13 +1884,22 @@ final class AppModel {
     /// and (re)sync routes from hardware. Called from `mode` /
     /// `streamingState` didSet plus init, so every state transition is
     /// covered without sprinkling calls over the reconcile paths.
+    /// Hand the current gate to the key controller. Split out from
+    /// `updateVolumeKeyEligibility` because the whole-home half of the gate
+    /// now depends on state the Router resolves asynchronously, so it has to
+    /// be re-pushed when that state lands — without re-running the Direct
+    /// Stereo hardware-snapshot machinery below.
+    func pushVolumeKeyEligibility() {
+        systemVolumeKeyController?.setEligible(systemVolumeKeyEligible)
+    }
+
     private func updateVolumeKeyEligibility(reason: String) {
         // The controller is told about EITHER mode, but everything below is
         // Direct Stereo's hardware-snapshot machinery and stays keyed to it.
         // Whole-home has no hardware to snapshot — its keys drive the master
         // fader, which is always in a known state — so arming the gate there
         // would hold keys hostage waiting for a snapshot that never comes.
-        systemVolumeKeyController?.setEligible(systemVolumeKeyEligible)
+        pushVolumeKeyEligibility()
         let eligible = directStereoVolumeKeyEligible
         if eligible {
             // Snapshot gate (Codex P2): keys stay held (tap consumes,
@@ -2501,6 +2503,67 @@ final class AppModel {
             clamped, forKey: AppModel.masterVolumeDefaultsKey
         )
         pushMasterVolume()
+    }
+
+    // MARK: Master slider (the one control, two possible authorities)
+    //
+    // In whole-home with SyncCast's own sink as the default output, the MASTER
+    // IS the macOS system volume. The panel's slider then has to be a view of
+    // that number, not a second number beside it — otherwise the popover and
+    // the menu bar drift apart and the user has two volumes to reconcile.
+    //
+    // Two-way rather than read-only: a slider you cannot drag in the one panel
+    // that shows it reads as broken, and writing macOS's own control is what
+    // keeps a single source of truth. The write goes to the device's
+    // VolumeScalar, macOS's UI follows it, and the change comes back through
+    // the same listener any other volume change does.
+
+    /// Slider position, 0…100, in whichever scale is in force. In the
+    /// sink-driven case this is the system volume scalar on the same integer
+    /// grid the panel already speaks (`VolumeCurve` supplies the rounding, not
+    /// its −30 dB curve — see `SystemSinkVolumeLaw.wholeHomeMasterAmplitude`
+    /// for why the scalar must NOT go through that curve).
+    var masterSliderPercent: Int {
+        guard wholeHomeMasterFollowsSystemVolume else { return masterVolumePercent }
+        return VolumeCurve.percent(
+            forFraction: Double(systemSink.status.masterVolume)
+        )
+    }
+
+    /// Mute state the slider should show, from the same authority.
+    var masterSliderMuted: Bool {
+        wholeHomeMasterFollowsSystemVolume
+            ? systemSink.status.masterMuted
+            : masterMuted
+    }
+
+    func setMasterSliderPercent(_ percent: Int) {
+        guard wholeHomeMasterFollowsSystemVolume else {
+            setMasterVolumePercent(percent)
+            return
+        }
+        let clamped = VolumeCurve.clampPercent(percent)
+        systemSink.writeSystemVolume(
+            scalar: Float(VolumeCurve.fraction(forPercent: clamped)),
+            router: router
+        )
+    }
+
+    func toggleMasterSliderMute() {
+        guard wholeHomeMasterFollowsSystemVolume else {
+            toggleMasterMute()
+            return
+        }
+        systemSink.writeSystemMute(!systemSink.status.masterMuted, router: router)
+    }
+
+    /// Reset is a fader concept: it means "put my own attenuation back to
+    /// none". It must NOT reach for the system volume — turning the user's Mac
+    /// up to 100 % because they clicked Reset in a third-party panel is not a
+    /// reset, it is a surprise.
+    var showsMasterVolumeReset: Bool {
+        !wholeHomeMasterFollowsSystemVolume
+            && (masterVolumePercent != VolumeCurve.defaultPercent || masterMuted)
     }
 
     func setMasterMuted(_ muted: Bool) {

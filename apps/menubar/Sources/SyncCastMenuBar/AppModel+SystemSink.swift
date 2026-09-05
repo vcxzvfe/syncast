@@ -1,25 +1,39 @@
 import Foundation
 import SyncCastRouter
 
-/// Menubar side of the system-sink Stereo path.
+/// Menubar side of every path whose default output is a sink device with a
+/// real volume control: the Stereo sink path, and whole-home when SyncCast's
+/// own driver is installed.
 ///
-/// The path's whole point is that SyncCast stops intercepting volume keys:
-/// macOS renders into a virtual sink device that HAS a volume control, so the
+/// The point of those paths is that SyncCast stops intercepting volume keys:
+/// macOS renders into a virtual device that HAS a volume control, so the
 /// menu-bar slider, F11/F12, the HUD and LinearMouse's scroll wheel all work
 /// natively. This coordinator is the one piece that has to exist on the app
 /// side: it WATCHES that device's volume/mute and forwards every change to the
-/// Router, which turns it into a real level on the physical speakers.
+/// Router, which turns it into a real level — per-output hardware levels in
+/// stereo, the master gain on the samples entering OwnTone in whole-home.
+///
+/// One coordinator for both modes rather than one per mode: it is one listener
+/// on one device, and the two modes differ only in what the Router does with
+/// the number. `Router.SystemSinkStatus.drivesSystemVolume` is the flag that
+/// says whether a watchable device is in force at all — whole-home's
+/// wrapped-aggregate fallback holds the default output but has no volume
+/// control, and reports `uid: nil`.
 ///
 /// Deliberately not an event tap, not a key handler, and not a poller: a
 /// CoreAudio property listener on one device, reusing the debounced
 /// `HardwareVolumeObserver` that Direct Stereo already relies on.
 ///
-/// Feedback safety: SyncCast never writes the SINK's volume — only macOS does
-/// — so there is no self-write echo to suppress here. What we write is the
-/// *downstream* devices (built-in speakers' hardware scalar, the display's
-/// DDC level), and those are not watched. The system slider is the single
-/// source of truth for level; an external change to a downstream device is
-/// overwritten on the next replan rather than fed back.
+/// Feedback safety: the ONE thing that writes this device's volume from inside
+/// SyncCast is the popover's master slider (`writeSystemVolume`), which exists
+/// so the panel and macOS's own UI cannot disagree. It announces itself
+/// through `HardwareVolumeObserver.noteAppInitiatedWrite` first, and the
+/// Router re-reads the device rather than trusting the payload, so the echo
+/// resolves to the value we just wrote and changes nothing. What we never
+/// watch is the *downstream* devices (built-in speakers' hardware scalar, the
+/// display's DDC level); the system volume is the single source of truth for
+/// level, and an external change to a downstream device is overwritten on the
+/// next replan rather than fed back.
 @MainActor
 @Observable
 final class SystemSinkCoordinator {
@@ -55,8 +69,14 @@ final class SystemSinkCoordinator {
     private(set) var backendsByDeviceID: [String: SystemSinkVolumeLaw.Backend] = [:]
     private(set) var driverInstallState: DriverInstallState = .idle
 
-    /// Whether the running configuration uses the sink path at all.
+    /// Whether the STEREO configuration uses the sink path at all. Whole-home
+    /// has no such switch — which owner it gets is decided by what is
+    /// installed, and the Router answers that through `status`.
     var pathIsSink: Bool { AppModel.selectedStereoOutputPath == .sink }
+
+    /// True when a watched device's own volume scalar is the level in force.
+    /// The single fact the panel and the media-key gate key on.
+    var drivesSystemVolume: Bool { status.active && status.drivesSystemVolume }
 
     /// Which sink this launch would use, independent of whether it is running.
     var installedSinkName: String? { SystemSinkDevice.resolved?.displayName }
@@ -99,8 +119,15 @@ final class SystemSinkCoordinator {
                 return
             }
             self.status = snapshot
-            guard snapshot.active, let uid = snapshot.uid else {
-                self.teardown()
+            // A sink that holds the default output but exposes no volume
+            // control (whole-home's wrapped aggregate) keeps its STATUS — the
+            // panel still has to say which device the Sound menu shows, and
+            // the displacement poll still has to work — but there is nothing
+            // to listen to.
+            guard snapshot.active, snapshot.drivesSystemVolume,
+                  let uid = snapshot.uid
+            else {
+                self.stopWatching()
                 return
             }
             self.startWatching(uid: uid, router: router, reason: reason)
@@ -115,8 +142,11 @@ final class SystemSinkCoordinator {
 
     /// Once-a-second displacement check. `false` for `isSystemDefaultOutput`
     /// while active means the user picked another output in the Sound menu.
-    func pollStatus(router: Router) async {
-        guard pathIsSink else { return }
+    ///
+    /// Runs in whole-home too: there the same property is what tells the user
+    /// their Mac is playing every track twice.
+    func pollStatus(router: Router, modeIsWholeHome: Bool) async {
+        guard pathIsSink || modeIsWholeHome else { return }
         let snapshot = await router.systemSinkStatus()
         guard snapshot != status else { return }
         status = snapshot
@@ -147,14 +177,7 @@ final class SystemSinkCoordinator {
     private func teardown() {
         refreshTask?.cancel()
         refreshTask = nil
-        capabilityTask?.cancel()
-        capabilityTask = nil
-        guard observer != nil || watchedUID != nil else { return }
-        observer?.setWatchedDevices([])
-        watchedUID = nil
-        backendsByDeviceID = [:]
-        backendsByUID = [:]
-        uidByDeviceID = [:]
+        stopWatching()
         // Otherwise the popover keeps showing a live "系统音量 NN%" line for a
         // path that is no longer running.
         status = Router.SystemSinkStatus(
@@ -165,7 +188,93 @@ final class SystemSinkCoordinator {
             masterVolume: status.masterVolume,
             masterMuted: status.masterMuted
         )
+    }
+
+    /// Detach the HAL listener without touching `status`. Split out from
+    /// `teardown` because a sink can legitimately hold the default output with
+    /// no volume control to listen to (whole-home's wrapped aggregate), and
+    /// blanking the status there would take the panel's device name and the
+    /// displacement banner down with it.
+    private func stopWatching() {
+        capabilityTask?.cancel()
+        capabilityTask = nil
+        guard observer != nil || watchedUID != nil else { return }
+        observer?.setWatchedDevices([])
+        watchedUID = nil
+        backendsByDeviceID = [:]
+        backendsByUID = [:]
+        uidByDeviceID = [:]
         SyncCastLog.log("systemSink: stopped watching the system volume")
+    }
+
+    // MARK: - Writing the system volume (the panel's master slider)
+
+    /// Move the system volume from inside SyncCast.
+    ///
+    /// Only the popover's master slider calls this, and only while the sink
+    /// drives the master. It writes macOS's OWN volume control rather than a
+    /// private copy, so there is exactly one number: drag the panel slider and
+    /// the menu-bar slider moves with it, and vice versa. A private mirror
+    /// would be a second authority over the same level, which is the drift
+    /// this whole path exists to remove.
+    ///
+    /// The write is announced to the observer first so the listener callback
+    /// it provokes is not mistaken for a user action mid-drag; the Router
+    /// re-reads the device anyway, so the worst case is a redundant apply.
+    @discardableResult
+    func writeSystemVolume(scalar: Float, router: Router) -> Bool {
+        guard drivesSystemVolume, let uid = status.uid else { return false }
+        let clamped = max(0, min(1, scalar))
+        observer?.noteAppInitiatedWrite(uid: uid)
+        guard AggregateDevice.applyHardwareVolume(uid: uid, volume: clamped) else {
+            SyncCastLog.log(
+                "systemSink: device \(uid) refused a volume write of \(clamped)"
+            )
+            return false
+        }
+        // Optimistic, so the slider tracks the drag instead of waiting a
+        // debounce for the listener to confirm what we just wrote.
+        status = Self.status(status, masterVolume: clamped)
+        Task { [router] in
+            await router.setSystemSinkMaster(volume: clamped, muted: nil)
+        }
+        return true
+    }
+
+    /// Mute counterpart of `writeSystemVolume`. Writes the device's own Mute
+    /// property, so the menu bar shows the same muted state.
+    @discardableResult
+    func writeSystemMute(_ muted: Bool, router: Router) -> Bool {
+        guard drivesSystemVolume, let uid = status.uid else { return false }
+        observer?.noteAppInitiatedWrite(uid: uid)
+        guard AggregateDevice.applyHardwareMute(uid: uid, muted: muted) else {
+            SyncCastLog.log("systemSink: device \(uid) refused a mute write")
+            return false
+        }
+        status = Self.status(status, masterMuted: muted)
+        Task { [router] in
+            await router.setSystemSinkMaster(volume: nil, muted: muted)
+        }
+        return true
+    }
+
+    /// Copy one field of a status snapshot. The struct has no `with`-style
+    /// API and open-coding the six-field initialiser at every call site is how
+    /// a field silently stops being carried.
+    private static func status(
+        _ base: Router.SystemSinkStatus,
+        masterVolume: Float? = nil,
+        masterMuted: Bool? = nil
+    ) -> Router.SystemSinkStatus {
+        Router.SystemSinkStatus(
+            active: base.active,
+            uid: base.uid,
+            displayName: base.displayName,
+            isSystemDefaultOutput: base.isSystemDefaultOutput,
+            masterVolume: masterVolume ?? base.masterVolume,
+            masterMuted: masterMuted ?? base.masterMuted,
+            drivesSystemVolume: base.drivesSystemVolume
+        )
     }
 
     /// Held so the observer callback (which arrives without context) can push
@@ -174,13 +283,10 @@ final class SystemSinkCoordinator {
 
     private func applySystemVolume(_ change: HardwareVolumeObserver.ExternalChange) {
         guard change.deviceID == Self.sinkPseudoDeviceID, let router else { return }
-        status = Router.SystemSinkStatus(
-            active: status.active,
-            uid: status.uid,
-            displayName: status.displayName,
-            isSystemDefaultOutput: status.isSystemDefaultOutput,
-            masterVolume: change.volume ?? status.masterVolume,
-            masterMuted: change.muted ?? status.masterMuted
+        status = Self.status(
+            status,
+            masterVolume: change.volume,
+            masterMuted: change.muted
         )
         Task { [router, change] in
             await router.setSystemSinkMaster(
@@ -344,6 +450,7 @@ extension AppModel {
     ///     is not receiving audio at all;
     ///   * not on the sink path — say what is carrying volume instead.
     var systemSinkStatusLine: String? {
+        if mode == .wholeHome { return wholeHomeSinkStatusLine }
         guard mode == .stereo else { return nil }
         guard AppModel.selectedStereoOutputPath == .sink else {
             guard AppModel.selectedStereoOutputPath == .direct else { return nil }
@@ -364,6 +471,36 @@ extension AppModel {
             return "输出已被切走：请在「声音」里选回「\(name)」 · output moved away, pick \(name) again"
         }
         let percent = Int((systemSink.status.masterVolume * 100).rounded())
+        return systemSink.status.masterMuted
+            ? "系统音量：静音（输出「\(name)」） · system volume muted"
+            : "系统音量 \(percent)%（输出「\(name)」） · system volume \(percent)%"
+    }
+
+    /// Whole-home's counterpart. Three things worth saying, in the order they
+    /// matter:
+    ///
+    ///   * paused because the user moved the output away — the one state where
+    ///     nothing is playing and there is an action to take;
+    ///   * the system volume IS the master — say the level, because "the
+    ///     panel's 总音量 slider now follows the menu bar" is the surprising
+    ///     part of this mode;
+    ///   * the wrapped fallback — say which device the Sound menu shows and
+    ///     that volume lives in the panel, since the system slider is greyed.
+    var wholeHomeSinkStatusLine: String? {
+        let name = systemSink.status.displayName ?? WholeHomeSinkOutput.displayName
+        if systemSinkPausedByDisplacement {
+            return "已暂停：输出被切到别处，选回「\(name)」后点继续 · paused, output moved away"
+        }
+        guard systemSink.status.active else { return nil }
+        guard systemSink.drivesSystemVolume else {
+            return "输出「\(name)」（系统滑杆置灰，音量用下面的总音量） · volume via the panel"
+        }
+        if !systemSink.status.isSystemDefaultOutput {
+            return "输出已被切走：请在「声音」里选回「\(name)」 · output moved away, pick \(name) again"
+        }
+        let percent = VolumeCurve.percent(
+            forFraction: Double(systemSink.status.masterVolume)
+        )
         return systemSink.status.masterMuted
             ? "系统音量：静音（输出「\(name)」） · system volume muted"
             : "系统音量 \(percent)%（输出「\(name)」） · system volume \(percent)%"
@@ -428,22 +565,32 @@ extension AppModel {
     /// Sink-path counterpart of `updateVolumeKeyEligibility`'s Direct Stereo
     /// half. Called from the same place, so every transition is covered.
     func refreshSystemSinkPath(reason: String) {
-        let eligible = mode == .stereo
+        let stereoSink = mode == .stereo
             && AppModel.selectedStereoOutputPath == .sink
             && streamingState == .running
-        // Leaving stereo mode entirely retires the displacement pause: it is a
-        // statement about the sink path's default output, and whole-home owns
-        // that property itself.
-        if mode != .stereo, systemSinkPausedByDisplacement {
+        // Whole-home always has a default-output owner while it runs; whether
+        // that owner has a volume control is the Router's answer, not ours.
+        let eligible = stereoSink
+            || (mode == .wholeHome && streamingState == .running)
+        // Switching modes is an explicit user action that re-establishes the
+        // default output, so it retires a displacement pause taken in the
+        // other mode. Without this the engine would refuse to start in the
+        // mode the user just picked, with a banner about the one they left.
+        if let pausedIn = systemSinkPauseMode, pausedIn != mode {
             systemSinkPausedByDisplacement = false
+            systemSinkPauseMode = nil
         }
         systemSink.refresh(router: router, eligible: eligible, reason: reason)
-        if eligible {
+        if stereoSink {
             systemSink.refreshCapabilities(
                 router: router,
                 uidByDeviceID: enabledCoreAudioUIDsByDeviceID()
             )
         }
+        // The media-key gate depends on whether the sink drives the system
+        // volume, which the refresh above resolves asynchronously — push it
+        // again once we know.
+        pushVolumeKeyEligibility()
     }
 
     /// Enabled local outputs as `device id → CoreAudio UID`, for mapping the
@@ -464,25 +611,31 @@ extension AppModel {
     /// Once-a-second poll: keeps the "output moved away" banner honest, and
     /// acts on it.
     ///
-    /// Picking another output in the Sound menu while the sink path runs is
-    /// treated as INTENT, not as a fault to heal: macOS is now rendering to
-    /// the device the user chose, our tap receives nothing, and re-asserting
-    /// the sink would yank the default back out from under a deliberate
-    /// choice. So we stop the engine, restore nothing (they already moved it),
-    /// and say so in the popover. `systemSinkPausedByDisplacement` keeps the
-    /// reconciler from immediately restarting and grabbing the output again.
+    /// Picking another output in the Sound menu while SyncCast owns the
+    /// default output is treated as INTENT, not as a fault to heal: macOS is
+    /// now rendering to the device the user chose, and SyncCast is either
+    /// receiving nothing (stereo sink path) or playing everything twice at two
+    /// latencies (whole-home). So we stop the engine, restore nothing (they
+    /// already moved it), and say so in the popover.
+    /// `systemSinkPausedByDisplacement` keeps the reconciler from immediately
+    /// restarting and grabbing the output back.
+    ///
+    /// ONE policy for every path that takes the default output over.
+    /// Whole-home used to have its own banner with a 「切回」 button that put
+    /// the sink back — i.e. the same condition, judged the opposite way. Two
+    /// answers to one question is how a user ends up clicking 「切回」 against
+    /// the headphones they just plugged in.
     func pollSystemSinkStatus() async {
-        await systemSink.pollStatus(router: router)
-        guard mode == .stereo,
-              AppModel.selectedStereoOutputPath == .sink,
-              streamingState == .running,
-              systemSink.status.active,
-              !systemSink.status.isSystemDefaultOutput,
-              !systemSinkPausedByDisplacement
+        await systemSink.pollStatus(router: router, modeIsWholeHome: mode == .wholeHome)
+        // The gate reads a status the poll above may have just changed.
+        pushVolumeKeyEligibility()
+        guard streamingState == .running, !systemSinkPausedByDisplacement,
+              await router.systemSinkDisplaced
         else {
             return
         }
         systemSinkPausedByDisplacement = true
+        systemSinkPauseMode = mode
         SyncCastLog.log(
             "systemSink: default output moved away by the user — stopping routing (no restore, no re-assert)"
         )
@@ -496,6 +649,7 @@ extension AppModel {
     func resumeAfterSystemSinkDisplacement() {
         guard systemSinkPausedByDisplacement else { return }
         systemSinkPausedByDisplacement = false
+        systemSinkPauseMode = nil
         SyncCastLog.log("systemSink: user asked to resume the sink path")
         reconcileEngine()
     }
