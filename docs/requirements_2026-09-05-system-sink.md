@@ -168,11 +168,34 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 
 ### 代码审查
 
-- Codex review（SOP 第一道闸）第一轮 7 条：4×P1（安装脚本 shell 注入、
-  stale-default 误伤用户自选的 BlackHole、14.0/14.1 上选了跑不了的路径、
-  tap 启动失败且回滚失败时丢掉 sink 所有权导致无人重试）+ 3×P2（启动失败未回滚
-  采样率、发行版 .app 里装不了驱动、capability 刷新互相取消导致每行提示空白）。
-  全部已修，并对 ownership claim 与 OS gate 补了单测。
+- **Codex review 第一轮 7 条**（4×P1 + 3×P2）：安装脚本 shell 注入、stale-default
+  误伤用户自选的 BlackHole、14.0/14.1 上选了跑不了的路径、tap 启动失败且回滚失败
+  时丢掉 sink 所有权、启动失败未回滚采样率、发行版 .app 里装不了驱动、capability
+  刷新互相取消。全部已修，并对 ownership claim 与 OS gate 补了单测。
+- **Codex review 第二轮 7 条**（3×P1 + 4×P2）：sink 起来了但一个本地输出都没打开
+  时静默「running 却没声音」、48 kHz 是异步配置变更却被当同步处理（tap 会拒旧格式）、
+  stale-default 清 claim 清得太早（把唯一的恢复证据丢了）、运行中换设备不刷新
+  capability（DDC 显示器被永久缓存成软件增益）、唤醒重建无视「用户切走了默认输出」、
+  打包不重编驱动会发出旧的、读不到 system output 时臆造了一个快照。全部已修。
+- **code-reviewer 深挖：1×CRITICAL + 2×HIGH + 8×MEDIUM + 7×LOW**：
+  - **CRITICAL（听力安全）**：master 从 sink 自己的 scalar 播种，而首次激活时它是
+    1.0（全新驱动 / 没人动过的 BlackHole），再原样拷到各设备硬件音量——戴着耳机
+    在 10% 听歌的人，路径一启动就会被顶到 100%。改成**接管谁就采纳谁的当前音量**
+    （否则取即将驱动的输出里最大的那个，再否则什么都不写，绝不编数）。实机验证
+    `previousDefault=0.1250 → sinkNow=0.1250`。★播种必须放在**接管之后**：macOS 会
+    在某设备成为默认输出的瞬间重新施加它自己记住的音量，先写会被覆盖（实测：写
+    0.125 读回 0.4375）。
+  - HIGH：coordinator 的 refresh 可能在 teardown 之后把监听器又挂回去，并且把
+    `watchedUID` 弄脏，导致下次真正启动被短路——系统音量静默失效直到重启 app。
+  - HIGH：`replan()` 的 sink 判据是「配置」，`applySystemSinkVolumes()` 的是「活着」，
+    两者不一致时每个输出被钉成 unity 且取消静音，用户的平衡量和静音一起丢。
+  - MEDIUM/LOW 里已修：唤醒重建缺 unwind、`stop()` 短路导致别的 owner 不被拆、
+    音量事件可能乱序（改成回读 sink 这个权威）、软件增益 pair 未知时静默全音量、
+    capability 探测不响应取消、装驱动会在引擎运行时重启 coreaudiod（改为拒绝并提示）、
+    驱动没持久化静音、driver 在输入 scope 报了控制、RT 回调里无谓 memset、
+    build.sh 没真清、install-driver.sh 的 755 权限、probe 的跨线程读。
+  - 未处理（记录在案）：`SystemSinkDevice.deinit` 里调 `stop()` 会在任意线程写默认
+    设备——与 `DirectStereoOutput` / `WholeHomeSinkOutput` 既有做法一致，本轮不单独改。
 
 ## 5. 已知限制
 
