@@ -58,6 +58,10 @@ scratchpad 里的 `dbprobe.swift` / `tapprevol.swift`。
   `BlackHole2ch_UID`），把它同时设成 `kAudioHardwarePropertyDefaultOutputDevice`
   与 `kAudioHardwarePropertyDefaultSystemOutputDevice`，把采样率钉到 48 kHz
   （`TapCapture` 不重采样，宁可报错），stop 时两个属性 + 采样率全部还原。
+  接管默认输出时会写一条 **ownership claim**（pid + sink uid，存 UserDefaults），
+  干净停止时清除；只有「claim 的进程已经死了」才授权下次启动去动默认输出——
+  BlackHole 是共享设备，用户完全可能自己把它选成默认来录音，SyncCast 光是启动
+  不许碰它（Codex R1-P1，已补 7 条单测，含这个误伤场景）。
   还原状态机 `restoreAction` 是纯函数（4 个分支全部有单测）：
   仍是我们的默认 → 还原快照；没有可用快照 → 退到任意普通输出（绝不把默认留在
   静音 sink 上）；**用户自己切走了 → 不抢回来**；当前默认读不出来 → 报失败，
@@ -81,7 +85,9 @@ scratchpad 里的 `dbprobe.swift` / `tapprevol.swift`。
   `systemSinkStatus()` / `systemSinkVolumeCapabilities()` / `setSystemSinkMaster`；
   诊断串新增 `driver=systemSink(n)`、`systemSink=active … master=…`；路由过滤器
   保证 sink 永远不会被当成播放目标。
-- **`StereoOutputPathPolicy`**：新增 `.sink`，**装了 sink 就默认走它**；
+- **`StereoOutputPathPolicy`**：新增 `.sink`，**装了 sink 且 macOS ≥ 14.2 才默认
+  走它**（capture 腿是 Process Tap，包的部署目标却是 14.0；14.0/14.1 上装了
+  BlackHole 会让每次 Stereo 启动直接抛错——Codex R1-P1）；
   `SYNCAST_STEREO_PATH=direct` 仍然强制旧路径，`sink` 但没装设备时降级到
   direct 并告警（绝不静默改语义）。
 
@@ -96,7 +102,11 @@ scratchpad 里的 `dbprobe.swift` / `tapprevol.swift`。
   `path == .direct`，sink 路径不满足，一行都不用改。whole-home 保持原样（见 §6）。
 - popover 增加一行状态：当前系统音量由哪台设备承载 / 被用户切走了 / 已暂停；
   以及「安装 SyncCast 音频驱动」按钮（走 `osascript … with administrator
-  privileges`，密码由 macOS 自己收，SyncCast 看不到）。
+  privileges`，密码由 macOS 自己收，SyncCast 看不到）。命令用 AppleScript
+  字面量转义 + `quoted form of` 双层引用——只转义双引号的话，路径里带
+  `$(...)`/反引号就会以 root 执行（Codex R1-P1）。`package-app.sh` 把编译好的
+  driver 和 `install-driver.sh` 一起塞进 `Contents/Resources`，脚本发现同级有
+  driver 就直接装它，所以发行版 .app 里这个按钮真的能用（Codex R1-P2）。
 - 用户在「声音」里把输出切走 = **意图**：停止路由、什么都不还原（他们已经自己
   改了）、popover 说明情况并给「继续」按钮。绝不定时抢回默认输出。
 
@@ -114,9 +124,9 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
 
 ### 已在真机验证
 
-- `swift build` + `swift test`：`core/router` 131 tests / 0 failures，
-  `apps/menubar` 138 tests / 0 failures（新增 37 条：sink 检测与优先级、音量法
-  映射、还原状态机、路径选择）。
+- `swift build` + `swift test`：`core/router` 139 tests / 0 failures，
+  `apps/menubar` 138 tests / 0 failures（新增 45 条：sink 检测与优先级、音量法
+  映射、还原状态机、路径选择、ownership claim）。
 - `SyncCastSystemSinkProbe --smoke`（BlackHole 作 sink）→ **PASS**：
   - pin 到 sink 的 tap 捕到 `written=240 maxPeak=0.2297`（信号来自**另一个进程**
     的 afplay；因为 sink 丢弃音频，全程听不到）；
@@ -141,6 +151,14 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
   `Scheduler` 按 12 ms 记本地输出），预算目标 ≤30 ms；**本轮没有实测数字**，
   不写没测过的数。
 
+### 代码审查
+
+- Codex review（SOP 第一道闸）第一轮 7 条：4×P1（安装脚本 shell 注入、
+  stale-default 误伤用户自选的 BlackHole、14.0/14.1 上选了跑不了的路径、
+  tap 启动失败且回滚失败时丢掉 sink 所有权导致无人重试）+ 3×P2（启动失败未回滚
+  采样率、发行版 .app 里装不了驱动、capability 刷新互相取消导致每行提示空白）。
+  全部已修，并对 ownership claim 与 OS gate 补了单测。
+
 ## 5. 已知限制
 
 - 路径在**每次启动时解析一次**（`SystemSinkDevice.resolved`）。装完驱动要重启
@@ -154,6 +172,10 @@ UID `SyncCastAudio_UID`、带音量 + 静音控制、**不缩放音频数据**�
   报错——宁可响亮失败，也不静默重采样。
 - DDC 写是异步的（几十 ms 落地），且显示器 OSD 的改动不会反向同步（DDC 没有变更
   通知）。与 2026-06-12 那轮的限制相同。
+- macOS < 14.2 没有 Process Tap，sink 路径整体不可用，自动回落到 Direct Stereo。
+- 单测会在 `~/Library/Preferences` 留下空的 `io.syncast.tests.*.plist`（tearDown
+  已清内容，文件壳由 cfprefsd 创建）。这是本仓库既有测试就有的脚印，不是本轮新增
+  的行为。
 
 ## 6. 没做（明确划界）
 
