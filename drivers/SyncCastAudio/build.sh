@@ -21,6 +21,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Building as root writes root-owned artefacts into whatever checkout this
+# lives in, which the developer's next ordinary build cannot overwrite, and
+# signs against root's keychain instead of theirs. install-driver.sh drops to
+# the console user before calling this; anything else that ends up here as root
+# is a mistake worth stopping for. The escape hatch exists for CI images that
+# genuinely run everything as root.
+if [[ "$(id -u)" == "0" && "${SYNCAST_ALLOW_ROOT_BUILD:-0}" != "1" ]]; then
+    echo "ERROR: refusing to build as root — the artefacts in $SCRIPT_DIR/build would be" >&2
+    echo "       root-owned. Run this as your normal user, or set" >&2
+    echo "       SYNCAST_ALLOW_ROOT_BUILD=1 if root really is the right user here." >&2
+    exit 1
+fi
+
 BUILD_DIR="$SCRIPT_DIR/build"
 BUNDLE="$BUILD_DIR/SyncCastAudio.driver"
 USE_DEV_CERT="${SYNCAST_USE_SYNCCAST_DEV:-0}"
