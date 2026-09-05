@@ -12,10 +12,35 @@ public enum LanReceiverEndpoint: Sendable, Equatable {
     case hostPort(host: String, port: UInt16)
 }
 
+/// Where one link is in its connect → handshake → stream cycle.
+///
+/// The UI needs this as well as `lastError`, because the two failures that
+/// look identical from outside — "nothing is listening" and "something
+/// accepted the TCP connection and then went silent" — need different advice.
+/// The second one is what a receiver behind an unanswered Application
+/// Firewall prompt looks like, and it is indistinguishable from a healthy
+/// connect unless the stage is reported.
+public enum LanLinkStage: String, Sendable, Equatable {
+    /// Never started, or stopped.
+    case idle
+    /// A TCP connect is in flight (`preparing` / `waiting`).
+    case connecting
+    /// TCP is up and `hello` is on the wire; waiting for `hello_ack`.
+    case handshaking
+    /// `hello_ack` arrived and the UDP socket is ready.
+    case streaming
+    /// Backing off before the next attempt.
+    case retrying
+}
+
 /// Everything the UI and the diagnostics line want to know about one link.
 public struct LanLinkSnapshot: Sendable, Equatable {
+    public var stage: LanLinkStage = .idle
     public var isConnected: Bool = false
     public var isAudioReady: Bool = false
+    /// Seconds since the control channel last became `.ready`, filled in when
+    /// the snapshot is taken. nil while nothing is connected.
+    public var connectedForSeconds: Double?
     /// Last failure, cleared on a successful connect. Non-nil while the link
     /// is retrying, which is what lets the row say WHY rather than just
     /// spinning.
@@ -65,6 +90,23 @@ public final class LanReceiverLink: @unchecked Sendable {
     /// the same number per line; this is the accumulation guard for a peer
     /// that never sends a newline at all.
     public static let maximumControlBufferBytes = LanControlCodec.maximumLineBytes
+    /// How long a control connect may stay in `preparing`/`waiting` before it
+    /// is torn down and retried. Network framework will sit in `waiting`
+    /// indefinitely on a host that never answers, which reads to a user as
+    /// "SyncCast did nothing at all".
+    public static let connectTimeoutSeconds: Double = 8
+    /// How long a READY control connection may go without answering `hello`.
+    ///
+    /// This is the timeout that catches a receiver behind an Application
+    /// Firewall: the kernel completes the TCP handshake before the firewall
+    /// decides, so the connect succeeds and the daemon never sees it. Without
+    /// this the link sits in `handshaking` forever, silently.
+    public static let helloAckTimeoutSeconds: Double = 5
+    /// Repeated identical `waiting` reasons are logged at most this often. A
+    /// down receiver produces one of these per connect attempt, and the
+    /// backoff caps at 8 s — without this a machine left on overnight fills
+    /// the log with the same line.
+    public static let waitingLogIntervalSeconds: Double = 30
 
     public let receiverUID: String
     private let endpoint: LanReceiverEndpoint
@@ -84,6 +126,15 @@ public final class LanReceiverLink: @unchecked Sendable {
     private var attempt = 0
     private var offsetEstimator = LanClockOffsetEstimator()
     private var resolvedHost: NWEndpoint.Host?
+    private var connectTimer: DispatchSourceTimer?
+    private var helloAckTimer: DispatchSourceTimer?
+    /// Last `waiting` reason logged, and when — the rate-limit state for
+    /// `Self.waitingLogIntervalSeconds`. A DIFFERENT reason is always logged
+    /// immediately: a change from "no route" to "connection refused" is the
+    /// interesting event.
+    private var lastWaitingLog: (message: String, atNs: UInt64)?
+    private let connectTimeoutSeconds: Double
+    private let helloAckTimeoutSeconds: Double
 
     // Published state, read from other threads under `stateLock`.
     private var _snapshot = LanLinkSnapshot()
@@ -91,6 +142,8 @@ public final class LanReceiverLink: @unchecked Sendable {
     private var _gain: (linear: Double, muted: Bool) = (1, false)
     private var _sentGain: (linear: Double, muted: Bool)?
     private var _sentTargetMs: Int?
+    /// Sender-clock time the control channel last became `.ready`.
+    private var _connectedSinceNs: UInt64?
 
     public init(
         receiverUID: String,
@@ -98,7 +151,9 @@ public final class LanReceiverLink: @unchecked Sendable {
         token: String,
         senderName: String,
         streamID: UInt32,
-        targetMs: Int
+        targetMs: Int,
+        connectTimeoutSeconds: Double = LanReceiverLink.connectTimeoutSeconds,
+        helloAckTimeoutSeconds: Double = LanReceiverLink.helloAckTimeoutSeconds
     ) {
         self.receiverUID = receiverUID
         self.endpoint = endpoint
@@ -106,6 +161,10 @@ public final class LanReceiverLink: @unchecked Sendable {
         self.senderName = senderName
         self.streamID = streamID
         self._targetMs = LanPcmWire.clampTargetMs(targetMs)
+        // Overridable so the timeout tests take a second rather than
+        // thirteen. Production always uses the two static defaults.
+        self.connectTimeoutSeconds = max(0.05, connectTimeoutSeconds)
+        self.helloAckTimeoutSeconds = max(0.05, helloAckTimeoutSeconds)
         // The label carries the UID rather than the friendly name so a crash
         // report identifies the link without printing a device name.
         self.queue = DispatchQueue(label: "io.syncast.lan.link")
@@ -121,6 +180,8 @@ public final class LanReceiverLink: @unchecked Sendable {
         running = false
         pingTimer?.cancel()
         reconnectTimer?.cancel()
+        connectTimer?.cancel()
+        helloAckTimer?.cancel()
         control?.cancel()
         audio?.cancel()
     }
@@ -129,7 +190,13 @@ public final class LanReceiverLink: @unchecked Sendable {
 
     public var snapshot: LanLinkSnapshot {
         stateLock.lock(); defer { stateLock.unlock() }
-        return _snapshot
+        var copy = _snapshot
+        // Derived at read time rather than stored: a stored age would be
+        // stale by exactly as long as the UI's poll interval.
+        if let since = _connectedSinceNs {
+            copy.connectedForSeconds = Double(Clock.nowNs() &- since) / 1_000_000_000
+        }
+        return copy
     }
 
     /// True once `hello_ack` has arrived and the UDP socket is ready. The
@@ -151,6 +218,31 @@ public final class LanReceiverLink: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    // MARK: - Diagnostics
+
+    /// One diagnostics line for this link.
+    ///
+    /// Every control-channel transition goes through here. Before this
+    /// existed the only thing a stuck link produced was the single "leg
+    /// opened" line from the Router, and a receiver that accepted the TCP
+    /// connection and then said nothing was indistinguishable in the log
+    /// from one that was playing.
+    private func log(_ message: String) {
+        RouterLog.write("[LAN] \(receiverUID.prefix(24)): \(message)\n")
+    }
+
+    /// Log a `waiting` reason, but not the same one more than once per
+    /// `waitingLogIntervalSeconds`.
+    private func logWaiting(_ message: String) {
+        let now = Clock.nowNs()
+        if let last = lastWaitingLog, last.message == message,
+           Double(now &- last.atNs) / 1_000_000_000 < Self.waitingLogIntervalSeconds {
+            return
+        }
+        lastWaitingLog = (message, now)
+        log(message)
+    }
+
     // MARK: - Lifecycle
 
     public func start() {
@@ -158,6 +250,7 @@ public final class LanReceiverLink: @unchecked Sendable {
             guard !running else { return }
             running = true
             attempt = 0
+            log("link starting")
             connect()
         }
     }
@@ -166,7 +259,9 @@ public final class LanReceiverLink: @unchecked Sendable {
         queue.async { [self] in
             guard running else { return }
             running = false
+            log("link stopping")
             mutateSnapshot {
+                $0.stage = .idle
                 $0.isConnected = false
                 $0.isAudioReady = false
             }
@@ -193,13 +288,17 @@ public final class LanReceiverLink: @unchecked Sendable {
     private func teardown() {
         pingTimer?.cancel(); pingTimer = nil
         reconnectTimer?.cancel(); reconnectTimer = nil
+        connectTimer?.cancel(); connectTimer = nil
+        helloAckTimer?.cancel(); helloAckTimer = nil
         control?.cancel(); control = nil
         audio?.cancel(); audio = nil
         controlBuffer.removeAll(keepingCapacity: false)
         resolvedHost = nil
+        lastWaitingLog = nil
         stateLock.lock()
         _sentGain = nil
         _sentTargetMs = nil
+        _connectedSinceNs = nil
         stateLock.unlock()
     }
 
@@ -224,16 +323,63 @@ public final class LanReceiverLink: @unchecked Sendable {
         parameters.includePeerToPeer = false
         let connection = NWConnection(to: nwEndpoint, using: parameters)
         control = connection
+        mutateSnapshot { $0.stage = .connecting }
         connection.stateUpdateHandler = { [weak self] state in
             self?.handleControlState(state, connection: connection)
         }
+        startConnectTimeout(for: connection)
         connection.start(queue: queue)
     }
+
+    /// Tear down a connect that never reached `.ready` and retry it.
+    ///
+    /// Network framework's own `connectionTimeout` only bounds the TCP
+    /// handshake; a route that never answers keeps the connection in
+    /// `waiting` forever, which is a silent hang from the user's side.
+    private func startConnectTimeout(for connection: NWConnection) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + connectTimeoutSeconds)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running, connection === self.control else { return }
+            self.connectTimer = nil
+            self.fail(
+                "control connect timed out after "
+                + "\(String(format: "%.0f", self.connectTimeoutSeconds)) s "
+                + "(receiver unreachable or not listening)"
+            )
+        }
+        connectTimer?.cancel()
+        connectTimer = timer
+        timer.resume()
+    }
+
+    /// Tear down a READY connection that never answered `hello`.
+    private func startHelloAckTimeout(for connection: NWConnection) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + helloAckTimeoutSeconds)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running, connection === self.control else { return }
+            self.helloAckTimer = nil
+            self.fail(Self.helloAckTimeoutMessage)
+        }
+        helloAckTimer?.cancel()
+        helloAckTimer = timer
+        timer.resume()
+    }
+
+    /// The one failure whose cause the user cannot guess: the TCP connection
+    /// was accepted (by the kernel) and the daemon behind it never spoke.
+    /// Named as a constant so the UI can key its advice off the same string.
+    public static let helloAckTimeoutMessage =
+        "receiver accepted TCP but never answered — check its Application Firewall / token"
 
     private func handleControlState(_ state: NWConnection.State, connection: NWConnection) {
         guard running, connection === control else { return }
         switch state {
+        case .preparing:
+            log("preparing")
         case .ready:
+            connectTimer?.cancel(); connectTimer = nil
             guard let host = Self.resolvedHost(of: connection) else {
                 fail("could not resolve the receiver's address")
                 return
@@ -247,34 +393,64 @@ public final class LanReceiverLink: @unchecked Sendable {
             }
             resolvedHost = host
             attempt = 0
+            lastWaitingLog = nil
+            stateLock.lock()
+            _connectedSinceNs = Clock.nowNs()
+            stateLock.unlock()
             mutateSnapshot {
+                $0.stage = .handshaking
                 $0.isConnected = true
                 $0.lastError = nil
             }
+            log("ready (host \(Self.describe(host)))")
             sendControl(.hello(token: token, senderName: senderName, streamID: streamID))
+            log("hello sent; waiting up to "
+                + "\(String(format: "%.0f", helloAckTimeoutSeconds)) s for hello_ack")
             receiveControl()
             startPingTimer()
+            startHelloAckTimeout(for: connection)
         case .failed(let error):
             fail("control channel failed: \(error.localizedDescription)")
         case .cancelled:
-            break
+            // Only reached for a connection we still consider current, i.e.
+            // one the peer or the stack dropped rather than one `teardown`
+            // just cancelled (which clears `control` first).
+            log("cancelled")
         case .waiting(let error):
             // `waiting` is Network framework retrying on its own (host down,
             // no route). Reported so the row can say why, but not treated as a
-            // failure — cancelling here would fight its retry.
-            mutateSnapshot { $0.lastError = "waiting: \(error.localizedDescription)" }
+            // failure — cancelling here would fight its retry. The connect
+            // timeout is what eventually breaks the cycle.
+            let message = "waiting: \(error.localizedDescription)"
+            mutateSnapshot {
+                $0.stage = .connecting
+                $0.lastError = message
+            }
+            logWaiting(message)
         default:
             break
         }
     }
 
+    /// A host rendered for the log. `NWEndpoint.Host`'s own description
+    /// carries a `%interface` scope suffix that is noise here.
+    static func describe(_ host: NWEndpoint.Host) -> String {
+        let text = String(describing: host)
+        if let percent = text.firstIndex(of: "%") { return String(text[text.startIndex..<percent]) }
+        return text
+    }
+
     private func fail(_ message: String) {
+        stateLock.lock()
+        _connectedSinceNs = nil
+        stateLock.unlock()
         mutateSnapshot {
+            $0.stage = .retrying
             $0.isConnected = false
             $0.isAudioReady = false
             $0.lastError = message
         }
-        RouterLog.write("[LAN] \(receiverUID.prefix(24)): \(message)\n")
+        log("failed: \(message)")
         scheduleReconnect()
     }
 
@@ -284,7 +460,8 @@ public final class LanReceiverLink: @unchecked Sendable {
         let index = min(attempt, Self.reconnectBackoffSeconds.count - 1)
         let delay = Self.reconnectBackoffSeconds[index]
         attempt += 1
-        mutateSnapshot { $0.reconnectCount += 1 }
+        mutateSnapshot { $0.stage = .retrying; $0.reconnectCount += 1 }
+        log("reconnect attempt \(attempt) in \(String(format: "%.1f", delay)) s")
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + delay)
         timer.setEventHandler { [weak self] in
@@ -300,6 +477,8 @@ public final class LanReceiverLink: @unchecked Sendable {
     /// Drop the sockets but keep `running` and the retry timer alive.
     private func teardownForRetry() {
         pingTimer?.cancel(); pingTimer = nil
+        connectTimer?.cancel(); connectTimer = nil
+        helloAckTimer?.cancel(); helloAckTimer = nil
         control?.cancel(); control = nil
         audio?.cancel(); audio = nil
         controlBuffer.removeAll(keepingCapacity: false)
@@ -308,6 +487,7 @@ public final class LanReceiverLink: @unchecked Sendable {
         _sentGain = nil
         _sentTargetMs = nil
         _snapshot.isAudioReady = false
+        _connectedSinceNs = nil
         stateLock.unlock()
     }
 
@@ -324,9 +504,21 @@ public final class LanReceiverLink: @unchecked Sendable {
 
     private func receiveControl() {
         guard let control else { return }
-        control.receive(minimumIncompleteLength: 1, maximumLength: 8 * 1024) {
+        receiveControl(on: control)
+    }
+
+    /// Read loop for ONE control connection.
+    ///
+    /// The identity guard is load-bearing. Cancelling a connection completes
+    /// its outstanding `receive` with `isComplete`, so a link torn down by a
+    /// timeout would immediately "fail" a second time with "receiver closed
+    /// the control channel" — burning a reconnect attempt and, worse,
+    /// overwriting the real reason with a meaningless one. That is exactly
+    /// what hid the handshake timeout the first time it was tested.
+    private func receiveControl(on connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8 * 1024) {
             [weak self] data, _, isComplete, error in
-            guard let self, self.running else { return }
+            guard let self, self.running, connection === self.control else { return }
             if let data, !data.isEmpty {
                 self.ingestControl(data)
             }
@@ -338,7 +530,7 @@ public final class LanReceiverLink: @unchecked Sendable {
                 self.fail("receiver closed the control channel")
                 return
             }
-            self.receiveControl()
+            self.receiveControl(on: connection)
         }
     }
 
@@ -373,11 +565,16 @@ public final class LanReceiverLink: @unchecked Sendable {
     private func handle(_ message: LanInboundMessage, receivedAtNs t4: UInt64) {
         switch message {
         case .helloAck(let ack):
+            helloAckTimer?.cancel(); helloAckTimer = nil
             mutateSnapshot {
                 $0.deviceName = ack.deviceName.isEmpty ? nil : ack.deviceName
                 $0.hasHardwareVolume = ack.hasHardwareVolume
                 $0.receiverBufferMs = ack.bufferMs
+                $0.lastError = nil
             }
+            log("hello_ack received (udp port \(ack.udpPort), device "
+                + "\(ack.deviceName.isEmpty ? "?" : ack.deviceName), "
+                + "hw_volume \(ack.hasHardwareVolume), buffer \(ack.bufferMs) ms)")
             openAudioSocket(port: ack.udpPort)
         case .pong(let t1, let t2, let t3):
             lastPongReceivedAtNs = t4
@@ -440,7 +637,8 @@ public final class LanReceiverLink: @unchecked Sendable {
             guard let self, connection === self.audio else { return }
             switch state {
             case .ready:
-                self.mutateSnapshot { $0.isAudioReady = true }
+                self.mutateSnapshot { $0.stage = .streaming; $0.isAudioReady = true }
+                self.log("audio socket ready; streaming")
                 // Both settings are re-sent on every (re)connect: a receiver
                 // that just restarted has neither, and a stale level is worse
                 // than a redundant message.

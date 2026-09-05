@@ -23,7 +23,7 @@ struct LanReceiverControls: View {
                     Text(summary)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(linkIsHealthy ? AnyShapeStyle(HierarchicalShapeStyle.secondary) : AnyShapeStyle(Color.orange))
-                        .lineLimit(2)
+                        .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("lanLinkSummary-\(deviceID)")
                 }

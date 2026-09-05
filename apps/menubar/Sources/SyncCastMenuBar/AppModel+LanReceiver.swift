@@ -141,14 +141,41 @@ extension AppModel {
         lanReceiverStatuses[deviceID]
     }
 
-    /// The one-line link readout: RTT, offset, buffer and the three fault
-    /// counters. nil while the link has said nothing yet.
+    /// Advice for the one failure a user cannot diagnose from the row alone:
+    /// the receiver's machine completed the TCP handshake in the kernel and
+    /// then never answered, which is what an unanswered Application Firewall
+    /// prompt (or a daemon that is not actually running) looks like from here.
+    static let lanBlockedAdvice =
+        "等待接收端响应（检查对方防火墙/令牌）· receiver accepted TCP but never answered"
+
+    /// The one-line link readout.
+    ///
+    /// Never nil once a link exists: a row that shows nothing is the exact
+    /// failure mode this replaced — a receiver blocked by its firewall used to
+    /// render "rtt:- off:- buf:-" forever with no hint of why.
     func lanLinkSummary(for deviceID: String) -> String? {
         guard let status = lanStatus(for: deviceID) else { return nil }
         let link = status.link
-        guard link.isConnected || link.lastError != nil else { return nil }
-        if let error = link.lastError, !link.isAudioReady {
-            return error
+        switch link.stage {
+        case .idle:
+            return link.lastError
+        case .connecting:
+            guard let error = link.lastError else { return "连接中 · connecting…" }
+            return "连接中 · \(error)"
+        case .handshaking:
+            var line = Self.lanBlockedAdvice
+            if let age = link.connectedForSeconds, age >= 1 {
+                line += String(format: " · 已连接 %.0f s", age)
+            }
+            return line
+        case .retrying:
+            guard let error = link.lastError else { return "重连中 · reconnecting…" }
+            if error == LanReceiverLink.helloAckTimeoutMessage {
+                return "\(Self.lanBlockedAdvice) · 重试 \(link.reconnectCount)"
+            }
+            return "\(error) · 重试 \(link.reconnectCount)"
+        case .streaming:
+            break
         }
         var parts: [String] = []
         if let rtt = link.roundTripMs {
@@ -165,7 +192,19 @@ extension AppModel {
         } else if let buffer = link.receiverBufferMs {
             parts.append("缓冲 \(buffer) ms")
         }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        if let age = link.connectedForSeconds, age >= 1 {
+            parts.append(lanConnectedFor(age))
+        }
+        if parts.isEmpty { return "已连接 · connected" }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "connected since", as an age rather than a timestamp: the useful
+    /// question is whether the link just came back, not what o'clock it was.
+    func lanConnectedFor(_ seconds: Double) -> String {
+        if seconds < 90 { return String(format: "已连接 %.0f s", seconds) }
+        if seconds < 5_400 { return String(format: "已连接 %.0f min", seconds / 60) }
+        return String(format: "已连接 %.1f h", seconds / 3_600)
     }
 
     /// Whether the receiver is carrying the master level in its own hardware
