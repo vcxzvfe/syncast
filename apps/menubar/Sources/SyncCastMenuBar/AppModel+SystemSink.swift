@@ -318,6 +318,14 @@ final class SystemSinkCoordinator {
         }
     }
 
+    /// Seam for the panel-authority tests: the real `status` arrives from the
+    /// Router across an actor hop, which a unit test cannot stage without a
+    /// running engine and an installed driver. Nothing in the app calls this —
+    /// the property stays `private(set)` for production code.
+    func applyStatusForTesting(_ status: Router.SystemSinkStatus) {
+        self.status = status
+    }
+
     private(set) var backendsByUID: [String: SystemSinkVolumeLaw.Backend] = [:]
     /// Last known device id -> CoreAudio UID mapping for the enabled outputs.
     private var uidByDeviceID: [String: String] = [:]
