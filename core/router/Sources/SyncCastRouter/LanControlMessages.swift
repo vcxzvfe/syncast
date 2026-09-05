@@ -19,7 +19,9 @@ public enum LanOutboundMessage: Equatable, Sendable {
     /// The playout target the receiver must honour.
     case latency(targetMs: Int)
     /// Round-trip probe and keep-alive. `t1` is sender monotonic ns.
-    case ping(t1: UInt64)
+    /// `prevT4`: when the previous pong arrived (sender clock), so the receiver
+    /// can close the NTP loop with all four timestamps (receiver-side extension).
+    case ping(t1: UInt64, prevT4: UInt64? = nil)
     /// Orderly shutdown.
     case bye
 
@@ -163,8 +165,9 @@ public enum LanControlCodec {
             object["muted"] = muted
         case .latency(let targetMs):
             object["target_ms"] = targetMs
-        case .ping(let t1):
+        case .ping(let t1, let prevT4):
             object["t1"] = t1
+            if let prevT4 { object["prev_t4"] = prevT4 }
         case .bye:
             break
         }

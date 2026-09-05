@@ -366,6 +366,10 @@ public final class LanReceiverLink: @unchecked Sendable {
         }
     }
 
+    /// Sender-clock arrival time of the last pong, echoed as `prev_t4` in the
+    /// next ping so the receiver can compute a full 4-timestamp NTP sample.
+    private var lastPongReceivedAtNs: UInt64?
+
     private func handle(_ message: LanInboundMessage, receivedAtNs t4: UInt64) {
         switch message {
         case .helloAck(let ack):
@@ -376,6 +380,7 @@ public final class LanReceiverLink: @unchecked Sendable {
             }
             openAudioSocket(port: ack.udpPort)
         case .pong(let t1, let t2, let t3):
+            lastPongReceivedAtNs = t4
             guard let sample = LanClockSample.fromTimestamps(t1: t1, t2: t2, t3: t3, t4: t4)
             else {
                 // A quadruple that cannot be physical. Dropped rather than
@@ -409,7 +414,7 @@ public final class LanReceiverLink: @unchecked Sendable {
         )
         timer.setEventHandler { [weak self] in
             guard let self, self.running else { return }
-            self.sendControl(.ping(t1: Clock.nowNs()))
+            self.sendControl(.ping(t1: Clock.nowNs(), prevT4: self.lastPongReceivedAtNs))
         }
         pingTimer?.cancel()
         pingTimer = timer

@@ -195,6 +195,11 @@ final class LanPcmProtocolTests: XCTestCase {
         ) as? [String: Any]
         XCTAssertEqual(ping?["type"] as? String, "ping")
         XCTAssertEqual(ping?["t1"] as? UInt64, 1_234_567_890_123)
+        XCTAssertNil(ping?["prev_t4"])
+        let ping2 = try JSONSerialization.jsonObject(
+            with: LanControlCodec.encode(.ping(t1: 10, prevT4: 7))
+        ) as? [String: Any]
+        XCTAssertEqual(ping2?["prev_t4"] as? UInt64, 7)
 
         let bye = try JSONSerialization.jsonObject(
             with: LanControlCodec.encode(.bye)
