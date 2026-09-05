@@ -643,22 +643,6 @@ public final class LocalOutput {
             driftLimitFrames: Int64(Self.driftResyncLimitMs) * Int64(sampleRate) / 1000
         )
         let startFrame: Int64 = plan.startFrame
-        // Counters. Skipped on the very first render: the cursor is 0 by
-        // construction there, and the ring is still filling, so counting it
-        // would put a permanent 1 in every session's "glitches" column.
-        // A couple of counts in the first few hundred ms after start are
-        // warm-up (the producer has not yet written `floor` frames); a
-        // steady-state claim is "these numbers did not move for N minutes".
-        if renderTickCount > 0 {
-            tally.record(plan)
-            // Publish. Single writer (this render thread), many readers, so
-            // plain release stores are enough — no CAS, no lock, no allocation.
-            sc_atomic_store_release(resyncCounter, tally.resyncCount)
-            sc_atomic_store_release(underrunCounter, tally.underrunCount)
-            sc_atomic_store_release(
-                minWaterLevelCounter, tally.minWaterLevelFrames ?? Self.waterLevelUnset
-            )
-        }
 
         // Capture the AUHAL output pointers (non-interleaved, one per
         // output channel). Used for the splat write below.
@@ -672,6 +656,26 @@ public final class LocalOutput {
             }
         }
         if !allOk { return noErr }
+
+        // Counters. Recorded only past the bail-out above, so a render that
+        // produced no audio is not booked as one that did.
+        //
+        // Skipped on the very first render: the cursor is 0 by construction
+        // there, so it always resyncs, and counting it would put a permanent 1
+        // in every session's glitch column. A few counts in the first hundreds
+        // of ms are warm-up (the producer has not written `floor` frames yet);
+        // the steady-state claim is "these numbers stopped moving", not "these
+        // numbers are zero".
+        if renderTickCount > 0 {
+            tally.record(plan)
+            // Publish. Single writer (this render thread), many readers, so
+            // plain release stores are enough — no CAS, no lock, no allocation.
+            sc_atomic_store_release(resyncCounter, tally.resyncCount)
+            sc_atomic_store_release(underrunCounter, tally.underrunCount)
+            sc_atomic_store_release(
+                minWaterLevelCounter, tally.minWaterLevelFrames ?? Self.waterLevelUnset
+            )
+        }
 
         // Read source channels (always `channelCount`, typically 2)
         // into the pre-allocated staging slabs.
