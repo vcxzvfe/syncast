@@ -3,6 +3,7 @@ import CoreAudio
 import AudioToolbox
 import AVFoundation
 import os.lock
+import SyncCastAtomic
 
 /// One AUHAL bound to a single CoreAudio output device. Reads from a shared
 /// `RingBuffer` at a per-device frame offset (= delay compensation), applies a
@@ -144,6 +145,26 @@ public final class LocalOutput {
     /// the producer stalled for a quarter second, which is a real event.
     public static let driftResyncLimitMs: Int = 250
 
+    // MARK: - Glitch counters (lock-free, written only by the render thread)
+
+    /// Renders after the first that re-anchored the cursor. Non-zero means an
+    /// audible discontinuity happened.
+    private let resyncCounter: UnsafeMutablePointer<SCAtomicInt64>
+    /// Renders after the first that asked for frames past the write cursor.
+    /// `RingBuffer.read` zero-fills those, so the output is a short silence
+    /// rather than stale ring content — still a dropout.
+    private let underrunCounter: UnsafeMutablePointer<SCAtomicInt64>
+    /// Smallest `writePosition − startFrame` seen. This is the headroom the
+    /// ring floor actually bought; if it approaches 0 the floor is too low.
+    private let minWaterLevelCounter: UnsafeMutablePointer<SCAtomicInt64>
+    /// Sentinel for "no render has been observed yet".
+    private static let waterLevelUnset: Int64 = Int64.max
+    /// The bookkeeping itself. Owned by the render thread (and by `start()`
+    /// before the AUHAL is running); the atomics above are its publication
+    /// channel for every other thread. `GlitchTally` holds the rule so it can
+    /// be tested without a CoreAudio device.
+    private var tally = GlitchTally()
+
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
@@ -163,6 +184,15 @@ public final class LocalOutput {
                 ?? RingFloorPolicy.frames(ms: RingFloorPolicy.legacyFloorMs, sampleRate: sampleRate),
             capacityFrames: ring.capacityFrames
         )
+        let resync = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
+        sc_atomic_init(resync, 0)
+        self.resyncCounter = resync
+        let underrun = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
+        sc_atomic_init(underrun, 0)
+        self.underrunCounter = underrun
+        let water = UnsafeMutablePointer<SCAtomicInt64>.allocate(capacity: 1)
+        sc_atomic_init(water, Self.waterLevelUnset)
+        self.minWaterLevelCounter = water
         // outputChannelCount defaults to channelCount (individual mode);
         // aggregate mode passes a wider count. We round up to an even
         // multiple of channelCount because the splat path writes pairs
@@ -223,6 +253,9 @@ public final class LocalOutput {
         _softwareGains.deallocate()
         _softwareGainsScratch.deinitialize(count: _softwareGainsCount)
         _softwareGainsScratch.deallocate()
+        resyncCounter.deallocate()
+        underrunCounter.deallocate()
+        minWaterLevelCounter.deallocate()
     }
 
     // MARK: - Ring floor
@@ -251,6 +284,39 @@ public final class LocalOutput {
     /// diagnostics; NOT used by the render target — see `_readBackoffFrames`.
     public var readBackoffFramesDiagnostic: Int {
         stateLock.withLock { _readBackoffFrames }
+    }
+
+    // MARK: - Glitch counters
+
+    /// Cursor re-anchors after the first render.
+    public var resyncCount: Int64 { sc_atomic_load_acquire(resyncCounter) }
+    /// Renders after the first that read past the producer's write cursor.
+    public var underrunCount: Int64 { sc_atomic_load_acquire(underrunCounter) }
+    /// Smallest observed water level (written frames ahead of the read point),
+    /// or nil when nothing has rendered yet.
+    public var minWaterLevelFrames: Int64? {
+        let value = sc_atomic_load_acquire(minWaterLevelCounter)
+        return value == Self.waterLevelUnset ? nil : value
+    }
+
+    /// Zero the glitch counters. Called from `start()` so each session's
+    /// numbers stand on their own. Also zeroes `renderTickCount`, which is
+    /// what "first render" is keyed on — otherwise a restarted output would
+    /// book its warm-up resync as a glitch.
+    public func resetGlitchCounters() {
+        tally.reset()
+        sc_atomic_store_release(resyncCounter, 0)
+        sc_atomic_store_release(underrunCounter, 0)
+        sc_atomic_store_release(minWaterLevelCounter, Self.waterLevelUnset)
+        renderTickCount = 0
+    }
+
+    /// One-line counter summary for diagnostics/health logs.
+    public func glitchSummary() -> String {
+        let water = minWaterLevelFrames.map {
+            String(format: "%.1fms", RingFloorPolicy.milliseconds(frames: Int($0), sampleRate: sampleRate))
+        } ?? "-"
+        return "resync:\(resyncCount) underrun:\(underrunCount) minWater:\(water)"
     }
 
     // MARK: - Hardware latency probing
@@ -369,6 +435,10 @@ public final class LocalOutput {
 
     public func start() throws {
         guard !initialized else { return }
+        // Zero the glitch counters BEFORE the AUHAL can call render(), so the
+        // reset never races a live render thread and the session's numbers
+        // start at zero.
+        resetGlitchCounters()
         var description = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
@@ -573,6 +643,22 @@ public final class LocalOutput {
             driftLimitFrames: Int64(Self.driftResyncLimitMs) * Int64(sampleRate) / 1000
         )
         let startFrame: Int64 = plan.startFrame
+        // Counters. Skipped on the very first render: the cursor is 0 by
+        // construction there, and the ring is still filling, so counting it
+        // would put a permanent 1 in every session's "glitches" column.
+        // A couple of counts in the first few hundred ms after start are
+        // warm-up (the producer has not yet written `floor` frames); a
+        // steady-state claim is "these numbers did not move for N minutes".
+        if renderTickCount > 0 {
+            tally.record(plan)
+            // Publish. Single writer (this render thread), many readers, so
+            // plain release stores are enough — no CAS, no lock, no allocation.
+            sc_atomic_store_release(resyncCounter, tally.resyncCount)
+            sc_atomic_store_release(underrunCounter, tally.underrunCount)
+            sc_atomic_store_release(
+                minWaterLevelCounter, tally.minWaterLevelFrames ?? Self.waterLevelUnset
+            )
+        }
 
         // Capture the AUHAL output pointers (non-interleaved, one per
         // output channel). Used for the splat write below.
@@ -594,7 +680,7 @@ public final class LocalOutput {
         // substitute anything: `RingBuffer.read` already zero-fills every
         // frame outside [writePos − capacity, writePos), so the tail of the
         // block is silence, not stale ring content from a lap ago. A short
-        // silence is the least-bad dropout.
+        // silence is the least-bad dropout and it is counted above.
         ring.read(at: startFrame, frames: frames, into: stagingChannels)
 
         // Splat: write the source stereo into every output channel

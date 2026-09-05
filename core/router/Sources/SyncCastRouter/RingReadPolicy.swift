@@ -126,6 +126,47 @@ public struct RingReadPlan: Equatable, Sendable {
     }
 }
 
+/// Glitch bookkeeping over a sequence of `RingReadPlan`s.
+///
+/// The rule lives here — as a plain value type folded by the render thread —
+/// so it can be unit-tested without a CoreAudio device. `LocalOutput` owns one
+/// instance (written only by its render callback) and republishes it into
+/// lock-free atomics for readers on other threads.
+///
+/// The very first render is deliberately NOT recorded: the cursor is 0 by
+/// construction there, so it always resyncs, and recording it would put a
+/// permanent 1 in every session's glitch column. Warm-up renders right after
+/// that (the producer has not written `floor` frames yet) DO count — hiding
+/// them would hide a genuinely bad floor. The claim a run supports is
+/// therefore "these numbers stopped moving", not "these numbers are zero".
+public struct GlitchTally: Equatable, Sendable {
+    /// Renders that re-anchored the cursor. Each one is an audible
+    /// discontinuity.
+    public private(set) var resyncCount: Int64 = 0
+    /// Renders that asked for frames past the producer's write cursor. The
+    /// ring zero-fills those, so the artefact is a short silence.
+    public private(set) var underrunCount: Int64 = 0
+    /// Smallest water level seen, or nil before the first recorded render.
+    public private(set) var minWaterLevelFrames: Int64?
+    /// How many renders have been folded in (excludes the skipped first one).
+    public private(set) var recordedRenders: UInt64 = 0
+
+    public init() {}
+
+    public mutating func record(_ plan: RingReadPlan) {
+        recordedRenders &+= 1
+        if plan.didResync { resyncCount &+= 1 }
+        if plan.underrunFrames > 0 { underrunCount &+= 1 }
+        if let current = minWaterLevelFrames {
+            minWaterLevelFrames = Swift.min(current, plan.waterLevelFrames)
+        } else {
+            minWaterLevelFrames = plan.waterLevelFrames
+        }
+    }
+
+    public mutating func reset() { self = GlitchTally() }
+}
+
 public enum RingReadPlanner {
     /// Decide where the next render block reads from.
     ///

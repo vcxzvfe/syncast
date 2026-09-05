@@ -695,14 +695,17 @@ public actor Router {
             } else {
                 label = String(id.prefix(6))
             }
-            // `floor` is the added latency this output is paying, and
-            // `schedBackoff` is what the Scheduler asked for — reported side
-            // by side because the second one does NOT move the read cursor
-            // (see LocalOutput._readBackoffFrames) and reading the two as one
-            // number is how the 71 ms latency claim got written down wrong.
+            // `floor` is the added latency this output is paying and the three
+            // glitch counters say whether that floor is holding: a headless run
+            // proves "no glitches in N minutes" by showing resync/underrun
+            // unchanged while ticks climbs. `schedBackoff` sits beside them
+            // because it does NOT move the read cursor (see
+            // LocalOutput._readBackoffFrames) and reading the two as one number
+            // is how the 71 ms latency claim got written down wrong.
             renderInfo += " render[\(label)]=ticks:\(out.renderTickCount)"
                 + " peak:\(String(format: "%.4f", out.lastRenderPeak))"
                 + " floor:\(String(format: "%.0fms", RingFloorPolicy.milliseconds(frames: out.ringFloorFrames, sampleRate: out.sampleRate)))"
+                + " \(out.glitchSummary())"
                 + " schedBackoff:\(out.readBackoffFramesDiagnostic)"
         }
         var awInfo = ""

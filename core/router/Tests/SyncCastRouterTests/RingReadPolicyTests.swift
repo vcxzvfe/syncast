@@ -217,6 +217,77 @@ final class RingReadPlannerTests: XCTestCase {
         XCTAssertEqual(result.startFrame, 500_000 - floor - 800 - Int64(block))
     }
 
+    // MARK: counter bookkeeping
+
+    func testTallyStartsEmpty() {
+        let tally = GlitchTally()
+        XCTAssertEqual(tally.resyncCount, 0)
+        XCTAssertEqual(tally.underrunCount, 0)
+        XCTAssertEqual(tally.recordedRenders, 0)
+        XCTAssertNil(tally.minWaterLevelFrames)
+    }
+
+    func testTallyCountsResyncsAndUnderrunsSeparately() {
+        var tally = GlitchTally()
+        // clean render
+        tally.record(RingReadPlan(startFrame: 10, didResync: false, underrunFrames: 0, waterLevelFrames: 1952))
+        // resync with no underrun (re-anchored back to target)
+        tally.record(RingReadPlan(startFrame: 20, didResync: true, underrunFrames: 0, waterLevelFrames: 1952))
+        // underrun without a resync should still be counted
+        tally.record(RingReadPlan(startFrame: 30, didResync: false, underrunFrames: 64, waterLevelFrames: 448))
+        // both at once counts once in each column, not twice in either
+        tally.record(RingReadPlan(startFrame: 40, didResync: true, underrunFrames: 512, waterLevelFrames: 0))
+        XCTAssertEqual(tally.resyncCount, 2)
+        XCTAssertEqual(tally.underrunCount, 2)
+        XCTAssertEqual(tally.recordedRenders, 4)
+    }
+
+    func testTallyTracksTheMinimumWaterLevelNotTheLast() {
+        var tally = GlitchTally()
+        tally.record(RingReadPlan(startFrame: 0, didResync: false, underrunFrames: 0, waterLevelFrames: 1952))
+        tally.record(RingReadPlan(startFrame: 0, didResync: false, underrunFrames: 0, waterLevelFrames: 700))
+        tally.record(RingReadPlan(startFrame: 0, didResync: false, underrunFrames: 0, waterLevelFrames: 1900))
+        XCTAssertEqual(tally.minWaterLevelFrames, 700)
+    }
+
+    func testTallyRecordsANegativeWaterLevel() {
+        // startFrame past the write cursor: the level is negative and must not
+        // be clamped away, or "how badly did we underrun" is unanswerable.
+        var tally = GlitchTally()
+        tally.record(RingReadPlan(startFrame: 0, didResync: false, underrunFrames: 64, waterLevelFrames: -64))
+        XCTAssertEqual(tally.minWaterLevelFrames, -64)
+        XCTAssertEqual(tally.underrunCount, 1)
+    }
+
+    func testTallyResetClearsEverything() {
+        var tally = GlitchTally()
+        tally.record(RingReadPlan(startFrame: 0, didResync: true, underrunFrames: 8, waterLevelFrames: 12))
+        tally.reset()
+        XCTAssertEqual(tally, GlitchTally())
+        XCTAssertNil(tally.minWaterLevelFrames)
+    }
+
+    func testSteadyStateRunLeavesTheCountersAtZero() {
+        // The evidence a headless run is supposed to produce: fold 5 minutes of
+        // in-sync renders and nothing should be counted.
+        var tally = GlitchTally()
+        var cursor: Int64 = 0
+        var writePos: Int64 = 96_000
+        var result = plan(writePosition: writePos, cursor: cursor)  // first render, not recorded
+        cursor = result.startFrame + Int64(block)
+        let ticks = 5 * 60 * 48_000 / block
+        for _ in 0..<ticks {
+            writePos += Int64(block)
+            result = plan(writePosition: writePos, cursor: cursor)
+            tally.record(result)
+            cursor = result.startFrame + Int64(block)
+        }
+        XCTAssertEqual(tally.resyncCount, 0)
+        XCTAssertEqual(tally.underrunCount, 0)
+        XCTAssertEqual(tally.recordedRenders, UInt64(ticks))
+        XCTAssertEqual(tally.minWaterLevelFrames, floor + Int64(block))
+    }
+
     func testLegacyFloorProducesTheHistoricalTarget() {
         // The SCK paths must behave exactly as they did with the hardcoded
         // 4800-frame baseline.
