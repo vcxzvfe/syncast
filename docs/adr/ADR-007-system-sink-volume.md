@@ -105,6 +105,19 @@ silently half-done.
   change to a downstream device (display OSD, Audio MIDI Setup) is overwritten
   on the next replan rather than mirrored back — that is what keeps the loop
   from oscillating.
+- **The sink path costs latency that Direct Stereo does not.** Direct Stereo
+  has apps render straight into the aggregate — no capture, no ring, ~0 added.
+  The sink path pays the capture chain: measured on this machine (probe
+  `--latency`, from device properties) 10.67 ms sink IO buffer + 10.67 ms
+  output IO buffer + 50 ms of `Scheduler.plan(safetyMarginMs:)` ring pre-roll
+  = ~71 ms added, against a ≤30 ms target. The dominant term is pre-existing
+  and shared with the SCK capture path, not introduced here. Two levers exist
+  and neither was pulled in this round: lowering the safety margin (trades
+  dropout headroom, needs a listening test rather than a blind edit), and
+  declaring the chain latency on the driver's `kAudioDevicePropertyLatency` so
+  video players compensate. Until then, video is the case to judge by ear —
+  the player believes audio lands at the sink's presentation time and does not
+  know about the downstream chain.
 - SyncCast now ships a kernel-adjacent component: a HAL plug-in installed to
   `/Library/Audio/Plug-Ins/HAL` with sudo, whose install restarts coreaudiod.
   The BlackHole fallback exists so the feature works before anyone types a

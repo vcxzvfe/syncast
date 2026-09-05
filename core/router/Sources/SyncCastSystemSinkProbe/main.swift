@@ -7,6 +7,7 @@ import SyncCastRouter
 // Stereo path, in the spirit of SyncCastDDCProbe.
 //
 //   swift run SyncCastSystemSinkProbe            read-only report
+//   swift run SyncCastSystemSinkProbe --latency  added-latency budget (read-only)
 //   swift run SyncCastSystemSinkProbe --smoke    end-to-end, restores state
 //
 // The read-only mode touches nothing. `--smoke` briefly makes the sink the
@@ -125,6 +126,75 @@ func report() {
     if let current = defaultOutput(kAudioHardwarePropertyDefaultSystemOutputDevice) {
         print("default system out: \(deviceName(current)) [\(deviceUID(current) ?? "?")]")
     }
+}
+
+// MARK: - Latency budget
+
+/// Added latency of the sink path, summed from the DEVICE PROPERTIES that
+/// determine it. This is a computed budget, not an acoustic measurement:
+/// SyncCast has no acoustic measurement path (retired 2026-08-09), and a probe
+/// that played test tones out of the speakers would be audible and would fight
+/// the running app. Every term below is read from CoreAudio, and each is
+/// labelled with where it comes from.
+func latencyBudget() {
+    guard let candidate = SystemSinkDevice.resolved,
+          let sinkID = deviceID(uid: candidate.uid) else {
+        print("no sink installed; nothing to budget")
+        return
+    }
+    func bufferFrames(_ id: AudioDeviceID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr
+        else {
+            return 0
+        }
+        return value
+    }
+    let rate = 48_000.0
+    func ms(_ frames: Double) -> String { String(format: "%.2f ms", frames / rate * 1000) }
+
+    // What SyncCast ADDS, term by term.
+    let sinkBuffer = Double(bufferFrames(sinkID))
+    print("sink IO buffer     : \(Int(sinkBuffer)) frames  \(ms(sinkBuffer))   [apps render here; one block before the tap sees it]")
+
+    var outputBuffer = 0.0
+    var outputHardware = 0.0
+    for uid in ["BuiltInSpeakerDevice"] {
+        guard let id = deviceID(uid: uid) else { continue }
+        outputBuffer = Double(bufferFrames(id))
+        outputHardware = Double(LocalOutput.outputLatencyFrames(deviceID: id))
+        print("output IO buffer   : \(Int(outputBuffer)) frames  \(ms(outputBuffer))   [\(deviceName(id)) AUHAL block]")
+        print("output hardware    : \(Int(outputHardware)) frames  \(ms(outputHardware))   [device presentation latency — paid on EVERY path, not added by us]")
+    }
+
+    // The dominant term, and it is not new: Scheduler.plan books local outputs
+    // at 12 ms and then adds a 50 ms safety margin, so a local-only session
+    // reads the ring 50 ms behind the write cursor. The existing SCK capture
+    // path pays exactly the same; Direct Stereo pays none of it because there
+    // is no ring at all (apps render straight to the aggregate).
+    let schedulerMarginMs = 50.0
+    print("ring backoff       : \(Int(schedulerMarginMs / 1000 * rate)) frames  \(String(format: "%.2f ms", schedulerMarginMs))   [Scheduler.plan safetyMarginMs, unchanged from the SCK path]")
+
+    let added = (sinkBuffer + outputBuffer) / rate * 1000 + schedulerMarginMs
+    print("")
+    print("ADDED by the sink path : \(String(format: "%.2f", added)) ms  (target was <= 30 ms — NOT met)")
+    print("  dominated by the \(Int(schedulerMarginMs)) ms scheduler safety margin, which is pre-existing")
+    print("  and shared with the SCK capture path. Levers, in order of size:")
+    print("   1. Scheduler.plan(safetyMarginMs:) — 50 ms of ring pre-roll for a")
+    print("      local-only session. Lowering it trades headroom against dropouts")
+    print("      and needs a listening test; NOT tuned blind in this round.")
+    print("   2. Declare the chain latency on SyncCastAudio.driver's")
+    print("      kAudioDevicePropertyLatency so video players compensate and A/V")
+    print("      sync is preserved even at this budget. Not implemented yet.")
+    print("")
+    print("NOTE: computed from CoreAudio device properties + the Scheduler constant.")
+    print("      NOT an acoustic measurement — SyncCast has no acoustic path (retired 2026-08-09).")
 }
 
 // MARK: - Smoke test
@@ -295,7 +365,9 @@ func smoke() -> Int32 {
 // MARK: - Entry
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-if arguments.contains("--smoke") {
+if arguments.contains("--latency") {
+    latencyBudget()
+} else if arguments.contains("--smoke") {
     if #available(macOS 14.2, *) {
         exit(smoke())
     } else {
