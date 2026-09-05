@@ -255,6 +255,13 @@ final class FakeLanReceiver: @unchecked Sendable {
 /// average rate — which is what lets the test assert exact packet spacing.
 final class SyntheticRingProducer: @unchecked Sendable {
     let ring: RingBuffer
+    /// Hardware-style capture stamps, exactly as `TapCapture` publishes them:
+    /// every block carries the host time of its FIRST frame, taken from the
+    /// (here, perfect) device clock rather than from when the writer happened
+    /// to be scheduled. That distinction is the point of the whole timeline —
+    /// the producer's own timer jitters by milliseconds, and none of it may
+    /// reach `play_at_ns`.
+    let anchors: CaptureAnchorPublisher
     private let sampleRate: Double
     private let queue = DispatchQueue(label: "test.synthetic.ring", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
@@ -265,6 +272,7 @@ final class SyntheticRingProducer: @unchecked Sendable {
     init(sampleRate: Double = 48_000, capacityFrames: Int = 1 << 18) {
         self.sampleRate = sampleRate
         self.ring = RingBuffer(channelCount: 2, capacityFrames: capacityFrames)
+        self.anchors = CaptureAnchorPublisher(sampleRate: sampleRate)
     }
 
     func start() {
@@ -307,6 +315,12 @@ final class SyntheticRingProducer: @unchecked Sendable {
                 ring.write(channels: table, frames: toWrite)
             }
         }
+        // The block that just landed at ring position `written` began at the
+        // device's nominal time for that frame.
+        anchors.publish(
+            frame: written,
+            hostNs: startNs &+ UInt64((Double(written) / sampleRate * 1_000_000_000).rounded())
+        )
         written = target
     }
 }

@@ -28,9 +28,13 @@ final class LanReceiverOutputTests: XCTestCase {
 
     /// Build the whole sender chain against the fake, and wait until audio is
     /// flowing. Returns once the link is up.
+    /// - Parameter hardwareStamps: whether the capture backend publishes
+    ///   `CaptureAnchor`s. False models `SCKCapture`, which does not, and
+    ///   exercises the fallback timeline.
     private func makeLink(
         token: String = "cafef00d",
-        targetMs: Int = LanPcmWire.defaultTargetMs
+        targetMs: Int = LanPcmWire.defaultTargetMs,
+        hardwareStamps: Bool = true
     ) throws -> LanReceiverLink {
         receiver = FakeLanReceiver()
         try receiver.start()
@@ -51,7 +55,8 @@ final class LanReceiverOutputTests: XCTestCase {
             sampleRate: 48_000,
             channelCount: 2,
             ringFloorFrames: 1_440,
-            link: link
+            link: link,
+            captureAnchors: hardwareStamps ? producer.anchors : nil
         )
         output.start()
         return link
@@ -128,56 +133,47 @@ final class LanReceiverOutputTests: XCTestCase {
             )
         }
 
-        // Playout times advance monotonically, one packet at a time.
+        // Playout times advance monotonically, one packet at a time — and,
+        // now that the timeline comes from the capture hardware's stamps
+        // rather than from a servo fed by `now()`, EXACTLY one packet apart.
         //
-        // The spacing is one packet at the RING's measured rate, not at the
-        // nominal one — that is the entire point of `RingWriteClock`, and a
-        // test that demanded exactly 5,000,000 ns here would be demanding that
-        // the sender ignore the producer's real clock. (The exact-5 ms
-        // property IS pinned, on the model itself, in
-        // `LanClockAndPlannerTests.testTimeAdvancesByExactlyOnePacketPerPacketAtNominalRate`.)
+        // This assertion used to allow a bounded phase step per second plus a
+        // 500 ppm band on the median, because the old estimator corrected
+        // itself against wall clock and those corrections landed in
+        // `play_at_ns`. They are what the receiver saw as level dips, and
+        // what it spliced on. With the fit driven by the device clock there
+        // is nothing to correct: the producer here runs at nominal, so every
+        // packet must be 5 ms after the one before it to within a
+        // microsecond. (A real device running 100 ppm off would give a
+        // uniformly stretched grid, not a jittery one; the tracking of that
+        // case is pinned in `LanHostAnchorClockTests`.)
         //
-        // So two claims are made instead, and together they are stronger than
-        // the literal one: no gap may exceed one packet by more than the
-        // model's own bounded phase step, and the MEDIAN spacing has to sit
-        // within 500 ppm of 5 ms — i.e. the timeline really is running at the
-        // ring's rate, not drifting away from it.
-        //
-        // The one thing asserted unconditionally is monotonicity, because a
-        // receiver that saw time run backwards would drop everything until it
-        // caught up. Corrections are COUNTED rather than forbidden: the model
-        // is allowed one bounded phase step per window (one second), and a
-        // loaded machine can additionally stall the producer hard enough to
-        // make it re-anchor. More than a couple of those in two seconds means
-        // the loop is not settling, which is the real fault.
+        // The one legitimate exception is a CURSOR re-anchor: if the test
+        // machine stalls the producer past the planner's drift limit, the
+        // sender deliberately skips forward in the ring and says so in its
+        // counters. Those are allowed for, one gap each; every other packet
+        // must be 5 ms after its predecessor to the nanosecond.
         let times = packets.map(\.header.playAtNs)
-        var spacings: [UInt64] = []
-        var corrections = 0
-        // One bounded phase step, plus room for the rate term and for integer
-        // rounding. 75 µs is 1.5 % of a packet.
-        let slack = UInt64(RingWriteClock.maximumPhaseStepNs) + 25_000
+        var deviations: [Int64] = []
         for index in 1..<times.count {
             XCTAssertGreaterThan(
                 times[index], times[index - 1],
                 "play_at_ns went backwards at packet \(index)"
             )
-            let spacing = times[index] - times[index - 1]
-            spacings.append(spacing)
-            if spacing > LanPcmWire.packetDurationNs + slack
-                || spacing + slack < LanPcmWire.packetDurationNs {
-                corrections += 1
-            }
+            let spacing = Int64(times[index] - times[index - 1])
+            deviations.append(abs(spacing - Int64(LanPcmWire.packetDurationNs)))
         }
+        let allowedGaps = output.counters.reanchorCount
+        let strayed = deviations.filter { $0 > 1_000 }
         XCTAssertLessThanOrEqual(
-            corrections, packets.count / 200 + 2,
-            "the clock model is correcting on nearly every packet, not settling"
+            strayed.count, allowedGaps,
+            "packet spacing strayed from 5 ms \(strayed.count) times "
+            + "(\(strayed.prefix(5)) ns) with only \(allowedGaps) cursor re-anchors to "
+            + "explain it; the timeline is not coming from the capture clock"
         )
-        let median = spacings.sorted()[spacings.count / 2]
-        let drift = abs(Double(median) - Double(LanPcmWire.packetDurationNs))
-            / Double(LanPcmWire.packetDurationNs)
-        XCTAssertLessThan(
-            drift, 500e-6,
-            "median packet spacing is \(median) ns, \(drift * 1e6) ppm off the ring's rate"
+        XCTAssertEqual(
+            deviations.sorted()[deviations.count / 2], 0,
+            "the typical packet is not exactly 5 ms after the one before it"
         )
 
         // And they are in the future by roughly the target when they are sent.
@@ -190,6 +186,31 @@ final class LanReceiverOutputTests: XCTestCase {
             "the newest packet's play time had already passed when it was sent"
         )
         XCTAssertLessThan(lastPlayAt - observedAtNs, targetNs * 3)
+    }
+
+    func testWithoutHardwareStampsTheTimelineFallsBackToTheEstimator() throws {
+        // `SCKCapture` publishes no timestamps, so the leg has to keep
+        // working from the write cursor alone. The bar is lower — the
+        // estimator servos itself and those corrections show up as spacing
+        // jitter — but the stream must still be continuous, monotonic and at
+        // the ring's rate.
+        let link = try makeLink(hardwareStamps: false)
+        XCTAssertTrue(
+            receiver.wait(upTo: 10) { $0.packets.count >= 200 },
+            "audio never started: \(link.snapshot)"
+        )
+        let packets = receiver.snapshot.packets
+        let times = packets.map(\.header.playAtNs)
+        var spacings: [UInt64] = []
+        for index in 1..<times.count {
+            XCTAssertGreaterThan(times[index], times[index - 1])
+            spacings.append(times[index] - times[index - 1])
+        }
+        let median = spacings.sorted()[spacings.count / 2]
+        let drift = abs(Double(median) - Double(LanPcmWire.packetDurationNs))
+            / Double(LanPcmWire.packetDurationNs)
+        XCTAssertLessThan(drift, 500e-6,
+                          "median spacing \(median) ns is \(drift * 1e6) ppm off")
     }
 
     func testTheAudioIsTheRingsAudioAndNotSilence() throws {
