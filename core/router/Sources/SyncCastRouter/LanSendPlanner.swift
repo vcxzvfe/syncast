@@ -58,6 +58,47 @@ public enum LanSendPlanner {
     /// trip past it is a real event.
     public static let driftResyncLimitMs: Int = 250
 
+    /// How far behind the send ceiling the cursor may sit on the first tick
+    /// after an idle stretch before the gap is skipped rather than played.
+    ///
+    /// One lag plus two packets. The lag is the distance the cursor is
+    /// supposed to hold anyway, and two packets is the slack a tick that
+    /// lands between capture blocks legitimately opens; anything past that on
+    /// a RESUME edge is the silence the producer was not writing, and
+    /// replaying it would put a burst of stale timestamps on the wire ahead
+    /// of the audio that is about to arrive.
+    ///
+    /// Deliberately far tighter than `driftResyncLimitMs`, which is the
+    /// threshold for a cursor that fell behind while the producer kept
+    /// running. That one has to be loose enough that ordinary jitter never
+    /// trips it; this one only ever runs on the single tick where the
+    /// producer starts again, so it can say exactly what it means.
+    public static func gapSkipLimitFrames(
+        lagFrames: Int64,
+        framesPerPacket: Int = LanPcmWire.framesPerPacket
+    ) -> Int64 {
+        max(0, lagFrames) + 2 * Int64(max(1, framesPerPacket))
+    }
+
+    /// Where the cursor should resume from when the producer starts writing
+    /// again after an idle stretch.
+    ///
+    /// - Returns: the frame to jump to, or nil when the existing cursor is
+    ///   close enough to simply carry on — which is the common case for a
+    ///   short pause between tracks.
+    public static func resumeCursor(
+        writePosition: Int64,
+        cursor: Int64?,
+        lagFrames: Int64,
+        framesPerPacket: Int = LanPcmWire.framesPerPacket
+    ) -> Int64? {
+        guard let cursor else { return nil }
+        let ceiling = writePosition - max(0, lagFrames)
+        let limit = gapSkipLimitFrames(lagFrames: lagFrames, framesPerPacket: framesPerPacket)
+        guard ceiling - cursor > limit else { return nil }
+        return ceiling
+    }
+
     /// - Parameters:
     ///   - writePosition: the capture ring's published write cursor.
     ///   - cursor: where we read up to last tick; nil before the first packet.
