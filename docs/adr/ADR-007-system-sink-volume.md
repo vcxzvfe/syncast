@@ -26,8 +26,9 @@ hardware/DDC writes. That works, but:
 - it only handles the KEYS. The menu-bar slider and the HUD stay dead, so the
   system's own volume UI still lies about what is happening.
 
-The user's request was explicit: the macOS volume UI itself should control the
-MacBook Pro speakers + ExternalDisplay playing together, not a key interceptor.
+The request was explicit: the macOS volume UI itself should control the
+built-in speakers and a DisplayPort display's speakers playing together, not a
+key interceptor.
 
 ## Decision
 
@@ -111,10 +112,10 @@ silently half-done.
   from oscillating.
 - **The sink path costs latency that Direct Stereo does not.** Direct Stereo
   has apps render straight into the aggregate — no capture, no ring, ~0 added.
-  The sink path pays the capture chain: on this machine (probe `--latency`,
-  from device properties plus `RingFloorPolicy`) 10.67 ms sink IO buffer +
-  30 ms ring floor + 10.67 ms output IO buffer = **~51 ms added**, against a
-  ≤30 ms target. Device hardware latency (16.62 ms here) is not counted —
+  The sink path pays the capture chain: on the reference machine (probe
+  `--latency`, from device properties plus `RingFloorPolicy`) 10.67 ms sink
+  IO buffer + 30 ms ring floor + 10.67 ms output IO buffer = **~51 ms added**,
+  against a ≤30 ms target. Device hardware latency (16.62 ms here) is not counted —
   every path pays it, SyncCast or not.
 
   **Correction, 2026-09-05.** The first version of this ADR said ~71 ms, of
