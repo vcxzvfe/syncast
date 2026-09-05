@@ -82,11 +82,12 @@ coreaudiod from a composition dictionary and we cannot add controls to one.
 merges two clock domains into one callback and throws away the drift
 compensation and per-device delay machinery that already works. Rejected for
 THIS round on reliability grounds — the ring-buffer chain is the same
-structure the SCK path has run for months — but the measured budget below
-(~71 ms added, target ≤30 ms) means latency is now a live argument for
-revisiting it. The cheaper levers come first: the 50 ms scheduler margin is
-the dominant term and a constant, and declaring the chain latency on the
-driver would restore A/V sync without touching the audio path at all.
+structure the SCK path has run for months — but the budget below (~51 ms
+added at the current default, target ≤30 ms) means latency is still a live
+argument for revisiting it. The cheaper levers come first: the ring floor is
+the dominant term and is now per-instance and tunable, and declaring the chain
+latency on the driver would restore A/V sync without touching the audio path
+at all.
 
 **Make whole-home share the sink observer.** Whole-home's default output is its
 own silent aggregate and its master fader lives in `AudioSocketWriter` on
@@ -110,17 +111,32 @@ silently half-done.
   from oscillating.
 - **The sink path costs latency that Direct Stereo does not.** Direct Stereo
   has apps render straight into the aggregate — no capture, no ring, ~0 added.
-  The sink path pays the capture chain: measured on this machine (probe
-  `--latency`, from device properties) 10.67 ms sink IO buffer + 10.67 ms
-  output IO buffer + 50 ms of `Scheduler.plan(safetyMarginMs:)` ring pre-roll
-  = ~71 ms added, against a ≤30 ms target. The dominant term is pre-existing
-  and shared with the SCK capture path, not introduced here. Two levers exist
-  and neither was pulled in this round: lowering the safety margin (trades
-  dropout headroom, needs a listening test rather than a blind edit), and
-  declaring the chain latency on the driver's `kAudioDevicePropertyLatency` so
-  video players compensate. Until then, video is the case to judge by ear —
-  the player believes audio lands at the sink's presentation time and does not
-  know about the downstream chain.
+  The sink path pays the capture chain: on this machine (probe `--latency`,
+  from device properties plus `RingFloorPolicy`) 10.67 ms sink IO buffer +
+  30 ms ring floor + 10.67 ms output IO buffer = **~51 ms added**, against a
+  ≤30 ms target. Device hardware latency (16.62 ms here) is not counted —
+  every path pays it, SyncCast or not.
+
+  **Correction, 2026-09-05.** The first version of this ADR said ~71 ms, of
+  which 50 ms was `Scheduler.plan(safetyMarginMs:)`. Both halves were wrong.
+  `LocalOutput.render()` copies the Scheduler's `readBackoffFrames` into its
+  state snapshot and never uses it — the read target is `writePosition −
+  ringFloor − hardwareCompensation − block`, and `ringFloor` was a hardcoded
+  4800 frames (100 ms). So the path actually cost ~121 ms, and no amount of
+  Scheduler tuning could have changed it. The 100 ms floor was sized for
+  ScreenCaptureKit's jittery 1024-frame chunks; this path's producer is a
+  Process Tap IOProc delivering regular 512-frame blocks, so it now gets its
+  own 30 ms floor (`SYNCAST_SINK_RING_FLOOR_MS`, 10…500 ms). The SCK and
+  aggregate paths keep 100 ms.
+
+  **The 30 ms floor has NOT been verified by listening yet.** The evidence
+  available so far is arithmetic plus the `resync` / `underrun` / `minWater`
+  counters now in the render diagnostic and the 30 s health line; a run that
+  leaves them at zero is what would promote this from "should hold" to
+  "holds". The remaining lever is declaring the chain latency on the driver's
+  `kAudioDevicePropertyLatency` so video players compensate. Until then, video
+  is the case to judge by ear — the player believes audio lands at the sink's
+  presentation time and does not know about the downstream chain.
 - SyncCast now ships a kernel-adjacent component: a HAL plug-in installed to
   `/Library/Audio/Plug-Ins/HAL` with sudo, whose install restarts coreaudiod.
   The BlackHole fallback exists so the feature works before anyone types a

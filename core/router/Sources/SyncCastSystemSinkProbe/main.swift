@@ -131,11 +131,20 @@ func report() {
 // MARK: - Latency budget
 
 /// Added latency of the sink path, summed from the DEVICE PROPERTIES that
-/// determine it. This is a computed budget, not an acoustic measurement:
-/// SyncCast has no acoustic measurement path (retired 2026-08-09), and a probe
-/// that played test tones out of the speakers would be audible and would fight
-/// the running app. Every term below is read from CoreAudio, and each is
-/// labelled with where it comes from.
+/// determine it plus the ring floor the Router will actually use. This is a
+/// computed budget, not an acoustic measurement: SyncCast has no acoustic
+/// measurement path (retired 2026-08-09), and a probe that played test tones
+/// out of the speakers would be audible and would fight the running app. Every
+/// term below is read from CoreAudio or from `RingFloorPolicy` — the SAME
+/// source the Router reads — and each is labelled with where it comes from.
+///
+/// CORRECTION (2026-09-05): this used to report ~71 ms and blame 50 ms of it
+/// on `Scheduler.plan(safetyMarginMs:)`. That was wrong. `LocalOutput.render()`
+/// copies the Scheduler's `readBackoffFrames` into its state snapshot and then
+/// never uses it; the read target is `writePosition − ringFloor − hardware
+/// compensation − block`, where `ringFloor` was a hardcoded 4800 frames
+/// (100 ms). The path's real cost was ~121 ms, not 71 ms, and the number the
+/// docs quoted could not have been moved by touching the Scheduler at all.
 func latencyBudget() {
     guard let candidate = SystemSinkDevice.resolved,
           let sinkID = deviceID(uid: candidate.uid) else {
@@ -173,28 +182,55 @@ func latencyBudget() {
         print("output hardware    : \(Int(outputHardware)) frames  \(ms(outputHardware))   [device presentation latency — paid on EVERY path, not added by us]")
     }
 
-    // The dominant term, and it is not new: Scheduler.plan books local outputs
-    // at 12 ms and then adds a 50 ms safety margin, so a local-only session
-    // reads the ring 50 ms behind the write cursor. The existing SCK capture
-    // path pays exactly the same; Direct Stereo pays none of it because there
-    // is no ring at all (apps render straight to the aggregate).
-    let schedulerMarginMs = 50.0
-    print("ring backoff       : \(Int(schedulerMarginMs / 1000 * rate)) frames  \(String(format: "%.2f ms", schedulerMarginMs))   [Scheduler.plan safetyMarginMs, unchanged from the SCK path]")
+    // The dominant term: the ring floor LocalOutput renders behind the
+    // producer. This is the ONLY ring term that exists — the Scheduler's
+    // backoff never reaches the read target. Read through RingFloorPolicy with
+    // the same env override the Router honours, so this line and the running
+    // app cannot disagree.
+    let resolved = RingFloorPolicy.resolveSinkFloorMs()
+    if let warning = resolved.warning {
+        print("WARNING            : \(warning)")
+    }
+    let floorFrames = Double(RingFloorPolicy.frames(ms: resolved.ms, sampleRate: rate))
+    let floorSource: String
+    if resolved.warning != nil {
+        floorSource = "default — the \(RingFloorPolicy.sinkFloorEnvVar) override was rejected"
+    } else if ProcessInfo.processInfo.environment[RingFloorPolicy.sinkFloorEnvVar] != nil {
+        floorSource = RingFloorPolicy.sinkFloorEnvVar
+    } else {
+        floorSource = "default"
+    }
+    print("ring floor         : \(Int(floorFrames)) frames  \(ms(floorFrames))   [LocalOutput read target, sink path; \(floorSource)]")
+    print("                     (SCK / aggregate paths still use \(RingFloorPolicy.legacyFloorMs) ms)")
 
-    let added = (sinkBuffer + outputBuffer) / rate * 1000 + schedulerMarginMs
+    let added = (sinkBuffer + floorFrames + outputBuffer) / rate * 1000
+    let target = 30.0
     print("")
-    print("ADDED by the sink path : \(String(format: "%.2f", added)) ms  (target was <= 30 ms — NOT met)")
-    print("  dominated by the \(Int(schedulerMarginMs)) ms scheduler safety margin, which is pre-existing")
-    print("  and shared with the SCK capture path. Levers, in order of size:")
-    print("   1. Scheduler.plan(safetyMarginMs:) — 50 ms of ring pre-roll for a")
-    print("      local-only session. Lowering it trades headroom against dropouts")
-    print("      and needs a listening test; NOT tuned blind in this round.")
+    print("ADDED by the sink path : \(String(format: "%.2f", added)) ms"
+        + "  (target <= \(Int(target)) ms — \(added <= target ? "met" : "NOT met"))")
+    print("  = sink IO buffer + ring floor + output IO buffer.")
+    print("  Device hardware latency is NOT counted: every path pays it, including")
+    print("  Direct Stereo and no-SyncCast-at-all.")
+    print("")
+    print("  Previous rounds reported ~71 ms here and blamed 50 ms of it on")
+    print("  Scheduler.plan(safetyMarginMs:). That was WRONG in both directions:")
+    print("  the Scheduler's backoff is copied into LocalOutput's snapshot and")
+    print("  never used, and the ring term was a hardcoded 100 ms floor, so the")
+    print("  real figure was ~121 ms. The floor is now per-instance and defaults")
+    print("  to \(RingFloorPolicy.sinkDefaultFloorMs) ms on this path.")
+    print("")
+    print("  Levers, in order of size:")
+    print("   1. \(RingFloorPolicy.sinkFloorEnvVar) — the ring floor, "
+        + "\(RingFloorPolicy.minFloorMs)...\(RingFloorPolicy.maxFloorMs) ms.")
+    print("      Lower trades dropout headroom for latency. Watch resync/underrun")
+    print("      in the app's health log before keeping a lower value.")
     print("   2. Declare the chain latency on SyncCastAudio.driver's")
     print("      kAudioDevicePropertyLatency so video players compensate and A/V")
     print("      sync is preserved even at this budget. Not implemented yet.")
     print("")
-    print("NOTE: computed from CoreAudio device properties + the Scheduler constant.")
+    print("NOTE: computed from CoreAudio device properties + RingFloorPolicy.")
     print("      NOT an acoustic measurement — SyncCast has no acoustic path (retired 2026-08-09).")
+    print("      Listening verification of the \(RingFloorPolicy.sinkDefaultFloorMs) ms floor is still PENDING.")
 }
 
 // MARK: - Smoke test

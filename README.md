@@ -150,9 +150,32 @@ software gain otherwise). While it runs, the Sound menu shows **SyncCast** (or
 # Which path will run, and which sink is installed:
 ( cd core/router && swift run SyncCastSystemSinkProbe )
 
+# Added-latency budget (read-only, computed from device properties):
+( cd core/router && swift run SyncCastSystemSinkProbe --latency )
+
 # End-to-end check (takes the default output for a few seconds, restores it):
 ( cd core/router && swift run SyncCastSystemSinkProbe --smoke )
 ```
+
+### Latency on the sink path
+
+The sink path adds **~51 ms** on this hardware: 10.7 ms sink IO buffer +
+30 ms ring floor + 10.7 ms output IO buffer. Device hardware latency is not
+counted — every path pays it. Direct Stereo adds ~0, because apps render
+straight into the aggregate with no capture and no ring.
+
+Earlier notes in this repo claimed 71 ms and blamed 50 ms of it on the
+Scheduler's safety margin. That was wrong: the Scheduler's backoff never
+reaches `LocalOutput`'s read target, and the ring term was a hardcoded 100 ms
+floor, so the real figure was ~121 ms. The floor is now sized per producer —
+100 ms for the ScreenCaptureKit paths, 30 ms for the sink path's Process Tap,
+which delivers regular 512-frame blocks and does not need the slack.
+
+Tune it with `SYNCAST_SINK_RING_FLOOR_MS` (10…500; anything else logs a
+warning and uses 30). Lower trades dropout headroom for latency — check the
+`resync` / `underrun` / `minWater` counters in the health lines of
+`~/Library/Logs/SyncCast/launch.log` before keeping a lower value.
+**The 30 ms default has not been verified by listening yet.**
 
 ### Installing the SyncCast audio driver
 

@@ -146,9 +146,28 @@ aggregate 则没有），用 Core Audio Process Tap 把它捕获下来，再把�
 # 看当前会走哪条路径、装了哪台 sink：
 ( cd core/router && swift run SyncCastSystemSinkProbe )
 
+# 看这条路径加了多少延迟（只读，按设备属性算）：
+( cd core/router && swift run SyncCastSystemSinkProbe --latency )
+
 # 端到端自检（会短暂占用默认输出几秒，结束后原样还原）：
 ( cd core/router && swift run SyncCastSystemSinkProbe --smoke )
 ```
+
+### sink 路径的延迟
+
+本机上 sink 路径多加 **~51 ms**：10.7 ms sink IO buffer + 30 ms ring floor +
+10.7 ms 输出 IO buffer。设备自身的硬件呈现延迟不算在内——任何路径都要付。
+Direct Stereo 加 ~0，因为 app 直接渲染进 aggregate，没有采集也没有环形缓冲。
+
+之前仓库里写的“71 ms，其中 50 ms 是 Scheduler 的安全余量”是错的：Scheduler 的
+backoff 根本没有进入 `LocalOutput` 的读取目标，而环形缓冲那一项是写死的 100 ms
+floor，所以真实数字是 ~121 ms。现在 floor 按生产者分开：ScreenCaptureKit 路径
+仍是 100 ms，sink 路径的 Process Tap 稳定给 512 帧块，用 30 ms。
+
+用 `SYNCAST_SINK_RING_FLOOR_MS` 调（10…500，其它值会打警告并回落到 30）。调低
+是拿 dropout 余量换延迟——在决定保留之前，先看
+`~/Library/Logs/SyncCast/launch.log` 健康日志里的 `resync` / `underrun` /
+`minWater` 三个计数器。**30 ms 这个默认值还没有做听感验证。**
 
 ### 安装 SyncCast 音频驱动
 

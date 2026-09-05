@@ -140,6 +140,9 @@ final class AppModel {
     /// would fight a deliberate choice (plugging in headphones is a legitimate
     /// thing to do mid-session), so the user gets a banner and a button.
     private(set) var wholeHomeSinkDisplaced: Bool = false
+    /// Ticks of the 1 Hz poller since the last periodic health line. See
+    /// `AppModel+Health.swift`.
+    var healthLogTicks: Int = 0
     static let airplayDelayMsKey = "syncast.airplayDelayMs"
     /// Fresh-install broadcast-delay default. CORRECTED to 0 to match the
     /// Direction-B timing model (sidecar `DEFAULT_LOCAL_FIFO_DELAY_MS`):
@@ -672,6 +675,7 @@ final class AppModel {
                 await self.refreshWholeHomeSinkState()
                 await self.pollSystemSinkStatus()
                 await self.refreshPairingStates()
+                await self.logPeriodicHealthIfDue()
             }
         }
         // 4. Arm auto-connect. Deliberately after discovery has been started

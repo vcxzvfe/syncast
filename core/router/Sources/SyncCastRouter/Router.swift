@@ -695,7 +695,18 @@ public actor Router {
             } else {
                 label = String(id.prefix(6))
             }
-            renderInfo += " render[\(label)]=ticks:\(out.renderTickCount) peak:\(String(format: "%.4f", out.lastRenderPeak))"
+            // `floor` is the added latency this output is paying and the three
+            // glitch counters say whether that floor is holding: a headless run
+            // proves "no glitches in N minutes" by showing resync/underrun
+            // unchanged while ticks climbs. `schedBackoff` sits beside them
+            // because it does NOT move the read cursor (see
+            // LocalOutput._readBackoffFrames) and reading the two as one number
+            // is how the 71 ms latency claim got written down wrong.
+            renderInfo += " render[\(label)]=ticks:\(out.renderTickCount)"
+                + " peak:\(String(format: "%.4f", out.lastRenderPeak))"
+                + " floor:\(String(format: "%.0fms", RingFloorPolicy.milliseconds(frames: out.ringFloorFrames, sampleRate: out.sampleRate)))"
+                + " \(out.glitchSummary())"
+                + " schedBackoff:\(out.readBackoffFramesDiagnostic)"
         }
         var awInfo = ""
         if let aw = audioWriter {
@@ -709,7 +720,13 @@ public actor Router {
         } else if let direct = directStereoOutput, direct.isActive {
             driverInfo = " driver=directStereo"
         } else if let sink = systemSink, sink.isActive {
-            driverInfo = " driver=systemSink(\(aggregateDevice != nil ? aggregateCoveredUIDs.count : localOutputs.count))"
+            let floorMs = RingFloorPolicy.milliseconds(
+                frames: ringFloorFrames(logWarnings: false),
+                sampleRate: activeCapture.sampleRate
+            )
+            driverInfo = " driver=systemSink("
+                + "\(aggregateDevice != nil ? aggregateCoveredUIDs.count : localOutputs.count)"
+                + ",floor=\(String(format: "%.0fms", floorMs)))"
         } else if aggregateDevice != nil {
             driverInfo = " driver=aggregate(\(aggregateCoveredUIDs.count))"
         } else if !localOutputs.isEmpty {
@@ -2005,6 +2022,39 @@ public actor Router {
         sinkCapture ?? capture
     }
 
+    /// How far behind the producer a freshly opened AUHAL should render.
+    ///
+    /// Keyed on WHICH producer is feeding the ring, not on which mode the user
+    /// picked: ScreenCaptureKit's 1024-frame chunks arrive on a media-service
+    /// thread we do not control and need the historical 100 ms of slack, while
+    /// the sink path's Process Tap is a HAL IOProc delivering regular
+    /// 512-frame blocks and only needs ~3 of them. The difference is pure A/V
+    /// lag, so it is worth keeping them apart. `SYNCAST_SINK_RING_FLOOR_MS`
+    /// overrides the sink figure (10…500; anything else logs and falls back).
+    private var localOutputRingFloorFrames: Int {
+        ringFloorFrames(logWarnings: true)
+    }
+
+    /// `logWarnings: false` is for read-only callers (the diagnostic line), so
+    /// polling a report never emits log lines.
+    private func ringFloorFrames(logWarnings: Bool) -> Int {
+        let source = activeCapture
+        guard sinkCapture != nil else {
+            return RingFloorPolicy.frames(
+                ms: RingFloorPolicy.legacyFloorMs, sampleRate: source.sampleRate
+            )
+        }
+        let resolved = RingFloorPolicy.resolveSinkFloorMs()
+        if logWarnings, let warning = resolved.warning, warning != lastSinkFloorWarning {
+            lastSinkFloorWarning = warning
+            FileHandle.standardError.write(Data("[Router] \(warning)\n".utf8))
+        }
+        return RingFloorPolicy.frames(ms: resolved.ms, sampleRate: source.sampleRate)
+    }
+    /// Last emitted floor-override warning, so a bad env var is reported once
+    /// per distinct value instead of on every AUHAL open.
+    private var lastSinkFloorWarning: String?
+
     private func openIndividualAUHAL(deviceID: String, uid: String, name: String) {
         guard let coreAudioID = try? Capture.deviceID(forUID: uid),
               coreAudioID != 0 else {
@@ -2016,7 +2066,8 @@ public actor Router {
             deviceID: coreAudioID, deviceUID: uid,
             ring: source.ringBuffer,
             sampleRate: source.sampleRate,
-            channelCount: source.channelCount
+            channelCount: source.channelCount,
+            ringFloorFrames: localOutputRingFloorFrames
         )
         do {
             try out.start()
@@ -2079,7 +2130,8 @@ public actor Router {
             ring: source.ringBuffer,
             sampleRate: source.sampleRate,
             channelCount: source.channelCount,
-            outputChannelCount: agg.outputChannelCount
+            outputChannelCount: agg.outputChannelCount,
+            ringFloorFrames: localOutputRingFloorFrames
         )
         do {
             try out.start()
