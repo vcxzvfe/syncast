@@ -73,10 +73,14 @@ branch. What changed and what was verified:
 
 Verified by `tests/run_property_sweep.sh` on 2026-09-05, macOS 26, Apple silicon:
 
-- plain vs the universal bundle: 2477 checks, 0 failures
-- ASan + UBSan: 2555 checks, 0 failures, no sanitizer reports
-- TSan: 2571 checks, 0 failures, no data races (~3.9M `GetZeroTimeStamp` calls
+- plain vs the universal bundle: ~2.5k checks, 0 failures
+- ASan + UBSan: ~2.5k checks, 0 failures, no sanitizer reports
+- TSan: ~2.5k checks, 0 failures, no data races (~3.9M `GetZeroTimeStamp` calls
   against ~230k property operations in the contention phase)
+
+(The exact check count moves a little between runs: the timeline and contention
+phases assert once per poll, so the total depends on how many polls fit in the
+wall-clock budget. Only "0 failures" is meaningful.)
 - timeline: 2 s of polling produced 4 steps of exactly 19200 frames, worst
   period error below the timer resolution
 - persistence: 200 volume steps in one burst → 0–1 storage writes; one step
