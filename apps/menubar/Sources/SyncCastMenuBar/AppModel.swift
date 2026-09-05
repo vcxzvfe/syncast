@@ -1097,14 +1097,16 @@ final class AppModel {
     }
 
     // BlackHole detection removed — SCK doesn't need it, and whole-home mode
-    // now resolves BlackHole itself in `WholeHomeSinkOutput.resolveBlackHoleUID`,
-    // which throws a user-actionable `blackHoleNotInstalled` out of
-    // `Router.start` instead of leaving the UI to guess.
+    // now resolves its silent sink itself in
+    // `WholeHomeSinkOutput.resolveSilentSinkUID` (SyncCast's own driver first,
+    // BlackHole 2ch as fallback), which throws a user-actionable
+    // `noSilentSinkInstalled` out of `Router.start` instead of leaving the UI
+    // to guess.
     private func detectBlackHole(in dev: Device) { /* no-op, retained for call-site compat */ }
 
     /// When the set of enabled devices changes (or whole-house mode flips),
-    /// reconcile the audio engine: start it if we have BlackHole + at least
-    /// one enabled output, stop it otherwise.
+    /// reconcile the audio engine: start it if we have a silent sink + at
+    /// least one enabled output, stop it otherwise.
     func reconcileEngine() {
         // Coalesce rapid-fire callers (toggleDevice / setVolume / toggleMute /
         // permission watcher). 30 ms is short enough that single-tap toggles
@@ -2913,11 +2915,11 @@ final class AppModel {
     ///     construction (`IsPrivate=1`), filtered as belt-and-braces.
     ///   - `DirectStereoOutput`  — public Direct Stereo aggregate; selecting it
     ///     would nest it inside itself.
-    ///   - `WholeHomeSinkOutput` — public "AirPlay 全屋" wrapper around
-    ///     BlackHole. It does NOT contain "blackhole" in its name, so the name
-    ///     check below cannot catch it, and enabling it would close a feedback
-    ///     loop (bridge → sink → BlackHole → ScreenCaptureKit → OwnTone →
-    ///     bridge).
+    ///   - `WholeHomeSinkOutput` — public "AirPlay 全屋" wrapper around the
+    ///     silent sink. It does NOT contain "blackhole" in its name, so the
+    ///     name check below cannot catch it, and enabling it would close a
+    ///     feedback loop (bridge → sink → silent device → ScreenCaptureKit →
+    ///     OwnTone → bridge).
     ///   - `SystemSinkDevice`   — the virtual sink that owns the system
     ///     volume on the sink path. Selecting it as an OUTPUT would route our
     ///     own fan-out back into the device we tap.

@@ -188,6 +188,15 @@ sudo bash scripts/install-driver.sh --uninstall
 路径（那条路依然靠媒体键 event tap）。可用 `SYNCAST_STEREO_PATH=sink|direct|capture`
 强制指定。
 
+全屋模式藏在「AirPlay 全屋」后面的那台静音设备走的是同一套优先级，所以
+**BlackHole 在任何模式下都只是兜底、可以不装**。装好 `SyncCastAudio.driver`
+之后可以直接卸掉它：
+
+```bash
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver
+sudo killall coreaudiod
+```
+
 ---
 
 ## 使用方法

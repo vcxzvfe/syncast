@@ -109,7 +109,7 @@ Or build from source — see below.
 SyncCast isn't notarized yet, so you build it locally. Three steps:
 
 ```bash
-# 1) Clone and bootstrap (BlackHole + OwnTone + Python deps)
+# 1) Clone and bootstrap (silent sink + OwnTone + Python deps)
 git clone https://github.com/<your-user>/syncast.git
 cd syncast
 ./scripts/bootstrap.sh
@@ -199,6 +199,15 @@ If the driver is not installed, SyncCast falls back to **BlackHole 2ch** when
 that is present, and to the legacy Direct Stereo path (which still uses the
 media-key event tap) when neither is. Force a path with
 `SYNCAST_STEREO_PATH=sink|direct|capture`.
+
+Whole-home mode uses the same preference order for the silent device it hides
+behind 「AirPlay 全屋」, so **BlackHole is optional in every mode**. Once
+`SyncCastAudio.driver` is installed you can remove it:
+
+```bash
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver
+sudo killall coreaudiod
+```
 
 ## Usage
 

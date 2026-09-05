@@ -1265,11 +1265,16 @@ public actor Router {
             // driver path, defeating the purpose.
             if uid.hasPrefix(AggregateDevice.uidPrefix) { return nil }
             if uid.hasPrefix(DirectStereoOutput.uidPrefix) { return nil }
-            // Our own whole-home sink wraps BlackHole under a friendly name,
-            // so the name-based filter below cannot see it. Rendering a bridge
-            // into it would close a feedback loop: bridge → sink → BlackHole →
-            // ScreenCaptureKit → OwnTone → bridge.
+            // Our own whole-home sink wraps the silent device under a
+            // friendly name, so the name-based filter below cannot see it.
+            // Rendering a bridge into it would close a feedback loop:
+            // bridge → sink → silent device → ScreenCaptureKit → OwnTone →
+            // bridge.
             if uid.hasPrefix(WholeHomeSinkOutput.uidPrefix) { return nil }
+            // The raw silent sinks themselves. BlackHole is caught by the name
+            // filter below, but `SyncCastAudio_UID` is named "SyncCast" and
+            // would sail straight through it into the same feedback loop.
+            if SystemSinkDevice.isSinkUID(uid) { return nil }
             // Same blackhole filter as stereo mode — never route audio
             // back into the loopback source.
             if dev.name.lowercased().contains("blackhole") { return nil }
@@ -1918,9 +1923,10 @@ public actor Router {
 
     /// Install the named silent sink as the macOS default output.
     /// Idempotent — safe to call from every whole-home start path.
-    /// Throws `WholeHomeSinkOutput.WholeHomeSinkError.blackHoleNotInstalled`
-    /// when the loopback driver is missing, which is the one condition that
-    /// used to fail silently into double-played audio.
+    /// Throws `WholeHomeSinkOutput.WholeHomeSinkError.noSilentSinkInstalled`
+    /// when neither SyncCast's own driver nor BlackHole 2ch is installed,
+    /// which is the one condition that used to fail silently into
+    /// double-played audio.
     private func startWholeHomeSink() throws {
         guard WholeHomeSinkOutput.enabled else { return }
         let sink = wholeHomeSink ?? WholeHomeSinkOutput()
