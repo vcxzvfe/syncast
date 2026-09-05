@@ -1914,6 +1914,114 @@ public actor Router {
         }
     }
 
+    // MARK: - Per-device equalizer
+    //
+    // One tone curve per physical output, keyed by CoreAudio UID and applied
+    // inside `LocalOutput.render()` on that device's own channel pair. The
+    // Router keeps the whole map rather than pushing one-shot edits so that a
+    // device which is re-plugged, re-enabled, or lands in a rebuilt aggregate
+    // picks its curve straight back up: `applyEqualizers()` runs on every
+    // driver reconcile and every replan, and is a no-op when nothing moved.
+    //
+    // SCOPE: this is the `localOutputs` path — Local Stereo on the system-sink
+    // or ScreenCaptureKit legs, individual or aggregate. It does NOT cover
+    // Direct Stereo (the HAL renders straight to the public aggregate, we
+    // never see the samples) and it does NOT cover whole-home (audio flows
+    // through OwnTone into `localBridges`). Both are stated in the UI so a
+    // hidden control is never mistaken for a broken one.
+
+    /// User curves keyed by CoreAudio UID. Absent means flat.
+    private var equalizerSettingsByUID: [String: EqualizerSettings] = [:]
+
+    /// Replace the whole UID → curve map. The menubar owns the persisted
+    /// store and pushes it in full, which keeps "the user deleted a device's
+    /// curve" and "the user changed it" on the same path.
+    public func setEqualizers(_ settingsByUID: [String: EqualizerSettings]) {
+        var sanitized: [String: EqualizerSettings] = [:]
+        for (uid, settings) in settingsByUID where !uid.isEmpty {
+            let clean = settings.sanitized()
+            // Storing flat curves would make `applyEqualizers` push identical
+            // no-ops forever; absent already means flat.
+            guard !clean.isNeutral || clean.hasUserCurve else { continue }
+            sanitized[uid] = clean
+        }
+        guard sanitized != equalizerSettingsByUID else { return }
+        equalizerSettingsByUID = sanitized
+        applyEqualizers()
+    }
+
+    /// Set (or clear, with `.flat`) one device's curve.
+    public func setEqualizer(uid: String, settings: EqualizerSettings) {
+        guard !uid.isEmpty else { return }
+        var next = equalizerSettingsByUID
+        let clean = settings.sanitized()
+        if clean.isNeutral && !clean.hasUserCurve {
+            next.removeValue(forKey: uid)
+        } else {
+            next[uid] = clean
+        }
+        setEqualizers(next)
+    }
+
+    /// The curves the Router currently holds. Mostly for tests and reports.
+    public func equalizers() -> [String: EqualizerSettings] { equalizerSettingsByUID }
+
+    /// CoreAudio UIDs whose samples this process renders itself, and can
+    /// therefore equalise. Empty on Direct Stereo and in whole-home mode —
+    /// which is exactly the question the UI asks before offering the control.
+    public func equalizableOutputUIDs() -> [String] {
+        equalizerTargets().map(\.uid)
+    }
+
+    /// Per-device limiter counts, keyed by UID. Non-zero means that device's
+    /// curve is pushing the signal past full scale.
+    public func equalizerClipCounts() -> [String: Int64] {
+        // The counter lives on the LocalOutput, not on the pair, so in
+        // aggregate mode every subdevice reports the aggregate AUHAL's total.
+        // Named honestly in the UI ("this output chain is clipping") rather
+        // than pretending to a per-speaker figure we do not have.
+        var result: [String: Int64] = [:]
+        for target in equalizerTargets() {
+            result[target.uid] = target.output.equalizerClipCount
+        }
+        return result
+    }
+
+    /// UID → (AUHAL, channel-pair) for every physical output we render.
+    ///
+    /// Mirrors `applySystemSinkVolumes`'s mapping: in aggregate mode the pair
+    /// comes from the aggregate's subdevice channel offset, in individual mode
+    /// there is one output and one pair. A subdevice whose offset cannot be
+    /// resolved is SKIPPED rather than defaulted to pair 0 — unlike a volume,
+    /// applying the wrong speaker's tone curve is silent and confusing, and
+    /// the fallback would put device B's bass cut on device A.
+    private func equalizerTargets() -> [(uid: String, output: LocalOutput, pair: Int)] {
+        guard mode == .stereo else { return [] }
+        if let aggregate = aggregateDevice,
+           let output = localOutputs[aggregate.aggregateUID] {
+            return aggregateUIDByDeviceID.values.compactMap { uid in
+                guard let offset = aggregate.subdeviceChannelOffset(uid: uid) else {
+                    return nil
+                }
+                return (uid: uid, output: output, pair: offset / max(1, output.channelCount))
+            }
+        }
+        return localOutputs.values.map { (uid: $0.deviceUID, output: $0, pair: 0) }
+    }
+
+    /// Push the stored curves onto the live outputs. Idempotent — a pair
+    /// already holding a curve takes `LocalOutput.setEqualizer`'s no-op path —
+    /// so this rides along with every reconcile and replan rather than needing
+    /// its own trigger.
+    private func applyEqualizers() {
+        for target in equalizerTargets() {
+            target.output.setEqualizer(
+                pair: target.pair,
+                settings: equalizerSettingsByUID[target.uid] ?? .flat
+            )
+        }
+    }
+
     // MARK: - Whole-home system sink ("AirPlay 全屋")
 
     /// Install the named silent sink as the macOS default output.
@@ -2056,6 +2164,11 @@ public actor Router {
                 openAggregateAUHAL(enabled: enabled, nameByUID: nameByUID)
             }
         }
+        // A rebuilt driver has fresh, flat AUHALs. Re-seed the user's curves
+        // here — this is the one place that sees every open/close, so a
+        // re-plugged monitor gets its tone control back without the menubar
+        // having to notice the transition.
+        applyEqualizers()
     }
 
     /// The producer the local outputs read from.
@@ -2587,6 +2700,11 @@ public actor Router {
             )
         }
         applySystemSinkVolumes()
+        // Cheap and idempotent (an unchanged curve takes the bank's no-op
+        // path), so it rides along with every replan the way the delay trims
+        // do, and covers any path that reopens an AUHAL without going through
+        // `reconcileLocalDriver`.
+        applyEqualizers()
 
         // In aggregate mode, also apply per-device HARDWARE volume on
         // the underlying physical DACs. The single AUHAL atop the
