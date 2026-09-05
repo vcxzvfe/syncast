@@ -302,10 +302,108 @@ floor 重新建起来），这次重锚同样不计——它是预期行为。
 
 ## 6. 没做（明确划界）
 
-- **whole-home 保持原样**：它的默认输出是自己的「AirPlay 全屋」aggregate（无音量
+- **whole-home 的音量保持原样**（设备选择这条轴见 §7）：它的默认输出是自己的
+  「AirPlay 全屋」aggregate（无音量
   控制），主音量在 `AudioSocketWriter` 里、走 OwnTone 的 −30 dB 曲线，跟 sink 的
   scalar 不是一个量纲；`wholeHomeVolumeKeyEligible` 因此保留事件 tap。把它接到同
   一个 sink 观察器上并不便宜（要么让 whole-home 也用可调音量的 sink 当默认输出，
   要么在两条音量曲线之间做映射），本轮不做。
 - 自动连接 profile（Track B，`feat/auto-connect` 并行）。
 - Sidecar / Python 侧无改动。
+
+---
+
+## 7. BlackHole 可卸载（2026-09-05 补，分支 `fix/wholehome-sink-syncast`）
+
+§6 说的「whole-home 保持原样」只针对**音量**那条轴（whole-home 的主音量仍然在
+`AudioSocketWriter` 里走 OwnTone 曲线，没变）。**用哪台静音设备**这条轴改了。
+
+### 7.1 改了什么
+
+`WholeHomeSinkOutput` 原来硬性要求 BlackHole 2ch：「AirPlay 全屋」这个 public
+aggregate 的唯一 subdevice 写死成 `BlackHole2ch_UID`，找不到就抛
+`blackHoleNotInstalled`。现在它跟 Stereo 的 sink 路径**共用同一份优先级表**
+（`SystemSinkDevice.candidates`，不是抄一份）：
+
+| 排名 | UID | 说明 |
+|---|---|---|
+| 0 | `SyncCastAudio_UID` | SyncCast 自己的驱动，名字显示为 "SyncCast" |
+| 1 | `BlackHole2ch_UID` | 兜底，给没装过驱动的机器 |
+
+两个都装 → 用 SyncCast 的；只装一个 → 用那个；一个都没有 → 再按
+「名字含 blackhole 且输出恰好 2 声道」扫一遍（应对 16ch 版 / 改过包名的安装），
+还是没有才抛新的 `noSilentSinkInstalled`，错误文案同时给出两条安装路径。
+
+aggregate 包装层和「AirPlay 全屋」这个名字**不变**：Sound 菜单里的 "SyncCast"
+只说明设备归谁，不说明当前是哪个模式；而且 `sweepOrphans()` 和「被顶掉」横幅都
+是认这个 aggregate 的 UID 前缀的。
+
+### 7.2 为什么随便哪台静音设备都行
+
+whole-home 的捕获是 `SCKCapture`（ScreenCaptureKit），**在 HAL 之上**抓系统音频，
+从来不打开这台 sink 设备。所以：
+
+- **不需要重采样。** SCK 固定 48 kHz；SyncCast 驱动原生 48 kHz
+  （`kDevice_DefaultSampleRate`，另支持 44.1 / 96）；BlackHole 在这台机器上是
+  96 kHz。三者互不相干——sink 的标称采样率根本不在信号通路上。
+  `inheritsSubdeviceSampleRate = true` 因此保留：强行给 aggregate 设采样率会传染
+  给 main subdevice，把一台**共享**设备的采样率替全系统改掉。
+- 对比 `SystemSinkDevice.requiredSampleRate = 48000`：那条路径是拿 Process Tap
+  去 tap 这台设备本身，格式不是 48 kHz 就直接报错，所以它必须钉住。两条路径的
+  差别就在这里，不是随手写的不一致。
+- sink 自己的 `VolumeScalar` 衰减同理，够不到 whole-home 的音频。
+
+### 7.3 还原逻辑（重要）
+
+`isRestorableDefault` 原来只按**名字**拒绝裸 BlackHole。现在多一条按 **UID** 拒绝
+`SystemSinkDevice.isSinkUID(uid)`——因为 SyncCast 驱动的名字就叫 "SyncCast"，
+`blackhole` 这个 needle 永远匹配不上。少了这条，退出 whole-home 时会把一台静音
+设备当成「用户原来的默认输出」还回去，全机所有 app 从此没声音，且没有任何提示。
+
+同理，`Router` 里 whole-home 的本地 bridge 目标过滤新增
+`SystemSinkDevice.isSinkUID` 一条：名字过滤看不见 "SyncCast"，往里渲染会闭合
+`bridge → sink → 静音设备 → SCK → OwnTone → bridge` 这个反馈环。
+
+输出列表侧不用改：`AppModel.isUserSelectableOutput` 早就有
+`SystemSinkDevice.isSinkUID` 这一条，`applyRememberedWholeHomeLocalOutputs` 走的是
+`isSelectableInMode`，`WholeHomeMemberStore` 只存/回放用户实际启用过的 UID，
+不会凭空提供这台设备。
+
+### 7.4 用户操作：卸载 BlackHole
+
+前提：`SyncCastAudio.driver` 已经装好并加载（Sound 菜单里能看到 "SyncCast"）。
+本机 2026-09-05 状态：两个驱动都在 `/Library/Audio/Plug-Ins/HAL/`，SyncCast 设备
+id = 144。
+
+```bash
+# 0) 先确认驱动在位（应输出 SyncCastAudio.driver）
+ls -d /Library/Audio/Plug-Ins/HAL/*.driver
+
+# 1) 退出 SyncCast（别在 whole-home 或 Stereo sink 路径运行时拔设备）
+
+# 2) 卸载 BlackHole
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver && sudo killall coreaudiod
+```
+
+`killall coreaudiod` 会让全机音频断一两秒并重新枚举设备，这是正常的。
+（用 `brew` 装的话 `brew uninstall --cask blackhole-2ch` 等效，但它同样要 sudo，
+而且不会替你重启 coreaudiod。）
+
+卸完检查：
+
+1. `ls -d /Library/Audio/Plug-Ins/HAL/*.driver` → 不再有 `BlackHole2ch.driver`。
+2. `( cd core/router && swift run SyncCastSystemSinkProbe )` → sink 应报
+   `SyncCastAudio_UID`，路径为 sink。
+3. 启动 SyncCast，切到 **whole-home**：System Settings → 声音 的输出应变成
+   **「AirPlay 全屋」**；`RouterLog` 里 `whole-home sink active:` 那行应是
+   `sub=SyncCastAudio_UID`。
+4. 退出 whole-home（或退出 app）：默认输出应回到你原来的喇叭，**不是**
+   "SyncCast"。
+5. 反悔的话 `brew install --cask blackhole-2ch` 随时装回来，代码里的兜底分支
+   没有删。
+
+### 7.5 未验证
+
+whole-home 以 `SyncCastAudio_UID` 作 sink 的**真实播放**（AirPlay 接收端 +
+本地喇叭同时出声、无双播、退出后默认输出正确还原）只能人工验证——本轮的自动化
+只覆盖到纯逻辑（优先级、错误文案、还原白名单）。

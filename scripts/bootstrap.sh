@@ -20,12 +20,32 @@ if ! command -v brew >/dev/null 2>&1; then
   fail "Homebrew not found. Install from https://brew.sh and re-run."
 fi
 
-# 1. BlackHole 2ch — virtual audio driver used as our capture source.
-if ! system_profiler SPAudioDataType 2>/dev/null | grep -qi 'BlackHole 2ch'; then
-  log "Installing BlackHole 2ch (virtual audio driver)…"
-  brew install --cask blackhole-2ch
+# 1. Silent virtual audio device.
+#
+# Both the local Stereo sink path and whole-home mode need ONE silent virtual
+# output device. Two are accepted, in this preference order:
+#
+#   1. SyncCast's own driver (drivers/SyncCastAudio, UID SyncCastAudio_UID) —
+#      installed with `sudo bash scripts/install-driver.sh`, or from the app's
+#      「安装 SyncCast 音频驱动」 menu item. Preferred: output-only, named
+#      "SyncCast", and not shared with whatever else the user set up.
+#   2. BlackHole 2ch — the fallback, kept working for machines that never ran
+#      the sudo-requiring driver install.
+#
+# So BlackHole is OPTIONAL. This script installs it only when SyncCast's own
+# driver is absent, and never uninstalls anything. If you already have the
+# SyncCast driver loaded you can remove BlackHole:
+#   sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver && sudo killall coreaudiod
+if [[ -d /Library/Audio/Plug-Ins/HAL/SyncCastAudio.driver ]]; then
+  log "SyncCast audio driver already installed — BlackHole is not needed."
+elif system_profiler SPAudioDataType 2>/dev/null | grep -qi 'BlackHole 2ch'; then
+  log "BlackHole 2ch already installed (fallback sink)."
+  log "  Optional upgrade: sudo bash scripts/install-driver.sh, then you may"
+  log "  uninstall BlackHole."
 else
-  log "BlackHole 2ch already installed."
+  log "No silent sink found. Installing BlackHole 2ch as the fallback…"
+  log "  (Recommended instead/afterwards: sudo bash scripts/install-driver.sh)"
+  brew install --cask blackhole-2ch
 fi
 
 # 2. OwnTone — AirPlay 2 multi-target sender (ADR-006).
@@ -74,11 +94,17 @@ log "Installing sidecar Python deps…"
 cat <<'EOF'
 
 Next steps:
-  • You no longer need to select "BlackHole 2ch" by hand. Entering whole-home
+  • Recommended: install SyncCast's own audio driver —
+        sudo bash scripts/install-driver.sh
+    It is preferred over BlackHole by BOTH the local Stereo sink path and
+    whole-home mode, and once it is loaded BlackHole can be uninstalled:
+        sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver
+        sudo killall coreaudiod
+  • You never need to select the silent device by hand. Entering whole-home
     mode switches the system output to  "AirPlay 全屋"  (a SyncCast-owned
-    wrapper around BlackHole) and restores your previous output on exit.
-    Note that the macOS volume slider is greyed out while it is selected —
-    use SyncCast's own panel for volume.
+    wrapper around whichever silent device is installed) and restores your
+    previous output on exit. Note that the macOS volume slider is greyed out
+    while it is selected — use SyncCast's own panel for volume.
   • If you want the Mac mini in your group, enable
     System Settings → General → AirDrop & Handoff → AirPlay Receiver
     on that Mac and set "Allow AirPlay for: Anyone on the same network".
