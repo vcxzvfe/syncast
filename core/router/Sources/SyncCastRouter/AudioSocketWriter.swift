@@ -10,10 +10,15 @@ import Darwin
 ///
 /// Runs on a dedicated background task; never on a real-time thread.
 public final class AudioSocketWriter: @unchecked Sendable {
+    /// Rate of the stream on this socket. A static as well as an instance
+    /// property so the equalizer bank — which fixes its coefficients at
+    /// construction — can be built in `init` from the one source of truth.
+    public static let wireSampleRate: Double = 48_000
+
     public let socketPath: URL
     public let frameCount = 480
     public let channelCount = 2
-    public let sampleRate: Double = 48_000
+    public let sampleRate: Double = AudioSocketWriter.wireSampleRate
 
     private let ring: RingBuffer
     private var fd: Int32 = -1
@@ -148,9 +153,65 @@ public final class AudioSocketWriter: @unchecked Sendable {
         masterGainLock.withLock { _masterGainCurrent }
     }
 
+    // MARK: - AirPlay group equalizer
+    //
+    // OwnTone sends ONE stream to every receiver: the sidecar hands it this
+    // socket and OwnTone fans the result out. There is no point downstream of
+    // that where a receiver's samples can be shaped on their own, so a
+    // PER-RECEIVER curve is not a feature this architecture can express — the
+    // honest offer is one curve for the whole AirPlay group, applied here.
+    //
+    // Order of the output stages, and why:
+    //
+    //     EQ (bank limiter, ±1) → master gain ramp → clamp → s16
+    //
+    //  * EQ FIRST, so it sits in the same place on the signal as on the local
+    //    legs (`LocalOutput.render` / `LocalAirPlayBridge.render` both put the
+    //    bank ahead of their gain stage). The master fader stays the last
+    //    attenuator, so turning the system down still turns a boosted curve
+    //    down rather than merely quieting a clipped one.
+    //  * The bank's own limiter clamps at full scale and COUNTS what it
+    //    clamped (`equalizerClipCount`). That count is the diagnostic that
+    //    tells the user to pull the trim down; leaving the boost unclamped
+    //    until after the master fader would hide it whenever the fader
+    //    happened to be low, which is exactly when a user stops noticing
+    //    distortion and starts blaming the speaker.
+    //  * The clamp before the s16 conversion stays where it was. It is now a
+    //    backstop rather than the primary limiter (the signal reaching it is
+    //    already inside ±1, and the master gain only attenuates), which is
+    //    what makes it safe for the s16 cast never to wrap.
+    //
+    // This runs on the writer's plain async Task, not a real-time thread, so
+    // the bank's RT contract is met with room to spare. The local bridges get
+    // their own PER-DEVICE curve from the same store; only receivers share.
+
+    /// One pair, matching the socket's stereo format.
+    private let equalizer: EqualizerBank
+
+    /// Install the AirPlay group curve. Idempotent — re-publishing an
+    /// unchanged curve is a no-op — so the Router can re-apply it on every
+    /// replan and on every sidecar reconnect.
+    ///
+    /// - Returns: whether anything was actually published.
+    @discardableResult
+    public func setEqualizer(_ settings: EqualizerSettings) -> Bool {
+        equalizer.setSettings(settings, pair: 0)
+    }
+
+    /// Samples the group equalizer's limiter had to clamp this session.
+    public var equalizerClipCount: Int64 { equalizer.clipCount }
+
+    /// True when the group curve changes the signal.
+    public var equalizerIsEngaged: Bool { equalizer.isEngaged }
+
     public init(ring: RingBuffer, socketPath: URL) {
         self.ring = ring
         self.socketPath = socketPath
+        self.equalizer = EqualizerBank(
+            pairCount: 1,
+            channelsPerPair: 2,
+            sampleRate: AudioSocketWriter.wireSampleRate
+        )
     }
 
     public func start() throws {
@@ -242,10 +303,28 @@ public final class AudioSocketWriter: @unchecked Sendable {
     private func runLoop() async {
         let bytesPerPacket = frameCount * channelCount * MemoryLayout<Int16>.size
         var packet = [Int16](repeating: 0, count: frameCount * channelCount)
-        var planar = [[Float]](
-            repeating: [Float](repeating: 0, count: frameCount),
-            count: channelCount
-        )
+        // Planar staging, heap-allocated once for the life of the loop rather
+        // than as a `[[Float]]`. Both consumers below (`RingBuffer.read` and
+        // `EqualizerBank.process`) want a channel-pointer TABLE, and taking
+        // one out of a Swift array means letting `baseAddress` escape its
+        // `withUnsafeMutableBufferPointer` closure — which this loop used to
+        // do. Allocating the slabs outright makes the pointers legitimately
+        // stable instead of relying on the array's storage not moving.
+        let planar: [UnsafeMutablePointer<Float>] = (0..<channelCount).map { _ in
+            let slab = UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
+            slab.initialize(repeating: 0, count: frameCount)
+            return slab
+        }
+        let planarTable = UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+            .allocate(capacity: channelCount)
+        for ch in 0..<channelCount { planarTable[ch] = planar[ch] }
+        defer {
+            planarTable.deallocate()
+            for slab in planar {
+                slab.deinitialize(count: frameCount)
+                slab.deallocate()
+            }
+        }
 
         // CRITICAL: pace at exactly real-time rate. Without this, the
         // previous version drained the ring at whatever rate the loop
@@ -318,47 +397,20 @@ public final class AudioSocketWriter: @unchecked Sendable {
                 // on the wire) and AirPlay receivers playing one initial
                 // burst then going silent forever.
                 for ch in 0..<channelCount {
-                    for f in 0..<frameCount { planar[ch][f] = 0 }
+                    planar[ch].update(repeating: 0, count: frameCount)
                 }
                 underrunPackets &+= 1
             } else {
-                let outPtrs = planar.indices.map { i in
-                    planar[i].withUnsafeMutableBufferPointer { $0.baseAddress! }
-                }
-                ring.read(at: nextRead, frames: frameCount, into: outPtrs)
+                ring.read(at: nextRead, frames: frameCount, into: planarTable)
                 nextRead &+= Int64(frameCount)
             }
 
-            // Master fader + Float→s16 conversion in one pass. One lock
-            // acquisition per packet (not per sample); the ramp itself runs
-            // off loop-local values so the fader can be dragged concurrently
-            // without ever contending here.
-            let masterSnapshot = masterGainLock.withLock {
-                (current: _masterGainCurrent, target: _masterGainTarget)
-            }
-            var gain = masterSnapshot.current
-            let ramping = masterSnapshot.current != masterSnapshot.target
-            let rampFrames = min(frameCount, masterRampFrames)
-            let gainStep = ramping
-                ? (masterSnapshot.target - masterSnapshot.current) / Float(rampFrames)
-                : 0
-            for f in 0..<frameCount {
-                if ramping {
-                    gain = f < rampFrames ? gain + gainStep : masterSnapshot.target
-                }
-                for ch in 0..<channelCount {
-                    let v = planar[ch][f] * gain
-                    let clamped = max(-1.0, min(1.0, v))
-                    packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
-                }
-            }
-            if ramping {
-                // `rampFrames <= frameCount` by construction, so a ramp always
-                // completes within the packet that started it. Persisting the
-                // reached value (rather than the target) keeps this honest if
-                // that ever stops being true.
-                let reached = frameCount >= rampFrames ? masterSnapshot.target : gain
-                masterGainLock.withLock { _masterGainCurrent = reached }
+            packet.withUnsafeMutableBufferPointer { out in
+                renderPacket(
+                    planar: planarTable,
+                    packet: out.baseAddress!,
+                    masterRampFrames: masterRampFrames
+                )
             }
 
             // 3. Send one well-framed packet down the Unix stream socket.
@@ -413,6 +465,75 @@ public final class AudioSocketWriter: @unchecked Sendable {
         }
     }
 
+    /// Turn one packet's worth of planar Float32 into the interleaved s16le
+    /// the socket carries: group EQ, then the master fader's ramp, then the
+    /// clamp, then the cast. See the AirPlay-group-equalizer note above for
+    /// why that is the order.
+    ///
+    /// One lock acquisition per packet (not per sample); the ramp itself runs
+    /// off loop-local values so the fader can be dragged concurrently without
+    /// ever contending here.
+    ///
+    /// Internal rather than inlined in `runLoop` so the stage ORDER — the part
+    /// a test can actually pin — is exercisable without a socket, a sidecar,
+    /// or wall-clock pacing.
+    ///
+    /// - Parameters:
+    ///   - planar: `channelCount` channel pointers, `frameCount` frames each.
+    ///     Equalised IN PLACE.
+    ///   - packet: `frameCount * channelCount` interleaved s16 slots.
+    ///   - masterRampFrames: longest ramp segment, in frames.
+    func renderPacket(
+        planar: UnsafeMutablePointer<UnsafeMutablePointer<Float>>,
+        packet: UnsafeMutablePointer<Int16>,
+        masterRampFrames: Int
+    ) {
+        // AirPlay group tone control, ahead of the master fader. A flat curve
+        // takes the bank's fast exit and leaves the samples byte-identical, so
+        // a user who never opens the group EQ gets the pre-feature wire format
+        // exactly. Silence from an underrun is fed through too, deliberately:
+        // the filter state has to keep decaying, or the next real packet would
+        // splice onto a stale tail.
+        equalizer.process(
+            pair: 0,
+            channels: planar,
+            channelOffset: 0,
+            channelCount: channelCount,
+            frames: frameCount
+        )
+
+        let masterSnapshot = masterGainLock.withLock {
+            (current: _masterGainCurrent, target: _masterGainTarget)
+        }
+        var gain = masterSnapshot.current
+        let ramping = masterSnapshot.current != masterSnapshot.target
+        let rampFrames = min(frameCount, max(1, masterRampFrames))
+        let gainStep = ramping
+            ? (masterSnapshot.target - masterSnapshot.current) / Float(rampFrames)
+            : 0
+        for f in 0..<frameCount {
+            if ramping {
+                gain = f < rampFrames ? gain + gainStep : masterSnapshot.target
+            }
+            for ch in 0..<channelCount {
+                let v = planar[ch][f] * gain
+                // Backstop, not the primary limiter: the equalizer bank has
+                // already brought the signal inside ±1 and the master fader
+                // only attenuates. It is what guarantees the cast below can
+                // never wrap a full-scale sample round to the opposite sign.
+                let clamped = max(-1.0, min(1.0, v))
+                packet[f * channelCount + ch] = Int16(clamped * 32_767.0)
+            }
+        }
+        if ramping {
+            // `rampFrames <= frameCount` by construction, so a ramp always
+            // completes within the packet that started it. Persisting the
+            // reached value (rather than the target) keeps this honest if that
+            // ever stops being true.
+            let reached = frameCount >= rampFrames ? masterSnapshot.target : gain
+            masterGainLock.withLock { _masterGainCurrent = reached }
+        }
+    }
 }
 
 private extension NSLock {
