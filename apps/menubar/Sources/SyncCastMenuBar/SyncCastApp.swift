@@ -7,15 +7,59 @@ import SyncCastRouter
 
 /// File-based logger reachable from `open`-launched apps where stderr is
 /// detached and NSLog is silently dropped by the system log subsystem.
-/// Always writes to ~/Library/Logs/SyncCast/launch.log.
+///
+/// Destination, in order:
+///   1. `SYNCAST_LOG_PATH`, if set to a non-empty path — an explicit override
+///      for scripted runs and for tests that want to READ back what was logged.
+///   2. A per-process file under the temp directory when running inside
+///      XCTest. `swift test` loads the app target, so without this every test
+///      run appended to the user's real log — which it did, dozens of lines
+///      per run, until 2026-09-05.
+///   3. `~/Library/Logs/SyncCast/launch.log` — the real app's log.
 public enum SyncCastLog {
-    private static let path: URL = {
-        let dir = FileManager.default
-            .urls(for: .libraryDirectory, in: .userDomainMask).first!
+    /// Explicit destination override. Takes precedence over the XCTest
+    /// redirect, so a test can point the log at a file it then reads.
+    public static let pathOverrideEnvVar = "SYNCAST_LOG_PATH"
+
+    /// Where a given environment sends the log. Pure, so the routing rule is
+    /// testable without touching the filesystem.
+    static func resolvePath(
+        environment: [String: String],
+        libraryDirectory: URL,
+        temporaryDirectory: URL,
+        processIdentifier: Int32,
+        underXCTest: Bool
+    ) -> URL {
+        if let override = environment[pathOverrideEnvVar],
+           !override.trimmingCharacters(in: .whitespaces).isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        if underXCTest || TestEnvironment.isRunningUnderXCTest(environment: environment) {
+            return temporaryDirectory
+                .appendingPathComponent("SyncCast-tests-\(processIdentifier).log")
+        }
+        return libraryDirectory
             .appendingPathComponent("Logs/SyncCast", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("launch.log")
+            .appendingPathComponent("launch.log")
+    }
+
+    private static let path: URL = {
+        let resolved = resolvePath(
+            environment: ProcessInfo.processInfo.environment,
+            libraryDirectory: FileManager.default
+                .urls(for: .libraryDirectory, in: .userDomainMask).first!,
+            temporaryDirectory: FileManager.default.temporaryDirectory,
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            underXCTest: TestEnvironment.isXCTestFrameworkLoaded
+        )
+        try? FileManager.default.createDirectory(
+            at: resolved.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        return resolved
     }()
+    /// Where this process is actually logging. Exposed so a test (or a support
+    /// request) can say which file to look in rather than guessing.
+    public static var currentPath: String { path.path }
     private static let lock = NSLock()
 
     public static func log(_ msg: String) {

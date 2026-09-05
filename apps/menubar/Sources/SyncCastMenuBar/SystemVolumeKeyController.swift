@@ -113,6 +113,13 @@ final class SystemVolumeKeyController {
 
     func start() {
         guard !started else { return }
+        // Under XCTest this would install a SESSION-WIDE event tap and two
+        // NSEvent monitors, once per test that constructs an AppModel — real
+        // system state, from a unit test, on the developer's own machine. The
+        // capture state stays at its `.needsPermission` initial value and no
+        // callback fires, which is the honest report: nothing is capturing.
+        // `stop()` then finds every handle nil and does nothing.
+        if TestEnvironment.isRunningUnderXCTest { return }
         started = true
         installMonitors()
         observeAccessibilityChanges()
@@ -261,6 +268,11 @@ final class SystemVolumeKeyController {
     // MARK: CGEventTap
 
     private func startTapThread() {
+        // Second XCTest gate. `start()` already declines, but
+        // `recheckPermission` reaches here on its own from the accessibility
+        // notification, so the tap installation itself is the choke point that
+        // has to refuse.
+        if TestEnvironment.isRunningUnderXCTest { return }
         // Main-thread `tapThread` guard FIRST: while a spawned thread is
         // still alive and un-stopped, bumping the generation below would
         // invalidate it (its tap discarded) without starting a successor.
