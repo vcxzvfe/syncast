@@ -15,14 +15,22 @@ public enum Clock {
 
     /// Current monotonic time in nanoseconds.
     public static func nowNs() -> UInt64 {
-        let raw = mach_absolute_time()
-        return raw &* UInt64(info.numer) / UInt64(info.denom)
+        hostTimeToNs(mach_absolute_time())
     }
 
-    /// Convert host-time ticks to nanoseconds (for CoreAudio time stamps which
-    /// use host-time units).
+    /// Convert host-time ticks to nanoseconds (for CoreAudio time stamps,
+    /// which are in host-time units).
+    ///
+    /// Split into whole and remainder rather than multiplied outright: on
+    /// Apple silicon the timebase is 125/3, and a raw `ticks * 125` overflows
+    /// 64 bits after a few years of uptime. The LAN link stamps every packet
+    /// from this, so a wrap here would not be a rounding error.
     public static func hostTimeToNs(_ ticks: UInt64) -> UInt64 {
-        ticks &* UInt64(info.numer) / UInt64(info.denom)
+        let numer = UInt64(info.numer)
+        let denom = UInt64(info.denom)
+        let whole = ticks / denom
+        let rest = ticks % denom
+        return whole &* numer &+ (rest &* numer) / denom
     }
 
     /// Convert nanoseconds to host-time ticks (for AudioUnit scheduled writes).
