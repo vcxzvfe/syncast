@@ -555,6 +555,11 @@ struct MainPopover: View {
                 // and its full-screen-PIN deadlock — cannot arise.
                 if !model.remoteAirPlayDevices.isEmpty {
                     sectionHeader("AirPlay")
+                    // One curve for all receivers, because OwnTone sends them
+                    // one stream. See `AirPlayGroupEqualizerRow`.
+                    if model.airPlayGroupEqualizerIsAvailable {
+                        AirPlayGroupEqualizerRow()
+                    }
                     ForEach(model.remoteAirPlayDevices) { dev in
                         DeviceRow(deviceID: dev.id)
                     }
@@ -746,7 +751,7 @@ private struct DeviceRow: View {
                         // curve would actually be applied — see
                         // `AppModel.equalizerIsAvailable(for:)`.
                         if model.equalizerIsAvailable(for: deviceID) {
-                            EqualizerToggleButton(deviceID: deviceID)
+                            EqualizerToggleButton(target: .device(deviceID))
                         }
                         // Per-row reset appears only when there is something
                         // to reset, so an untouched row gains no chrome —
@@ -823,9 +828,9 @@ private struct DeviceRow: View {
                         LocalDelayTrimControl(deviceID: deviceID)
                     }
                     // Inline equalizer panel for the one row the user opened.
-                    if model.equalizerEditorDeviceID == deviceID,
+                    if model.equalizerEditorTarget == .device(deviceID),
                        model.equalizerIsAvailable(for: deviceID) {
-                        EqualizerEditor(deviceID: deviceID)
+                        EqualizerEditor(target: .device(deviceID))
                     }
                     // A remembered curve that the current path cannot apply
                     // says so, rather than looking as if it were in effect.

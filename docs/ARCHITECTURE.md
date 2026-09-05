@@ -193,11 +193,13 @@ the device and re-applied on every connect.
 - **Clip protection**: hard clamp to ±1.0 with a lock-free count, surfaced as
   `eqClip:<n>` in the diagnostic line (only when non-zero) and as a live
   warning in the editor.
-- **Scope**: the `localOutputs` render path only — Local Stereo on the
-  system-sink or capture legs. NOT Direct Stereo (the HAL renders straight into
-  the public aggregate) and NOT whole-home (audio flows through OwnTone into
-  `LocalAirPlayBridge`). The UI hides the control there and annotates a stored
-  curve that is not being applied.
+- **Scope**: every leg whose samples this process renders — the `localOutputs`
+  pairs in Local Stereo, and in whole-home each `LocalAirPlayBridge` (same UID
+  key, same bank, same position on the signal) plus ONE group curve for all
+  AirPlay receivers together, applied in `AudioSocketWriter` upstream of
+  OwnTone's fan-out under a reserved pseudo-UID. NOT Direct Stereo (the HAL
+  renders straight into the public aggregate); the UI hides the control there
+  and annotates a stored curve that is not being applied.
 - **Re-application**: the Router holds the whole UID → curve map and re-applies
   it at the end of every `reconcileLocalDriver` and every `replan()`, both
   idempotent. That, not the UI, is what makes "每次连接都默认这样" true across a

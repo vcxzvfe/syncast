@@ -442,6 +442,10 @@ public actor Router {
         writer.seedMasterGain(
             VolumeCurve.masterAmplitude(forPercent: masterVolumePercent)
         )
+        // Same reasoning for the AirPlay group curve: a brand-new writer
+        // starts flat and would drop the user's tone setting on the floor at
+        // every sidecar reconnect.
+        writer.setEqualizer(airPlayGroupEqualizer)
         self.audioWriter = writer
     }
 
@@ -710,7 +714,8 @@ public actor Router {
         }
         var awInfo = ""
         if let aw = audioWriter {
-            awInfo = " airplayWriter=pkts:\(aw.packetsSent) underrun:\(aw.underrunPackets) partial:\(aw.partialSends) bytes:\(aw.bytesSent) err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
+            let eqClip = aw.equalizerClipCount
+            awInfo = " airplayWriter=pkts:\(aw.packetsSent) underrun:\(aw.underrunPackets) partial:\(aw.partialSends) bytes:\(aw.bytesSent)\(eqClip > 0 ? " eqClip:\(eqClip)" : "") err:\(aw.lastSendError.isEmpty ? "none" : aw.lastSendError)"
         }
         // Driver mode: most useful in field reports — tells us instantly
         // if the kernel-level synchronized aggregate is engaged or not.
@@ -753,7 +758,11 @@ public actor Router {
         // reported beside it so the audible level is still recoverable.
         var bridgeInfo = ""
         for (id, b) in localBridges {
-            bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) gain:\(String(format: "%.3f", b.lastRenderGain)) err:\(b.lastError.isEmpty ? "none" : b.lastError)"
+            // `eqClip` only once it is non-zero, the same rule
+            // `LocalOutput.glitchSummary()` follows: it is a fault signal, and
+            // a permanent `eqClip:0` would train the reader to skip it.
+            let eqClip = b.equalizerClipCount
+            bridgeInfo += " bridge[\(id.prefix(6))]=pkts:\(b.packetsReceived) ticks:\(b.renderTickCount) peak:\(String(format: "%.4f", b.lastRenderPeak)) gain:\(String(format: "%.3f", b.lastRenderGain))\(eqClip > 0 ? " eqClip:\(eqClip)" : "") err:\(b.lastError.isEmpty ? "none" : b.lastError)"
         }
         let masterInfo =
             " master=\(masterVolumePercent)%"
@@ -1354,6 +1363,11 @@ public actor Router {
         // half needs IPC and is pushed by the caller via
         // `applyDeviceDelayTrims()`.
         applyLocalDelayTrims(normalizedDelayTrims())
+        // Same for the tone curves: a bridge that was just created (or rebuilt
+        // after an AudioDeviceID change) starts flat, and the user's curve for
+        // that UID has to be pushed onto it before it renders anything the
+        // user hears. Idempotent, so re-applying the whole map costs nothing.
+        applyEqualizers()
         scheduleMeasuredAirPlayOffsetPush()
     }
 
@@ -1928,15 +1942,47 @@ public actor Router {
     // picks its curve straight back up: `applyEqualizers()` runs on every
     // driver reconcile and every replan, and is a no-op when nothing moved.
     //
-    // SCOPE: this is the `localOutputs` path — Local Stereo on the system-sink
-    // or ScreenCaptureKit legs, individual or aggregate. It does NOT cover
-    // Direct Stereo (the HAL renders straight to the public aggregate, we
-    // never see the samples) and it does NOT cover whole-home (audio flows
-    // through OwnTone into `localBridges`). Both are stated in the UI so a
+    // SCOPE: every leg whose samples this process renders.
+    //
+    //   * Local Stereo on the system-sink or ScreenCaptureKit legs
+    //     (`localOutputs`), individual or aggregate — one pair per physical
+    //     device.
+    //   * Whole-home local outputs (`localBridges`) — one bridge per physical
+    //     device, rendering OwnTone's fifo broadcast. Same UID key, so a
+    //     speaker tuned in Stereo keeps its curve in whole-home.
+    //   * The whole-home AirPlay leg, as ONE group curve applied upstream in
+    //     `AudioSocketWriter` — see `airPlayGroupEqualizerUID`.
+    //
+    // It does NOT cover Direct Stereo: the HAL renders straight to the public
+    // aggregate and we never see the samples. That is stated in the UI so a
     // hidden control is never mistaken for a broken one.
 
     /// User curves keyed by CoreAudio UID. Absent means flat.
+    ///
+    /// One reserved key, `airPlayGroupEqualizerUID`, is not a CoreAudio device
+    /// at all: it carries the AirPlay group curve. Keeping it in the same map
+    /// means the menubar pushes ONE map, persists it in ONE store, and the
+    /// group curve is remembered exactly like a device's.
     private var equalizerSettingsByUID: [String: EqualizerSettings] = [:]
+
+    /// Reserved pseudo-UID for the AirPlay group curve.
+    ///
+    /// OwnTone sends ONE stream to every receiver — the sidecar's fifo input
+    /// is upstream of the fan-out — so per-receiver equalisation is not
+    /// something this architecture can express at all. What it CAN do is shape
+    /// that single stream, which is what this key means: one curve, applied to
+    /// every AirPlay receiver together.
+    ///
+    /// Namespaced so it cannot collide with a real CoreAudio device UID.
+    public static let airPlayGroupEqualizerUID = "syncast.airplay-group"
+
+    /// The AirPlay group curve currently held, whether or not a writer exists
+    /// to apply it. Kept separate from the writer so a sidecar reconnect
+    /// (which builds a brand-new `AudioSocketWriter`) can re-seed it, exactly
+    /// as the master fader is re-seeded.
+    private var airPlayGroupEqualizer: EqualizerSettings {
+        equalizerSettingsByUID[Self.airPlayGroupEqualizerUID] ?? .flat
+    }
 
     /// Replace the whole UID → curve map. The menubar owns the persisted
     /// store and pushes it in full, which keeps "the user deleted a device's
@@ -1972,10 +2018,17 @@ public actor Router {
     public func equalizers() -> [String: EqualizerSettings] { equalizerSettingsByUID }
 
     /// CoreAudio UIDs whose samples this process renders itself, and can
-    /// therefore equalise. Empty on Direct Stereo and in whole-home mode —
-    /// which is exactly the question the UI asks before offering the control.
+    /// therefore equalise: the local Stereo pairs in stereo mode, the local
+    /// bridges in whole-home mode. Empty on Direct Stereo — which is exactly
+    /// the question the UI asks before offering the control.
+    ///
+    /// The AirPlay group curve is NOT in this list: it is not a device, and
+    /// the UI offers it from its own row.
     public func equalizableOutputUIDs() -> [String] {
-        localPairTargets().map(\.uid)
+        if mode == .wholeHome {
+            return localBridges.values.map(\.deviceUID)
+        }
+        return localPairTargets().map(\.uid)
     }
 
     /// Per-device limiter counts, keyed by UID. Non-zero means that device's
@@ -1988,6 +2041,12 @@ public actor Router {
         var result: [String: Int64] = [:]
         for target in localPairTargets() {
             result[target.uid] = target.output.equalizerClipCount
+        }
+        for bridge in localBridges.values {
+            result[bridge.deviceUID] = bridge.equalizerClipCount
+        }
+        if let writer = audioWriter {
+            result[Self.airPlayGroupEqualizerUID] = writer.equalizerClipCount
         }
         return result
     }
@@ -2030,6 +2089,15 @@ public actor Router {
                 settings: equalizerSettingsByUID[target.uid] ?? .flat
             )
         }
+        // Whole-home local leg. Keyed by the SAME CoreAudio UID as the stereo
+        // path, which is what makes a curve the user dialled in on one mode
+        // apply in the other without re-entering it.
+        for bridge in localBridges.values {
+            bridge.setEqualizer(equalizerSettingsByUID[bridge.deviceUID] ?? .flat)
+        }
+        // Whole-home AirPlay leg: one curve for all receivers, applied
+        // upstream of OwnTone's fan-out.
+        audioWriter?.setEqualizer(airPlayGroupEqualizer)
     }
 
     // MARK: - Per-device delay compensation (local Stereo)

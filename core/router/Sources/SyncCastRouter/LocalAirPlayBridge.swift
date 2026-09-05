@@ -142,7 +142,10 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// backstop at every rate, i.e. strictly more forgiving.
     public static let defaultRingCapacityFrames: Int = 262_144
     public let ringCapacityFrames: Int = LocalAirPlayBridge.defaultRingCapacityFrames
-    private let ring: RingBuffer
+    /// Internal rather than private so a test can fill it and step `render()`
+    /// without a CoreAudio device — the same seam `LocalOutput` gets for free
+    /// by taking its ring by injection (see `LocalOutputDelayRenderTests`).
+    let ring: RingBuffer
 
     // AUHAL state
     private var unit: AudioUnit?
@@ -281,6 +284,21 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// constant regardless of the device's render quantum.
     private static let peakMeasurementSamples: Int = 128
 
+    // MARK: - Tone control (whole-home local leg)
+
+    /// This device's tone curve, applied in `render()` between the ring read
+    /// and the volume ramp — the same position, and the same `EqualizerBank`,
+    /// that `LocalOutput.render()` uses on the local Stereo path. One pair,
+    /// because a bridge drives exactly one physical stereo output.
+    ///
+    /// The curve is keyed by CoreAudio UID upstream (`Router.setEqualizers`),
+    /// so a speaker tuned in Stereo mode sounds the same in whole-home mode
+    /// without the user re-entering anything.
+    ///
+    /// Costs nothing while the curve is flat: `EqualizerBank.process` exits on
+    /// two atomic loads and leaves the buffer byte-identical.
+    private let equalizer: EqualizerBank
+
     // MARK: - Per-device delay trim (user listening-position compensation)
     //
     // The trim is a pure READ-TAP OFFSET: render() reads the ring at
@@ -392,14 +410,37 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         return frames / deviceSampleRate * 1000.0 + Self.packetQuantizationMs
     }
 
+    /// - Parameter renderSampleRate: rate the equalizer's coefficients are
+    ///   computed for. Defaults to the bound device's nominal rate, queried
+    ///   here rather than in `openAudioUnit` because `EqualizerBank` fixes its
+    ///   rate at construction and the bank must exist before the AUHAL can
+    ///   start pulling. `openAudioUnit` re-reads the device rate for the
+    ///   resampler and logs a mismatch (a device that changed rate between
+    ///   these two queries would put the band centres off by that ratio).
+    ///   Tests pass an explicit rate so the render path can be driven without
+    ///   a CoreAudio device.
     public init(
         deviceID: AudioObjectID,
         deviceUID: String,
-        socketPath: URL
+        socketPath: URL,
+        renderSampleRate: Double? = nil
     ) {
         self.deviceID = deviceID
         self.deviceUID = deviceUID
         self.socketPath = socketPath
+        let equalizerRate = renderSampleRate
+            ?? Self.nominalSampleRate(of: deviceID)
+            ?? 44_100
+        self.equalizer = EqualizerBank(
+            pairCount: 1,
+            channelsPerPair: 2,
+            sampleRate: equalizerRate
+        )
+        if let renderSampleRate, renderSampleRate > 0 {
+            // Injected rate: keep every rate-derived quantity self-consistent
+            // before `openAudioUnit` overwrites them from the live device.
+            self.deviceSampleRate = renderSampleRate
+        }
         self.ring = RingBuffer(
             channelCount: 2,
             capacityFrames: Self.defaultRingCapacityFrames
@@ -518,6 +559,38 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     public var currentVolume: Float {
         stateLock.withLock { _volumeGainTarget }
     }
+
+    // MARK: - Equalizer
+
+    /// Install this device's tone curve.
+    ///
+    /// Idempotent: re-installing an unchanged curve returns false without
+    /// touching the render thread, which is what lets the Router re-apply its
+    /// whole UID → curve map on every replan and every bridge rebuild.
+    ///
+    /// - Returns: whether anything was actually published.
+    @discardableResult
+    public func setEqualizer(_ settings: EqualizerSettings) -> Bool {
+        equalizer.setSettings(settings, pair: 0)
+    }
+
+    /// Drop back to flat. Used when a bridge is repurposed so it never
+    /// inherits the previous device's curve.
+    public func resetEqualizer() {
+        equalizer.resetAll()
+    }
+
+    /// Samples the equalizer's output limiter had to clamp this session.
+    /// Non-zero means a boosted band is driving this output past full scale
+    /// and the user wants negative trim.
+    public var equalizerClipCount: Int64 { equalizer.clipCount }
+
+    /// True when this bridge holds a curve that changes the signal.
+    public var equalizerIsEngaged: Bool { equalizer.isEngaged }
+
+    /// Rate the equalizer's coefficients were computed for. Compared against
+    /// the live device rate in `openAudioUnit`.
+    public var equalizerSampleRate: Double { equalizer.sampleRate }
 
     // MARK: - Delay trim
 
@@ -1125,6 +1198,17 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         // doc comment for why we resample explicitly instead of trusting
         // the AUHAL's implicit conversion.
         deviceSampleRate = Self.nominalSampleRate(of: deviceID) ?? inboundSampleRate
+        // The equalizer's coefficients were computed at init, from the same
+        // property. A disagreement means the device changed rate in between,
+        // which puts every band centre off by that ratio — rare, but silent,
+        // so it is logged rather than left to be heard.
+        if deviceSampleRate != equalizer.sampleRate {
+            RouterLog.write(
+                "[Router] bridge: equalizer built for \(equalizer.sampleRate) Hz"
+                    + " but device now runs at \(deviceSampleRate) Hz;"
+                    + " band centres are scaled by that ratio\n"
+            )
+        }
         backoffFrames = Int64((deviceSampleRate * Self.baselineBackoffMs / 1000.0).rounded())
         // Same write-once-before-Start discipline as `backoffFrames`, which is
         // what makes both safe to read unlocked from the render callback.
@@ -1279,7 +1363,9 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
     /// async, NO Swift runtime calls beyond the unfair-lock acquire.
     /// Pipeline: ring read at the Layer-2 cursor → software-gain ramp.
     /// The gain ramp is what suppresses clicks on sudden volume changes.
-    private func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    /// Internal (not private) so the render path can be driven headlessly by
+    /// tests, exactly as `LocalOutput.render` is.
+    func render(frames: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         guard let ioData = ioData else { return noErr }
         let bufList = UnsafeMutableAudioBufferListPointer(ioData)
         if bufList.count < channelCount { return noErr }
@@ -1424,6 +1510,31 @@ public final class LocalAirPlayBridge: @unchecked Sendable {
         let peakChannel = outPtrs[0]
         for i in 0..<peakSamples { pk = max(pk, abs(peakChannel[i])) }
         lastRenderPeak = pk
+
+        // Per-device tone control, in the same place on the signal as on the
+        // local Stereo path: after the source read (here: the ring read plus
+        // any trim cross-fade) and BEFORE the gain stage, so the user's volume
+        // slider stays the last attenuator and a boosted curve that would clip
+        // at unity does not clip once the speaker is turned down. The bank's
+        // own limiter still catches full-scale material plus a boost, and
+        // counts it (`equalizerClipCount`).
+        //
+        // A flat bridge takes the bank's fast exit and leaves the buffer
+        // byte-identical, so a user who never opens the EQ gets the
+        // pre-feature render path exactly.
+        //
+        // Blocks longer than `EqualizerBank.maxFramesPerBlock` (4096) are left
+        // unequalised rather than served from a short scratch buffer — the
+        // bank refuses them. Device quanta are 512–2048 in practice; the
+        // alternative (an allocation on the RT thread) is worse than an
+        // unshaped block.
+        equalizer.process(
+            pair: 0,
+            channels: outPtrs,
+            channelOffset: 0,
+            channelCount: channelCount,
+            frames: frames
+        )
 
         // Software gain: ramp per-sample if current != target, vDSP
         // fast path otherwise. Ramped to suppress click on sudden

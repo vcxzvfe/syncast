@@ -2,41 +2,45 @@ import SwiftUI
 import SyncCastDiscovery
 import SyncCastRouter
 
-/// Row affordance that opens/closes one output's tone panel.
+/// Row affordance that opens/closes one target's tone panel.
 ///
-/// Only ever rendered on a row where the curve would actually be applied —
-/// `AppModel.equalizerIsAvailable(for:)` answers that — so a visible button
+/// Only ever rendered where the curve would actually be applied —
+/// `AppModel.equalizerIsAvailable(target:)` answers that — so a visible button
 /// always does something. The one case where a control appears but is inert is
 /// deliberately NOT offered: on Direct Stereo the samples never reach us, and
 /// a slider that silently changes nothing is worse than no slider.
 struct EqualizerToggleButton: View {
-    let deviceID: String
+    let target: EqualizerTarget
+    /// Tooltip, so the AirPlay group can say what it really is rather than
+    /// claiming to be a speaker's control.
+    var helpText: String = "调音器 · per-speaker equalizer"
 
     @Environment(AppModel.self) private var model
 
-    private var isOpen: Bool { model.equalizerEditorDeviceID == deviceID }
+    private var isOpen: Bool { model.equalizerEditorTarget == target }
 
     var body: some View {
         Button {
-            model.equalizerEditorDeviceID = isOpen ? nil : deviceID
+            model.equalizerEditorTarget = isOpen ? nil : target
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "slider.vertical.3")
                     .font(.system(size: 10))
-                if model.hasEqualizerCurve(for: deviceID) {
+                if model.hasEqualizerCurve(target: target) {
                     Text("EQ")
                         .font(.system(size: 9, weight: .semibold))
                 }
             }
             .foregroundStyle(
-                model.hasEqualizerCurve(for: deviceID) && !model.equalizerIsBypassed(for: deviceID)
+                model.hasEqualizerCurve(target: target)
+                    && !model.equalizerIsBypassed(target: target)
                     ? AnyShapeStyle(.tint)
                     : AnyShapeStyle(HierarchicalShapeStyle.secondary)
             )
         }
         .buttonStyle(.borderless)
-        .help("调音器 · per-speaker equalizer")
-        .accessibilityIdentifier("equalizerToggleButton-\(deviceID)")
+        .help(helpText)
+        .accessibilityIdentifier("equalizerToggleButton-\(target.accessibilityKey)")
         .accessibilityLabel(Text(isOpen ? "Close equalizer" : "Open equalizer"))
     }
 }
@@ -54,7 +58,7 @@ struct EqualizerToggleButton: View {
 /// 20 ms. So a drag is audible while it happens and is already saved if the
 /// app is killed mid-tuning.
 struct EqualizerEditor: View {
-    let deviceID: String
+    let target: EqualizerTarget
 
     @Environment(AppModel.self) private var model
 
@@ -64,8 +68,11 @@ struct EqualizerEditor: View {
     private static let bandColumnWidth: CGFloat = 29
 
     private var settings: EqualizerSettings {
-        model.equalizerSettings(for: deviceID)
+        model.equalizerSettings(target: target)
     }
+
+    /// Suffix for every accessibility identifier in the panel.
+    private var key: String { target.accessibilityKey }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -101,14 +108,14 @@ struct EqualizerEditor: View {
                 "旁路",
                 isOn: Binding(
                     get: { settings.bypassed },
-                    set: { model.setEqualizerBypassed($0, for: deviceID) }
+                    set: { model.setEqualizerBypassed($0, target: target) }
                 )
             )
             .toggleStyle(.switch)
             .controlSize(.mini)
             .font(.system(size: 9))
             .help("旁路：保留曲线但暂时不生效 · keep the curve, stop applying it")
-            .accessibilityIdentifier("equalizerBypassToggle-\(deviceID)")
+            .accessibilityIdentifier("equalizerBypassToggle-\(key)")
         }
     }
 
@@ -138,7 +145,9 @@ struct EqualizerEditor: View {
             Slider(
                 value: Binding(
                     get: { band.gainDb },
-                    set: { model.setEqualizerBandGain($0, bandIndex: index, for: deviceID) }
+                    set: {
+                        model.setEqualizerBandGain($0, bandIndex: index, target: target)
+                    }
                 ),
                 in: EqualizerLimits.bandGainRangeDb,
                 step: EqualizerLimits.gainStepDb
@@ -153,7 +162,7 @@ struct EqualizerEditor: View {
             .frame(width: Self.bandColumnWidth, height: Self.bandSliderLength)
             .disabled(settings.bypassed)
             .accessibilityIdentifier(
-                "equalizerBandSlider-\(deviceID)-\(Int(band.frequency.rounded()))"
+                "equalizerBandSlider-\(key)-\(Int(band.frequency.rounded()))"
             )
             .accessibilityLabel(
                 Text("\(AppModel.equalizerFrequencyLabel(band.frequency)) hertz")
@@ -178,14 +187,14 @@ struct EqualizerEditor: View {
             Slider(
                 value: Binding(
                     get: { settings.trimDb },
-                    set: { model.setEqualizerTrim($0, for: deviceID) }
+                    set: { model.setEqualizerTrim($0, target: target) }
                 ),
                 in: EqualizerLimits.trimRangeDb,
                 step: EqualizerLimits.gainStepDb
             )
             .controlSize(.mini)
             .disabled(settings.bypassed)
-            .accessibilityIdentifier("equalizerTrimSlider-\(deviceID)")
+            .accessibilityIdentifier("equalizerTrimSlider-\(key)")
             .accessibilityValue(Text("\(AppModel.equalizerGainLabel(settings.trimDb)) dB"))
             Text(AppModel.equalizerGainLabel(settings.trimDb))
                 .font(.system(size: 9, design: .monospaced))
@@ -204,28 +213,28 @@ struct EqualizerEditor: View {
     private var footerRow: some View {
         HStack(spacing: 8) {
             Button("重置") {
-                model.resetEqualizer(for: deviceID)
+                model.resetEqualizer(target: target)
             }
             .buttonStyle(.borderless)
             .font(.system(size: 9))
-            .disabled(!model.hasEqualizerCurve(for: deviceID))
+            .disabled(!model.hasEqualizerCurve(target: target))
             .help("所有频段回到 0 dB · flatten every band")
-            .accessibilityIdentifier("equalizerResetButton-\(deviceID)")
+            .accessibilityIdentifier("equalizerResetButton-\(key)")
 
             // Live limiter indicator. A boost that pushes the chain past full
             // scale is clamped rather than wrapped, and this is the only place
             // the user can find out it is happening — the audible symptom
             // (distortion on peaks) is easy to blame on the speaker.
-            if model.equalizerIsClipping(for: deviceID) {
+            if model.equalizerIsClipping(target: target) {
                 Label("输出削波，建议降低总量", systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(.orange)
                     .lineLimit(1)
-                    .accessibilityIdentifier("equalizerClipIndicator-\(deviceID)")
+                    .accessibilityIdentifier("equalizerClipIndicator-\(key)")
             }
             Spacer(minLength: 0)
             Button("收起") {
-                model.equalizerEditorDeviceID = nil
+                model.equalizerEditorTarget = nil
             }
             .buttonStyle(.borderless)
             .font(.system(size: 9))

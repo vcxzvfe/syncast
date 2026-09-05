@@ -45,12 +45,12 @@ reason is:
 | Local Stereo, system-sink leg | yes | samples pass through `LocalOutput.render()` |
 | Local Stereo, ScreenCaptureKit leg | yes | same render path |
 | Local Stereo, **Direct Stereo** leg | **no** | the HAL renders straight into the public aggregate; SyncCast never sees a buffer |
-| **Whole-home** (AirPlay 全屋) | **no** | audio flows OwnTone → `LocalAirPlayBridge`, a different render path, deliberately out of scope |
-| AirPlay receivers | **no** | their audio is produced by OwnTone, not by us |
+| Whole-home, local outputs | yes | each has a `LocalAirPlayBridge` whose render callback runs the same bank on the same UID-keyed curve — see §6 |
+| Whole-home, AirPlay receivers | group only | OwnTone sends them ONE stream; one curve applies to all of them together — see §6 |
 
-The UI hides the control on those paths rather than showing an inert one, and a
-row that HAS a stored curve which is not currently being applied says so
-(`AppModel.equalizerInactiveHint`).
+The UI hides the control on the one path that cannot carry it rather than
+showing an inert one, and a row that HAS a stored curve which is not currently
+being applied says so (`AppModel.equalizerInactiveHint`).
 
 ### 2.2 Filters
 
@@ -260,9 +260,9 @@ Other measured properties, all through `process()`:
 
 ## 4. Known limits
 
-- Direct Stereo and whole-home are not equalised (§2.1). On those paths the
-  control is hidden and a stored curve is annotated rather than silently
-  ignored.
+- Direct Stereo is not equalised (§2.1). On that path the control is hidden and
+  a stored curve is annotated rather than silently ignored.
+- AirPlay receivers share one curve and cannot have individual ones (§6.1).
 - Digital attenuation: a large cut loses effective bit depth, the same trade-off
   the existing per-pair software gain documents.
 - The graphic layout is fixed at ten bands. The store and the DSP are
@@ -295,3 +295,137 @@ Changed:
   properties and three push points (engine start, stereo reconcile, 1 Hz poll).
 - `apps/menubar/Sources/SyncCastMenuBar/MainPopover.swift` — the row button,
   the inline editor, the inactive hint, the accessibility summary.
+
+## 6. Whole-home (added 2026-09-05, Track E)
+
+The first cut of this feature ran only on the local Stereo render path, so
+switching to 「AirPlay 全屋」 silently dropped every curve the user had dialled
+in. Both whole-home legs now carry one.
+
+### 6.1 Two legs, two different answers
+
+```
+capture ring
+   │
+   ▼
+AudioSocketWriter ──[AirPlay GROUP EQ]──► master gain ─► clamp ─► s16 ─► sidecar ─► OwnTone
+                                                                                     │
+                                            ┌────────────────────────────────────────┴───────────┐
+                                            ▼                                                    ▼
+                                     AirPlay outputs                                    fifo output
+                                  (one stream, N receivers)                                  │
+                                                                              LocalFifoBroadcaster
+                                                                                             │
+                                                                    LocalAirPlayBridge.render() per device
+                                                                    ring read → trim → [PER-DEVICE EQ] → volume → AUHAL
+```
+
+**Local outputs get a per-device curve**, keyed by the same CoreAudio UID as in
+Stereo mode and applied by the same `EqualizerBank` in the same place on the
+signal (after the source read and the delay-trim cross-fade, before the volume
+ramp). Because the key is the same, a speaker tuned in Stereo sounds the same in
+whole-home with nothing re-entered — that identity is the feature, not a side
+effect.
+
+**AirPlay receivers get ONE group curve, and cannot get individual ones.** The
+sidecar hands OwnTone a single stream and OwnTone fans it out; nothing
+downstream of that split belongs to us. A per-receiver control would therefore
+be a promise the pipeline cannot keep at any amount of UI work. The group curve
+is applied in `AudioSocketWriter`, upstream of everything, and the UI says so on
+the row itself rather than only in a tooltip.
+
+### 6.2 Order of the writer's stages
+
+```
+EQ (bank limiter, ±1) → master gain ramp → clamp → s16
+```
+
+- **EQ first**, so it sits where it sits on both local legs and the master fader
+  stays the last attenuator: turning the system down turns a boosted curve down
+  rather than merely quieting an already-clipped one.
+- The bank's own limiter clamps at full scale **and counts** what it clamped.
+  That count is the diagnostic that tells the user to pull the trim down;
+  clamping only after the master fader would hide the distortion exactly when
+  the fader is low — which is when a listener stops suspecting the app and
+  starts blaming the speaker.
+- The pre-cast clamp stays where it was, now as a backstop rather than the
+  primary limiter. The signal reaching it is already inside ±1 and the master
+  gain only attenuates, which is what makes it safe to say the s16 conversion
+  can never wrap.
+
+### 6.3 What is shared, and what is not
+
+| Setting | Scope | Store key |
+|---|---|---|
+| A local output's curve | that CoreAudio UID, both modes | the device's UID |
+| The AirPlay group curve | every receiver together | reserved `Router.airPlayGroupEqualizerUID` |
+
+Both live in the same versioned record (`syncast.deviceEqualizer.v1`) and the
+same UID → curve map the menubar pushes to the Router, so the group curve is
+remembered, validated on load and re-applied on reconnect exactly like a
+device's. The reserved key is namespaced so it cannot collide with a real
+CoreAudio UID; nothing about the stored format changed, so a v1 record written
+before this change loads unchanged.
+
+Re-application points: `applyEqualizers()` pushes to `localOutputs`,
+`localBridges` and the writer, and runs on every replan, every driver
+reconcile, every bridge (re)build, and on the sidecar reconnect that builds a
+fresh `AudioSocketWriter` — the same discipline the master fader follows, and
+for the same reason (a new writer or a rebuilt bridge starts flat).
+
+### 6.4 Verified
+
+Offline, through the shipping code paths (`WholeHomeEqualizerTests`):
+
+- an impulse through `LocalAirPlayBridge.render()` with a hand-built
+  `AudioBufferList` and no CoreAudio device measures +6 dB at the dialled band
+  and matches the analytic curve at every band centre within 0.35 dB;
+- a flat bridge is bit-identical: one impulse in, exactly one identical sample
+  out;
+- a sine through the writer's packet stage changes level by the analytic amount,
+  a flat group curve leaves the s16 bytes untouched, an +18 dB chain on a
+  0.95 FS sine clamps, is counted, and never wraps, and the master fader still
+  attenuates downstream of the curve (−6.02 dB at 50 %).
+
+Model level (`WholeHomeEqualizerUITests`): which rows offer the control in which
+mode, one editor open at a time, a Stereo curve being the same record in
+whole-home, and the group curve's round trip through the store.
+
+### 6.5 Not verified
+
+- Real listening on real receivers and real local speakers in whole-home. The
+  supervisor / user owns that.
+- CPU cost of the bank inside a bridge render callback, and of the group EQ in
+  the writer's packet loop (a plain async task, not a real-time thread).
+- The bridge fixes its coefficients at construction from the device's nominal
+  rate. A device that changes rate between the bridge being built and its AUHAL
+  opening would put the band centres off by that ratio; the case is logged, not
+  handled, and has not been provoked.
+- Blocks longer than `EqualizerBank.maxFramesPerBlock` (4096) are left
+  unequalised rather than served from a short scratch buffer. Device quanta are
+  512–2048 in practice; no device with a larger quantum was tested.
+
+### 6.6 Files (Track E)
+
+New:
+
+- `apps/menubar/Sources/SyncCastMenuBar/EqualizerTarget.swift`
+- `apps/menubar/Sources/SyncCastMenuBar/AppModel+GroupEqualizer.swift`
+- `apps/menubar/Sources/SyncCastMenuBar/AirPlayGroupEqualizerRow.swift`
+- `core/router/Tests/SyncCastRouterTests/WholeHomeEqualizerTests.swift`
+- `apps/menubar/Tests/SyncCastMenuBarTests/WholeHomeEqualizerUITests.swift`
+
+Changed:
+
+- `core/router/Sources/SyncCastRouter/LocalAirPlayBridge.swift` — owns an
+  `EqualizerBank`, applies it in `render()`, exposes `setEqualizer` and the clip
+  count; `init` takes an optional render sample rate.
+- `core/router/Sources/SyncCastRouter/AudioSocketWriter.swift` — the group bank,
+  `renderPacket()` extracted so the stage order is testable without a socket,
+  explicit planar slabs instead of an escaped `baseAddress`.
+- `core/router/Sources/SyncCastRouter/Router.swift` — reserved pseudo-UID,
+  bridges and writer in `applyEqualizers` / `equalizerClipCounts` /
+  `equalizableOutputUIDs`, group curve re-seeded on sidecar reconnect, `eqClip`
+  in the bridge and writer diagnostic lines.
+- `apps/menubar/Sources/SyncCastMenuBar/{AppModel,AppModel+Equalizer,EqualizerSection,MainPopover}.swift`
+  — editor keyed by `EqualizerTarget`, whole-home availability, the group row.

@@ -234,18 +234,22 @@ final class DeviceEqualizerPersistenceTests: XCTestCase {
         )
     }
 
-    func test_whole_home_hides_the_control_and_says_why() {
+    /// Whole-home used to hide the control and explain itself. It no longer
+    /// has to: each local output renders through its own `LocalAirPlayBridge`,
+    /// which runs the same curve, so the control is live and there is nothing
+    /// to apologise for.
+    func test_whole_home_offers_the_control_on_a_local_output() {
         let model = AppModel()
         model.devices = [localDevice(id: "dev-1", uid: "uid-a")]
         model.routing["dev-1"] = DeviceRouting(deviceID: "dev-1", enabled: true)
         model.setEqualizerBandGain(-6, bandIndex: 1, for: "dev-1")
 
         model.mode = .wholeHome
-        XCTAssertFalse(model.equalizerIsSupportedOnCurrentPath)
-        XCTAssertFalse(model.equalizerIsAvailable(for: "dev-1"))
-        XCTAssertNotNil(
+        XCTAssertTrue(model.equalizerIsSupportedOnCurrentPath)
+        XCTAssertTrue(model.equalizerIsAvailable(for: "dev-1"))
+        XCTAssertNil(
             model.equalizerInactiveHint(for: "dev-1"),
-            "a stored curve that is not being applied has to say so"
+            "the curve IS being applied in whole-home; saying otherwise is the bug"
         )
     }
 
