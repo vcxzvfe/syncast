@@ -114,10 +114,16 @@ OSStatus SyncCastAudio_StreamControl_IsPropertySettable(AudioObjectID inObjectID
 
     switch(inAddress->mSelector)
     {
-        // The three writable properties. The volume pair is the point of the
-        // whole driver: macOS greys the system slider out for any device
-        // whose level is not settable.
-        case kAudioStreamPropertyIsActive:
+        // The writable properties. The volume pair is the point of the whole
+        // driver: macOS greys the system slider out for any device whose level
+        // is not settable.
+        //
+        // kAudioStreamPropertyIsActive is deliberately NOT here. The stream is
+        // permanently active, so claiming it is settable and then ignoring the
+        // write tells clients a lie they cannot detect — a client that
+        // deactivates the stream and reads back 1 has no way to know whether it
+        // failed or raced. Reporting false, and failing the set, is the honest
+        // answer and the one clients already handle.
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat:
         case kAudioLevelControlPropertyScalarValue:
@@ -364,34 +370,86 @@ OSStatus SyncCastAudio_StreamControl_GetPropertyData(AudioObjectID inObjectID, c
 
 #pragma mark - SetPropertyData
 
-/// Persist the level so a reboot (or a coreaudiod restart, which every driver
-/// install performs) comes back where the user left it, the way a real device
-/// does.
-static void SyncCastAudio_PersistVolume(Float32 inScalar)
+/// Persist the level and the mute so a reboot — or a coreaudiod restart, which
+/// every driver install performs — comes back where the user left it, the way
+/// a real device does. Mute matters MORE than the level: without it a user who
+/// was muted comes back unmuted at their previous level, which is the loud
+/// surprise the seeding logic on the SyncCast side exists to prevent.
+///
+/// The catch is the rate. A volume drag or a scroll gesture sets the scalar
+/// dozens of times a second, and each WriteToStorage is a CF allocation plus a
+/// preference write; doing one per step is pointless I/O on the thread the HAL
+/// uses to answer every other client's property calls. So the setters only mark
+/// the value dirty and the write is coalesced to at most one per
+/// kPersist_MinIntervalNanos, with an unconditional flush when IO stops.
+///
+/// Trade-off worth naming: the last value of a burst is not written until the
+/// next set after the interval, or until StopIO. Losing it means coming back at
+/// the level from ~500 ms earlier in the same gesture — inaudible, and the
+/// common case (a level the user then leaves alone) still ends at StopIO with
+/// the true value on disk.
+
+#define kPersist_MinIntervalNanos   500000000ull
+
+// All four are guarded by gPlugIn_StateMutex.
+static Boolean  gPersist_VolumeDirty        = false;
+static Float32  gPersist_VolumeScalar       = 1.0f;
+static Boolean  gPersist_MuteDirty          = false;
+static bool     gPersist_MuteValue          = false;
+static UInt64   gPersist_LastWriteHostTime  = 0;
+
+static UInt64 SyncCastAudio_NanosToHostTicks(UInt64 inNanos)
 {
-    if(gPlugIn_Host == NULL) { return; }
-    CFNumberRef theValue = CFNumberCreate(NULL, kCFNumberFloat32Type, &inScalar);
+    struct mach_timebase_info theTimeBaseInfo;
+    mach_timebase_info(&theTimeBaseInfo);
+    if(theTimeBaseInfo.numer == 0) { return inNanos; }
+    return (inNanos * (UInt64)theTimeBaseInfo.denom) / (UInt64)theTimeBaseInfo.numer;
+}
+
+static void SyncCastAudio_WriteNumberToStorage(CFStringRef inKey, CFNumberType inType, const void* inValue)
+{
+    CFNumberRef theValue = CFNumberCreate(NULL, inType, inValue);
     if(theValue != NULL)
     {
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("volumeScalar"), theValue);
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, inKey, theValue);
         CFRelease(theValue);
     }
 }
 
-/// Mute persists for the same reason the level does — and it matters MORE:
-/// installing this driver restarts coreaudiod, so without this a user who was
-/// muted comes back unmuted at their previous level, which is the loud
-/// surprise the seeding logic on the SyncCast side exists to prevent.
-static void SyncCastAudio_PersistMute(bool inMuted)
+void SyncCastAudio_FlushPersistentState(Boolean inForce)
 {
     if(gPlugIn_Host == NULL) { return; }
-    SInt32 theRaw = inMuted ? 1 : 0;
-    CFNumberRef theValue = CFNumberCreate(NULL, kCFNumberSInt32Type, &theRaw);
-    if(theValue != NULL)
+
+    Boolean theWriteVolume = false;
+    Boolean theWriteMute = false;
+    Float32 theVolume = 1.0f;
+    SInt32 theMute = 0;
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(gPersist_VolumeDirty || gPersist_MuteDirty)
     {
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("muted"), theValue);
-        CFRelease(theValue);
+        UInt64 theNow = mach_absolute_time();
+        UInt64 theInterval = SyncCastAudio_NanosToHostTicks(kPersist_MinIntervalNanos);
+        // A first write (last == 0) is never held back: the interesting case is
+        // a single deliberate change, not a drag.
+        if(inForce || (gPersist_LastWriteHostTime == 0) ||
+           ((theNow - gPersist_LastWriteHostTime) >= theInterval))
+        {
+            theWriteVolume = gPersist_VolumeDirty;
+            theWriteMute = gPersist_MuteDirty;
+            theVolume = gPersist_VolumeScalar;
+            theMute = gPersist_MuteValue ? 1 : 0;
+            gPersist_VolumeDirty = false;
+            gPersist_MuteDirty = false;
+            gPersist_LastWriteHostTime = theNow;
+        }
     }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    // Outside the mutex: WriteToStorage can re-enter us, and it must not be
+    // able to block a property getter.
+    if(theWriteVolume) { SyncCastAudio_WriteNumberToStorage(CFSTR("volumeScalar"), kCFNumberFloat32Type, &theVolume); }
+    if(theWriteMute)   { SyncCastAudio_WriteNumberToStorage(CFSTR("muted"), kCFNumberSInt32Type, &theMute); }
 }
 
 OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, const void* inData, UInt32* outNumberPropertiesChanged, AudioObjectPropertyAddress outChangedAddresses[2])
@@ -405,10 +463,11 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
     switch(inAddress->mSelector)
     {
         case kAudioStreamPropertyIsActive:
-            // Accepted and ignored: the stream is always active. Refusing
-            // would make ordinary clients log errors for no benefit.
-            if(inDataSize != sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
-            return 0;
+            // The stream cannot be deactivated — the device has exactly one
+            // stream and it exists to make the device a legal output. Say so,
+            // rather than swallowing the write and continuing to report 1.
+            // IsPropertySettable reports false for the same reason.
+            return kAudioHardwareUnsupportedOperationError;
 
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat:
@@ -419,6 +478,15 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
             if((theFormat->mFormatFlags & kAudioFormatFlagIsFloat) == 0) { return kAudioDeviceUnsupportedFormatError; }
             if(theFormat->mBitsPerChannel != kDevice_BitsPerChannel) { return kAudioDeviceUnsupportedFormatError; }
             if(theFormat->mChannelsPerFrame != kDevice_ChannelCount) { return kAudioDeviceUnsupportedFormatError; }
+            // The layout fields matter as much as the sample size: the stream
+            // advertises one interleaved packed frame per packet, and a client
+            // that gets a "yes" for a non-interleaved or differently-strided
+            // format would lay its buffers out to match a format this device
+            // never agreed to. Check everything FillFormat sets.
+            if((theFormat->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mFramesPerPacket != 1) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mBytesPerFrame != kDevice_BytesPerFrame) { return kAudioDeviceUnsupportedFormatError; }
+            if(theFormat->mBytesPerPacket != kDevice_BytesPerFrame) { return kAudioDeviceUnsupportedFormatError; }
             if((theFormat->mSampleRate != kDevice_SampleRate_44100) &&
                (theFormat->mSampleRate != kDevice_DefaultSampleRate) &&
                (theFormat->mSampleRate != kDevice_SampleRate_96000))
@@ -449,6 +517,11 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
             pthread_mutex_lock(&gPlugIn_StateMutex);
             Boolean theChanged = (gVolume_Output_Scalar != theNewScalar);
             gVolume_Output_Scalar = theNewScalar;
+            if(theChanged)
+            {
+                gPersist_VolumeScalar = theNewScalar;
+                gPersist_VolumeDirty = true;
+            }
             pthread_mutex_unlock(&gPlugIn_StateMutex);
 
             if(theChanged)
@@ -464,7 +537,8 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
                 outChangedAddresses[1].mSelector = kAudioLevelControlPropertyDecibelValue;
                 outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
                 outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
-                SyncCastAudio_PersistVolume(theNewScalar);
+                // Rate-limited: a drag writes storage at most twice a second.
+                SyncCastAudio_FlushPersistentState(false);
             }
             return 0;
         }
@@ -476,6 +550,11 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
             pthread_mutex_lock(&gPlugIn_StateMutex);
             Boolean theChanged = (gMute_Output_Value != theNewValue);
             gMute_Output_Value = theNewValue;
+            if(theChanged)
+            {
+                gPersist_MuteValue = theNewValue;
+                gPersist_MuteDirty = true;
+            }
             pthread_mutex_unlock(&gPlugIn_StateMutex);
 
             if(theChanged)
@@ -484,7 +563,9 @@ OSStatus SyncCastAudio_StreamControl_SetPropertyData(AudioObjectID inObjectID, c
                 outChangedAddresses[0].mSelector = kAudioBooleanControlPropertyValue;
                 outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
                 outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
-                SyncCastAudio_PersistMute(theNewValue);
+                // Forced: mute is one discrete press, never a burst, and it is
+                // the value whose loss is actually audible.
+                SyncCastAudio_FlushPersistentState(true);
             }
             return 0;
         }

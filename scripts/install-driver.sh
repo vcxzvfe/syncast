@@ -50,6 +50,39 @@ if [[ "$(id -u)" != "0" ]]; then
     exit 3
 fi
 
+# Build the driver as a real (non-root) user.
+#
+# This script always runs as root, and there are two ways in: `sudo bash
+# scripts/install-driver.sh`, which sets SUDO_USER, and the menubar app's
+# `osascript ... with administrator privileges`, which does NOT — it hands us a
+# bare root shell. Building there as root leaves a root-owned build/ in the
+# developer's checkout that the next ordinary `bash build.sh` cannot overwrite,
+# and signs with root's keychain rather than the user's.
+build_driver() {
+    local theBuildUser="${SUDO_USER:-}"
+    if [[ -z "$theBuildUser" ]]; then
+        # No SUDO_USER: fall back to whoever owns the console (the logged-in
+        # GUI user), which is who the osascript prompt was shown to.
+        theBuildUser="$(stat -f %Su /dev/console 2>/dev/null || true)"
+    fi
+    if [[ -z "$theBuildUser" || "$theBuildUser" == "root" ]]; then
+        echo "ERROR: cannot determine a non-root user to build as, and refusing to" >&2
+        echo "       build in $DRIVER_SRC_DIR as root (it would leave root-owned" >&2
+        echo "       artefacts in the checkout)." >&2
+        echo "       Build it yourself first and re-run this script:" >&2
+        echo "           bash $DRIVER_SRC_DIR/build.sh" >&2
+        echo "       or install a prebuilt SyncCastAudio.driver next to this script." >&2
+        exit 5
+    fi
+    echo "==> building as $theBuildUser"
+    # sudo scrubs the environment, so the one build-affecting variable is
+    # forwarded explicitly — through env(1) rather than as a `sudo VAR=value`
+    # assignment, which a sudoers policy without SETENV would refuse.
+    sudo -u "$theBuildUser" /usr/bin/env \
+        "SYNCAST_USE_SYNCCAST_DEV=${SYNCAST_USE_SYNCCAST_DEV:-0}" \
+        bash "$DRIVER_SRC_DIR/build.sh"
+}
+
 restart_coreaudiod() {
     echo "==> restarting coreaudiod (all audio briefly stops)"
     launchctl kickstart -k system/com.apple.audio.coreaudiod
@@ -67,19 +100,17 @@ if [[ "$UNINSTALL" == "1" ]]; then
     exit 0
 fi
 
-if [[ ! -d "$BUILT_DRIVER" ]]; then
-    if [[ -z "$DRIVER_SRC_DIR" ]]; then
-        echo "ERROR: no driver bundled next to this script and no source tree to build from." >&2
-        exit 4
-    fi
-    echo "==> driver not built yet; building"
-    # Build as the invoking user when run under sudo, so build artefacts do not
-    # end up owned by root in the developer's checkout.
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        sudo -u "$SUDO_USER" bash "$DRIVER_SRC_DIR/build.sh"
-    else
-        bash "$DRIVER_SRC_DIR/build.sh"
-    fi
+if [[ -n "$DRIVER_SRC_DIR" ]]; then
+    # Source checkout present: ALWAYS rebuild. A build/ left over from an
+    # earlier edit looks exactly like a fresh one, so "build only if missing"
+    # silently installs stale code — the single worst failure mode here,
+    # because the symptom (an old bug still present after a fix) points
+    # everywhere except at the installer.
+    echo "==> rebuilding from source"
+    build_driver
+elif [[ ! -d "$BUILT_DRIVER" ]]; then
+    echo "ERROR: no driver bundled next to this script and no source tree to build from." >&2
+    exit 4
 fi
 
 if [[ ! -x "$BUILT_DRIVER/Contents/MacOS/SyncCastAudio" ]]; then

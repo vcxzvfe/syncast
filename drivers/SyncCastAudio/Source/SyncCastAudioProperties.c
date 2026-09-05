@@ -135,7 +135,12 @@ static OSStatus SyncCastAudio_GetPlugInPropertyData(const AudioObjectPropertyAdd
 
         case kAudioPlugInPropertyTranslateUIDToDevice:
         {
+            // The qualifier is the UID to translate. A caller that passes the
+            // right SIZE but a NULL POINTER would dereference NULL here, so
+            // guard the pointer as well as the size: the HAL is not the only
+            // thing that can reach this entry point.
             if(inQualifierDataSize != sizeof(CFStringRef)) { return kAudioHardwareBadPropertySizeError; }
+            if(inQualifierData == NULL) { return kAudioHardwareIllegalOperationError; }
             if(inDataSize < sizeof(AudioObjectID)) { return kAudioHardwareBadPropertySizeError; }
             CFStringRef theUID = *((const CFStringRef*)inQualifierData);
             *((AudioObjectID*)outData) =

@@ -33,7 +33,6 @@
 #define SyncCastAudio_h
 
 #include <CoreAudio/AudioServerPlugIn.h>
-#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -98,24 +97,51 @@
 
 #pragma mark - Shared state
 //
-// Guarded by gPlugIn_StateMutex. The IO path touches only the timestamp
-// fields, which are written under the same mutex from the (rare) StartIO /
-// StopIO calls and read on the IO thread; Apple's sample uses the same
-// arrangement.
+// TWO mutexes, exactly as Apple's NullAudio splits them, because they are
+// taken from threads with completely different deadlines:
+//
+//   gPlugIn_StateMutex   property state — the rate, the ref count, the IO
+//                        client count, the volume/mute values. Taken by every
+//                        property getter and setter, i.e. by the HAL's
+//                        property thread and by any client that reads the
+//                        device, so it can be held for as long as a
+//                        CFPropertyList write to storage.
+//
+//   gDevice_IOMutex      timeline state — gDevice_HostTicksPerFrame,
+//                        gDevice_NumberTimeStamps, gDevice_AnchorSampleTime,
+//                        gDevice_AnchorHostTime. Taken by GetZeroTimeStamp on
+//                        the real-time IO thread, and by the (rare) StartIO /
+//                        StopIO / PerformDeviceConfigurationChange re-anchor.
+//                        Every critical section under it is a handful of
+//                        arithmetic ops with no allocation and no CF call, so
+//                        the IO thread can never be made to wait on a property
+//                        getter.
+//
+// LOCK ORDER: never hold both at once. Where a path needs both (the rate
+// change: rate under the state mutex, the derived tick count and the anchor
+// under the IO mutex) it takes them one after the other, state first.
 
 extern pthread_mutex_t              gPlugIn_StateMutex;
+extern pthread_mutex_t              gDevice_IOMutex;
 extern AudioServerPlugInHostRef     gPlugIn_Host;
 extern UInt32                       gPlugIn_RefCount;
 
+// gPlugIn_StateMutex
 extern Float64                      gDevice_SampleRate;
 extern UInt64                       gDevice_IORunningCounter;
+extern Float32                      gVolume_Output_Scalar;
+extern bool                         gMute_Output_Value;
+
+// gDevice_IOMutex
 extern Float64                      gDevice_HostTicksPerFrame;
 extern UInt64                       gDevice_NumberTimeStamps;
 extern Float64                      gDevice_AnchorSampleTime;
 extern UInt64                       gDevice_AnchorHostTime;
 
-extern Float32                      gVolume_Output_Scalar;
-extern bool                         gMute_Output_Value;
+/// Recompute the host-ticks-per-frame from a sample rate. Takes gDevice_IOMutex
+/// itself; the caller must NOT hold it (and must not hold the state mutex
+/// either — see the lock order above).
+void SyncCastAudio_ResetTimeline(Float64 inSampleRate);
 
 #pragma mark - Volume law helpers (pure)
 
@@ -169,6 +195,16 @@ OSStatus SyncCastAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver,
 // entry points validate the driver and the object id, then dispatch here for
 // the output stream and the two controls. Split across two files only to keep
 // each one readable — the object graph is one unit.
+
+/// Write any volume/mute change that has not reached storage yet.
+///
+/// The volume setter is called once per scroll tick / arrow key, so it marks
+/// the value dirty and lets this coalesce the writes; `inForce` bypasses the
+/// rate limit and is what StopIO uses to make sure the final level is on disk.
+///
+/// Storage writes allocate and touch the filesystem: call this from the
+/// property/control path only, NEVER from the IO thread.
+void SyncCastAudio_FlushPersistentState(Boolean inForce);
 
 Boolean SyncCastAudio_StreamControl_HasProperty(AudioObjectID inObjectID,
                                                 const AudioObjectPropertyAddress* inAddress);
