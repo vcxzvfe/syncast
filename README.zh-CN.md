@@ -21,6 +21,7 @@
 - [核心功能](#核心功能)
 - [系统要求](#系统要求)
 - [安装](#安装)
+- [系统音量](#系统音量)
 - [使用方法](#使用方法)
 - [架构概览](#架构概览)
 - [项目状态](#项目状态)
@@ -128,6 +129,47 @@ swift build -c release
 
 ---
 
+## 系统音量
+
+本地 **Stereo** 模式下，SyncCast 可以把自己接到 macOS 自己的音量 UI 底下：菜单栏
+滑杆、F11/F12、音量 HUD、LinearMouse 滚轮，都直接调你那几只喇叭。不需要辅助功能
+权限，也不再抢媒体键。
+
+原理：把一台**虚拟 sink 设备**设成默认输出（macOS 会给这类设备真正的音量控制，
+aggregate 则没有），用 Core Audio Process Tap 把它捕获下来，再把音量施加到真实
+输出上——设备自己有硬件音量就写硬件音量，显示器支持 DDC/CI 就写 VCP 0x62，都没有
+就走软件增益。运行期间「声音」菜单里显示的输出会是 **SyncCast**（或
+**BlackHole 2ch**），那就是这台 sink，不是出错。
+
+```bash
+# 看当前会走哪条路径、装了哪台 sink：
+( cd core/router && swift run SyncCastSystemSinkProbe )
+
+# 端到端自检（会短暂占用默认输出几秒，结束后原样还原）：
+( cd core/router && swift run SyncCastSystemSinkProbe --smoke )
+```
+
+### 安装 SyncCast 音频驱动
+
+SyncCast 自带一台只有输出流的虚拟声卡（`SyncCastAudio.driver`，2 ch / 48 kHz；
+没有输入流，所以不会触发任何麦克风类权限）。安装要管理员密码（HAL 插件放在
+`/Library/Audio/Plug-Ins/HAL`），并且会重启 coreaudiod——全机音频会断一两秒。
+
+```bash
+bash drivers/SyncCastAudio/build.sh          # 产出 build/SyncCastAudio.driver
+sudo bash scripts/install-driver.sh          # 安装并重启 coreaudiod
+sudo bash scripts/install-driver.sh --uninstall
+```
+
+弹窗里的**「安装 SyncCast 音频驱动」**按钮走的是同一个脚本，密码由 macOS 自己的
+授权对话框收取。装完请重启 SyncCast——路径每次启动只解析一次。
+
+没装驱动时：有 **BlackHole 2ch** 就用它兜底；两者都没有则回到旧的 Direct Stereo
+路径（那条路依然靠媒体键 event tap）。可用 `SYNCAST_STEREO_PATH=sink|direct|capture`
+强制指定。
+
+---
+
 ## 使用方法
 
 1. 装好后启动:`open /Applications/SyncCast.app`
@@ -136,7 +178,8 @@ swift build -c release
    - **AirPlay 实验模式**:列出 AirPlay 2 接收器和可用本地输出,勾选要播的设备
    - **本地模式**:列出全部本地 CoreAudio 输出,勾选要播的设备
 4. 用任意 macOS 应用播放音频(Music、Spotify、网页视频等),被勾选的设备就会同时出声
-5. 用每台设备旁边的推子调音量
+5. 调音量：sink 路径下**系统音量滑杆就是总音量**，每台设备旁边的推子是叠加在它
+   上面的平衡量（详见[系统音量](#系统音量)）
 
 切换模式时会重新规划输出。Stereo 本地模式是当前推荐的日常稳定路径; AirPlay 实验模式适合继续测试同步、漂移和中断恢复。
 

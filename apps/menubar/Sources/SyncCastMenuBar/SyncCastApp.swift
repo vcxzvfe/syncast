@@ -81,21 +81,23 @@ struct SyncCastApp: App {
         SyncCastLog.log("=== SyncCast process starting (pid \(getpid())) ===")
         NSApp?.setActivationPolicy(.accessory)
 
-        // Only ScreenCaptureKit needs Screen Recording. Tap mode and Direct
-        // Stereo mode must not trip this TCC class, otherwise DRM validation
-        // is meaningless.
+        // Only ScreenCaptureKit needs Screen Recording. Tap mode, Direct
+        // Stereo and the system-sink path (whose tap is System Audio
+        // Recording, a different TCC class) must not trip it, otherwise DRM
+        // validation is meaningless.
         let captureBackend = ProcessInfo.processInfo
             .environment["SYNCAST_CAPTURE_BACKEND"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let selectedStereoPath = StereoOutputPathPolicy.selectedPath()
+        let selectedStereoPath = StereoOutputPathPolicy.resolvedPath()
         let initialMode = ProcessInfo.processInfo
             .environment["SYNCAST_INITIAL_MODE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let startsWholeHome = initialMode == "wholehome" || initialMode == "whole_home"
         let skipScreenRecordingPreflight =
-            captureBackend == "tap" || (selectedStereoPath == .direct && !startsWholeHome)
+            captureBackend == "tap"
+            || (selectedStereoPath != .capture && !startsWholeHome)
         if skipScreenRecordingPreflight {
             SyncCastLog.log("screen-recording preflight skipped: capture=\(captureBackend ?? "sck") stereoPath=\(selectedStereoPath.rawValue)")
         } else {

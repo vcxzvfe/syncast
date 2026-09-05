@@ -113,6 +113,28 @@ if [[ -d "$SPM_BUNDLE" ]]; then
 </plist>
 PLIST
 fi
+# ---- 2b) SyncCastAudio.driver + its installer -----------------------------
+# The driver is NOT loaded from the bundle — HAL plug-ins must live in
+# /Library/Audio/Plug-Ins/HAL — but it and its installer ride along so the
+# popover's "install SyncCast audio driver" action works from a distributed
+# .app, with no source checkout anywhere. install-driver.sh detects a driver
+# sitting next to it and installs that instead of building.
+DRIVER_BUILD="$REPO_ROOT/drivers/SyncCastAudio/build/SyncCastAudio.driver"
+# ALWAYS rebuild. A stale build/ directory from an earlier edit would otherwise
+# be shipped and then installed into /Library by the in-app installer, which is
+# the worst possible place to discover you packaged an obsolete driver. The
+# build is a few seconds of clang.
+log "Building SyncCastAudio.driver"
+bash "$REPO_ROOT/drivers/SyncCastAudio/build.sh" || log "WARNING: driver build failed; the .app will ship without it"
+if [[ -d "$DRIVER_BUILD" ]]; then
+  cp -R "$DRIVER_BUILD" "$RES_DIR/SyncCastAudio.driver"
+  cp "$REPO_ROOT/scripts/install-driver.sh" "$RES_DIR/install-driver.sh"
+  chmod 755 "$RES_DIR/install-driver.sh"
+  log "Bundled SyncCastAudio.driver + install-driver.sh into Resources"
+else
+  log "WARNING: no SyncCastAudio.driver to bundle; the in-app installer will be unavailable"
+fi
+
 cat > "$CONTENTS/PkgInfo" <<'EOF'
 APPL????
 EOF

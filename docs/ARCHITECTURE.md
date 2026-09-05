@@ -1,6 +1,6 @@
 # SyncCast Architecture
 
-> Last updated: 2026-05-16 · Status: living alpha document
+> Last updated: 2026-09-05 · Status: living alpha document
 
 ## 1. Goals & non-goals
 
@@ -26,7 +26,9 @@
                                 ▼
                    ┌────────────────────────────┐
                    │ Capture backend             │
-                   │ Direct Stereo · SCK/Tap     │
+                   │ System Sink (tap pinned to  │
+                   │ a volume-owning HAL device) │
+                   │ · Direct Stereo · SCK/Tap   │
                    └─────────────┬──────────────┘
                                  │ system audio frames
                                  ▼
@@ -70,7 +72,8 @@
 | Module | Language | Responsibility |
 |---|---|---|
 | `core/discovery` | Swift Package | CoreAudio enumeration + Bonjour (`_airplay._tcp`) browsing. Produces stable `Device` records. |
-| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
+| `core/router` | Swift Package | System capture, ring buffer, scheduler, local CoreAudio fan-out, the system-volume sink path, IPC client to sidecar, local AirPlay bridge + clock-following control loop. |
+| `drivers/SyncCastAudio` | C (AudioServerPlugIn) | Output-only virtual HAL device named "SyncCast" with volume + mute controls. Discards audio; exists so macOS has something volume-controllable to make the default output. Installed to `/Library/Audio/Plug-Ins/HAL` by `scripts/install-driver.sh`. |
 | `sidecar/` | Python | Lifecycle-manages OwnTone (multi-target AirPlay 2 sender) and proxies our IPC to OwnTone's REST + FIFO. Uses pyatv for discovery + pairing only. |
 | `proto/` | Markdown + JSON Schema | IPC contract (`ipc-schema.md`). |
 | `tools/syncast-discover` | Swift exec | CLI for inspecting discovery output (debugging + CI smoke). |
@@ -78,7 +81,10 @@
 
 ## 4. Audio data path
 
-1. **Capture / local output**: local Stereo defaults to Direct Stereo, which makes a normal CoreAudio output/aggregate the system default and avoids capture. AirPlay and other capture-dependent paths still write Float32 frames into `RingBuffer` through ScreenCaptureKit or Process Tap.
+1. **Capture / local output**: local Stereo runs one of two paths, chosen by `StereoOutputPathPolicy` (see [ADR-007](adr/ADR-007-system-sink-volume.md)):
+   - **System sink** (default when a virtual sink device is installed): a HAL device that HAS a volume control — SyncCast's own `SyncCastAudio.driver`, or BlackHole 2ch as fallback — becomes both the default output and the default *system* output, so the macOS volume UI controls SyncCast natively. A Process Tap pinned to that device (`CATapDescription.deviceUID`) feeds `RingBuffer`, and the ordinary aggregate/AUHAL fan-out plays it on the real speakers. The sink's `VolumeScalar` is the master volume; `SystemSinkVolumeLaw` turns it into a hardware scalar, a DDC/CI percent or a software gain per device.
+   - **Direct Stereo** (no sink installed): a public CoreAudio aggregate becomes the system default and no capture happens at all. Aggregates expose no volume control, so this path still needs the media-key event tap.
+   AirPlay and other capture-dependent paths write Float32 frames into `RingBuffer` through ScreenCaptureKit or a global Process Tap.
 2. **Ring buffer**: SPSC-from-producer-side, MPSC-from-consumer-side, lock-free reads via stable per-consumer absolute frame cursors. Capacity 2¹⁸ frames ≈ 5.46 s @ 48 kHz — comfortable margin over AirPlay's ~1.8 s buffer.
 3. **Scheduler**: takes the maximum end-to-end latency across enabled devices (`T_master`). Every consumer's read cursor is `writePos − backoff_i`, where `backoff_i = T_master − L_i + manualTrim_i` translated to frames.
 4. **Local fan-out**: one AUHAL (`kAudioUnitSubType_HALOutput`) per physical output, bound to that output device. Render callback reads from the ring at the per-device cursor, applies the per-device gain, writes into AUHAL's output buffer.
@@ -126,6 +132,8 @@ Two sockets keeps audio out of the JSON parser and lets us tune kernel buffers s
 |---|---|---|
 | Whole-home local member selection | `UserDefaults` key `syncast.wholeHome.localMemberUIDs` | Keyed by CoreAudio UID so it survives replug |
 | Global local-fifo delay + lock | `UserDefaults` keys `syncast.airplayDelayMs`, `syncast.airplayDelayLockedAt` | Survives launches |
+| Per-device volume / balance | `UserDefaults` key `syncast.deviceVolumes`, a `[deviceID: percent]` map. On the sink path this value is a BALANCE composed with the system volume in the dB domain, not an absolute level. |
+| Sink device level | Owned by macOS (the sink's own `VolumeScalar`), and by the driver's own storage for `SyncCastAudio.driver`. SyncCast never writes it. |
 | Per-speaker delay trim | `UserDefaults` key `syncast.deviceDelayTrimMs`, a `[persistenceKey: rawMs]` map | Keyed by `Device.persistenceKey` (`ca:<UID>` / `ap:<hex deviceid>`), never by `Device.id`, which is re-minted every process. Stores RAW signed intent, never the normalised output — normalisation depends on which devices are present, so persisting it would drift each session. A device that is absent keeps its entry, same rule as the member store. |
 
 Note: earlier revisions of this document described a `~/Library/Application Support/SyncCast/devices.json` routing store. No such file exists or has ever been written; per-device routing is rebuilt from discovery on each launch, and only the keys above are persisted.
@@ -135,7 +143,8 @@ Note: earlier revisions of this document described a `~/Library/Application Supp
 - Swift Packages built with the Xcode 15+ toolchain (`swift build`).
 - Python sidecar bundled inside the .app via PyInstaller into a single binary; no system-Python dependency.
 - Notarized via `xcrun notarytool`. Distributed as a `.pkg` from GitHub Releases.
-- No BlackHole bootstrap is required for the current alpha. Local Stereo defaults to Direct Stereo; Process Tap is the intended replacement for ScreenCaptureKit on capture-dependent paths.
+- No BlackHole bootstrap is required for the current alpha. Local Stereo prefers the system-sink path when a sink device is installed and falls back to Direct Stereo otherwise; Process Tap is the intended replacement for ScreenCaptureKit on capture-dependent paths.
+- `drivers/SyncCastAudio` is built by its own `build.sh` (clang, universal, ad-hoc or "SyncCast Dev" signed) and installed with sudo. It is NOT part of the .app bundle: HAL plug-ins must live in `/Library/Audio/Plug-Ins/HAL`.
 
 ## 10. ADRs
 
@@ -144,3 +153,5 @@ Note: earlier revisions of this document described a `~/Library/Application Supp
 - [ADR-003: Python sidecar for AirPlay 2 (pyatv)](adr/ADR-003-airplay-sidecar.md)
 - [ADR-004: Pad-the-fast-path sync](adr/ADR-004-sync-strategy.md)
 - [ADR-005: MenuBarExtra + @Observable for UI](adr/ADR-005-ui-stack.md)
+- [ADR-006: OwnTone for AirPlay 2 streaming](adr/ADR-006-owntone-streaming.md)
+- [ADR-007: Own the system volume with a virtual sink, not an event tap](adr/ADR-007-system-sink-volume.md)

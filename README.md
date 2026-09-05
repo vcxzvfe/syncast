@@ -131,6 +131,51 @@ open /Applications/SyncCast.app
 
 Development installs use ad-hoc signing by default. That is fine for the default local Stereo / Direct Stereo path, which does not need Screen Recording. If you need stable TCC grants while testing SCK fallback or other capture-dependent paths, create a self-signed code-signing identity named `SyncCast Dev` and run package/install with `SYNCAST_USE_SYNCCAST_DEV=1`.
 
+## System volume
+
+In local **Stereo** mode SyncCast can put itself under the macOS volume UI: the
+menu-bar slider, F11/F12, the volume HUD and third-party helpers (LinearMouse)
+all control your speakers together, with no Accessibility permission and no
+media-key interception.
+
+It works by making a *virtual sink device* the default output — macOS gives any
+such device a real volume control, unlike an aggregate — capturing it with a
+Core Audio Process Tap, and re-applying the level on your real outputs
+(hardware volume where the device has one, DDC/CI on displays that answer it,
+software gain otherwise). While it runs, the Sound menu shows **SyncCast** (or
+**BlackHole 2ch**) as the output; that is the sink, not a mistake.
+
+```bash
+# Which path will run, and which sink is installed:
+( cd core/router && swift run SyncCastSystemSinkProbe )
+
+# End-to-end check (takes the default output for a few seconds, restores it):
+( cd core/router && swift run SyncCastSystemSinkProbe --smoke )
+```
+
+### Installing the SyncCast audio driver
+
+SyncCast ships its own output-only virtual device (`SyncCastAudio.driver`,
+2 ch / 48 kHz, no input stream, so no microphone-shaped permission anywhere).
+Installing it needs an admin password because HAL plug-ins live in
+`/Library/Audio/Plug-Ins/HAL`, and installing restarts coreaudiod — all audio
+stops for a second or two.
+
+```bash
+bash drivers/SyncCastAudio/build.sh          # -> build/SyncCastAudio.driver
+sudo bash scripts/install-driver.sh          # install + restart coreaudiod
+sudo bash scripts/install-driver.sh --uninstall
+```
+
+The popover's **安装 SyncCast 音频驱动 / Install SyncCast audio driver** button
+runs the same script through macOS's own authorization dialog. Restart SyncCast
+afterwards — the path is resolved once per launch.
+
+If the driver is not installed, SyncCast falls back to **BlackHole 2ch** when
+that is present, and to the legacy Direct Stereo path (which still uses the
+media-key event tap) when neither is. Force a path with
+`SYNCAST_STEREO_PATH=sink|direct|capture`.
+
 ## Usage
 
 1. **Launch SyncCast.** Look for the icon in the macOS menubar.
@@ -139,7 +184,8 @@ Development installs use ad-hoc signing by default. That is fine for the default
    - *AirPlay experimental* — AirPlay receivers plus selected local outputs. Expect added latency; per-output delay trims are available for fine alignment.
    - *Stereo* — local outputs only, low-latency aggregate device, suitable for video.
 4. **Tick the devices you want.** Discovery runs continuously; new AirPlay receivers and audio devices appear within a few seconds.
-5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the Direct Stereo output; capture-dependent modes use the selected capture backend.
+5. **Play music from anything** — Music.app, Spotify, a browser tab, mpv. In Stereo, macOS routes audio through the system sink (or the Direct Stereo output when no sink is installed); capture-dependent modes use the selected capture backend.
+6. **Use the normal volume controls.** On the sink path the system slider is the master and each device row is a balance on top of it. See [System volume](#system-volume).
 
 ## Project status
 
