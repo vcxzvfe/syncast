@@ -21,13 +21,17 @@ the deviation belongs here first.
 | Discovery | Bonjour `_synccast-pcm._udp` |
 | Control | TCP on the advertised port, newline-delimited JSON (UTF-8) |
 | Audio | UDP to the port the receiver names in `hello_ack` |
-| Format | 48 000 Hz, 2 channels interleaved, **Int16 little-endian** |
-| Packet | 240 frames = exactly 5 ms = 960 bytes of PCM |
+| Format | 48 000 Hz, 2 channels interleaved, **Int16 LE** (`s16le`, v1) or **Float32 LE** (`f32le`), negotiated per stream |
+| Packet | 240 frames = exactly 5 ms = 960 bytes (`s16le`) or 1920 bytes (`f32le`) of PCM |
 | Endianness | every multi-byte header field is little-endian |
 
-Int16 rather than Float32: the wire is a LAN, the receiver converts to Float32
-before its DAC anyway, and doubling the bandwidth buys nothing audible at these
-levels.
+The sender asks for `f32le` in `hello` (`"format":"f32le"`); a receiver that
+echoes `"format":"f32le"` in `hello_ack` gets Float32, any other answer — a v1
+receiver sends no `format` — gets `s16le`. Float32 exists because the master
+level is applied on the RECEIVER: the signal on the wire is pre-volume and
+legitimately exceeds full scale on a hot programme or an EQ boost, and Int16
+had to clip it there where the sender's own outputs, which scale before their
+DAC, do not. Doubling 1.5 Mbit/s on a LAN costs nothing.
 
 ### TXT record
 
@@ -55,7 +59,8 @@ offset size field
 12     8    u64 play_at_ns SENDER monotonic ns at which frame 0 of this packet
                            must leave the receiver's DAC
 20     4    u32 frames     = 240
-24     960  Int16 LE interleaved L,R,L,R,…
+24     960  Int16 LE interleaved L,R,L,R,…      (s16le)
+24    1920  Float32 LE interleaved L,R,L,R,…    (f32le)
 ```
 
 Receiver behaviour:
@@ -73,7 +78,8 @@ Receiver behaviour:
 
 ```json
 {"type":"hello","v":1,"token":"<shared token>","name":"<sender name>",
- "rate":48000,"channels":2,"frames_per_packet":240,"stream_id":<u32>}
+ "rate":48000,"channels":2,"frames_per_packet":240,"stream_id":<u32>,
+ "format":"f32le"}
 {"type":"gain","linear":<0..1>,"muted":<bool>}
 {"type":"latency","target_ms":<int>}
 {"type":"ping","t1":<sender monotonic ns>}
@@ -92,7 +98,7 @@ Receiver behaviour:
 
 ```json
 {"type":"hello_ack","v":1,"udp_port":<int>,"device":"<output device name>",
- "device_uid":"<uid>","hw_volume":<bool>,"buffer_ms":<int>}
+ "device_uid":"<uid>","hw_volume":<bool>,"buffer_ms":<int>,"format":"f32le"}
 {"type":"pong","t1":<echo>,"t2":<recv monotonic ns>,"t3":<send monotonic ns>}
 {"type":"stats","late":<n>,"lost":<n>,"underrun":<n>,
  "buffer_ms":<float>,"ratio":<float>,"clip":<n>,

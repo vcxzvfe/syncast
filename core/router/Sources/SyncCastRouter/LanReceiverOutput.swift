@@ -168,7 +168,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
             .allocate(capacity: self.channelCount)
         for index in 0..<self.channelCount { table[index] = slabs[index] }
         self.stagingChannels = table
-        self.packetScratch = [UInt8](repeating: 0, count: LanPcmWire.packetBytes)
+        self.packetScratch = [UInt8](repeating: 0, count: LanPcmWire.maximumPacketBytes)
     }
 
     deinit {
@@ -596,17 +596,31 @@ public final class LanReceiverOutput: @unchecked Sendable {
             frames: UInt32(LanPcmWire.framesPerPacket)
         )
         var clipped = 0
+        let format = link.payloadFormat
         packetScratch.withUnsafeMutableBytes { raw in
             header.encode(into: raw)
-            clipped = LanPcmEncoder.encode(
-                channels: stagingChannels,
-                channelCount: channelCount,
-                frames: LanPcmWire.framesPerPacket,
-                into: raw,
-                offset: LanPcmWire.headerBytes
-            )
+            switch format {
+            case .int16:
+                clipped = LanPcmEncoder.encode(
+                    channels: stagingChannels,
+                    channelCount: channelCount,
+                    frames: LanPcmWire.framesPerPacket,
+                    into: raw,
+                    offset: LanPcmWire.headerBytes
+                )
+            case .float32:
+                // Nothing is clipped on this path; the count says the
+                // programme is hot, which the receiver reports too.
+                clipped = LanPcmEncoder.encodeFloat32(
+                    channels: stagingChannels,
+                    channelCount: channelCount,
+                    frames: LanPcmWire.framesPerPacket,
+                    into: raw,
+                    offset: LanPcmWire.headerBytes
+                )
+            }
         }
-        link.sendAudio(Data(packetScratch))
+        link.sendAudio(Data(packetScratch[0..<LanPcmWire.packetBytes(for: format)]))
         sequence &+= 1
         lastPlayAtNs = playAtNs
         counterLock.lock()

@@ -53,6 +53,10 @@ public struct LanHelloAck: Equatable, Sendable {
     public let hasHardwareVolume: Bool
     /// The receiver's own jitter-buffer depth, in milliseconds.
     public let bufferMs: Int
+    /// The payload format the receiver will decode. A v1 receiver sends no
+    /// `format`, which means `s16le`; an unknown string is treated the same
+    /// way rather than trusted.
+    public let format: LanPcmWire.SampleFormat
 
     public init(
         version: Int,
@@ -60,7 +64,8 @@ public struct LanHelloAck: Equatable, Sendable {
         deviceName: String,
         deviceUID: String,
         hasHardwareVolume: Bool,
-        bufferMs: Int
+        bufferMs: Int,
+        format: LanPcmWire.SampleFormat = .int16
     ) {
         self.version = version
         self.udpPort = udpPort
@@ -68,6 +73,7 @@ public struct LanHelloAck: Equatable, Sendable {
         self.deviceUID = deviceUID
         self.hasHardwareVolume = hasHardwareVolume
         self.bufferMs = bufferMs
+        self.format = format
     }
 }
 
@@ -176,6 +182,7 @@ public enum LanControlCodec {
             object["channels"] = LanPcmWire.channelCount
             object["frames_per_packet"] = LanPcmWire.framesPerPacket
             object["stream_id"] = streamID
+            object["format"] = LanPcmWire.preferredFormat.rawValue
         case .gain(let linear, let muted):
             object["linear"] = linear
             object["muted"] = muted
@@ -220,7 +227,9 @@ public enum LanControlCodec {
                     deviceName: (dictionary["device"] as? String) ?? "",
                     deviceUID: (dictionary["device_uid"] as? String) ?? "",
                     hasHardwareVolume: (dictionary["hw_volume"] as? Bool) ?? false,
-                    bufferMs: intValue(dictionary["buffer_ms"]) ?? 0
+                    bufferMs: intValue(dictionary["buffer_ms"]) ?? 0,
+                    format: (dictionary["format"] as? String)
+                        .flatMap(LanPcmWire.SampleFormat.init(rawValue:)) ?? .int16
                 )
             )
         case "pong":

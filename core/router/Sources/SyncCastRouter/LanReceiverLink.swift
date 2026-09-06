@@ -51,6 +51,9 @@ public struct LanLinkSnapshot: Sendable, Equatable {
     public var hasHardwareVolume: Bool?
     /// Receiver's own jitter-buffer depth from `hello_ack`.
     public var receiverBufferMs: Int?
+    /// Payload format the receiver agreed to in `hello_ack`; `s16le` until
+    /// then, and for a v1 receiver that never says.
+    public var payloadFormat: LanPcmWire.SampleFormat = .int16
     public var roundTripMs: Double?
     /// Receiver clock minus sender clock. Signed, and expected to be large —
     /// two machines' `mach_absolute_time` epochs are unrelated.
@@ -121,6 +124,16 @@ public final class LanReceiverLink: @unchecked Sendable {
 
     private var control: NWConnection?
     private var audio: NWConnection?
+    /// Read by the producer 200 times a second, so it gets its own lock
+    /// rather than a trip through the snapshot.
+    private let formatLock = NSLock()
+    private var negotiatedFormat: LanPcmWire.SampleFormat = .int16
+
+    /// The payload format to encode with right now.
+    public var payloadFormat: LanPcmWire.SampleFormat {
+        formatLock.lock(); defer { formatLock.unlock() }
+        return negotiatedFormat
+    }
     private var pingTimer: DispatchSourceTimer?
     private var reconnectTimer: DispatchSourceTimer?
     private var controlBuffer = Data()
@@ -572,11 +585,14 @@ public final class LanReceiverLink: @unchecked Sendable {
                 $0.deviceName = ack.deviceName.isEmpty ? nil : ack.deviceName
                 $0.hasHardwareVolume = ack.hasHardwareVolume
                 $0.receiverBufferMs = ack.bufferMs
+                $0.payloadFormat = ack.format
                 $0.lastError = nil
             }
+            formatLock.lock(); negotiatedFormat = ack.format; formatLock.unlock()
             log("hello_ack received (udp port \(ack.udpPort), device "
                 + "\(ack.deviceName.isEmpty ? "?" : ack.deviceName), "
-                + "hw_volume \(ack.hasHardwareVolume), buffer \(ack.bufferMs) ms)")
+                + "hw_volume \(ack.hasHardwareVolume), buffer \(ack.bufferMs) ms, "
+                + "payload \(ack.format.rawValue))")
             openAudioSocket(port: ack.udpPort)
         case .pong(let t1, let t2, let t3):
             lastPongReceivedAtNs = t4

@@ -36,6 +36,45 @@ public enum LanPcmWire {
         framesPerPacket * channelCount * bytesPerSample
     public static let packetBytes: Int = headerBytes + payloadBytes
 
+    /// Payload sample format, negotiated per stream.
+    ///
+    /// `s16le` is the v1 wire format. `f32le` carries the sender's Float32
+    /// mix untouched: the master level is applied on the RECEIVER (in
+    /// hardware when it has it), so the signal on the wire is pre-volume and
+    /// legitimately exceeds full scale on a hot programme or an EQ boost —
+    /// Int16 had to clip it there, where the local outputs, which scale
+    /// before their DAC, did not. The sender asks for `f32le` in `hello`; a
+    /// receiver that echoes it in `hello_ack` gets it, any other (a v1
+    /// receiver says nothing) gets `s16le`.
+    public enum SampleFormat: String, Sendable, CaseIterable {
+        case int16 = "s16le"
+        case float32 = "f32le"
+
+        public var bytesPerSample: Int {
+            switch self {
+            case .int16: return 2
+            case .float32: return 4
+            }
+        }
+    }
+
+    /// The format this sender asks for.
+    public static let preferredFormat: SampleFormat = .float32
+
+    public static func payloadBytes(for format: SampleFormat) -> Int {
+        framesPerPacket * channelCount * format.bytesPerSample
+    }
+
+    public static func packetBytes(for format: SampleFormat) -> Int {
+        headerBytes + payloadBytes(for: format)
+    }
+
+    /// The largest packet either format produces; the producer's scratch is
+    /// sized for it once.
+    public static var maximumPacketBytes: Int {
+        SampleFormat.allCases.map(packetBytes(for:)).max() ?? packetBytes
+    }
+
     /// Nanoseconds one packet covers, by definition of `framesPerPacket`.
     public static let packetDurationNs: UInt64 = 5_000_000
 
@@ -205,6 +244,63 @@ public enum LanPcmEncoder {
             }
         }
         return clipped
+    }
+
+    /// Write `frames` frames of planar Float32 as interleaved Float32 LE,
+    /// untouched. Returns how many samples lie past ±1.0 — not clipped, only
+    /// counted, so the diagnostics can still say the programme is hot.
+    @discardableResult
+    public static func encodeFloat32(
+        channels: UnsafeMutablePointer<UnsafeMutablePointer<Float>>,
+        channelCount: Int,
+        frames: Int,
+        into buffer: UnsafeMutableRawBufferPointer,
+        offset: Int
+    ) -> Int {
+        let needed = frames * channelCount * LanPcmWire.SampleFormat.float32.bytesPerSample
+        guard frames > 0, channelCount > 0, buffer.count >= offset + needed else { return 0 }
+        var hot = 0
+        var byteIndex = offset
+        for frame in 0..<frames {
+            for channel in 0..<channelCount {
+                var sample = channels[channel][frame]
+                if !sample.isFinite { sample = 0; hot += 1 } else if sample > 1 || sample < -1 { hot += 1 }
+                let bits = sample.bitPattern
+                buffer[byteIndex] = UInt8(truncatingIfNeeded: bits)
+                buffer[byteIndex + 1] = UInt8(truncatingIfNeeded: bits >> 8)
+                buffer[byteIndex + 2] = UInt8(truncatingIfNeeded: bits >> 16)
+                buffer[byteIndex + 3] = UInt8(truncatingIfNeeded: bits >> 24)
+                byteIndex += 4
+            }
+        }
+        return hot
+    }
+
+    /// The inverse of `encodeFloat32`, for tests. Interleaved Float32.
+    public static func decodeFloat32(payload: Data, channelCount: Int) -> [Float] {
+        let sampleCount = payload.count / 4
+        guard sampleCount > 0, channelCount > 0 else { return [] }
+        var out: [Float] = []
+        out.reserveCapacity(sampleCount)
+        payload.withUnsafeBytes { raw in
+            for index in 0..<sampleCount {
+                let o = index * 4
+                var bits = UInt32(raw[o])
+                bits |= UInt32(raw[o + 1]) << 8
+                bits |= UInt32(raw[o + 2]) << 16
+                bits |= UInt32(raw[o + 3]) << 24
+                out.append(Float(bitPattern: bits))
+            }
+        }
+        return out
+    }
+
+    /// Decode a payload of either format.
+    public static func decode(payload: Data, channelCount: Int, format: LanPcmWire.SampleFormat) -> [Float] {
+        switch format {
+        case .int16: return decode(payload: payload, channelCount: channelCount)
+        case .float32: return decodeFloat32(payload: payload, channelCount: channelCount)
+        }
     }
 
     /// The inverse, for tests and for anything that wants to look at what was
