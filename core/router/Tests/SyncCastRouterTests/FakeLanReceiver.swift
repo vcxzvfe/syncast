@@ -22,7 +22,12 @@ final class FakeLanReceiver: @unchecked Sendable {
         var targets: [Int] = []
         var pings: Int = 0
         var sawBye = false
-        var packets: [(header: LanAudioPacketHeader, payload: Data)] = []
+        /// Every audio packet, with the monotonic time it landed. The arrival
+        /// stamp is what lets a test measure the LEAD — `play_at_ns` minus
+        /// arrival — which is the sender-side proxy for the receiver's jitter
+        /// buffer level: a link that puts more audio on the wire than the ring
+        /// produces shows up here as a lead that grows without bound.
+        var packets: [(header: LanAudioPacketHeader, payload: Data, arrivalNs: UInt64)] = []
         var rejectedPackets: Int = 0
     }
 
@@ -236,7 +241,10 @@ final class FakeLanReceiver: @unchecked Sendable {
             guard let self else { return }
             if let data {
                 if let parsed = LanAudioPacketHeader.decodePacket(data) {
-                    self.mutate { $0.packets.append(parsed) }
+                    let arrival = Clock.nowNs()
+                    self.mutate {
+                        $0.packets.append((parsed.header, parsed.payload, arrival))
+                    }
                 } else {
                     self.mutate { $0.rejectedPackets += 1 }
                 }
@@ -250,35 +258,83 @@ final class FakeLanReceiver: @unchecked Sendable {
 /// A capture ring driven at real-time 48 kHz by a timer, so a producer under
 /// test sees the same frame-versus-wall-clock relationship a live tap gives.
 ///
+/// # Two delivery shapes
+///
+/// `.smooth` writes whatever has become due on every tick, which is a
+/// convenient fiction: no capture backend delivers a handful of frames every
+/// two milliseconds.
+///
+/// `.bursty` writes whole 512-frame blocks — 10.67 ms of audio, what a
+/// CoreAudio IOProc actually hands over — and holds each one for a random 0…4
+/// ms before releasing it, so the write cursor stands still for milliseconds
+/// at a time and then jumps. That is the shape that made the old sender
+/// synthesise silence packets: a 5 ms producer tick against a 10.67 ms block
+/// finds nothing new roughly every second wake.
+///
+/// # Frames, time, and the two clocks
+///
 /// The frame count is computed from ELAPSED TIME rather than accumulated per
-/// tick, so timer jitter moves the size of a write but never the ring's
-/// average rate — which is what lets the test assert exact packet spacing.
+/// tick, so timer jitter moves the size or the moment of a write but never
+/// the ring's average rate.
+///
+/// The capture ANCHOR is separate from all of that: a block's anchor carries
+/// the host time of its first frame taken from the (here, perfect) device
+/// clock, not the moment the writer happened to be scheduled. That
+/// distinction is the point of the whole timeline — the release jitter above
+/// must never reach `play_at_ns`.
+///
+/// `pause()` freezes the ring where it is, exactly as a capture backend that
+/// stops delivering does; `resume()` starts a new epoch, so the frames after
+/// the gap carry the host times they are really captured at rather than
+/// pretending the missing seconds were recorded.
 final class SyntheticRingProducer: @unchecked Sendable {
+
+    enum Mode {
+        /// Write everything due on every tick.
+        case smooth
+        /// Write whole 512-frame blocks, each held for a random 0…4 ms.
+        case bursty
+    }
+
+    /// What a CoreAudio IOProc hands over in one go at 48 kHz: 10.67 ms.
+    static let blockFrames: Int = 512
+    /// Ceiling on the random hold applied to a block in `.bursty`, in
+    /// nanoseconds. Re-drawn per block, so it jitters the arrival of each
+    /// block by ±2 ms about its 2 ms mean without accumulating.
+    static let burstJitterSpanNs: Double = 4_000_000
+
     let ring: RingBuffer
-    /// Hardware-style capture stamps, exactly as `TapCapture` publishes them:
-    /// every block carries the host time of its FIRST frame, taken from the
-    /// (here, perfect) device clock rather than from when the writer happened
-    /// to be scheduled. That distinction is the point of the whole timeline —
-    /// the producer's own timer jitters by milliseconds, and none of it may
-    /// reach `play_at_ns`.
     let anchors: CaptureAnchorPublisher
+    private let mode: Mode
     private let sampleRate: Double
     private let queue = DispatchQueue(label: "test.synthetic.ring", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
-    private var startNs: UInt64 = 0
+    /// Start of the current epoch, and the ring frame it began at. A pause
+    /// ends one epoch; a resume opens the next.
+    private var epochNs: UInt64 = 0
+    private var epochFrame: Int64 = 0
     private var written: Int64 = 0
     private var phase: Double = 0
+    private var holdNs: Double = 0
+    private var random = SystemRandomNumberGenerator()
 
-    init(sampleRate: Double = 48_000, capacityFrames: Int = 1 << 18) {
+    init(mode: Mode = .smooth, sampleRate: Double = 48_000, capacityFrames: Int = 1 << 18) {
+        self.mode = mode
         self.sampleRate = sampleRate
         self.ring = RingBuffer(channelCount: 2, capacityFrames: capacityFrames)
         self.anchors = CaptureAnchorPublisher(sampleRate: sampleRate)
     }
 
     func start() {
-        startNs = Clock.nowNs()
+        queue.sync {
+            epochNs = Clock.nowNs()
+            epochFrame = written
+            holdNs = 0
+        }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(2), leeway: .microseconds(200))
+        let period: DispatchTimeInterval = mode == .bursty
+            ? .milliseconds(1) : .milliseconds(2)
+        timer.schedule(deadline: .now(), repeating: period, leeway: .microseconds(200))
         timer.setEventHandler { [weak self] in self?.tick() }
         self.timer = timer
         timer.resume()
@@ -289,38 +345,77 @@ final class SyntheticRingProducer: @unchecked Sendable {
         timer = nil
     }
 
+    /// Freeze the ring where it is. The write cursor stops moving and no
+    /// further anchors are published — what a capture backend that stops
+    /// delivering looks like from the ring's side.
+    func pause() { stop() }
+
+    /// Start writing again, in a new epoch. Frames after the gap carry the
+    /// host times they are captured at; the silence in between was never
+    /// recorded and is never written.
+    func resume() { start() }
+
+    /// Host time this producer's clock assigns to a ring frame. The test uses
+    /// it to say what `play_at_ns` should have been.
+    func hostNs(forFrame frame: Int64) -> UInt64 {
+        queue.sync {
+            epochNs &+ UInt64((Double(frame - epochFrame) / sampleRate * 1_000_000_000).rounded())
+        }
+    }
+
     private func tick() {
-        let elapsed = Double(Clock.nowNs() - startNs) / 1_000_000_000
-        let target = Int64((elapsed * sampleRate).rounded())
-        var toWrite = Int(target - written)
-        guard toWrite > 0 else { return }
-        toWrite = min(toWrite, 4_096)
-        var left = [Float](repeating: 0, count: toWrite)
-        var right = [Float](repeating: 0, count: toWrite)
-        // A 440 Hz tone, so a listener inspecting a capture hears something
-        // recognisable and a decode check has non-trivial content.
+        let now = Clock.nowNs()
+        let elapsed = Double(now &- epochNs)
+        switch mode {
+        case .smooth:
+            let target = epochFrame + Int64((elapsed / 1_000_000_000 * sampleRate).rounded())
+            let toWrite = min(Int(target - written), 4_096)
+            guard toWrite > 0 else { return }
+            writeBlock(frames: toWrite)
+        case .bursty:
+            // A block is released once its whole 10.67 ms has elapsed AND the
+            // random hold drawn for it has passed.
+            while true {
+                let releasable = epochFrame
+                    + Int64(max(0, elapsed - holdNs) / 1_000_000_000 * sampleRate)
+                guard written + Int64(Self.blockFrames) <= releasable else { return }
+                writeBlock(frames: Self.blockFrames)
+                holdNs = Double.random(in: 0...Self.burstJitterSpanNs, using: &random)
+            }
+        }
+    }
+
+    /// Write `frames` of a 440 Hz tone and publish the block's anchor.
+    private func writeBlock(frames: Int) {
+        var left = [Float](repeating: 0, count: frames)
+        var right = [Float](repeating: 0, count: frames)
         let step = 2 * Double.pi * 440 / sampleRate
-        for index in 0..<toWrite {
-            left[index] = Float(sin(phase) * 0.25)
-            right[index] = Float(sin(phase) * -0.25)
+        for index in 0..<frames {
+            // Never exactly zero: a test that asserts the link sent no silent
+            // packets needs the ring itself to be unambiguously non-silent.
+            left[index] = Float(sin(phase) * 0.25 + 0.05)
+            right[index] = Float(sin(phase) * -0.25 - 0.05)
             phase += step
             if phase > 2 * Double.pi { phase -= 2 * Double.pi }
         }
+        let startFrame = written
         left.withUnsafeBufferPointer { l in
             right.withUnsafeBufferPointer { r in
                 let table = UnsafeMutablePointer<UnsafePointer<Float>>.allocate(capacity: 2)
                 defer { table.deallocate() }
                 table[0] = l.baseAddress!
                 table[1] = r.baseAddress!
-                ring.write(channels: table, frames: toWrite)
+                ring.write(channels: table, frames: frames)
             }
         }
-        // The block that just landed at ring position `written` began at the
-        // device's nominal time for that frame.
+        written = startFrame + Int64(frames)
+        // The block began at the device's own time for its first frame, not
+        // at the moment this writer was scheduled.
         anchors.publish(
-            frame: written,
-            hostNs: startNs &+ UInt64((Double(written) / sampleRate * 1_000_000_000).rounded())
+            frame: startFrame,
+            hostNs: epochNs &+ UInt64(
+                (Double(startFrame - epochFrame) / sampleRate * 1_000_000_000).rounded()
+            )
         )
-        written = target
     }
 }

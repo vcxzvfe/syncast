@@ -42,6 +42,9 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// `play_at_ns` progressively further from the truth; the estimator, fed
     /// from the write cursor, at least degrades honestly.
     public static let anchorStaleLimitNs: UInt64 = 1_000_000_000
+    /// How long the ring's write cursor may stand still before the producer
+    /// is treated as idle. See `ProducerIdleDetector`.
+    public static let idleThresholdMs: Int = ProducerIdleDetector.defaultIdleThresholdMs
 
     public let receiverUID: String
     /// Friendly name, for logs and the diagnostics line.
@@ -84,11 +87,15 @@ public final class LanReceiverOutput: @unchecked Sendable {
     private var cursor: Int64?
     private var sequence: UInt32 = 0
     private var lastPlayAtNs: UInt64?
-    private var lastWritePosition: Int64 = -1
+    /// Idleness is read off the ring, never off a single tick. See
+    /// `ProducerIdleDetector` for why that distinction is the whole fix.
+    private var idleDetector = ProducerIdleDetector(thresholdMs: idleThresholdMs)
 
     private let counterLock = NSLock()
     private var _packetsSent: UInt64 = 0
     private var _silencePackets: UInt64 = 0
+    private var _idleTicks: UInt64 = 0
+    private var _gapSkips: Int = 0
     private var _reanchorCount: Int = 0
     private var _encoderClipCount: Int64 = 0
 
@@ -163,7 +170,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
             cursor = nil
             sequence = 0
             lastPlayAtNs = nil
-            lastWritePosition = -1
+            idleDetector.reset()
             ringClock = RingWriteClock(sampleRate: sampleRate)
             hostClock = HostAnchoredRingClock(sampleRate: sampleRate)
             lastAnchorFrame = .min
@@ -220,7 +227,21 @@ public final class LanReceiverOutput: @unchecked Sendable {
 
     public struct Counters: Sendable, Equatable {
         public let packetsSent: UInt64
+        /// Packets whose payload came out of the chain digitally silent.
+        ///
+        /// These are REAL packets read from real ring frames — the sender no
+        /// longer synthesises anything — so a non-zero count means the ring
+        /// itself was carrying silence, which is a fact about the program
+        /// rather than about the link. During continuous playback it must be
+        /// zero; if it is not, the capture backend is the place to look.
         public let silencePackets: UInt64
+        /// Ticks that ran while the producer was judged idle (the ring's
+        /// write cursor had stood still for `idleThresholdMs`). Nothing is
+        /// sent on those ticks.
+        public let idleTicks: UInt64
+        /// Times the cursor skipped a gap on the tick where the producer
+        /// resumed, rather than replaying stale frames.
+        public let gapSkips: Int
         public let reanchorCount: Int
         public let encoderClipCount: Int64
         public let ringClockPpm: Double
@@ -234,6 +255,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
         counterLock.lock()
         let sent = _packetsSent
         let silence = _silencePackets
+        let idle = _idleTicks
+        let skips = _gapSkips
         let reanchors = _reanchorCount
         let clips = _encoderClipCount
         counterLock.unlock()
@@ -249,6 +272,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
         return Counters(
             packetsSent: sent,
             silencePackets: silence,
+            idleTicks: idle,
+            gapSkips: skips,
             reanchorCount: reanchors,
             encoderClipCount: clips,
             ringClockPpm: ppm,
@@ -271,10 +296,18 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let clipInfo = clip > 0 ? " clip:\(clip)" : ""
         let silence = counters.silencePackets
         let silenceInfo = silence > 0 ? " silence:\(silence)" : ""
+        let idleInfo = counters.idleTicks > 0 ? " idle:\(counters.idleTicks)" : ""
+        // Refusals are OUR fault, not the link's: the receiver only ever
+        // reports them when this side stamps more than one timeline.
+        let refused = (stats?.overlap ?? 0) + (stats?.farFuture ?? 0)
+        let refusedInfo = refused > 0
+            ? " refused:\(stats?.overlap ?? 0)/\(stats?.farFuture ?? 0)" : ""
+        let skipInfo = counters.gapSkips > 0 ? " gapSkips:\(counters.gapSkips)" : ""
         return "rtt:\(rtt) off:\(offset) buf:\(buffer)"
             + " late:\(stats?.late ?? 0) lost:\(stats?.lost ?? 0)"
             + " underrun:\(stats?.underrun ?? 0)"
             + " pkts:\(counters.packetsSent) resync:\(counters.reanchorCount)"
+            + idleInfo + skipInfo + refusedInfo
             + " clk:\(counters.clockSource)"
             + " ppm:\(String(format: "%.1f", counters.ringClockPpm))"
             + "\(clipInfo)\(silenceInfo)"
@@ -287,10 +320,22 @@ public final class LanReceiverOutput: @unchecked Sendable {
         guard running else { return }
         let writePosition = ring.writePosition
         let now = Clock.nowNs()
-        // The fallback estimator is fed on every tick whether or not it is
-        // the one in use: a backend whose stamps stop has to have something
-        // warm to fall back TO.
-        ringClock.observe(writePosition: writePosition, nowNs: now)
+        // Idleness is a property of the ring over TIME, never of one tick.
+        // The capture backend writes a 512-frame block every ~10.7 ms while
+        // this timer runs every 5 ms, so about half of all ticks find the
+        // write cursor exactly where they left it and the audio for that slot
+        // is a millisecond away. It is decided first because it also decides
+        // whether this tick's observations carry any information.
+        let producer = idleDetector.observe(writePosition: writePosition, nowNs: now)
+        if producer != .idle {
+            // The fallback estimator is fed whether or not it is the one in
+            // use: a backend whose stamps stop has to have something warm to
+            // fall back TO. But a frozen write cursor paired with an
+            // advancing `now` says nothing about the ring's rate — it is pure
+            // phase error — and feeding it would re-anchor the estimator
+            // every 100 ms for the whole of a silent stretch.
+            ringClock.observe(writePosition: writePosition, nowNs: now)
+        }
         observeAnchor(nowNs: now)
 
         guard link.isAudioReady else {
@@ -299,12 +344,36 @@ public final class LanReceiverOutput: @unchecked Sendable {
             // position the ring has long overwritten.
             cursor = nil
             lastPlayAtNs = nil
-            lastWritePosition = writePosition
+            idleDetector.reset()
             return
         }
 
-        let producerAdvanced = lastWritePosition < 0 || writePosition > lastWritePosition
-        lastWritePosition = writePosition
+        switch producer {
+        case .running:
+            break
+        case .idle:
+            // The producer has genuinely stopped. Send NOTHING: the receiver
+            // zero-fills what it does not have, which is the correct
+            // rendering of silence and costs no packet to say. Anything
+            // synthesised here would have to invent a timestamp, and a second
+            // timeline interleaved with the ring's is what garbled the audio
+            // before this fix.
+            counterLock.lock(); _idleTicks &+= 1; counterLock.unlock()
+        case .resumed:
+            // First frames after an idle stretch. Everything between the old
+            // cursor and the new write head is the silence that was not
+            // written; replaying it would put a burst of stale timestamps on
+            // the wire ahead of the audio that is about to arrive.
+            if let skipped = LanSendPlanner.resumeCursor(
+                writePosition: writePosition, cursor: cursor, lagFrames: lagFrames
+            ) {
+                cursor = skipped
+                counterLock.lock(); _gapSkips += 1; counterLock.unlock()
+                RouterLog.write(
+                    "[LAN] \(displayName) producer resumed; skipped the idle gap\n"
+                )
+            }
+        }
 
         let plan = LanSendPlanner.plan(
             writePosition: writePosition,
@@ -318,20 +387,11 @@ public final class LanReceiverOutput: @unchecked Sendable {
             counterLock.lock(); _reanchorCount += 1; counterLock.unlock()
         }
 
-        guard plan.packets > 0 else {
-            // The producer is not feeding us. Keep the receiver's jitter
-            // buffer primed with silence rather than letting it drain: an
-            // empty buffer is an underrun burst the moment audio resumes, and
-            // the receiver's clock loop has nothing to lock to meanwhile.
-            //
-            // Only while the producer is genuinely idle. A tick that simply
-            // arrived before the next packet was written must NOT inject
-            // silence — the audio for that slot is a millisecond away.
-            if !producerAdvanced, cursor != nil {
-                sendSilencePacket()
-            }
-            return
-        }
+        // Zero packets is the normal outcome of roughly every second tick and
+        // is not a fault: the timer runs faster than the capture block rate,
+        // and `play_at_ns` comes from the FRAME number, so a tick that sends
+        // nothing costs the receiver's timeline nothing either.
+        guard plan.packets > 0 else { return }
 
         for index in 0..<plan.packets {
             let frame = plan.startFrame + Int64(index) * Int64(LanPcmWire.framesPerPacket)
@@ -341,27 +401,33 @@ public final class LanReceiverOutput: @unchecked Sendable {
     }
 
     /// Read one packet's worth of ring, run the chain, packetise, send.
+    ///
+    /// This is the ONLY thing that puts a packet on the wire, which is the
+    /// point: every `play_at_ns` on this link is derived from a ring frame
+    /// index through `timeOf(frame)`, and the cursor advances by whole
+    /// packets for every one of them. There is no second timeline to
+    /// interleave with this one.
     private func sendPacket(readingFrame frame: Int64) {
         ring.read(at: frame, frames: LanPcmWire.framesPerPacket, into: stagingChannels)
         applyChain()
         let playAt = playAtNs(forFrame: frame)
-        emit(playAtNs: playAt, silence: false)
+        emit(playAtNs: playAt, silence: stagingIsSilent())
     }
 
-    /// Send a packet of digital silence, pacing `play_at_ns` off the previous
-    /// packet so the receiver's timeline stays continuous.
-    private func sendSilencePacket() {
+    /// Whether the packet about to be sent is digitally silent.
+    ///
+    /// Cheap (480 float compares on a non-real-time thread, 200 times a
+    /// second) and worth having: it separates "the link sent nothing" from
+    /// "the link sent zeros", which are different faults with the same
+    /// symptom at the speaker.
+    private func stagingIsSilent() -> Bool {
         for channel in 0..<channelCount {
-            stagingSlabs[channel].update(
-                repeating: 0, count: LanPcmWire.framesPerPacket
-            )
+            let samples = stagingSlabs[channel]
+            for index in 0..<LanPcmWire.framesPerPacket where samples[index] != 0 {
+                return false
+            }
         }
-        // The chain is deliberately NOT run on silence: a crosstalk recursion
-        // fed zeros still decays its own state, which is what we want, but
-        // running three banks 200 times a second for a buffer that is zero on
-        // the way in and zero on the way out is pure waste.
-        let playAt = (lastPlayAtNs ?? (Clock.nowNs() + targetNs)) + LanPcmWire.packetDurationNs
-        emit(playAtNs: playAt, silence: true)
+        return true
     }
 
     private func applyChain() {
@@ -393,12 +459,12 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// the playout target.
     ///
     /// Monotonicity is enforced rather than assumed. In steady state the ring
-    /// clock advances exactly one packet per packet and the guard never fires;
-    /// it exists for the seam where a stretch of silence packets (paced off
-    /// wall clock) hands back to ring-derived timestamps, and for a cursor
-    /// re-anchor that lands on an earlier ring time than the packet before it.
-    /// A receiver that saw time run backwards would drop everything until it
-    /// caught up.
+    /// clock advances exactly one packet per packet and the guard never
+    /// fires; it exists for the two seams where it could: the timeline handing
+    /// over between the hardware anchors and the fallback estimator, and a
+    /// cursor re-anchor that lands on an earlier ring time than the packet
+    /// before it. A receiver that saw time run backwards would drop
+    /// everything until it caught up.
     /// Take the newest hardware anchor, if the backend has published one we
     /// have not folded in yet.
     private func observeAnchor(nowNs: UInt64) {

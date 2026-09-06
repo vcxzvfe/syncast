@@ -350,6 +350,19 @@ local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
   `LanSendPlanner` holds the cursor a constant distance behind the producer
   and sends whole packets. The receiver closes its own DAC-clock difference
   with a water-level PI loop and a fractional resampler.
+- **One timeline, and nothing else on the wire**: every packet — there is no
+  silent variety — comes from a ring frame index through that clock, and the
+  cursor advances by whole packets for each. The producer wakes faster than
+  the capture backend writes, so a tick that finds no new frames is normal and
+  sends nothing. Idleness is read off the RING instead
+  (`ProducerIdleDetector`: the write cursor standing still for 100 ms), and
+  the response to it is to send nothing at all — the receiver renders what it
+  does not have as silence, which needs no packet to say. On the resume edge
+  `LanSendPlanner.resumeCursor` skips a backlog bigger than the lag plus two
+  packets rather than emitting stale timestamps. Diagnostics: `idle:`,
+  `gapSkips:`, `silence:` (packets whose payload came out of the chain zero,
+  which must be 0 during playback) and `refused:<overlap>/<far_future>`
+  echoed back from the receiver.
 - **Alignment**: `LanAlignmentPlanner` computes how far the local CoreAudio
   legs must be held back to land with the receiver, and it is applied as
   `LocalDelayTrimPlanner`'s `extraHoldFrames` — after normalisation, because a
@@ -367,7 +380,11 @@ local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
   [requirements_2026-09-05-lan-receiver.md](requirements_2026-09-05-lan-receiver.md);
   what the first two-machine run over Wi-Fi found and what was changed on both
   sides because of it:
-  [requirements_2026-09-05-lan-timing.md](requirements_2026-09-05-lan-timing.md).
+  [requirements_2026-09-05-lan-timing.md](requirements_2026-09-05-lan-timing.md);
+  and what the SECOND run found — a third of the wire being silence packets
+  stamped from a second timeline — with the sender and receiver changes that
+  followed:
+  [requirements_2026-09-06-lan-silence-timeline.md](requirements_2026-09-06-lan-silence-timeline.md).
 
 ## 9. Build & distribution
 

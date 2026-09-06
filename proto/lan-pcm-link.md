@@ -95,7 +95,8 @@ Receiver behaviour:
  "device_uid":"<uid>","hw_volume":<bool>,"buffer_ms":<int>}
 {"type":"pong","t1":<echo>,"t2":<recv monotonic ns>,"t3":<send monotonic ns>}
 {"type":"stats","late":<n>,"lost":<n>,"underrun":<n>,
- "buffer_ms":<float>,"ratio":<float>,"clip":<n>}
+ "buffer_ms":<float>,"ratio":<float>,"clip":<n>,
+ "overlap":<n>,"far_future":<n>}
 {"type":"error","message":"..."}
 ```
 
@@ -103,7 +104,16 @@ Receiver behaviour:
   `udp_port` on the address the control connection resolved to.
 - `hw_volume` says whether the receiver can carry `gain` in its output device's
   own volume control, or has to apply it as software gain.
-- `stats` every 1000 ms.
+- `stats` every 1000 ms. Receivers may add fields (the reference one reports
+  its re-anchor causes, measured arrival jitter and effective target as well);
+  senders read what they know and ignore the rest.
+- `overlap` and `far_future` count packets the receiver REFUSED, and both are
+  the sender's fault rather than the link's. A packet may never claim playout
+  frames another packet already delivered — every packet comes from a distinct
+  span of the sender's capture ring, so an overlap means the sender is stamping
+  more than one timeline — and a play time more than two seconds past the
+  newest buffered frame is a number no jitter buffer can hold. A sender seeing
+  either climb should look at its own timestamping, not at the network.
 - `error` on a bad token, followed by a close. Send the error and give it time
   to leave before closing, or the sender sees an opaque disconnect instead of a
   reason it can show the user.

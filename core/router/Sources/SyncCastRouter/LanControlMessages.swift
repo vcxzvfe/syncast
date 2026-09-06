@@ -86,10 +86,24 @@ public struct LanReceiverStats: Equatable, Sendable {
     public let ratio: Double
     /// Samples the receiver's own output limiter had to clamp.
     public let clip: Int
+    /// Packets the receiver REFUSED because their frames overlapped audio it
+    /// already held.
+    ///
+    /// This one is about US. A correct sender cannot produce it: every packet
+    /// comes from a distinct span of the capture ring. A non-zero count means
+    /// this side is stamping more than one timeline, which is the fault a
+    /// two-machine run heard as two copies of the programme at once — so it
+    /// is surfaced in our own diagnostics rather than left in the receiver's
+    /// log.
+    public let overlap: Int
+    /// Packets the receiver refused as stamped implausibly far ahead. Also
+    /// ours: it means our clock model has come loose.
+    public let farFuture: Int
 
     public init(
         late: Int, lost: Int, underrun: Int,
-        bufferMs: Double, ratio: Double, clip: Int
+        bufferMs: Double, ratio: Double, clip: Int,
+        overlap: Int = 0, farFuture: Int = 0
     ) {
         self.late = late
         self.lost = lost
@@ -97,6 +111,8 @@ public struct LanReceiverStats: Equatable, Sendable {
         self.bufferMs = bufferMs
         self.ratio = ratio
         self.clip = clip
+        self.overlap = overlap
+        self.farFuture = farFuture
     }
 
     public static let zero = LanReceiverStats(
@@ -226,7 +242,9 @@ public enum LanControlCodec {
                     underrun: intValue(dictionary["underrun"]) ?? 0,
                     bufferMs: doubleValue(dictionary["buffer_ms"]) ?? 0,
                     ratio: doubleValue(dictionary["ratio"]) ?? 1,
-                    clip: intValue(dictionary["clip"]) ?? 0
+                    clip: intValue(dictionary["clip"]) ?? 0,
+                    overlap: intValue(dictionary["overlap"]) ?? 0,
+                    farFuture: intValue(dictionary["far_future"]) ?? 0
                 )
             )
         case "error":
