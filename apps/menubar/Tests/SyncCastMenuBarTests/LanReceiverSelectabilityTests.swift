@@ -77,13 +77,9 @@ final class LanReceiverStoreTests: XCTestCase {
     }
 
     func testTheTokenRoundTripsThroughTheKeychain() throws {
-        // Opt-in: touching the login keychain from an ad-hoc xctest binary makes
-        // macOS prompt for the keychain password on EVERY build. Run with
-        // SYNCAST_KEYCHAIN_TESTS=1 to exercise the real keychain.
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["SYNCAST_KEYCHAIN_TESTS"] == "1",
-            "keychain round-trip is opt-in (SYNCAST_KEYCHAIN_TESTS=1)"
-        )
+        LanReceiverTokenStore.directoryOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("synccast-token-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { LanReceiverTokenStore.directoryOverride = nil }
         // A test-only service name, so the suite never touches the real items.
         let service = "syncast.test.lanReceiverTokens.\(UUID().uuidString)"
         let uid = "lan:receiver-a"
@@ -109,13 +105,9 @@ final class LanReceiverStoreTests: XCTestCase {
     }
 
     func testSavingAnEmptyTokenClearsTheItem() throws {
-        // Opt-in: touching the login keychain from an ad-hoc xctest binary makes
-        // macOS prompt for the keychain password on EVERY build. Run with
-        // SYNCAST_KEYCHAIN_TESTS=1 to exercise the real keychain.
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["SYNCAST_KEYCHAIN_TESTS"] == "1",
-            "keychain round-trip is opt-in (SYNCAST_KEYCHAIN_TESTS=1)"
-        )
+        LanReceiverTokenStore.directoryOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("synccast-token-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { LanReceiverTokenStore.directoryOverride = nil }
         let service = "syncast.test.lanReceiverTokens.\(UUID().uuidString)"
         let uid = "lan:receiver-a"
         defer { LanReceiverTokenStore.remove(forUID: uid, service: service) }

@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// Keychain storage for LAN receiver pairing tokens.
+/// File-backed storage for LAN receiver pairing tokens (0600, app-private).
 ///
 /// # Why not `UserDefaults`
 ///
@@ -17,7 +17,7 @@ import Security
 /// The service name doubles as the version marker, so a future record shape
 /// change gets a new service rather than a migration.
 enum LanReceiverTokenStore {
-    /// Keychain service. The `.v1` suffix is the schema version.
+    /// Store name. The `.v1` suffix is the schema version.
     static let service = "syncast.lanReceiverTokens.v1"
 
     /// Longest token accepted. The daemon generates 32 hex characters; the
@@ -50,114 +50,139 @@ enum LanReceiverTokenStore {
         String(token.prefix(8)).lowercased()
     }
 
-    // MARK: - Keychain
+    // MARK: - File store
 
-    static func token(forUID uid: String, service: String = service) -> String? {
-        var query = baseQuery(uid: uid, service: service)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else {
-            if status != errSecItemNotFound {
-                SyncCastLog.log("lan token: keychain read failed for \(uid) (status \(status))")
-            }
-            return nil
-        }
-        guard let data = result as? Data,
-              let token = String(data: data, encoding: .utf8)
-        else {
-            SyncCastLog.log("lan token: keychain item for \(uid) was not readable text")
-            return nil
-        }
-        return token
+    /// Where the tokens live: one JSON object per store (service name), in the
+    /// app's own Application Support directory, mode 0600 in a 0700 folder.
+    ///
+    /// Why a file and not the keychain any more (2026-09-06): the keychain
+    /// item's ACL is bound to the app binary, and every rebuild/reinstall of a
+    /// self-signed menubar app is a "different" binary to it. A read that the
+    /// ACL refused came back as "no receivers" without a word in the log, and
+    /// the only LAN output silently failed to open on every launch. The token
+    /// is a LAN pairing secret of the same weight as the daemon's own copy,
+    /// which the daemon keeps in a 0600 file — so this side does the same.
+    static var directoryOverride: URL?
+
+    static func storeDirectory() -> URL {
+        if let directoryOverride { return directoryOverride }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("SyncCast", isDirectory: true)
     }
 
-    /// Store (or replace) a receiver's token.
-    ///
-    /// - Returns: whether the write landed. A failure is reported rather than
-    ///   swallowed: a token the user believes they saved and did not is a
-    ///   receiver that never connects and never says why.
+    static func storeURL(service: String) -> URL {
+        let safe = service.replacingOccurrences(of: "/", with: "_")
+        return storeDirectory().appendingPathComponent("\(safe).json")
+    }
+
+    private static func readStore(service: String) -> [String: String] {
+        let url = storeURL(service: service)
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            SyncCastLog.log("lan token: store \(url.lastPathComponent) unreadable; ignoring it")
+            return [:]
+        }
+        var out: [String: String] = [:]
+        for (uid, value) in raw {
+            guard let token = value as? String, let clean = sanitize(token),
+                  !uid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            out[uid] = clean
+        }
+        return out
+    }
+
+    private static func writeStore(_ tokens: [String: String], service: String) -> Bool {
+        let directory = storeDirectory()
+        let url = storeURL(service: service)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            if tokens.isEmpty {
+                if FileManager.default.fileExists(atPath: url.path) {
+                    try FileManager.default.removeItem(at: url)
+                }
+                return true
+            }
+            let data = try JSONSerialization.data(withJSONObject: tokens, options: [.sortedKeys])
+            try data.write(to: url, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return true
+        } catch {
+            SyncCastLog.log("lan token: could not write \(url.lastPathComponent): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    static func token(forUID uid: String, service: String = service) -> String? {
+        readStore(service: service)[uid]
+    }
+
+    /// Store (or, for an empty/whitespace token, clear) the token for one
+    /// receiver. Returns false only when the file could not be written.
     @discardableResult
     static func save(_ token: String, forUID uid: String, service: String = service) -> Bool {
-        guard let clean = sanitize(token) else { return remove(forUID: uid, service: service) }
-        let data = Data(clean.utf8)
-        var query = baseQuery(uid: uid, service: service)
-        let attributes: [String: Any] = [kSecValueData as String: data]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if updateStatus == errSecSuccess { return true }
-        guard updateStatus == errSecItemNotFound else {
-            SyncCastLog.log("lan token: keychain update failed for \(uid) (status \(updateStatus))")
-            return false
+        var tokens = readStore(service: service)
+        if let clean = sanitize(token) {
+            tokens[uid] = clean
+        } else {
+            tokens.removeValue(forKey: uid)
         }
-        query[kSecValueData as String] = data
-        // The token is only useful while this Mac is unlocked and running, and
-        // it must never leave the machine — so no iCloud sync and the
-        // strictest accessibility class that still survives a reboot.
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let addStatus = SecItemAdd(query as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            SyncCastLog.log("lan token: keychain write failed for \(uid) (status \(addStatus))")
-            return false
-        }
-        return true
+        return writeStore(tokens, service: service)
     }
 
     @discardableResult
     static func remove(forUID uid: String, service: String = service) -> Bool {
-        let status = SecItemDelete(baseQuery(uid: uid, service: service) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            SyncCastLog.log("lan token: keychain delete failed for \(uid) (status \(status))")
-            return false
-        }
-        return true
+        var tokens = readStore(service: service)
+        tokens.removeValue(forKey: uid)
+        return writeStore(tokens, service: service)
     }
 
-    /// Every stored token, keyed by receiver UID.
-    ///
-    /// Read once at launch and after each edit; the Router keeps the map in
-    /// memory from then on, so the keychain is not touched on the audio path.
-    ///
-    /// Two passes on purpose: the account names first, then one read per
-    /// account. Asking for attributes AND data in a single `kSecMatchLimitAll`
-    /// query is accepted by the API and returns nothing on the file-based
-    /// keychain, which is a silent "you have no receivers" — the worst
-    /// possible failure for a pairing store.
+    /// Every stored receiver token. Migrates once from the keychain item the
+    /// previous implementation used, WITHOUT ever showing a keychain dialog:
+    /// a refused read simply means the user re-enters the token.
     static func loadAll(service: String = service) -> [String: String] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrSynchronizable as String: false,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else {
-            if status != errSecItemNotFound {
-                SyncCastLog.log("lan token: keychain enumeration failed (status \(status))")
+        var tokens = readStore(service: service)
+        if tokens.isEmpty, directoryOverride == nil {
+            let migrated = migrateFromKeychain(service: service)
+            if !migrated.isEmpty {
+                tokens = migrated
+                _ = writeStore(tokens, service: service)
+                SyncCastLog.log("lan token: migrated \(migrated.count) receiver token(s) from the keychain")
             }
-            return [:]
         }
-        guard let items = result as? [[String: Any]] else { return [:] }
-        var tokens: [String: String] = [:]
-        for item in items {
-            guard let uid = item[kSecAttrAccount as String] as? String,
-                  let token = token(forUID: uid, service: service),
-                  let clean = sanitize(token)
-            else { continue }
-            tokens[uid] = clean
-        }
+        SyncCastLog.log("lan token: \(tokens.count) receiver token(s) loaded")
         return tokens
     }
 
-    private static func baseQuery(uid: String, service: String) -> [String: Any] {
-        [
+    private static func migrateFromKeychain(service: String) -> [String: String] {
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: uid,
-            kSecAttrSynchronizable as String: false,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
         ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            if status != errSecItemNotFound {
+                SyncCastLog.log("lan token: keychain migration skipped (status \(status))")
+            }
+            return [:]
+        }
+        var out: [String: String] = [:]
+        for item in items {
+            guard let uid = item[kSecAttrAccount as String] as? String,
+                  let data = item[kSecValueData as String] as? Data,
+                  let token = String(data: data, encoding: .utf8),
+                  let clean = sanitize(token) else { continue }
+            out[uid] = clean
+        }
+        return out
     }
 }
 
