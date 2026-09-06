@@ -57,6 +57,8 @@ public struct LanLinkSnapshot: Sendable, Equatable {
     public var offsetMs: Double?
     public var stats: LanReceiverStats?
     public var packetsSent: UInt64 = 0
+    /// Packets the producer handed over while the UDP socket was not ready.
+    public var packetsDroppedNotReady: UInt64 = 0
     public var reconnectCount: Int = 0
 
     public init() {}
@@ -645,12 +647,30 @@ public final class LanReceiverLink: @unchecked Sendable {
                 self.pushPendingSettings(force: true)
             case .failed(let error):
                 self.fail("audio socket failed: \(error.localizedDescription)")
+            case .waiting(let error):
+                // Network framework will retry on its own, but a UDP socket
+                // that sits in `waiting` (path lost after a Wi-Fi hiccup) is a
+                // silent stream: `sendAudio` drops every packet. Give the
+                // stack a few seconds, then treat it as a failure so the
+                // whole link reconnects and the receiver re-primes.
+                self.mutateSnapshot { $0.isAudioReady = false }
+                self.log("audio socket waiting: \(error.localizedDescription)")
+                self.queue.asyncAfter(deadline: .now() + Self.audioWaitingGraceSeconds) { [weak self] in
+                    guard let self, connection === self.audio else { return }
+                    if case .waiting = connection.state {
+                        self.fail("audio socket stayed in waiting for \(Int(Self.audioWaitingGraceSeconds)) s; reconnecting")
+                    }
+                }
             default:
                 break
             }
         }
         connection.start(queue: queue)
     }
+
+    /// How long the UDP socket may sit in `.waiting` before the link is
+    /// considered down and rebuilt.
+    static let audioWaitingGraceSeconds: Double = 3
 
     /// Hand one packet to the socket. Called from the producer timer.
     ///
@@ -660,7 +680,10 @@ public final class LanReceiverLink: @unchecked Sendable {
     /// send 5 ms of audio ago, and the receiver's `lost` counter is the
     /// authoritative report anyway.
     public func sendAudio(_ packet: Data) {
-        guard let audio, audio.state == .ready else { return }
+        guard let audio, audio.state == .ready else {
+            mutateSnapshot { $0.packetsDroppedNotReady &+= 1 }
+            return
+        }
         audio.send(content: packet, completion: .idempotent)
         mutateSnapshot { $0.packetsSent &+= 1 }
     }

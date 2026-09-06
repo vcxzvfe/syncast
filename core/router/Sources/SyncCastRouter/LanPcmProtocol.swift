@@ -44,13 +44,13 @@ public enum LanPcmWire {
 
     // MARK: - Latency target
 
-    /// Default playout target, in milliseconds. 120 ms because the field runs
-    /// over Wi-Fi showed periodic ~100 ms stalls (macOS background roaming
+    /// Default playout target, in milliseconds. 150 ms because the field runs
+    /// over Wi-Fi showed periodic ~100 ms stalls (and occasional longer ones) (macOS background roaming
     /// scans / power save): a target below the stall length throws a whole
     /// stall's worth of packets away as late. The receiver raises its own
     /// floor to the maximum arrival spread it measures, so this is the
     /// starting point, not a ceiling.
-    public static let defaultTargetMs: Int = 120
+    public static let defaultTargetMs: Int = 150
     public static let targetRangeMs: ClosedRange<Int> = 30...300
     public static let targetStepMs: Int = 5
 
