@@ -281,11 +281,21 @@ extension Router {
         let targets = lanReceiverOutputs.values.map { $0.link.targetMs }
         guard let slowest = targets.max() else { return 0 }
         return LanAlignmentPlanner.localHoldFrames(
-            targetMs: slowest,
+            targetMs: slowest + lanScheduleLagMs(),
             ringFloorFrames: ringFloorFrames(logWarnings: false),
             maximumDeviceLatencyFrames: maximumLocalDeviceLatencyFrames(),
             sampleRate: activeCapture.sampleRate
         )
+    }
+
+    /// The LAN producer's read lag in whole milliseconds — the amount every
+    /// packet's `play_at_ns` carries on top of the target, so the local legs
+    /// must hold by the same amount to play the same frame together.
+    func lanScheduleLagMs() -> Int {
+        let frames = LanReceiverOutput.scheduleLagFrames(
+            ringFloorFrames: ringFloorFrames(logWarnings: false)
+        )
+        return Int((Double(frames) / activeCapture.sampleRate * 1000).rounded())
     }
 
     /// The largest output latency any enabled local device reports, in frames.
@@ -310,7 +320,7 @@ extension Router {
         let targets = lanReceiverOutputs.values.map { $0.link.targetMs }
         guard let slowest = targets.max() else { return nil }
         return LanAlignmentPlanner.totalLagMs(
-            targetMs: slowest,
+            targetMs: slowest + lanScheduleLagMs(),
             ringFloorFrames: ringFloorFrames(logWarnings: false),
             maximumDeviceLatencyFrames: maximumLocalDeviceLatencyFrames(),
             sampleRate: activeCapture.sampleRate

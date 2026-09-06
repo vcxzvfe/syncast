@@ -33,6 +33,16 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// Extra ring lag on top of the capture floor, so a tick that runs 1–2 ms
     /// late still finds a whole packet written. One packet.
     public static let extraLagFrames: Int = LanPcmWire.framesPerPacket
+
+    /// Frames the producer holds behind the ring's write head before it will
+    /// read a packet: the capture floor plus one packet of tick slack. This is
+    /// also how far in the PAST every packet already is when it leaves the
+    /// machine, so `play_at_ns` adds it back on top of the target — otherwise
+    /// the receiver's whole budget minus this lag is what is actually left for
+    /// the network, which on Wi-Fi was the difference between 55 ms and 90 ms.
+    public static func scheduleLagFrames(ringFloorFrames: Int) -> Int {
+        max(0, ringFloorFrames) + extraLagFrames
+    }
     /// How stale the newest hardware anchor may be before the packet timeline
     /// falls back to the estimator.
     ///
@@ -95,6 +105,15 @@ public final class LanReceiverOutput: @unchecked Sendable {
     private var _packetsSent: UInt64 = 0
     private var _silencePackets: UInt64 = 0
     private var _idleTicks: UInt64 = 0
+    /// Producer-thread health: the longest gap between two ticks and the
+    /// number of ticks that ran more than 3x late since the last snapshot,
+    /// plus the largest packet burst one tick emitted. A bursty producer is
+    /// indistinguishable from a jittery network at the receiver, so this is
+    /// how the two are told apart.
+    private var _lastTickNs: UInt64 = 0
+    private var _tickMaxIntervalNs: UInt64 = 0
+    private var _tickLateTicks: UInt64 = 0
+    private var _burstMaxPackets: Int = 0
     private var _gapSkips: Int = 0
     private var _reanchorCount: Int = 0
     private var _encoderClipCount: Int64 = 0
@@ -115,7 +134,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         self.sampleRate = sampleRate > 0 ? sampleRate : LanPcmWire.sampleRate
         self.channelCount = max(1, channelCount)
         self.link = link
-        self.lagFrames = Int64(max(0, ringFloorFrames) + Self.extraLagFrames)
+        self.lagFrames = Int64(Self.scheduleLagFrames(ringFloorFrames: ringFloorFrames))
         self.queue = DispatchQueue(label: "io.syncast.lan.producer", qos: .userInitiated)
         self.ringClock = RingWriteClock(sampleRate: self.sampleRate)
         self.anchors = captureAnchors
@@ -249,6 +268,12 @@ public final class LanReceiverOutput: @unchecked Sendable {
         /// Which timeline `play_at_ns` is currently derived from: "hal" when
         /// the capture backend stamps its blocks, "est" when it does not.
         public let clockSource: String
+        /// Longest tick-to-tick gap since the previous snapshot, ms.
+        public let tickMaxIntervalMs: Double
+        /// Ticks that ran more than 3x late since the previous snapshot.
+        public let tickLateTicks: UInt64
+        /// Largest number of packets one tick emitted since the previous snapshot.
+        public let burstMaxPackets: Int
     }
 
     public var counters: Counters {
@@ -259,6 +284,12 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let skips = _gapSkips
         let reanchors = _reanchorCount
         let clips = _encoderClipCount
+        let tickMax = _tickMaxIntervalNs
+        let tickLate = _tickLateTicks
+        let burst = _burstMaxPackets
+        _tickMaxIntervalNs = 0
+        _tickLateTicks = 0
+        _burstMaxPackets = 0
         counterLock.unlock()
         // The clocks are queue-confined; a torn read of two Doubles is not
         // possible in practice here, but the diagnostic is read once a second
@@ -278,7 +309,10 @@ public final class LanReceiverOutput: @unchecked Sendable {
             encoderClipCount: clips,
             ringClockPpm: ppm,
             ringClockReanchors: clockReanchors,
-            clockSource: source
+            clockSource: source,
+            tickMaxIntervalMs: Double(tickMax) / 1_000_000,
+            tickLateTicks: tickLate,
+            burstMaxPackets: burst
         )
     }
 
@@ -297,6 +331,10 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let silence = counters.silencePackets
         let silenceInfo = silence > 0 ? " silence:\(silence)" : ""
         let idleInfo = counters.idleTicks > 0 ? " idle:\(counters.idleTicks)" : ""
+        let tickInfo = String(
+            format: " tickMax:%.1fms tickLate:%d burst:%d",
+            counters.tickMaxIntervalMs, Int(counters.tickLateTicks), counters.burstMaxPackets
+        )
         // Refusals are OUR fault, not the link's: the receiver only ever
         // reports them when this side stamps more than one timeline.
         let refused = (stats?.overlap ?? 0) + (stats?.farFuture ?? 0)
@@ -307,7 +345,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
             + " late:\(stats?.late ?? 0) lost:\(stats?.lost ?? 0)"
             + " underrun:\(stats?.underrun ?? 0)"
             + " pkts:\(counters.packetsSent) resync:\(counters.reanchorCount)"
-            + idleInfo + skipInfo + refusedInfo
+            + idleInfo + skipInfo + refusedInfo + tickInfo
             + " clk:\(counters.clockSource)"
             + " ppm:\(String(format: "%.1f", counters.ringClockPpm))"
             + "\(clipInfo)\(silenceInfo)"
@@ -320,6 +358,14 @@ public final class LanReceiverOutput: @unchecked Sendable {
         guard running else { return }
         let writePosition = ring.writePosition
         let now = Clock.nowNs()
+        counterLock.lock()
+        if _lastTickNs != 0 {
+            let interval = now &- _lastTickNs
+            if interval > _tickMaxIntervalNs { _tickMaxIntervalNs = interval }
+            if interval > UInt64(Self.tickIntervalMs) * 3_000_000 { _tickLateTicks &+= 1 }
+        }
+        _lastTickNs = now
+        counterLock.unlock()
         // Idleness is a property of the ring over TIME, never of one tick.
         // The capture backend writes a 512-frame block every ~10.7 ms while
         // this timer runs every 5 ms, so about half of all ticks find the
@@ -393,6 +439,9 @@ public final class LanReceiverOutput: @unchecked Sendable {
         // nothing costs the receiver's timeline nothing either.
         guard plan.packets > 0 else { return }
 
+        counterLock.lock()
+        if plan.packets > _burstMaxPackets { _burstMaxPackets = plan.packets }
+        counterLock.unlock()
         for index in 0..<plan.packets {
             let frame = plan.startFrame + Int64(index) * Int64(LanPcmWire.framesPerPacket)
             sendPacket(readingFrame: frame)
@@ -455,6 +504,11 @@ public final class LanReceiverOutput: @unchecked Sendable {
         UInt64(LanPcmWire.clampTargetMs(link.targetMs)) * 1_000_000
     }
 
+    /// The read lag expressed in nanoseconds of ring time.
+    private var lagNs: UInt64 {
+        UInt64((Double(lagFrames) / sampleRate * 1_000_000_000).rounded())
+    }
+
     /// `play_at_ns` for a ring frame: when the ring says it was captured, plus
     /// the playout target.
     ///
@@ -502,7 +556,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         logClockSource(hostAnchored ? "hal" : "est")
         let base = (hostAnchored
             ? hostClock.timeNs(forFrame: frame)
-            : ringClock.timeNs(forFrame: frame)) &+ targetNs
+            : ringClock.timeNs(forFrame: frame)) &+ lagNs &+ targetNs
         if let last = lastPlayAtNs, base <= last {
             return last &+ LanPcmWire.packetDurationNs
         }
