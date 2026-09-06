@@ -1284,6 +1284,12 @@ final class AppModel {
                 // gated by it. If SCK is slow / failing / waiting on a
                 // TCC prompt, AirPlay should still kick off.
                 await pushAirplayState()
+                // The LAN receiver legs are opened INSIDE `router.start`, and a
+                // leg without its token is not opened at all — so the tokens
+                // and targets must reach the Router before, not after. Pushing
+                // them only post-start left a LAN-only selection failing with
+                // "no output could be opened" on every launch.
+                await pushLanReceiverConfiguration()
                 try await router.start(devices: snapshot)
                 SyncCastLog.log("reconcile: router.start OK")
 
