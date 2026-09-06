@@ -46,6 +46,19 @@ final class LanReceiverDspAvailabilityTests: XCTestCase {
         XCTAssertEqual(model.channelMatrixIsAvailable(for: "lan-1"), model.channelMatrixIsSupportedOnCurrentPath)
     }
 
+    /// The editor writes through `EqualizerTarget`, a second UID lookup that
+    /// also used to be CoreAudio-only: the sliders rendered but sat at 0.0.
+    func test_editor_target_setters_reach_a_lan_receiver() {
+        let model = AppModel()
+        model.devices = [lanDevice()]
+        model.setEqualizerBandGain(-3, bandIndex: 2, target: .device("lan-1"))
+        model.setEqualizerTrim(-1.5, target: .device("lan-1"))
+        let uid = Device.lanReceiverUID(serviceName: "receiver-a")!
+        XCTAssertEqual(model.deviceEqualizers[uid]?.settings.bands[2].gainDb, -3)
+        XCTAssertEqual(model.deviceEqualizers[uid]?.settings.trimDb, -1.5)
+        XCTAssertEqual(model.equalizerSettings(for: "lan-1").bands[2].gainDb, -3)
+    }
+
     func test_lan_receiver_curve_is_stored_under_its_service_uid() {
         let model = AppModel()
         model.devices = [lanDevice()]

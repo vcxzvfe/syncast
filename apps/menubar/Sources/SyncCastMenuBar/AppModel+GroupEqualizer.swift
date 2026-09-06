@@ -44,7 +44,7 @@ extension AppModel {
     /// already dropped).
     func equalizerUID(for target: EqualizerTarget) -> String? {
         switch target {
-        case .device(let deviceID): return coreAudioUID(forDeviceID: deviceID)
+        case .device(let deviceID): return dspUID(forDeviceID: deviceID)
         case .airPlayGroup: return AppModel.airPlayGroupEqualizerUID
         }
     }
