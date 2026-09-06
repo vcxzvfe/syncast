@@ -327,7 +327,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         // is a millisecond away. It is decided first because it also decides
         // whether this tick's observations carry any information.
         let producer = idleDetector.observe(writePosition: writePosition, nowNs: now)
-        if producer != .idle {
+        if producer != ProducerIdleDetector.State.idle {
             // The fallback estimator is fed whether or not it is the one in
             // use: a backend whose stamps stop has to have something warm to
             // fall back TO. But a frozen write cursor paired with an
