@@ -114,6 +114,12 @@ public final class LanReceiverOutput: @unchecked Sendable {
     private var _tickMaxIntervalNs: UInt64 = 0
     private var _tickLateTicks: UInt64 = 0
     private var _burstMaxPackets: Int = 0
+    /// Probe for the "half the packets are zero" field symptom: packets whose
+    /// ring read returned fewer valid frames than a packet (the rest was
+    /// zero-filled because the requested span lay outside the ring's window),
+    /// plus the geometry of the most recent one. Logged rate-limited.
+    private var _shortReads: UInt64 = 0
+    private var _lastShortReadLogNs: UInt64 = 0
     private var _gapSkips: Int = 0
     private var _reanchorCount: Int = 0
     private var _encoderClipCount: Int64 = 0
@@ -274,6 +280,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
         public let tickLateTicks: UInt64
         /// Largest number of packets one tick emitted since the previous snapshot.
         public let burstMaxPackets: Int
+        /// Packets whose ring read came back partly zero-filled (see `_shortReads`).
+        public let shortReads: UInt64
     }
 
     public var counters: Counters {
@@ -287,6 +295,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let tickMax = _tickMaxIntervalNs
         let tickLate = _tickLateTicks
         let burst = _burstMaxPackets
+        let shortReads = _shortReads
         _tickMaxIntervalNs = 0
         _tickLateTicks = 0
         _burstMaxPackets = 0
@@ -312,7 +321,8 @@ public final class LanReceiverOutput: @unchecked Sendable {
             clockSource: source,
             tickMaxIntervalMs: Double(tickMax) / 1_000_000,
             tickLateTicks: tickLate,
-            burstMaxPackets: burst
+            burstMaxPackets: burst,
+            shortReads: shortReads
         )
     }
 
@@ -334,7 +344,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let tickInfo = String(
             format: " tickMax:%.1fms tickLate:%d burst:%d",
             counters.tickMaxIntervalMs, Int(counters.tickLateTicks), counters.burstMaxPackets
-        )
+        ) + " short:\(counters.shortReads)"
         // Refusals are OUR fault, not the link's: the receiver only ever
         // reports them when this side stamps more than one timeline.
         let refused = (stats?.overlap ?? 0) + (stats?.farFuture ?? 0)
@@ -457,7 +467,22 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// packets for every one of them. There is no second timeline to
     /// interleave with this one.
     private func sendPacket(readingFrame frame: Int64) {
-        ring.read(at: frame, frames: LanPcmWire.framesPerPacket, into: stagingChannels)
+        let valid = ring.read(at: frame, frames: LanPcmWire.framesPerPacket, into: stagingChannels)
+        if valid < LanPcmWire.framesPerPacket {
+            let writePosition = ring.writePosition
+            let now = Clock.nowNs()
+            counterLock.lock()
+            _shortReads &+= 1
+            let shouldLog = now &- _lastShortReadLogNs > 1_000_000_000
+            if shouldLog { _lastShortReadLogNs = now }
+            let total = _shortReads
+            counterLock.unlock()
+            if shouldLog {
+                RouterLog.write(
+                    "[LAN] \(displayName) short read #\(total): frame=\(frame) valid=\(valid)/\(LanPcmWire.framesPerPacket) writePos=\(writePosition) lowerValid=\(writePosition - Int64(ring.capacityFrames)) cursorLag=\(writePosition - frame) lag=\(lagFrames) cap=\(ring.capacityFrames)\n"
+                )
+            }
+        }
         applyChain()
         let playAt = playAtNs(forFrame: frame)
         emit(playAtNs: playAt, silence: stagingIsSilent())
