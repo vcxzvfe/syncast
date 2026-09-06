@@ -236,7 +236,7 @@ enum LanReceiverTargetStore {
     // The range lives in the router package (`LanPcmWire`); these two
     // re-expose it so this file has no import beyond Foundation and the tests
     // read one number rather than two.
-    static let defaultTargetMs = 90
+    static let defaultTargetMs = 120
     static let rangeMs: ClosedRange<Int> = 30...300
     static let stepMs = 5
 

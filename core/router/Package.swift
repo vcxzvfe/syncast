@@ -14,6 +14,10 @@ let package = Package(
             name: "SyncCastSystemSinkProbe",
             targets: ["SyncCastSystemSinkProbe"]
         ),
+        .executable(
+            name: "SyncCastLanLinkProbe",
+            targets: ["SyncCastLanLinkProbe"]
+        ),
     ],
     dependencies: [
         .package(path: "../discovery"),
@@ -41,6 +45,11 @@ let package = Package(
             name: "SyncCastSystemSinkProbe",
             dependencies: ["SyncCastRouter"],
             path: "Sources/SyncCastSystemSinkProbe"
+        ),
+        .executableTarget(
+            name: "SyncCastLanLinkProbe",
+            dependencies: ["SyncCastRouter"],
+            path: "Sources/SyncCastLanLinkProbe"
         ),
         .testTarget(
             name: "SyncCastRouterTests",
