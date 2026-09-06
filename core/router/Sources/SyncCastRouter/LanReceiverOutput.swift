@@ -297,12 +297,17 @@ public final class LanReceiverOutput: @unchecked Sendable {
         let silence = counters.silencePackets
         let silenceInfo = silence > 0 ? " silence:\(silence)" : ""
         let idleInfo = counters.idleTicks > 0 ? " idle:\(counters.idleTicks)" : ""
+        // Refusals are OUR fault, not the link's: the receiver only ever
+        // reports them when this side stamps more than one timeline.
+        let refused = (stats?.overlap ?? 0) + (stats?.farFuture ?? 0)
+        let refusedInfo = refused > 0
+            ? " refused:\(stats?.overlap ?? 0)/\(stats?.farFuture ?? 0)" : ""
         let skipInfo = counters.gapSkips > 0 ? " gapSkips:\(counters.gapSkips)" : ""
         return "rtt:\(rtt) off:\(offset) buf:\(buffer)"
             + " late:\(stats?.late ?? 0) lost:\(stats?.lost ?? 0)"
             + " underrun:\(stats?.underrun ?? 0)"
             + " pkts:\(counters.packetsSent) resync:\(counters.reanchorCount)"
-            + idleInfo + skipInfo
+            + idleInfo + skipInfo + refusedInfo
             + " clk:\(counters.clockSource)"
             + " ppm:\(String(format: "%.1f", counters.ringClockPpm))"
             + "\(clipInfo)\(silenceInfo)"
