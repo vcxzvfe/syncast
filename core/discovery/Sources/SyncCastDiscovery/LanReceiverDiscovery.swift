@@ -196,10 +196,40 @@ public final class LanReceiverDiscovery: @unchecked Sendable {
         }
     }
 
+    /// How long a receiver has to stay absent from the browse results before
+    /// it is reported gone. Bonjour on this platform periodically reports an
+    /// EMPTY result set for a beat and then repopulates it; treating that beat
+    /// as a removal dropped the row's routing, stopped the engine and tore the
+    /// live link down for nothing. The link has its own 5 s keep-alive, so a
+    /// receiver that really went away is noticed there first.
+    static let removalGraceSeconds: TimeInterval = 20
+    private var absentSince: [String: Date] = [:]
+
     private func emitRemovals(keptKeys: Set<String>) {
+        let now = Date()
+        for key in keptKeys { absentSince.removeValue(forKey: key) }
+        var needsRecheck = false
         for (key, device) in seen where !keptKeys.contains(key) {
-            seen.removeValue(forKey: key)
-            continuation?.yield(.disappeared(deviceID: device.id))
+            let since: Date
+            if let existing = absentSince[key] {
+                since = existing
+            } else {
+                absentSince[key] = now
+                since = now
+            }
+            if now.timeIntervalSince(since) >= Self.removalGraceSeconds {
+                seen.removeValue(forKey: key)
+                absentSince.removeValue(forKey: key)
+                continuation?.yield(.disappeared(deviceID: device.id))
+            } else {
+                needsRecheck = true
+            }
+        }
+        if needsRecheck {
+            queue.asyncAfter(deadline: .now() + Self.removalGraceSeconds + 0.5) { [weak self] in
+                guard let self else { return }
+                self.emitRemovals(keptKeys: self.removalGate.lastBrowserKeys)
+            }
         }
     }
 
