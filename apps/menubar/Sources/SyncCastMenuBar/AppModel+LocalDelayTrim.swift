@@ -58,14 +58,14 @@ extension AppModel {
     func localDelayTrimIsAvailable(for deviceID: String) -> Bool {
         guard localDelayTrimIsSupportedOnCurrentPath else { return false }
         guard routing[deviceID]?.enabled ?? false else { return false }
-        return coreAudioUID(forDeviceID: deviceID) != nil
+        return dspUID(forDeviceID: deviceID) != nil
     }
 
     /// One line explaining why a stored value is not being applied right now,
     /// or nil when it is. Only ever shown on a row that HAS one — silently
     /// ignoring a saved setting is the behaviour that reads as a bug.
     func localDelayTrimInactiveHint(for deviceID: String) -> String? {
-        guard let uid = coreAudioUID(forDeviceID: deviceID),
+        guard let uid = dspUID(forDeviceID: deviceID),
               (localDelayTrims[uid]?.delayMs ?? 0) != 0
         else {
             return nil
@@ -86,7 +86,7 @@ extension AppModel {
     /// The value dialled in for a device, in milliseconds. Signed: positive
     /// means "make this one sound later".
     func localDelayTrimMs(for deviceID: String) -> Int {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return 0 }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return 0 }
         return localDelayTrims[uid]?.delayMs ?? 0
     }
 
@@ -122,14 +122,19 @@ extension AppModel {
     ///   in-memory value is what gets pushed either way, so "live" and "saved"
     ///   never disagree about what is playing.
     func setLocalDelayTrim(_ ms: Int, for deviceID: String, persist: Bool = true) {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else {
+        guard let uid = dspUID(forDeviceID: deviceID) else {
             // The UI never offers the control on a row with no CoreAudio UID
             // (an AirPlay receiver never reaches our render callback); this is
             // the backstop, and it says so rather than failing silently.
             SyncCastLog.log("localDelay: ignoring edit for un-keyable device \(deviceID)")
             return
         }
-        let clamped = LocalDelayTrim.clamp(ms)
+        var clamped = LocalDelayTrim.clamp(ms)
+        // A LAN receiver can only be delayed: the local legs are already held
+        // to its schedule, so "make it earlier" has nothing to take from.
+        if devices.first(where: { $0.id == deviceID })?.transport == .lanReceiver {
+            clamped = max(0, clamped)
+        }
         let current = localDelayTrims[uid]?.delayMs ?? 0
         let name = devices.first { $0.id == deviceID }?.name
         if clamped == current {

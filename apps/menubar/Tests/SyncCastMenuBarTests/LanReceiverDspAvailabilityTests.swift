@@ -59,6 +59,25 @@ final class LanReceiverDspAvailabilityTests: XCTestCase {
         XCTAssertEqual(model.equalizerSettings(for: "lan-1").bands[2].gainDb, -3)
     }
 
+    /// The delay trim is the fourth control a LAN row shares with a local one;
+    /// it is stored under the same UID the Router pushes to the LAN output,
+    /// and it cannot go negative (a LAN leg can only be delayed).
+    func test_lan_receiver_gets_a_delay_trim_that_cannot_go_negative() {
+        UserDefaults.standard.removeObject(forKey: LocalDelayTrimStore.defaultsKey)
+        defer { UserDefaults.standard.removeObject(forKey: LocalDelayTrimStore.defaultsKey) }
+        let model = AppModel()
+        model.mode = .stereo
+        model.devices = [lanDevice()]
+        model.routing["lan-1"] = DeviceRouting(deviceID: "lan-1", enabled: true)
+        XCTAssertEqual(model.localDelayTrimIsAvailable(for: "lan-1"), model.localDelayTrimIsSupportedOnCurrentPath)
+        model.setLocalDelayTrim(12, for: "lan-1")
+        XCTAssertEqual(model.localDelayTrimMs(for: "lan-1"), 12)
+        let uid = Device.lanReceiverUID(serviceName: "receiver-a")!
+        XCTAssertEqual(model.localDelayTrims[uid]?.delayMs, 12)
+        model.setLocalDelayTrim(-20, for: "lan-1")
+        XCTAssertEqual(model.localDelayTrimMs(for: "lan-1"), 0, "a LAN leg cannot be advanced")
+    }
+
     func test_lan_receiver_curve_is_stored_under_its_service_uid() {
         let model = AppModel()
         model.devices = [lanDevice()]

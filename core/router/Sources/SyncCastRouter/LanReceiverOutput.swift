@@ -76,6 +76,13 @@ public final class LanReceiverOutput: @unchecked Sendable {
     /// so the receiver can use its own hardware volume. This is only the
     /// per-device fader and the per-device mute.
     private var balanceAmplitude: Float = 1
+    /// Extra playout delay for THIS receiver, added to every `play_at_ns`, so
+    /// a receiver that sounds early against the local legs (a display whose
+    /// panel adds latency it never declares; a speaker with a slow DSP) can be
+    /// moved later by ear, the same way `LocalOutput` pairs can. Non-negative:
+    /// a LAN leg can only be delayed. The local alignment hold does NOT
+    /// include it — that is the point, it moves this leg relative to them.
+    private var presentationTrimNs: UInt64 = 0
 
     // Staging: two planar Float32 slabs of one packet each, allocated once.
     private let stagingSlabs: [UnsafeMutablePointer<Float>]
@@ -236,6 +243,14 @@ public final class LanReceiverOutput: @unchecked Sendable {
     @discardableResult
     public func setChannelMatrix(_ settings: ChannelMatrixSettings) -> Bool {
         channelMatrix.setSettings(settings, pair: 0)
+    }
+
+    /// The user's delay trim for this receiver, in milliseconds. Negative
+    /// values clamp to zero: nothing can play a frame before the sender has
+    /// captured it, and the local legs are aligned by their own hold.
+    public func setPresentationTrim(milliseconds: Int) {
+        let clamped = UInt64(max(0, min(milliseconds, LocalDelayTrim.rangeMs.upperBound)))
+        queue.async { [self] in presentationTrimNs = clamped * 1_000_000 }
     }
 
     /// Per-device balance and mute, as a linear amplitude.
@@ -581,7 +596,7 @@ public final class LanReceiverOutput: @unchecked Sendable {
         logClockSource(hostAnchored ? "hal" : "est")
         let base = (hostAnchored
             ? hostClock.timeNs(forFrame: frame)
-            : ringClock.timeNs(forFrame: frame)) &+ lagNs &+ targetNs
+            : ringClock.timeNs(forFrame: frame)) &+ lagNs &+ targetNs &+ presentationTrimNs
         if let last = lastPlayAtNs, base <= last {
             return last &+ LanPcmWire.packetDurationNs
         }

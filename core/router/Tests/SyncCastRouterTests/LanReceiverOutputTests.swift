@@ -298,6 +298,33 @@ final class LanReceiverOutputTests: XCTestCase {
 
     // MARK: - The per-device chain
 
+    /// A presentation trim moves THIS leg later by exactly the trim: the
+    /// playout grid, otherwise 5 ms per packet, shows one step of 5 + trim.
+    func testAPresentationTrimShiftsThePlayoutGridOnce() throws {
+        _ = try makeLink()
+        XCTAssertTrue(receiver.wait(upTo: 5) { $0.packets.count > 60 })
+        let before = receiver.snapshot.packets.count
+        output.setPresentationTrim(milliseconds: 30)
+        XCTAssertTrue(receiver.wait(upTo: 5) { $0.packets.count > before + 60 })
+        let times = receiver.snapshot.packets.map(\.header.playAtNs)
+        var gaps: [Int64] = []
+        for index in 1..<times.count {
+            gaps.append(Int64(bitPattern: times[index] &- times[index - 1]))
+        }
+        let largest = gaps.max() ?? 0
+        XCTAssertEqual(Double(largest) / 1e6, 35, accuracy: 0.5,
+                       "the grid must step by 5 ms + the 30 ms trim exactly once")
+        XCTAssertEqual(gaps.filter { $0 > 6_000_000 }.count, 1, "one step, not a drift")
+        // Never backwards, and a negative request is a no-op.
+        output.setPresentationTrim(milliseconds: -50)
+        let after = receiver.snapshot.packets.count
+        XCTAssertTrue(receiver.wait(upTo: 5) { $0.packets.count > after + 40 })
+        let tail = receiver.snapshot.packets.suffix(40).map(\.header.playAtNs)
+        for index in 1..<tail.count {
+            XCTAssertGreaterThan(tail[index], tail[index - 1], "playout time ran backwards")
+        }
+    }
+
     func testTheChannelMatrixIsAppliedBeforePacketising() throws {
         _ = try makeLink()
         XCTAssertTrue(receiver.wait(upTo: 5) { $0.packets.count > 30 })

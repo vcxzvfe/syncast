@@ -243,6 +243,15 @@ extension Router {
             output.setEqualizer(equalizerSettings(forUID: output.receiverUID))
             output.setStereoImage(stereoImageSettings(forUID: output.receiverUID))
             output.setChannelMatrix(channelMatrixSettingsByUID[output.receiverUID] ?? .stereo)
+            output.setPresentationTrim(milliseconds: localDelayTrimMsByUID[output.receiverUID] ?? 0)
+        }
+    }
+
+    /// The per-receiver delay trims, keyed like the local ones (by UID), so
+    /// the same store and the same control serve both kinds of output.
+    func applyLanPresentationTrims() {
+        for output in lanReceiverOutputs.values {
+            output.setPresentationTrim(milliseconds: localDelayTrimMsByUID[output.receiverUID] ?? 0)
         }
     }
 

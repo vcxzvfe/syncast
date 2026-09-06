@@ -2391,7 +2391,9 @@ public actor Router {
     // separate settings — see `LocalDelayTrim`.
 
     /// User trims in milliseconds, keyed by CoreAudio UID. Absent means 0.
-    private var localDelayTrimMsByUID: [String: Int] = [:]
+    /// Internal rather than private: the LAN extension reads it for the
+    /// receivers' presentation trims, which share this store.
+    var localDelayTrimMsByUID: [String: Int] = [:]
     /// Automatic seed in frames, keyed by CoreAudio UID. NEGATIVE of the
     /// device's reported output latency: a device that reports more latency
     /// already sounds later and therefore needs less hold.
@@ -2419,6 +2421,7 @@ public actor Router {
         guard sanitized != localDelayTrimMsByUID else { return }
         localDelayTrimMsByUID = sanitized
         applyLocalPairDelays()
+        applyLanPresentationTrims()
     }
 
     /// Set (or clear, with 0) one device's trim.
