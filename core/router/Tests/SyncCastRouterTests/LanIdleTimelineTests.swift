@@ -37,8 +37,12 @@ final class LanIdleTimelineTests: XCTestCase {
     /// block after `F` was captured — and it is stamped for one target after
     /// that same moment.
     private static var expectedLeadMs: Double {
+        // `play_at_ns` now carries the producer's read lag on top of the
+        // target, so the lag no longer eats into the lead; what remains is
+        // the packet the tick has not yet sent and the block the ring has
+        // not yet written.
         Double(LanPcmWire.defaultTargetMs)
-            - Double(lagFrames + LanPcmWire.framesPerPacket + SyntheticRingProducer.blockFrames)
+            - Double(LanPcmWire.framesPerPacket + SyntheticRingProducer.blockFrames)
             / 48.0
     }
 
