@@ -36,6 +36,8 @@ struct MainPopover: View {
             // Under the device list on purpose: the rule is expressed in terms
             // of the rows above it ("switch these on when that one appears").
             Divider().padding(.horizontal, 12)
+            DspProfileSection()
+            Divider().padding(.horizontal, 12)
             AutoConnectSection()
             // Sync slider is only meaningful in whole-home mode.
             if model.mode == .wholeHome {

@@ -2346,6 +2346,10 @@ final class AppModel {
     /// curve back up without the UI having to notice the transition.
     var deviceEqualizers: [String: DeviceEqualizerProfile] = DeviceEqualizerStore.load()
 
+    /// Saved whole-configuration snapshots ("调音方案"). Behaviour in
+    /// `AppModel+DspProfiles.swift`.
+    var dspProfiles: [DspProfile] = DspProfileStore.load()
+
     /// Debounced push of `deviceEqualizers` to the Router, so dragging a
     /// slider costs one actor hop per settle rather than one per pixel.
     var equalizerCommitTask: Task<Void, Never>?
