@@ -22,6 +22,7 @@ extension AppModel {
     /// Snapshot everything as it is now.
     @discardableResult
     func saveCurrentDspProfile(named name: String? = nil) -> DspProfile? {
+        reloadDspProfilesFromStore()
         guard canSaveMoreDspProfiles else { return nil }
         let profile = DspProfile(
             name: name ?? DspProfileStore.defaultName(existing: dspProfiles),
@@ -62,7 +63,17 @@ extension AppModel {
         }
     }
 
+    /// Re-read the saved list. Called when the section comes on screen, so a
+    /// profile written to the defaults from outside the app (a snapshot taken
+    /// by a script, say) shows up without a relaunch — and is not clobbered
+    /// by the next save, which writes the whole list.
+    func reloadDspProfilesFromStore() {
+        let stored = DspProfileStore.load()
+        if stored != dspProfiles { dspProfiles = stored }
+    }
+
     func deleteDspProfile(_ profile: DspProfile) {
+        reloadDspProfilesFromStore()
         dspProfiles.removeAll { $0.id == profile.id }
         DspProfileStore.save(dspProfiles)
     }

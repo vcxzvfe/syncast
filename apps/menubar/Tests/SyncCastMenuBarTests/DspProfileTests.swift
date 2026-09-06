@@ -52,6 +52,23 @@ final class DspProfileTests: XCTestCase {
         XCTAssertEqual(DspProfileStore.load().map(\.name), ["A"])
     }
 
+    /// A profile written to the defaults by something other than the app must
+    /// survive the app's next save rather than being overwritten by its
+    /// in-memory list.
+    func test_externally_added_profiles_are_picked_up_and_kept() {
+        let m = model()
+        m.saveCurrentDspProfile(named: "A")
+        var stored = DspProfileStore.load()
+        stored.append(DspProfile(name: "外部", equalizers: [], stereoImages: [], channelMatrices: [], delayTrims: []))
+        DspProfileStore.save(stored)
+        XCTAssertEqual(m.dspProfiles.map(\.name), ["A"], "not seen yet")
+        m.reloadDspProfilesFromStore()
+        XCTAssertEqual(m.dspProfiles.map(\.name), ["A", "外部"])
+        m.setEqualizerBandGain(2, bandIndex: 0, for: "d1")
+        m.saveCurrentDspProfile(named: "B")
+        XCTAssertEqual(DspProfileStore.load().map(\.name), ["A", "外部", "B"])
+    }
+
     func test_default_names_are_numbered() {
         let name = DspProfileStore.defaultName(existing: [], now: Date(timeIntervalSince1970: 0))
         XCTAssertTrue(name.hasPrefix("方案 1 · "), name)

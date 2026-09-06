@@ -66,5 +66,6 @@ struct DspProfileSection: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
+        .onAppear { model.reloadDspProfilesFromStore() }
     }
 }
