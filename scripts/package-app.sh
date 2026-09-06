@@ -86,8 +86,16 @@ bash "$REPO_ROOT/scripts/pii_scan.sh" \
   || fail "pii_scan failed — see the hits above; nothing was packaged"
 
 log "Building Swift menubar binary (release)…"
-( cd apps/menubar && swift build -c release )
 SWIFT_BIN="$REPO_ROOT/apps/menubar/.build/release/SyncCastMenuBar"
+# Remove the previous binary first: a failed build must never let a stale
+# executable from the last packaging slip into the bundle (it did once).
+rm -f "$SWIFT_BIN"
+BUILD_LOG="$(mktemp)"
+if ! ( cd apps/menubar && swift build -c release 2>&1 | tee "$BUILD_LOG" ) || grep -q "error:" "$BUILD_LOG"; then
+  rm -f "$BUILD_LOG"
+  fail "release build failed (see errors above); nothing was packaged"
+fi
+rm -f "$BUILD_LOG"
 [[ -x "$SWIFT_BIN" ]] || fail "Swift build did not produce $SWIFT_BIN"
 
 # ---- 2) bundle skeleton ---------------------------------------------------
