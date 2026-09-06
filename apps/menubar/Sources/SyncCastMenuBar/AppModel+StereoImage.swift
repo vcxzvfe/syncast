@@ -37,14 +37,14 @@ extension AppModel {
     func stereoImageIsAvailable(for deviceID: String) -> Bool {
         guard stereoImageIsSupportedOnCurrentPath else { return false }
         guard routing[deviceID]?.enabled ?? false else { return false }
-        return coreAudioUID(forDeviceID: deviceID) != nil
+        return dspUID(forDeviceID: deviceID) != nil
     }
 
     /// One line explaining why an existing setting is not being applied right
     /// now, or nil when it is. Only ever shown on a row that HAS a setting —
     /// silently ignoring a saved setting is the behaviour that reads as a bug.
     func stereoImageInactiveHint(for deviceID: String) -> String? {
-        guard let uid = coreAudioUID(forDeviceID: deviceID),
+        guard let uid = dspUID(forDeviceID: deviceID),
               deviceStereoImages[uid]?.settings.hasUserSetting == true
         else {
             return nil
@@ -61,14 +61,14 @@ extension AppModel {
     /// The setting to show in the editor. A device with nothing stored gets
     /// the neutral defaults, so the panel always has values to draw.
     func stereoImageSettings(for deviceID: String) -> StereoImageSettings {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return .neutral }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return .neutral }
         return deviceStereoImages[uid]?.settings ?? .neutral
     }
 
     /// True when the user has dialled something in for this device, whether or
     /// not it is currently bypassed. Gates the row's badge.
     func hasStereoImageSetting(for deviceID: String) -> Bool {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return false }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return false }
         return deviceStereoImages[uid]?.settings.hasUserSetting ?? false
     }
 
@@ -101,7 +101,7 @@ extension AppModel {
     /// aggregate, so every member device reports the same figure — the UI says
     /// "输出链" rather than claiming a per-speaker number we do not have.
     func stereoImageIsClipping(for deviceID: String) -> Bool {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return false }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return false }
         return (stereoImageClipCounts[uid] ?? 0) > 0
     }
 
@@ -281,7 +281,7 @@ extension AppModel {
         for deviceID: String,
         _ transform: (inout StereoImageSettings) -> Void
     ) {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else {
+        guard let uid = dspUID(forDeviceID: deviceID) else {
             // The UI never offers the control on such a row; this is the
             // backstop, and it says so rather than failing silently.
             SyncCastLog.log("stereo image: ignoring edit for un-keyable device \(deviceID)")

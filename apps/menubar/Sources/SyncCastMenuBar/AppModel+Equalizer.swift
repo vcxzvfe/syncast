@@ -1,4 +1,5 @@
 import Foundation
+import SyncCastDiscovery
 import SyncCastRouter
 
 /// Per-output tone control: read, edit, remember, push.
@@ -46,14 +47,14 @@ extension AppModel {
     func equalizerIsAvailable(for deviceID: String) -> Bool {
         guard equalizerIsSupportedOnCurrentPath else { return false }
         guard routing[deviceID]?.enabled ?? false else { return false }
-        return coreAudioUID(forDeviceID: deviceID) != nil
+        return dspUID(forDeviceID: deviceID) != nil
     }
 
     /// One line explaining why an existing curve is not being applied right
     /// now, or nil when it is. Only ever shown on a row that HAS a curve —
     /// silently ignoring a saved setting is the behaviour that reads as a bug.
     func equalizerInactiveHint(for deviceID: String) -> String? {
-        guard let uid = coreAudioUID(forDeviceID: deviceID),
+        guard let uid = dspUID(forDeviceID: deviceID),
               deviceEqualizers[uid]?.settings.hasUserCurve == true
         else {
             return nil
@@ -76,13 +77,35 @@ extension AppModel {
         return device.coreAudioUID
     }
 
+    /// The key a per-output DSP setting (EQ, 声场) is stored and pushed under.
+    ///
+    /// Every output whose samples pass through this process's own chain gets
+    /// one: a CoreAudio device by its UID, a LAN receiver by its service UID
+    /// (`LanReceiverOutput` runs the same equalizer → stereo image → channel
+    /// matrix chain as `LocalOutput`, and the Router keys its settings by
+    /// exactly this string). AirPlay receivers get none — OwnTone fans one
+    /// stream out to all of them, so a per-receiver curve is not something
+    /// the architecture can express; they have the group EQ instead.
+    ///
+    /// Same rule as `channelMatrixUID(forDeviceID:)`, which is what made the
+    /// 声道 button appear on a LAN row while EQ and 声场 did not: those two
+    /// were gated on `coreAudioUID`, which is nil for anything but CoreAudio.
+    func dspUID(forDeviceID deviceID: String) -> String? {
+        guard let device = devices.first(where: { $0.id == deviceID }) else { return nil }
+        switch device.transport {
+        case .coreAudio: return device.coreAudioUID
+        case .lanReceiver: return Device.lanReceiverUID(serviceName: device.lanServiceName)
+        case .airplay2: return nil
+        }
+    }
+
     // MARK: - Reading
 
     /// The curve to show in the editor. A device with nothing stored gets the
     /// ten-band graphic layout at 0 dB, so the editor always has sliders to
     /// draw and the "band index" the mutators take is always meaningful.
     func equalizerSettings(for deviceID: String) -> EqualizerSettings {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else {
+        guard let uid = dspUID(forDeviceID: deviceID) else {
             return .graphicFlat
         }
         return equalizerSettings(forUID: uid)
@@ -104,7 +127,7 @@ extension AppModel {
     /// True when the user has dialled something in for this device, whether or
     /// not it is currently bypassed. Gates the row's "EQ" badge.
     func hasEqualizerCurve(for deviceID: String) -> Bool {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return false }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return false }
         return deviceEqualizers[uid]?.settings.hasUserCurve ?? false
     }
 
@@ -145,7 +168,7 @@ extension AppModel {
     /// aggregate, so every member device reports the same figure — the UI says
     /// "输出链" rather than claiming a per-speaker number we do not have.
     func equalizerIsClipping(for deviceID: String) -> Bool {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else { return false }
+        guard let uid = dspUID(forDeviceID: deviceID) else { return false }
         return (equalizerClipCounts[uid] ?? 0) > 0
     }
 
@@ -212,7 +235,7 @@ extension AppModel {
         for deviceID: String,
         _ transform: (inout EqualizerSettings) -> Void
     ) {
-        guard let uid = coreAudioUID(forDeviceID: deviceID) else {
+        guard let uid = dspUID(forDeviceID: deviceID) else {
             // A device with no CoreAudio UID cannot be keyed, and a device
             // curve is CoreAudio-only, so there is nothing to edit. The UI
             // never offers the control on such a row; this is the backstop.
