@@ -822,3 +822,20 @@ public final class SystemSinkDevice {
         AggregateDevice.readHardwareVolume(uid: uid) != nil
     }
 }
+
+extension SystemSinkDevice {
+    /// `kAudioDevicePropertyDeviceIsRunningSomewhere` for a device UID: true
+    /// when any process has IO running on it. nil when unreadable.
+    public static func isRunningSomewhere(uid: String) -> Bool? {
+        guard let id = try? Capture.deviceID(forUID: uid), id != 0 else { return nil }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value != 0
+    }
+}

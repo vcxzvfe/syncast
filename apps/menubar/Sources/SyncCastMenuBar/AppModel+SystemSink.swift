@@ -458,6 +458,7 @@ extension AppModel {
     ///     is not receiving audio at all;
     ///   * not on the sink path — say what is carrying volume instead.
     var systemSinkStatusLine: String? {
+        if let starved = captureStarvationHint { return starved }
         if mode == .wholeHome { return wholeHomeSinkStatusLine }
         guard mode == .stereo else { return nil }
         guard AppModel.selectedStereoOutputPath == .sink else {

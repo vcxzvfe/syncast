@@ -3784,3 +3784,34 @@ public actor Router {
     }
 
 }
+
+
+// MARK: - Capture starvation probe
+
+extension Router {
+    /// What the app needs to tell "the tap is silently denied" from "nothing is
+    /// playing": how many blocks the active capture has delivered so far, and
+    /// whether the sink device is currently running IO for SOME client (i.e.
+    /// an app IS rendering into it). Ticks that stand still while the sink is
+    /// running means the capture is not receiving what the device is playing —
+    /// on macOS that is what a refused "System Audio Recording" permission
+    /// looks like: the tap is created, never errors, never fires.
+    public struct CaptureHealth: Sendable, Equatable {
+        public let captureTicks: UInt64
+        public let sinkIsRunningSomewhere: Bool?
+        public let sinkPathActive: Bool
+    }
+
+    public func captureHealth() -> CaptureHealth {
+        let ticks = activeCapture.tickCount
+        var running: Bool? = nil
+        if let sink = systemSink, sink.isActive {
+            running = SystemSinkDevice.isRunningSomewhere(uid: sink.sinkUID)
+        }
+        return CaptureHealth(
+            captureTicks: ticks,
+            sinkIsRunningSomewhere: running,
+            sinkPathActive: systemSink?.isActive ?? false
+        )
+    }
+}

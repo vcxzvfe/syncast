@@ -139,6 +139,13 @@ final class AppModel {
     /// Ticks of the 1 Hz poller since the last periodic health line. See
     /// `AppModel+Health.swift`.
     var healthLogTicks: Int = 0
+    /// Capture-starvation probe state (see `AppModel+Health.swift`): last seen
+    /// capture tick count and how many consecutive seconds it has stood still
+    /// while the sink device was running IO for someone.
+    @ObservationIgnored var captureProbeLastTicks: UInt64 = 0
+    @ObservationIgnored var captureProbeStalledSeconds: Int = 0
+    /// Non-nil while the capture is judged starved; shown in the popover.
+    var captureStarvationHint: String?
     static let airplayDelayMsKey = "syncast.airplayDelayMs"
     /// Fresh-install broadcast-delay default. CORRECTED to 0 to match the
     /// Direction-B timing model (sidecar `DEFAULT_LOCAL_FIFO_DELAY_MS`):
