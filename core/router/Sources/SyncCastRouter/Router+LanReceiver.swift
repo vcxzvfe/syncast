@@ -140,18 +140,30 @@ extension Router {
     /// a jitter-buffer refill and would be audible.
     func reconcileLanReceivers(devices: [Device]) {
         guard lanReceiversAreSupported else {
+            if !lanReceiverOutputs.isEmpty || devices.contains(where: { $0.transport == .lanReceiver && (routing[$0.id]?.enabled ?? false) }) {
+                RouterLog.write("[Router] LAN reconcile: unsupported on mode=\(mode) path=\(stereoPath); tearing down\n")
+            }
             tearDownLanReceivers()
             return
         }
         let enabled = devices.filter {
             $0.transport == .lanReceiver && (routing[$0.id]?.enabled ?? false)
         }
+        if enabled.isEmpty, devices.contains(where: { $0.transport == .lanReceiver }) {
+            let seen = devices.filter { $0.transport == .lanReceiver }
+                .map { "\($0.name)[enabled=\(routing[$0.id]?.enabled ?? false)]" }
+            RouterLog.write("[Router] LAN reconcile: no enabled receiver among \(seen.joined(separator: ", "))\n")
+        }
         var wanted: Set<String> = []
         for device in enabled {
             guard let uid = device.persistenceKey,
                   let serviceName = device.lanServiceName
-            else { continue }
+            else {
+                RouterLog.write("[Router] LAN reconcile: \(device.name) has no persistence key or service name; skipped\n")
+                continue
+            }
             guard let token = lanReceiverTokensByUID[uid] else {
+                RouterLog.write("[Router] LAN reconcile: \(device.name) has no token yet (\(lanReceiverTokensByUID.count) known); skipped\n")
                 // No token yet: the row says "needs pairing" and nothing is
                 // opened. Refusing to connect without one is not politeness —
                 // the receiver would close on us and we would retry forever.
