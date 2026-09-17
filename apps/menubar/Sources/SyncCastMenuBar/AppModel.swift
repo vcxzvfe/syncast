@@ -287,7 +287,9 @@ final class AppModel {
         routing.values.contains { $0.enabled }
     }
 
-    private let discovery: DiscoveryService
+    /// Internal rather than private: `AppModel+LanReceiver` tells it which
+    /// receivers are paired.
+    let discovery: DiscoveryService
     let router: Router
     private let sidecarLauncher = SidecarLauncher()
     var sidecarRunning: Bool = false
