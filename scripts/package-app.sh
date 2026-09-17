@@ -113,6 +113,12 @@ SPM_BUNDLE="$REPO_ROOT/apps/menubar/.build/release/SyncCastMenuBar_SyncCastMenuB
 if [[ -d "$SPM_BUNDLE" ]]; then
   DEST_BUNDLE="$MACOS_DIR/SyncCastMenuBar_SyncCastMenuBar.bundle"
   cp -R "$SPM_BUNDLE" "$DEST_BUNDLE"
+  # Newer SwiftPM toolchains emit a DEEP resource bundle (Contents/Info.plist
+  # + Contents/Resources) that already carries its own Info.plist. Writing a
+  # second one at the root of such a bundle makes codesign refuse it
+  # ("unsealed contents present in the bundle root"), so the shallow plist is
+  # only for the flat layout older toolchains produce.
+  if [[ ! -d "$DEST_BUNDLE/Contents" ]]; then
   cat > "$DEST_BUNDLE/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -129,6 +135,7 @@ if [[ -d "$SPM_BUNDLE" ]]; then
 </dict>
 </plist>
 PLIST
+  fi
 fi
 # ---- 2b) SyncCastAudio.driver + its installer -----------------------------
 # The driver is NOT loaded from the bundle — HAL plug-ins must live in
