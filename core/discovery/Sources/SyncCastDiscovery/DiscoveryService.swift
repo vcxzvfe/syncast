@@ -59,6 +59,13 @@ public actor DiscoveryService {
         lanReceivers.rescan()
     }
 
+    /// Receivers the user has paired with, by Bonjour instance name. They are
+    /// listed whether or not browsing currently sees them — see
+    /// `LanReceiverDiscovery.setPinned`.
+    public func setPinnedLanReceivers(_ serviceNames: Set<String>) {
+        lanReceivers.setPinned(serviceNames: serviceNames)
+    }
+
     public func stop() {
         pumpTask?.cancel()
         pumpTask = nil

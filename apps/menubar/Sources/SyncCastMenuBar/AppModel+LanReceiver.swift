@@ -97,8 +97,16 @@ extension AppModel {
         lanTokenSaveError = nil
         // The token is never logged, here or anywhere else.
         SyncCastLog.log("lan token: stored for \(uid)")
+        Task { await pushPinnedLanReceivers() }
         Task { await pushLanReceiverConfiguration() }
         reconcileEngine()
+    }
+
+    /// Tell discovery which receivers are paired, so their rows do not depend
+    /// on the browser seeing them at this moment.
+    func pushPinnedLanReceivers() async {
+        let names = Set(LanReceiverTokenStore.allUIDs().compactMap(Device.lanServiceName(fromUID:)))
+        await discovery.setPinnedLanReceivers(names)
     }
 
     /// Open the token window for one receiver, creating it on first use.

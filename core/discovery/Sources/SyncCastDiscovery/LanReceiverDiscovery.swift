@@ -43,6 +43,20 @@ public final class LanReceiverDiscovery: @unchecked Sendable {
     private var seen: [String: Device] = [:]
     private let idMap = StableIDMap()
     private let queue = DispatchQueue(label: "io.syncast.discovery.lan")
+    /// Instance names the user has PAIRED with (the app holds a token for
+    /// them). A pinned receiver is listed whether or not the browser can see
+    /// it right now, and is never removed on absence.
+    ///
+    /// Why: mDNS browsing on Wi-Fi is best-effort. In the field a receiver
+    /// that was up and advertising dropped out of the sender's browse results
+    /// for half an hour after a wake, and with it went the row — the only
+    /// place the user can switch it on. Reaching a receiver does not need the
+    /// browser at all: `NWConnection` to the `.service` endpoint resolves the
+    /// name itself, with a directed query that survives conditions a passive
+    /// browse does not. So a paired receiver's row is a fact about the user's
+    /// setup, not about the last multicast packet; if the machine really is
+    /// off, the link says so on the row and keeps retrying.
+    private var pinned: Set<String> = []
 
     public init() {}
 
@@ -52,6 +66,49 @@ public final class LanReceiverDiscovery: @unchecked Sendable {
             self.start()
             continuation.onTermination = { @Sendable _ in self.stop() }
         }
+    }
+
+    /// Replace the set of paired receivers (Bonjour instance names). Safe to
+    /// call before `events()`; the rows are emitted once a subscriber exists.
+    public func setPinned(serviceNames: Set<String>) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let cleaned = Set(serviceNames.compactMap { name -> String? in
+                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            })
+            guard cleaned != self.pinned else { return }
+            self.pinned = cleaned
+            self.emitPinned()
+            // An un-pinned receiver the browser cannot see either has no
+            // reason to stay; run the normal absence rule over it.
+            self.emitRemovals(keptKeys: self.removalGate.lastBrowserKeys)
+        }
+    }
+
+    /// Yield a row for every pinned receiver the browser has not reported.
+    /// The row carries no TXT data (no friendly name, no token hint); the
+    /// real one replaces it with `.updated` the moment the browser sees it.
+    private func emitPinned() {
+        guard continuation != nil else { return }
+        for device in Self.placeholders(pinned: pinned, seenKeys: Set(seen.keys), id: { idMap.id(for: "lan:\($0)") }) {
+            guard let key = device.lanServiceName else { continue }
+            seen[key] = device
+            continuation?.yield(.appeared(device))
+        }
+    }
+
+    /// Pure: the placeholder devices for pinned names not yet seen, sorted so
+    /// the emission order is stable.
+    static func placeholders(pinned: Set<String>, seenKeys: Set<String>, id: (String) -> String) -> [Device] {
+        pinned.subtracting(seenKeys).sorted().map { name in
+            makeDevice(instanceName: name, domain: "local.", txt: [:], id: id(name))
+        }
+    }
+
+    /// Pure: which absent keys the absence rule may act on at all.
+    static func removableKeys(seenKeys: Set<String>, keptKeys: Set<String>, pinned: Set<String>) -> Set<String> {
+        seenKeys.subtracting(keptKeys).subtracting(pinned)
     }
 
     /// Tear down and restart the browser, forcing a fresh round of queries.
@@ -86,6 +143,7 @@ public final class LanReceiverDiscovery: @unchecked Sendable {
         }
         browser.start(queue: queue)
         self.browser = browser
+        queue.async { [weak self] in self?.emitPinned() }
     }
 
     private func stop() {
@@ -208,8 +266,10 @@ public final class LanReceiverDiscovery: @unchecked Sendable {
     private func emitRemovals(keptKeys: Set<String>) {
         let now = Date()
         for key in keptKeys { absentSince.removeValue(forKey: key) }
+        for key in pinned { absentSince.removeValue(forKey: key) }
         var needsRecheck = false
-        for (key, device) in seen where !keptKeys.contains(key) {
+        let removable = Self.removableKeys(seenKeys: Set(seen.keys), keptKeys: keptKeys, pinned: pinned)
+        for (key, device) in seen where removable.contains(key) {
             let since: Date
             if let existing = absentSince[key] {
                 since = existing

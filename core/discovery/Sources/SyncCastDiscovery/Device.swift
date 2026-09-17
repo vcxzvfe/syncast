@@ -129,6 +129,15 @@ public struct Device: Identifiable, Hashable, Sendable, Codable {
         return "lan:\(trimmed)"
     }
 
+    /// The inverse of `lanReceiverUID(serviceName:)`: the Bonjour instance
+    /// name inside a `lan:` UID, or nil for any other kind of key.
+    public static func lanServiceName(fromUID uid: String) -> String? {
+        let prefix = "lan:"
+        guard uid.hasPrefix(prefix) else { return nil }
+        let name = String(uid.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
     /// Canonical uppercase colon-free form of an AirPlay `deviceid`, e.g.
     /// `0200CAFE0001`. OwnTone's output id is this value read as hex.
     public static func normalizedAirplayDeviceID(_ raw: String?) -> String? {

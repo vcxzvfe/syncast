@@ -659,6 +659,7 @@ final class AppModel {
         loadWholeHomeLocalOutputSelection()
         // 2. Start discovery (CoreAudio + Bonjour).
         SyncCastLog.log("[SyncCast] starting discovery".replacingOccurrences(of: "[SyncCast] ", with: ""))
+        await pushPinnedLanReceivers()
         await discovery.start()
         let stream = await discovery.subscribe()
         Task { [weak self] in

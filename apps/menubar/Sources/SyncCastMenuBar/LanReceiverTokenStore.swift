@@ -116,6 +116,12 @@ enum LanReceiverTokenStore {
         }
     }
 
+    /// Every receiver UID a token is stored for — the set of receivers the
+    /// user has paired with.
+    static func allUIDs(service: String = service) -> [String] {
+        readStore(service: service).keys.sorted()
+    }
+
     static func token(forUID uid: String, service: String = service) -> String? {
         readStore(service: service)[uid]
     }

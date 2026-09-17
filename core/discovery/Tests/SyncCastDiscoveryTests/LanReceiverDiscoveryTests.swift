@@ -50,3 +50,36 @@ final class LanReceiverDiscoveryTests: XCTestCase {
     }
 
 }
+
+/// Paired receivers are listed without the browser's help and are exempt
+/// from the absence rule; everything else behaves as before.
+final class LanReceiverPinningTests: XCTestCase {
+    func testPlaceholdersCoverOnlyPinnedNamesNotYetSeen() {
+        let devices = LanReceiverDiscovery.placeholders(
+            pinned: ["receiver-a", "receiver-b"], seenKeys: ["receiver-b"], id: { "id-\($0)" }
+        )
+        XCTAssertEqual(devices.map(\.lanServiceName), ["receiver-a"])
+        XCTAssertEqual(devices.first?.id, "id-receiver-a")
+        XCTAssertEqual(devices.first?.transport, .lanReceiver)
+        XCTAssertEqual(devices.first?.lanServiceDomain, "local.")
+        XCTAssertEqual(devices.first?.persistenceKey, "lan:receiver-a",
+                       "the placeholder must key the same stores the real row does")
+        XCTAssertNil(devices.first?.lanTokenHint, "no TXT data has been seen yet")
+    }
+
+    func testPinnedReceiversAreNeverRemovable() {
+        let removable = LanReceiverDiscovery.removableKeys(
+            seenKeys: ["receiver-a", "receiver-b", "receiver-c"],
+            keptKeys: ["receiver-c"], pinned: ["receiver-a"]
+        )
+        XCTAssertEqual(removable, ["receiver-b"])
+    }
+
+    func testServiceNameRoundTripsThroughTheUID() {
+        XCTAssertEqual(Device.lanServiceName(fromUID: "lan:receiver-a"), "receiver-a")
+        XCTAssertNil(Device.lanServiceName(fromUID: "BuiltInSpeakerDevice"))
+        XCTAssertNil(Device.lanServiceName(fromUID: "lan:  "))
+        XCTAssertEqual(Device.lanReceiverUID(serviceName: Device.lanServiceName(fromUID: "lan:receiver-a")),
+                       "lan:receiver-a")
+    }
+}
