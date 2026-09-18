@@ -81,7 +81,7 @@ enum LocalDelayTrimStore {
         do {
             // Sorted so the stored blob is stable across launches; a plist that
             // churns on every save is noise in backups and in diffs.
-            return try JSONEncoder().encode(profiles.sorted { $0.uid < $1.uid })
+            return try StableJSON.encoder.encode(profiles.sorted { $0.uid < $1.uid })
         } catch {
             SyncCastLog.log("localDelay: encode error \(error)")
             return nil

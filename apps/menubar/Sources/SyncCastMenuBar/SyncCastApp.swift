@@ -166,6 +166,7 @@ struct SyncCastApp: App {
             MainPopover()
                 .environment(model)
                 .frame(width: 340)
+                .popoverAutosize()
         } label: {
             Label {
                 Text("SyncCast")

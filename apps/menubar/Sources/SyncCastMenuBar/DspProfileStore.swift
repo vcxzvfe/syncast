@@ -74,7 +74,7 @@ enum DspProfileStore {
             return
         }
         do {
-            defaults.set(try JSONEncoder().encode(profiles), forKey: defaultsKey)
+            defaults.set(try StableJSON.encoder.encode(profiles), forKey: defaultsKey)
         } catch {
             SyncCastLog.log("dspProfiles: could not encode \(profiles.count) profile(s): \(error)")
         }
