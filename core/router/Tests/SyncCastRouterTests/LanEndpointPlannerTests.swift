@@ -5,10 +5,10 @@ final class LanEndpointPlannerTests: XCTestCase {
     private let serviceName = LanReceiverEndpoint.bonjour(name: "receiver-a", domain: "local.")
     private let last = LanReceiverLastEndpoint(host: "192.0.2.10", port: 47_100)
 
-    func testTheNameIsTriedFirstAndTheAddressEveryOtherAttempt() {
+    func testTheRememberedAddressIsTriedFirstAndTheNameEveryOtherAttempt() {
         let picks = (0..<4).map { LanEndpointPlanner.endpoint(primary: serviceName, fallback: last, attempt: $0) }
-        XCTAssertEqual(picks, [serviceName, .hostPort(host: "192.0.2.10", port: 47_100),
-                               serviceName, .hostPort(host: "192.0.2.10", port: 47_100)])
+        XCTAssertEqual(picks, [.hostPort(host: "192.0.2.10", port: 47_100), serviceName,
+                               .hostPort(host: "192.0.2.10", port: 47_100), serviceName])
     }
 
     func testWithoutARememberedAddressOnlyTheNameIsUsed() {

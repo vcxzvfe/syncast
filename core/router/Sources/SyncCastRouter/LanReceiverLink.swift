@@ -25,14 +25,17 @@ public struct LanReceiverLastEndpoint: Codable, Sendable, Equatable {
 public enum LanEndpointPlanner {
     /// Which endpoint attempt number `attempt` (0 = first) should use.
     ///
-    /// The Bonjour name stays the primary — it follows the receiver across
-    /// DHCP changes. The remembered address takes every other attempt, so a
-    /// name that will not resolve costs one timeout, not the connection; and
-    /// a stale address costs one timeout before the name is tried again.
+    /// A remembered address goes FIRST: on a home LAN it is almost always
+    /// still right, it connects in milliseconds, and it does not depend on
+    /// mDNS at all — whereas a name that will not resolve costs a full
+    /// connect timeout before anything else is tried, which is what made
+    /// every enable feel slow. The Bonjour name takes every other attempt,
+    /// so a receiver whose DHCP lease moved costs one timeout, not the
+    /// connection. With nothing remembered, the name is all there is.
     public static func endpoint(
         primary: LanReceiverEndpoint, fallback: LanReceiverLastEndpoint?, attempt: Int
     ) -> LanReceiverEndpoint {
-        guard case .bonjour = primary, let fallback, attempt % 2 == 1 else { return primary }
+        guard case .bonjour = primary, let fallback, attempt % 2 == 0 else { return primary }
         return .hostPort(host: fallback.host, port: fallback.port)
     }
 }
@@ -356,7 +359,7 @@ public final class LanReceiverLink: @unchecked Sendable {
         let nwEndpoint: NWEndpoint
         let chosen = LanEndpointPlanner.endpoint(primary: endpoint, fallback: fallbackEndpoint, attempt: attempt)
         if chosen != endpoint, case .hostPort(let host, let port) = chosen {
-            log("service name did not connect; trying the last known address \(host):\(port)")
+            log("connecting to the last known address \(host):\(port)")
         }
         switch chosen {
         case .bonjour(let name, let domain):
