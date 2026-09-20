@@ -2267,6 +2267,7 @@ public actor Router {
     /// Shared secrets, keyed by receiver UID (`lan:<instance name>`). Pushed
     /// by the menubar, which owns keychain storage. NEVER logged.
     var lanReceiverTokensByUID: [String: String] = [:]
+    var lanLastEndpointByUID: [String: LanReceiverLastEndpoint] = [:]
     /// Playout targets in milliseconds, keyed by receiver UID. Absent means
     /// `LanPcmWire.defaultTargetMs`.
     var lanReceiverTargetMsByUID: [String: Int] = [:]

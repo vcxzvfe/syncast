@@ -71,6 +71,24 @@ extension Router {
     }
 
     /// Replace the whole receiver-UID → playout-target map.
+    /// Last known literal addresses, keyed by receiver UID. The app persists
+    /// them; the Router hands them to each link as its fallback and collects
+    /// fresh ones as links connect.
+    public func setLanReceiverLastEndpoints(_ endpoints: [String: LanReceiverLastEndpoint]) {
+        for (uid, endpoint) in endpoints where lanLastEndpointByUID[uid] == nil {
+            lanLastEndpointByUID[uid] = endpoint
+        }
+        for output in lanReceiverOutputs.values {
+            output.link.setFallbackEndpoint(lanLastEndpointByUID[output.receiverUID])
+        }
+    }
+
+    public func lanReceiverLastEndpoints() -> [String: LanReceiverLastEndpoint] { lanLastEndpointByUID }
+
+    func noteLanEndpoint(_ endpoint: LanReceiverLastEndpoint, forUID uid: String) {
+        lanLastEndpointByUID[uid] = endpoint
+    }
+
     public func setLanReceiverTargets(_ msByUID: [String: Int]) {
         var sanitized: [String: Int] = [:]
         for (uid, ms) in msByUID where !uid.isEmpty {
@@ -187,6 +205,10 @@ extension Router {
                 streamID: lanStreamID,
                 targetMs: targetMs(forUID: uid)
             )
+            link.setFallbackEndpoint(lanLastEndpointByUID[uid])
+            link.onConnectedEndpoint = { [weak self] endpoint in
+                Task { await self?.noteLanEndpoint(endpoint, forUID: uid) }
+            }
             let source = activeCapture
             let output = LanReceiverOutput(
                 receiverUID: uid,

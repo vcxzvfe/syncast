@@ -242,6 +242,7 @@ extension AppModel {
     func pushLanReceiverConfiguration() async {
         await router.setLanReceiverTokens(lanReceiverTokens)
         await router.setLanReceiverTargets(lanReceiverTargets)
+        await router.setLanReceiverLastEndpoints(LanReceiverEndpointStore.load())
     }
 
     /// Sample the live link state. Runs on the same 1 Hz poll as the
@@ -254,6 +255,12 @@ extension AppModel {
         }
         let statuses = await router.lanReceiverStatuses()
         if statuses != lanReceiverStatuses { lanReceiverStatuses = statuses }
+        // Persist any address a link connected on, so the next launch can
+        // reach the receiver even if its service name will not resolve.
+        let endpoints = await router.lanReceiverLastEndpoints()
+        if !endpoints.isEmpty, endpoints != LanReceiverEndpointStore.load() {
+            LanReceiverEndpointStore.save(endpoints)
+        }
         let lag = await router.lanTotalLagMs()
         if lag != lanTotalLagMs { lanTotalLagMs = lag }
     }

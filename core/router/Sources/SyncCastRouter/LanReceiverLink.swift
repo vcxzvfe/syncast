@@ -12,6 +12,31 @@ public enum LanReceiverEndpoint: Sendable, Equatable {
     case hostPort(host: String, port: UInt16)
 }
 
+/// The literal address a link last reached its receiver on. Kept so the next
+/// connection does not depend on mDNS: in the field a receiver that was up,
+/// listening and reachable by IP could not be connected to for hours because
+/// its Bonjour service would not resolve from the sender.
+public struct LanReceiverLastEndpoint: Codable, Sendable, Equatable {
+    public var host: String
+    public var port: UInt16
+    public init(host: String, port: UInt16) { self.host = host; self.port = port }
+}
+
+public enum LanEndpointPlanner {
+    /// Which endpoint attempt number `attempt` (0 = first) should use.
+    ///
+    /// The Bonjour name stays the primary — it follows the receiver across
+    /// DHCP changes. The remembered address takes every other attempt, so a
+    /// name that will not resolve costs one timeout, not the connection; and
+    /// a stale address costs one timeout before the name is tried again.
+    public static func endpoint(
+        primary: LanReceiverEndpoint, fallback: LanReceiverLastEndpoint?, attempt: Int
+    ) -> LanReceiverEndpoint {
+        guard case .bonjour = primary, let fallback, attempt % 2 == 1 else { return primary }
+        return .hostPort(host: fallback.host, port: fallback.port)
+    }
+}
+
 /// Where one link is in its connect → handshake → stream cycle.
 ///
 /// The UI needs this as well as `lastError`, because the two failures that
@@ -115,6 +140,11 @@ public final class LanReceiverLink: @unchecked Sendable {
 
     public let receiverUID: String
     private let endpoint: LanReceiverEndpoint
+    /// Queue-confined like the rest of the connection state.
+    private var fallbackEndpoint: LanReceiverLastEndpoint?
+    /// Called (on the link's queue) with the literal address of every
+    /// connection that reaches `.ready`.
+    public var onConnectedEndpoint: (@Sendable (LanReceiverLastEndpoint) -> Void)?
     private let token: String
     private let senderName: String
     let streamID: UInt32
@@ -317,9 +347,18 @@ public final class LanReceiverLink: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// The address to fall back to when the Bonjour name will not resolve.
+    public func setFallbackEndpoint(_ fallback: LanReceiverLastEndpoint?) {
+        queue.async { [self] in fallbackEndpoint = fallback }
+    }
+
     private func connect() {
         let nwEndpoint: NWEndpoint
-        switch endpoint {
+        let chosen = LanEndpointPlanner.endpoint(primary: endpoint, fallback: fallbackEndpoint, attempt: attempt)
+        if chosen != endpoint, case .hostPort(let host, let port) = chosen {
+            log("service name did not connect; trying the last known address \(host):\(port)")
+        }
+        switch chosen {
         case .bonjour(let name, let domain):
             nwEndpoint = .service(
                 name: name,
@@ -407,6 +446,11 @@ public final class LanReceiverLink: @unchecked Sendable {
                 return
             }
             resolvedHost = host
+            if case let .hostPort(_, port)? = connection.currentPath?.remoteEndpoint {
+                let reached = LanReceiverLastEndpoint(host: "\(host)", port: port.rawValue)
+                fallbackEndpoint = reached
+                onConnectedEndpoint?(reached)
+            }
             attempt = 0
             lastWaitingLog = nil
             stateLock.lock()
