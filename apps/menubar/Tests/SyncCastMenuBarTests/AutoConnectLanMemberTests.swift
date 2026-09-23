@@ -54,3 +54,31 @@ final class AutoConnectLanMemberTests: XCTestCase {
         XCTAssertEqual(rule?.displayName(for: lanUID), "receiver-a")
     }
 }
+
+/// Leaving keeps SyncCast on the laptop at a set level; arriving sets a level.
+final class AutoConnectVolumeRuleTests: XCTestCase {
+    func testOlderStoredRulesDecodeWithTheNewFieldsOff() throws {
+        let json = #"[{"id":"00000000-0000-0000-0000-000000000001","enabled":true,"triggerUID":"d","memberUIDs":["d"],"onDisconnect":{"restoreBuiltIn":false},"displayNames":{}}]"#
+        let rules = AutoConnectProfileStore.decode(Data(json.utf8))
+        XCTAssertEqual(rules.count, 1)
+        XCTAssertNil(rules[0].arriveSystemVolumePercent)
+        XCTAssertFalse(rules[0].onDisconnect.keepsBuiltIn)
+        XCTAssertNil(rules[0].onDisconnect.systemVolumePercent)
+    }
+
+    func testNewFieldsRoundTripAndClamp() throws {
+        let rule = AutoConnectProfile(
+            triggerUID: "d", memberUIDs: ["d", "lan:receiver-a"],
+            onDisconnect: .init(restoreBuiltIn: false, builtInVolumePercent: nil,
+                                keepBuiltInViaSyncCast: true, systemVolumePercent: -5),
+            arriveSystemVolumePercent: 140
+        )
+        XCTAssertEqual(rule.arriveSystemVolumePercent, 100)
+        XCTAssertEqual(rule.onDisconnect.systemVolumePercent, 0)
+        let data = try XCTUnwrap(AutoConnectProfileStore.encode([rule]))
+        let back = AutoConnectProfileStore.decode(data)
+        XCTAssertEqual(back.first?.arriveSystemVolumePercent, 100)
+        XCTAssertEqual(back.first?.onDisconnect.keepsBuiltIn, true)
+        XCTAssertEqual(back.first?.onDisconnect.systemVolumePercent, 0)
+    }
+}

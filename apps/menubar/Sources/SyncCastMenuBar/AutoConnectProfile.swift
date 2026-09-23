@@ -36,13 +36,27 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
         /// setting is "unplugging in a café must not make the laptop audible",
         /// and -30 dB is quiet but not silent.
         var builtInVolumePercent: Int?
+        /// Leaving mode "keep playing on the laptop": instead of switching
+        /// the rule's members off and handing the output back to macOS, keep
+        /// SyncCast running with the built-in speakers as its only output.
+        /// Optional so rules stored before it existed decode as nil (= off).
+        var keepBuiltInViaSyncCast: Bool?
+        /// System volume (the SyncCast sink's slider position, 0–100) to set
+        /// when leaving in keep mode — typically 0, so the laptop is silent
+        /// until the user turns it up. Nil leaves the volume alone.
+        var systemVolumePercent: Int?
 
         static let off = DisconnectAction(restoreBuiltIn: false, builtInVolumePercent: nil)
 
-        init(restoreBuiltIn: Bool, builtInVolumePercent: Int?) {
+        init(restoreBuiltIn: Bool, builtInVolumePercent: Int?,
+             keepBuiltInViaSyncCast: Bool? = nil, systemVolumePercent: Int? = nil) {
             self.restoreBuiltIn = restoreBuiltIn
             self.builtInVolumePercent = builtInVolumePercent.map(AutoConnect.clampPercent)
+            self.keepBuiltInViaSyncCast = keepBuiltInViaSyncCast
+            self.systemVolumePercent = systemVolumePercent.map(AutoConnect.clampPercent)
         }
+
+        var keepsBuiltIn: Bool { keepBuiltInViaSyncCast == true }
     }
 
     var id: UUID
@@ -55,6 +69,9 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
     /// it: "monitor appears → play on the desk speakers only" is legal.
     var memberUIDs: [String]
     var onDisconnect: DisconnectAction
+    /// System volume (slider position, 0–100) to set once the rule has
+    /// brought its outputs up on arrival. Nil leaves the volume alone.
+    var arriveSystemVolumePercent: Int?
     /// UID → last known display name, for the UI while a device is absent.
     /// Purely cosmetic; never used for matching.
     var displayNames: [String: String]
@@ -65,6 +82,7 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
         triggerUID: String,
         memberUIDs: [String],
         onDisconnect: DisconnectAction = .off,
+        arriveSystemVolumePercent: Int? = nil,
         displayNames: [String: String] = [:]
     ) {
         self.id = id
@@ -72,6 +90,7 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
         self.triggerUID = triggerUID
         self.memberUIDs = AutoConnect.dedupePreservingOrder(memberUIDs)
         self.onDisconnect = onDisconnect
+        self.arriveSystemVolumePercent = arriveSystemVolumePercent.map(AutoConnect.clampPercent)
         self.displayNames = displayNames
     }
 
@@ -242,8 +261,12 @@ enum AutoConnectProfileStore {
             normalized.memberUIDs = AutoConnect.dedupePreservingOrder(profile.memberUIDs)
             normalized.onDisconnect = AutoConnectProfile.DisconnectAction(
                 restoreBuiltIn: profile.onDisconnect.restoreBuiltIn,
-                builtInVolumePercent: profile.onDisconnect.builtInVolumePercent
+                builtInVolumePercent: profile.onDisconnect.builtInVolumePercent,
+                keepBuiltInViaSyncCast: profile.onDisconnect.keepBuiltInViaSyncCast,
+                systemVolumePercent: profile.onDisconnect.systemVolumePercent
             )
+            normalized.arriveSystemVolumePercent = profile.arriveSystemVolumePercent
+                .map(AutoConnect.clampPercent)
             guard normalized.isWellFormed, seenIDs.insert(normalized.id).inserted else {
                 continue
             }

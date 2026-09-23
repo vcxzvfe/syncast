@@ -288,6 +288,9 @@ extension AppModel {
                 + "members=[\(memberUIDs.joined(separator: ","))] (\(reason))"
             )
             if autoConnectApplyActivation(memberUIDs: memberUIDs) {
+                if let percent = autoConnectProfiles.first(where: { $0.id == profileID })?.arriveSystemVolumePercent {
+                    autoConnectSetSystemVolume(percent: percent, reason: "arrival")
+                }
                 autoConnectScheduleRecheck(after: 0.2, reason: "post-activate")
             } else {
                 autoConnectHandleActivationFailure(profileID: profileID)
@@ -312,12 +315,17 @@ extension AppModel {
                 + "restoreBuiltIn=\(restoreBuiltIn) "
                 + "volume=\(volumePercent.map { "\($0)%" } ?? "unchanged") (\(reason))"
             )
-            autoConnectApplyDeactivation(
-                profileID: profileID,
-                memberUIDs: memberUIDs,
-                restoreBuiltIn: restoreBuiltIn,
-                volumePercent: volumePercent
-            )
+            if let rule = autoConnectProfiles.first(where: { $0.id == profileID }),
+               rule.onDisconnect.keepsBuiltIn {
+                autoConnectApplyKeepBuiltIn(memberUIDs: memberUIDs, action: rule.onDisconnect)
+            } else {
+                autoConnectApplyDeactivation(
+                    profileID: profileID,
+                    memberUIDs: memberUIDs,
+                    restoreBuiltIn: restoreBuiltIn,
+                    volumePercent: volumePercent
+                )
+            }
             autoConnectScheduleRecheck(after: 0.2, reason: "post-deactivate")
             return
         }
@@ -462,6 +470,60 @@ extension AppModel {
     /// built-in half runs after a delay because it has to win against
     /// `DirectStereoOutput.stop()`, which restores the PREVIOUS default output
     /// — the monitor that just left.
+    /// Leaving in keep mode: the rule's other members go off, the built-in
+    /// speakers stay (or are switched) on in local Stereo, SyncCast keeps
+    /// owning the output, and the system volume goes to the configured level.
+    private func autoConnectApplyKeepBuiltIn(
+        memberUIDs: [String],
+        action: AutoConnectProfile.DisconnectAction
+    ) {
+        autoConnectReassertUntil = nil
+        let builtInUID = AutoConnect.builtInOutputUID(in: devices)
+        autoConnectApplying = true
+        if mode != .stereo { setMode(.stereo) }
+        for device in devices where device.transport == .coreAudio || device.transport == .lanReceiver {
+            guard let uid = AutoConnect.memberKey(for: device) else { continue }
+            let isEnabled = routing[device.id]?.enabled == true
+            if uid == builtInUID {
+                if !isEnabled { setDeviceEnabled(true, for: device.id) }
+            } else if memberUIDs.contains(uid), isEnabled {
+                setDeviceEnabled(false, for: device.id)
+            }
+        }
+        autoConnectApplying = false
+        SyncCastLog.log(
+            "autoconnect: leaving — keeping SyncCast on the built-in speakers"
+            + (builtInUID == nil ? " (built-in not found!)" : "")
+        )
+        reconcileEngine()
+        if let percent = action.systemVolumePercent {
+            autoConnectSetSystemVolume(percent: percent, reason: "leaving")
+        }
+    }
+
+    /// Set the system volume (the SyncCast sink's own slider) once the sink
+    /// is actually carrying it. The engine starts asynchronously after a
+    /// reconcile, so this waits for the sink to be up instead of writing into
+    /// a device that is about to be taken over; it gives up after a bounded
+    /// wait rather than applying the level at some surprising later moment.
+    func autoConnectSetSystemVolume(percent: Int, reason: String) {
+        autoConnectVolumeTask?.cancel()
+        let scalar = Float(AutoConnect.clampPercent(percent)) / 100
+        autoConnectVolumeTask = Task { @MainActor [weak self] in
+            let deadline = Date().addingTimeInterval(AppModel.autoConnectVolumeWaitSeconds)
+            while let self, !Task.isCancelled, Date() < deadline {
+                if self.systemSink.drivesSystemVolume {
+                    let ok = self.systemSink.writeSystemVolume(scalar: scalar, router: self.router)
+                    SyncCastLog.log("autoconnect: system volume → \(percent)% on \(reason) (\(ok ? "ok" : "refused"))")
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            guard !Task.isCancelled else { return }
+            SyncCastLog.log("autoconnect: system volume \(percent)% on \(reason) not applied — the sink never came up")
+        }
+    }
+
     private func autoConnectApplyDeactivation(
         profileID: UUID,
         memberUIDs: [String],

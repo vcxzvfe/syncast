@@ -315,6 +315,9 @@ final class AppModel {
     /// More than this inside one window is somebody actually choosing another
     /// output; the normal pause then applies.
     static let autoConnectReassertLimit = 3
+    /// The pending system-volume write an arrival or departure asked for.
+    var autoConnectVolumeTask: Task<Void, Never>?
+    static let autoConnectVolumeWaitSeconds: TimeInterval = 15
 
     /// How media volume keys are currently captured (event tap / monitor
     /// fallback / permission missing). Mirrored from the controller so
