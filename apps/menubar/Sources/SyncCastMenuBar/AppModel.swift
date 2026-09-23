@@ -306,6 +306,15 @@ final class AppModel {
     /// action that re-establishes the default output) retires it. Nil whenever
     /// `systemSinkPausedByDisplacement` is false.
     var systemSinkPauseMode: AppModel.Mode?
+    /// Until when a displacement is taken back rather than paused on, because
+    /// an auto-connect rule has just brought the outputs up and macOS is still
+    /// reacting to the device that arrived. Nil outside that window.
+    var autoConnectReassertUntil: Date?
+    var autoConnectReassertCount = 0
+    static let autoConnectReassertWindowSeconds: TimeInterval = 20
+    /// More than this inside one window is somebody actually choosing another
+    /// output; the normal pause then applies.
+    static let autoConnectReassertLimit = 3
 
     /// How media volume keys are currently captured (event tap / monitor
     /// fallback / permission missing). Mirrored from the controller so

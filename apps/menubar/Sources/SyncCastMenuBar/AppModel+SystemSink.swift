@@ -643,6 +643,18 @@ extension AppModel {
         else {
             return
         }
+        if let until = autoConnectReassertUntil, Date() < until,
+           autoConnectReassertCount < AppModel.autoConnectReassertLimit {
+            autoConnectReassertCount += 1
+            SyncCastLog.log(
+                "systemSink: default output moved during an auto-connect arrival — "
+                + "taking it back (\(autoConnectReassertCount)/\(AppModel.autoConnectReassertLimit))"
+            )
+            await router.stop()
+            streamingState = .idle
+            reconcileEngine()
+            return
+        }
         systemSinkPausedByDisplacement = true
         systemSinkPauseMode = mode
         SyncCastLog.log(

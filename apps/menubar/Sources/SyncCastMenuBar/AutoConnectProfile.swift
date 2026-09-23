@@ -77,7 +77,7 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
 
     /// Every UID that has to be present before the rule may fire.
     var requiredUIDs: Set<String> {
-        Set(memberUIDs).union([triggerUID])
+        Set(memberUIDs.filter { !AutoConnect.isOptionalMember($0) }).union([triggerUID])
     }
 
     func displayName(for uid: String) -> String {
@@ -106,6 +106,25 @@ enum AutoConnect {
     /// second-choice match when the exact UID above is not present (Apple has
     /// changed it before: `BuiltInSpeakerDevice`, `BuiltInHeadphoneDevice`).
     static let builtInUIDPrefix = "BuiltIn"
+
+    /// The key a device is stored under in a rule: its CoreAudio UID, or for a
+    /// LAN receiver its `lan:<service>` UID (the same key every per-device
+    /// store uses). AirPlay receivers cannot be rule members: whole-home is a
+    /// different mode and the rule always lands in local Stereo.
+    static func memberKey(for device: Device) -> String? {
+        switch device.transport {
+        case .coreAudio: return device.coreAudioUID
+        case .lanReceiver: return Device.lanReceiverUID(serviceName: device.lanServiceName)
+        case .airplay2: return nil
+        }
+    }
+
+    /// A member whose absence must not hold the rule back. A LAN receiver is
+    /// another machine that may be asleep or off: the rule still brings up the
+    /// local outputs, and switches the receiver on too when it is there.
+    static func isOptionalMember(_ key: String) -> Bool {
+        Device.lanServiceName(fromUID: key) != nil
+    }
 
     static let percentRange: ClosedRange<Int> = 0...100
 

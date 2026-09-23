@@ -76,9 +76,18 @@ extension AppModel {
         }
     }
 
-    /// Local outputs the user currently has switched on, as devices.
+    /// Local outputs the user currently has switched on, as devices. LAN
+    /// receivers count: they are members of the local Stereo selection like
+    /// any speaker, and "arrive home → play on all three" needs them.
     var autoConnectEnabledLocalDevices: [Device] {
-        localDevices.filter { routing[$0.id]?.enabled == true }
+        autoConnectMemberCandidates.filter { routing[$0.id]?.enabled == true }
+    }
+
+    /// Everything a rule may switch on: CoreAudio outputs selectable now, and
+    /// every known LAN receiver (listed regardless of mode, because the rule
+    /// switches to local Stereo before it enables anything).
+    var autoConnectMemberCandidates: [Device] {
+        localDevices + devices.filter { $0.transport == .lanReceiver }
     }
 
     /// Whether the rule's trigger device is connected right now.
@@ -98,7 +107,7 @@ extension AppModel {
     }
 
     func autoConnectDisplayName(for uid: String, in profile: AutoConnectProfile) -> String {
-        if let live = devices.first(where: { $0.coreAudioUID == uid })?.name {
+        if let live = devices.first(where: { AutoConnect.memberKey(for: $0) == uid })?.name {
             return live
         }
         return profile.displayName(for: uid)
@@ -113,7 +122,7 @@ extension AppModel {
     /// usable rule — a rule that can never fire is worse than no rule, because
     /// the user believes automation is in place.
     func autoConnectCreateProfile(triggerUID: String) {
-        let members = autoConnectEnabledLocalDevices.compactMap(\.coreAudioUID)
+        let members = autoConnectEnabledLocalDevices.compactMap(AutoConnect.memberKey(for:))
         guard !triggerUID.isEmpty, !members.isEmpty else {
             SyncCastLog.log(
                 "autoconnect: refusing to create rule (trigger=\(triggerUID.isEmpty ? "none" : triggerUID) members=\(members.count))"
@@ -123,7 +132,7 @@ extension AppModel {
         }
         var names: [String: String] = [:]
         for uid in Set(members + [triggerUID]) {
-            if let name = devices.first(where: { $0.coreAudioUID == uid })?.name {
+            if let name = devices.first(where: { AutoConnect.memberKey(for: $0) == uid })?.name {
                 names[uid] = name
             }
         }
@@ -329,12 +338,12 @@ extension AppModel {
     /// set permanently unsettled.
     func autoConnectPresentUIDs() -> Set<String> {
         let simulatedAbsent = AppModel.autoConnectSimulatedAbsentUIDs
-        return Set(localDevices.compactMap(\.coreAudioUID))
+        return Set(autoConnectMemberCandidates.compactMap(AutoConnect.memberKey(for:)))
             .subtracting(simulatedAbsent)
     }
 
     func autoConnectEnabledUIDs() -> Set<String> {
-        Set(autoConnectEnabledLocalDevices.compactMap(\.coreAudioUID))
+        Set(autoConnectEnabledLocalDevices.compactMap(AutoConnect.memberKey(for:)))
     }
 
     // MARK: - Applying actions
@@ -359,12 +368,27 @@ extension AppModel {
                 return false
             }
         }
+        // The trigger arriving is the user's intent ("I am home, play here"),
+        // exactly like picking a mode: it retires a displacement pause. The
+        // pause is almost always macOS itself having moved the default output
+        // to the display that just connected, and without this the rule would
+        // enable everything and the engine would still refuse to start.
+        if systemSinkPausedByDisplacement {
+            systemSinkPausedByDisplacement = false
+            systemSinkPauseMode = nil
+            SyncCastLog.log("autoconnect: rule arrival retires the displacement pause")
+        }
+        // And macOS may move the output AFTER this runs, as the new device
+        // finishes coming up; for a short window a displacement is taken back
+        // instead of paused on (see `pollSystemSinkStatus`).
+        autoConnectReassertUntil = Date().addingTimeInterval(AppModel.autoConnectReassertWindowSeconds)
+        autoConnectReassertCount = 0
         // Before the members go on, never after: the Direct Stereo snapshot
         // that runs on enabling reads the hardware as the authority.
         autoConnectRestoreBuiltInLevel(memberUIDs: memberUIDs)
         let wanted = Set(memberUIDs)
-        for device in localDevices {
-            guard let uid = device.coreAudioUID else { continue }
+        for device in autoConnectMemberCandidates {
+            guard let uid = AutoConnect.memberKey(for: device) else { continue }
             let shouldEnable = wanted.contains(uid)
             let isEnabled = routing[device.id]?.enabled == true
             guard shouldEnable != isEnabled else { continue }
@@ -483,8 +507,8 @@ extension AppModel {
     private func autoConnectApplyMemberTeardown(_ disableUIDs: Set<String>) {
         autoConnectApplying = true
         defer { autoConnectApplying = false }
-        for device in devices where device.transport == .coreAudio {
-            guard let uid = device.coreAudioUID,
+        for device in devices where device.transport == .coreAudio || device.transport == .lanReceiver {
+            guard let uid = AutoConnect.memberKey(for: device),
                   disableUIDs.contains(uid),
                   routing[device.id]?.enabled == true
             else { continue }
