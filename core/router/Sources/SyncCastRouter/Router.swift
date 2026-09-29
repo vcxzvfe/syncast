@@ -2264,6 +2264,9 @@ public actor Router {
     /// Open LAN legs, keyed by SyncCast device id (the same key
     /// `localOutputs` uses in individual mode).
     var lanReceiverOutputs: [String: LanReceiverOutput] = [:]
+    /// Per LAN leg, the target the local legs are aligned to: the request, or
+    /// the receiver's own lifted target while it reports one.
+    var lanEffectiveTargetMsByDeviceID: [String: Int] = [:]
     /// Shared secrets, keyed by receiver UID (`lan:<instance name>`). Pushed
     /// by the menubar, which owns keychain storage. NEVER logged.
     var lanReceiverTokensByUID: [String: String] = [:]

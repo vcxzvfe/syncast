@@ -99,6 +99,7 @@ extension Router {
         for output in lanReceiverOutputs.values {
             output.link.setTargetMs(targetMs(forUID: output.receiverUID))
         }
+        refreshLanEffectiveTargets()
         // The local legs have to move with it — see `LanAlignmentPlanner`.
         applyLocalPairDelays()
     }
@@ -209,6 +210,9 @@ extension Router {
             link.onConnectedEndpoint = { [weak self] endpoint in
                 Task { await self?.noteLanEndpoint(endpoint, forUID: uid) }
             }
+            link.onTargetReport = { [weak self] in
+                Task { await self?.lanTargetReportChanged() }
+            }
             let source = activeCapture
             let output = LanReceiverOutput(
                 receiverUID: uid,
@@ -233,6 +237,7 @@ extension Router {
         for (deviceID, output) in lanReceiverOutputs where !wanted.contains(deviceID) {
             output.stop()
             lanReceiverOutputs.removeValue(forKey: deviceID)
+            lanEffectiveTargetMsByDeviceID.removeValue(forKey: deviceID)
             lanReceiverRevisionByDeviceID.removeValue(forKey: deviceID)
             RouterLog.write("[Router] LAN leg closed for \(output.receiverUID.prefix(24))\n")
         }
@@ -243,6 +248,7 @@ extension Router {
         guard !lanReceiverOutputs.isEmpty else { return }
         for (_, output) in lanReceiverOutputs { output.stop() }
         lanReceiverOutputs.removeAll()
+        lanEffectiveTargetMsByDeviceID.removeAll()
         lanReceiverRevisionByDeviceID.removeAll()
     }
 
@@ -321,14 +327,61 @@ extension Router {
     /// the user fixes by raising their targets — and the UI says so.
     func lanAlignmentHoldFrames() -> Int {
         guard !lanReceiverOutputs.isEmpty else { return 0 }
-        let targets = lanReceiverOutputs.values.map { $0.link.targetMs }
-        guard let slowest = targets.max() else { return 0 }
+        guard let slowest = slowestLanTargetMs() else { return 0 }
         return LanAlignmentPlanner.localHoldFrames(
             targetMs: slowest + lanScheduleLagMs(),
             ringFloorFrames: ringFloorFrames(logWarnings: false),
             maximumDeviceLatencyFrames: maximumLocalDeviceLatencyFrames(),
             sampleRate: activeCapture.sampleRate
         )
+    }
+
+    /// The largest target any live receiver is playing at, as last settled by
+    /// `refreshLanEffectiveTargets()`. A receiver with nothing settled yet
+    /// counts at its requested target.
+    func slowestLanTargetMs() -> Int? {
+        lanReceiverOutputs.map { deviceID, output in
+            lanEffectiveTargetMsByDeviceID[deviceID] ?? output.link.targetMs
+        }.max()
+    }
+
+    /// Recompute every live receiver's effective target from its request and
+    /// its latest fresh report, with hysteresis. Returns whether the slowest
+    /// one moved.
+    ///
+    /// The receiver lifts its playout target when the network turns jittery
+    /// and says so in every `stats`. Aligning to the request alone left the
+    /// local legs early by the lift, which is the mini sounding late.
+    @discardableResult
+    func refreshLanEffectiveTargets() -> Bool {
+        let before = slowestLanTargetMs()
+        for (deviceID, output) in lanReceiverOutputs {
+            let requested = output.link.targetMs
+            let candidate = LanAlignmentPlanner.effectiveTargetMs(
+                requestedMs: requested,
+                reportedMs: output.link.reportedTargetMs(
+                    maxAgeSeconds: LanAlignmentPlanner.reportMaxAgeSeconds
+                )
+            )
+            lanEffectiveTargetMsByDeviceID[deviceID] = LanAlignmentPlanner.settledTargetMs(
+                current: lanEffectiveTargetMsByDeviceID[deviceID],
+                candidate: candidate,
+                requestedMs: requested
+            )
+        }
+        let after = slowestLanTargetMs()
+        guard before != after else { return false }
+        if let before, let after {
+            RouterLog.write("[LAN] alignment follows receiver target \(before)→\(after) ms\n")
+        }
+        return true
+    }
+
+    /// A link reported (or lost) its receiver's target; re-plan the local
+    /// legs if that moved the slowest one.
+    func lanTargetReportChanged() {
+        guard !lanReceiverOutputs.isEmpty else { return }
+        if refreshLanEffectiveTargets() { applyLocalPairDelays() }
     }
 
     /// The LAN producer's read lag in whole milliseconds — the amount every
@@ -360,8 +413,7 @@ extension Router {
     /// audio into the ring), which adds a few milliseconds on top.
     public func lanTotalLagMs() -> Double? {
         guard !lanReceiverOutputs.isEmpty else { return nil }
-        let targets = lanReceiverOutputs.values.map { $0.link.targetMs }
-        guard let slowest = targets.max() else { return nil }
+        guard let slowest = slowestLanTargetMs() else { return nil }
         return LanAlignmentPlanner.totalLagMs(
             targetMs: slowest + lanScheduleLagMs(),
             ringFloorFrames: ringFloorFrames(logWarnings: false),

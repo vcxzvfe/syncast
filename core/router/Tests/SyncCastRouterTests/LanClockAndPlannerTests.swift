@@ -290,6 +290,88 @@ final class LanClockAndPlannerTests: XCTestCase {
         XCTAssertEqual(hold, 0)
     }
 
+    // MARK: - Following the receiver's own target
+
+    func testTheEffectiveTargetIsTheLargerOfRequestAndReport() {
+        XCTAssertEqual(LanAlignmentPlanner.effectiveTargetMs(requestedMs: 60, reportedMs: 171), 171)
+        // The receiver never plays below the request, so a smaller report is
+        // noise and the request stands.
+        XCTAssertEqual(LanAlignmentPlanner.effectiveTargetMs(requestedMs: 90, reportedMs: 60), 90)
+    }
+
+    func testNoFreshReportFallsBackToTheRequest() {
+        XCTAssertEqual(LanAlignmentPlanner.effectiveTargetMs(requestedMs: 60, reportedMs: nil), 60)
+    }
+
+    func testTheEffectiveTargetIsClampedToTheProtocolRange() {
+        XCTAssertEqual(
+            LanAlignmentPlanner.effectiveTargetMs(requestedMs: 60, reportedMs: 9_000),
+            LanPcmWire.targetRangeMs.upperBound
+        )
+        XCTAssertEqual(
+            LanAlignmentPlanner.effectiveTargetMs(requestedMs: 1, reportedMs: nil),
+            LanPcmWire.targetRangeMs.lowerBound
+        )
+    }
+
+    func testALiftedTargetGrowsTheLocalHold() {
+        func hold(_ target: Int) -> Int {
+            LanAlignmentPlanner.localHoldFrames(
+                targetMs: target, ringFloorFrames: 1_440,
+                maximumDeviceLatencyFrames: 960, sampleRate: 48_000
+            )
+        }
+        let lifted = LanAlignmentPlanner.effectiveTargetMs(requestedMs: 90, reportedMs: 171)
+        XCTAssertEqual(hold(lifted) - hold(90), 81 * 48)
+    }
+
+    func testSmallMovesBetweenLiftedTargetsAreIgnored() {
+        XCTAssertEqual(
+            LanAlignmentPlanner.settledTargetMs(current: 120, candidate: 124, requestedMs: 60), 120)
+        XCTAssertEqual(
+            LanAlignmentPlanner.settledTargetMs(current: 120, candidate: 116, requestedMs: 60), 120)
+        XCTAssertEqual(
+            LanAlignmentPlanner.settledTargetMs(current: 120, candidate: 125, requestedMs: 60), 125)
+        XCTAssertEqual(
+            LanAlignmentPlanner.settledTargetMs(current: nil, candidate: 63, requestedMs: 60), 63)
+    }
+
+    func testFallingBackToTheRequestIsAlwaysExact() {
+        // A stale lift must never leave the local legs held by a few ms.
+        XCTAssertEqual(
+            LanAlignmentPlanner.settledTargetMs(current: 63, candidate: 60, requestedMs: 60), 60)
+    }
+
+    func testAStaleReportAgesOutOfTheLink() {
+        let link = LanReceiverLink(
+            receiverUID: "t", endpoint: .hostPort(host: "127.0.0.1", port: 1),
+            token: "x", senderName: "t", streamID: 1, targetMs: 60
+        )
+        // Nothing received yet: nothing to follow.
+        XCTAssertNil(link.reportedTargetMs(maxAgeSeconds: LanAlignmentPlanner.reportMaxAgeSeconds))
+    }
+
+    func testTheStatsMessageCarriesTheReceiversTarget() throws {
+        let line = Data(#"{"type":"stats","late":0,"lost":0,"underrun":0,"buffer_ms":40,"ratio":1,"clip":0,"target_ms":170.6}"#.utf8)
+        guard case .stats(let stats) = try LanControlCodec.decode(line: line) else {
+            return XCTFail("expected stats")
+        }
+        XCTAssertEqual(stats.targetMs, 170.6, accuracy: 1e-9)
+        // A receiver that predates the field reports nothing, which reads as
+        // "no report" rather than a target of zero.
+        let old = Data(#"{"type":"stats","late":0,"lost":0,"underrun":0,"buffer_ms":40,"ratio":1,"clip":0}"#.utf8)
+        guard case .stats(let oldStats) = try LanControlCodec.decode(line: old) else {
+            return XCTFail("expected stats")
+        }
+        XCTAssertEqual(oldStats.targetMs, 0)
+        // A wild value decodes fine; bounding happens where it becomes an Int.
+        let wild = Data(#"{"type":"stats","target_ms":1e100}"#.utf8)
+        guard case .stats(let wildStats) = try LanControlCodec.decode(line: wild) else {
+            return XCTFail("expected stats")
+        }
+        XCTAssertEqual(wildStats.targetMs, 1e100)
+    }
+
     func testTheReportedLagIsWhicheverLegIsSlowest() {
         XCTAssertEqual(
             LanAlignmentPlanner.totalLagMs(

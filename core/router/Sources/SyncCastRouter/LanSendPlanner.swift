@@ -197,6 +197,45 @@ public enum LanAlignmentPlanner {
     /// below the target's own tuning range.
     public static let assumedRenderBlockFrames: Int = 512
 
+    /// How old a receiver's `stats` may be before its reported target is
+    /// ignored. The receiver sends one a second, so three seconds is three
+    /// missed reports: past that the number describes a receiver that may
+    /// already have re-anchored or gone.
+    public static let reportMaxAgeSeconds: Double = 3
+
+    /// A reported-target move smaller than this is not followed. The receiver
+    /// reports a fractional target that wobbles as its guard re-evaluates,
+    /// and every accepted change re-plans the local legs (a 20 ms crossfade),
+    /// so sub-perceptual drift is not worth the churn.
+    public static let followHysteresisMs: Int = 5
+
+    /// The target the receiver is really playing at: the larger of what was
+    /// asked for and what it reports, clamped to the protocol range.
+    ///
+    /// The receiver only ever lifts its target above the request (jitter
+    /// guard), never lowers it below, so a smaller report is just noise or a
+    /// receiver that has not caught up yet and the request stands. `nil` (no
+    /// fresh report) is the request itself.
+    public static func effectiveTargetMs(requestedMs: Int, reportedMs: Int?) -> Int {
+        let requested = LanPcmWire.clampTargetMs(requestedMs)
+        guard let reportedMs else { return requested }
+        return max(requested, LanPcmWire.clampTargetMs(reportedMs))
+    }
+
+    /// The value to actually align to, given the one in force (`current`) and
+    /// the freshly computed `candidate`.
+    ///
+    /// Falling back to the plain request is always immediate and exact, so a
+    /// receiver that stops reporting can never leave the local legs held on a
+    /// stale lift; between lifted values a change under
+    /// `followHysteresisMs` is ignored.
+    public static func settledTargetMs(current: Int?, candidate: Int, requestedMs: Int) -> Int {
+        let requested = LanPcmWire.clampTargetMs(requestedMs)
+        guard let current else { return candidate }
+        if candidate == requested { return candidate }
+        return abs(candidate - current) < followHysteresisMs ? current : candidate
+    }
+
     /// Frames the local legs already lag the ring by.
     public static func localPresentationLagFrames(
         ringFloorFrames: Int,

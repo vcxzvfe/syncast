@@ -190,6 +190,14 @@ public final class LanReceiverLink: @unchecked Sendable {
     private var _gain: (linear: Double, muted: Bool) = (1, false)
     private var _sentGain: (linear: Double, muted: Bool)?
     private var _sentTargetMs: Int?
+    /// Sender-clock time the latest `stats` arrived; nil before the first one
+    /// of this connection. Cleared whenever the connection is torn down or
+    /// re-handshaken, so a report never outlives the stream it described.
+    private var _statsAtNs: UInt64?
+    /// Called (on the link's queue) whenever the receiver's reported target
+    /// may have changed or gone stale: on each `stats`, on a reset, and on
+    /// every ping tick, which is what lets a silent receiver age out.
+    public var onTargetReport: (@Sendable () -> Void)?
     /// Sender-clock time the control channel last became `.ready`.
     private var _connectedSinceNs: UInt64?
 
@@ -258,6 +266,21 @@ public final class LanReceiverLink: @unchecked Sendable {
     public var targetMs: Int {
         stateLock.lock(); defer { stateLock.unlock() }
         return _targetMs
+    }
+
+    /// The target the receiver reports it is actually playing at, rounded up
+    /// to whole milliseconds, or nil when nothing fresh is on record (no
+    /// stats yet, a receiver that does not report it, or stats older than
+    /// `maxAgeSeconds`).
+    public func reportedTargetMs(maxAgeSeconds: Double) -> Int? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard let at = _statsAtNs, let stats = _snapshot.stats,
+              stats.targetMs.isFinite, stats.targetMs > 0
+        else { return nil }
+        let age = Double(Clock.nowNs() &- at) / 1_000_000_000
+        guard age <= maxAgeSeconds else { return nil }
+        // Bounded first: a wild value must not trap the Int conversion.
+        return Int(min(stats.targetMs, Double(LanPcmWire.targetRangeMs.upperBound)).rounded(.up))
     }
 
     private func mutateSnapshot(_ body: (inout LanLinkSnapshot) -> Void) {
@@ -346,6 +369,7 @@ public final class LanReceiverLink: @unchecked Sendable {
         stateLock.lock()
         _sentGain = nil
         _sentTargetMs = nil
+        _statsAtNs = nil
         _connectedSinceNs = nil
         stateLock.unlock()
     }
@@ -549,8 +573,10 @@ public final class LanReceiverLink: @unchecked Sendable {
         _sentGain = nil
         _sentTargetMs = nil
         _snapshot.isAudioReady = false
+        _statsAtNs = nil
         _connectedSinceNs = nil
         stateLock.unlock()
+        onTargetReport?()
     }
 
     // MARK: - Control channel
@@ -636,6 +662,10 @@ public final class LanReceiverLink: @unchecked Sendable {
                 $0.lastError = nil
             }
             formatLock.lock(); negotiatedFormat = ack.format; formatLock.unlock()
+            // A fresh handshake starts a fresh stream: a report from the one
+            // before it says nothing about this one.
+            stateLock.lock(); _statsAtNs = nil; stateLock.unlock()
+            onTargetReport?()
             log("hello_ack received (udp port \(ack.udpPort), device "
                 + "\(ack.deviceName.isEmpty ? "?" : ack.deviceName), "
                 + "hw_volume \(ack.hasHardwareVolume), buffer \(ack.bufferMs) ms, "
@@ -658,7 +688,9 @@ public final class LanReceiverLink: @unchecked Sendable {
                 $0.roundTripMs = rttMs
             }
         case .stats(let stats):
+            stateLock.lock(); _statsAtNs = Clock.nowNs(); stateLock.unlock()
             mutateSnapshot { $0.stats = stats }
+            onTargetReport?()
         case .error(let message):
             // The receiver rejected us — a wrong token, almost always. Retry
             // anyway (the user may be typing the right one right now), but say
@@ -677,6 +709,7 @@ public final class LanReceiverLink: @unchecked Sendable {
         timer.setEventHandler { [weak self] in
             guard let self, self.running else { return }
             self.sendControl(.ping(t1: Clock.nowNs(), prevT4: self.lastPongReceivedAtNs))
+            self.onTargetReport?()
         }
         pingTimer?.cancel()
         pingTimer = timer

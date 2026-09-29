@@ -105,12 +105,17 @@ public struct LanReceiverStats: Equatable, Sendable {
     /// Packets the receiver refused as stamped implausibly far ahead. Also
     /// ours: it means our clock model has come loose.
     public let farFuture: Int
+    /// The playout target the receiver is ACTUALLY running, in milliseconds.
+    /// Above the requested value while its jitter guard has lifted it; 0 from
+    /// a receiver that does not report it.
+    public let targetMs: Double
 
     public init(
         late: Int, lost: Int, underrun: Int,
         bufferMs: Double, ratio: Double, clip: Int,
-        overlap: Int = 0, farFuture: Int = 0
+        overlap: Int = 0, farFuture: Int = 0, targetMs: Double = 0
     ) {
+        self.targetMs = targetMs
         self.late = late
         self.lost = lost
         self.underrun = underrun
@@ -253,7 +258,8 @@ public enum LanControlCodec {
                     ratio: doubleValue(dictionary["ratio"]) ?? 1,
                     clip: intValue(dictionary["clip"]) ?? 0,
                     overlap: intValue(dictionary["overlap"]) ?? 0,
-                    farFuture: intValue(dictionary["far_future"]) ?? 0
+                    farFuture: intValue(dictionary["far_future"]) ?? 0,
+                    targetMs: doubleValue(dictionary["target_ms"]) ?? 0
                 )
             )
         case "error":
