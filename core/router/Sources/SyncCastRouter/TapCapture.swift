@@ -176,6 +176,50 @@ public final class TapCapture: @unchecked Sendable {
         }
     }
 
+    /// Processes excluded on top of our own, as last applied.
+    public private(set) var additionalExcludedProcesses: [AudioObjectID] = []
+
+    /// Replace the processes excluded from the running tap, on top of our
+    /// own. Rewrites `kAudioTapPropertyDescription` in place (the HAL
+    /// documents it as settable on an existing tap), so the capture keeps
+    /// running without a gap. Returns false when the tap is not running or
+    /// the HAL refused the new description; the old exclusion list stays.
+    @discardableResult
+    public func setAdditionalExcludedProcesses(_ processes: [AudioObjectID]) -> Bool {
+        guard tapID != 0 else { return false }
+        guard processes != additionalExcludedProcesses else { return true }
+        guard let ownProcess = try? Self.currentProcessObjectID() else {
+            return false
+        }
+        let description = CATapDescription(
+            stereoGlobalTapButExcludeProcesses: [ownProcess] + processes
+        )
+        description.name = "SyncCast System Audio Tap"
+        description.isPrivate = true
+        description.muteBehavior = CATapMuteBehavior(rawValue: 0) ?? description.muteBehavior
+        if let tapDeviceUID {
+            description.deviceUID = tapDeviceUID
+        }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyDescription,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var object: CATapDescription = description
+        let status = withUnsafeMutablePointer(to: &object) { pointer in
+            AudioObjectSetPropertyData(
+                tapID, &address, 0, nil,
+                UInt32(MemoryLayout<CATapDescription>.size), pointer
+            )
+        }
+        guard status == noErr else {
+            debugLastReason = "tap exclusion update failed: \(status)"
+            return false
+        }
+        additionalExcludedProcesses = processes
+        return true
+    }
+
     public func stop() {
         if let procID = ioProcID, aggregateID != 0 {
             AudioDeviceStop(aggregateID, procID)
@@ -192,6 +236,7 @@ public final class TapCapture: @unchecked Sendable {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = 0
         }
+        additionalExcludedProcesses = []
         debugLastReason = "stopped"
     }
 

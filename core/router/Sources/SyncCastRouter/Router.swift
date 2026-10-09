@@ -134,11 +134,11 @@ public actor Router {
     // the audio out through the normal aggregate/AUHAL machinery. See
     // `SystemSinkDevice` and docs/adr/ADR-007-system-sink-volume.md.
     /// The installed sink while the path runs; nil otherwise.
-    private var systemSink: SystemSinkDevice?
+    var systemSink: SystemSinkDevice?
     /// Process Tap pinned to the sink. Held as the protocol type because
     /// `TapCapture` is macOS 14.2+ and Router is not availability-annotated.
     /// Replaces `capture` as the ring source while it is non-nil.
-    private var sinkCapture: (any SystemAudioCapture)?
+    var sinkCapture: (any SystemAudioCapture)?
     /// The system volume, as last read from (or written to) the sink's
     /// `kAudioDevicePropertyVolumeScalar`. 0…1 on the HAL's perceptual scale,
     /// NOT a linear amplitude — `SystemSinkVolumeLaw` does that conversion.
@@ -160,6 +160,10 @@ public actor Router {
     var sinkDDCHandBacks: [String: SinkDDCHandBack] = [:]
     /// Background re-probe loop for displays stuck on software gain.
     var sinkDDCRecoveryTask: Task<Void, Never>?
+    /// Screen-sharing loop guard: the poll task, and the processes it has
+    /// excluded from the sink tap. See `Router+ScreenShareLoopGuard.swift`.
+    var screenShareGuardTask: Task<Void, Never>?
+    var screenShareExcludedProcesses: [AudioObjectID] = []
     /// Identifies the live recovery loop so a cancelled one cannot clear its
     /// successor's handle on the way out.
     var sinkDDCRecoveryGeneration = 0
@@ -1556,6 +1560,10 @@ public actor Router {
         /// on. Every "is the system volume ours?" decision keys on THIS, never
         /// on `active` alone.
         public let drivesSystemVolume: Bool
+        /// True while Screen Sharing's return audio is excluded from the sink
+        /// tap to break a feedback loop through a LAN receiver
+        /// (`ScreenShareLoopGuard`).
+        public let screenShareReturnExcluded: Bool
 
         public init(
             active: Bool,
@@ -1564,7 +1572,8 @@ public actor Router {
             isSystemDefaultOutput: Bool,
             masterVolume: Float,
             masterMuted: Bool,
-            drivesSystemVolume: Bool = false
+            drivesSystemVolume: Bool = false,
+            screenShareReturnExcluded: Bool = false
         ) {
             self.active = active
             self.uid = uid
@@ -1573,6 +1582,7 @@ public actor Router {
             self.masterVolume = masterVolume
             self.masterMuted = masterMuted
             self.drivesSystemVolume = drivesSystemVolume
+            self.screenShareReturnExcluded = screenShareReturnExcluded
         }
     }
 
@@ -1600,7 +1610,8 @@ public actor Router {
             isSystemDefaultOutput: sink.isSystemDefaultOutput,
             masterVolume: sinkMasterVolume,
             masterMuted: sinkMasterMuted,
-            drivesSystemVolume: true
+            drivesSystemVolume: true,
+            screenShareReturnExcluded: !screenShareExcludedProcesses.isEmpty
         )
     }
 
@@ -1907,6 +1918,7 @@ public actor Router {
             throw error
         }
         sinkCapture = tap
+        startScreenShareLoopGuard()
         RouterLog.write(
             "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n"
         )
@@ -1946,6 +1958,7 @@ public actor Router {
         sinkCapture = nil
         sinkVolumeBackends.removeAll()
         resetSinkDDCRecovery()
+        stopScreenShareLoopGuard()
         guard let sink = systemSink else { return nil }
         guard sink.stop() else {
             let status = sink.lastStopStatusText ?? sink.diagnostic

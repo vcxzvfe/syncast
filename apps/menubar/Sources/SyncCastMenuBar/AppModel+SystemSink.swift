@@ -479,6 +479,12 @@ extension AppModel {
         if !systemSink.status.isSystemDefaultOutput {
             return "输出已被切走：请在「声音」里选回「\(name)」 · output moved away, pick \(name) again"
         }
+        if systemSink.status.screenShareReturnExcluded {
+            // The one live condition that changes what the user hears: the
+            // remote Mac's audio from Screen Sharing is deliberately not
+            // played, because it would loop back through the LAN receiver.
+            return "屏幕共享的回传声音不经 SyncCast 播放（防止经接收端回环啸叫） · screen-sharing audio excluded to prevent a feedback loop"
+        }
         let percent = Int((systemSink.status.masterVolume * 100).rounded())
         return systemSink.status.masterMuted
             ? "系统音量：静音（输出「\(name)」） · system volume muted"
