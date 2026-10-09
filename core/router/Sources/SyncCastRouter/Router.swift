@@ -1805,22 +1805,45 @@ public actor Router {
     ///      physical outputs we are about to drive, so nothing gets turned UP;
     ///   3. failing that, nil — leave the sink's stored level alone rather
     ///      than inventing a number.
+    ///
+    /// Every level read here is a device WE drive, so it is the master with
+    /// that device's per-row balance already composed in
+    /// (`SystemSinkVolumeLaw.effectiveScalar`). Each one is turned back into
+    /// the master it implies (`SystemSinkVolumeLaw.masterScalar`) before it is
+    /// used. Taken raw, a speaker kept below the others (balance < 1) seeded
+    /// the master at its OWN level, every start lowered the system volume by
+    /// that speaker's offset, and since per-row balances persist on this path
+    /// the system volume ratcheted toward silence across launches and wakes.
     private func systemSinkSeedVolume(devices: [Device]) -> Float? {
+        let balanceByUID = Dictionary(
+            devices.compactMap { device -> (String, Float)? in
+                guard let uid = device.coreAudioUID else { return nil }
+                return (uid, routing[device.id]?.volume ?? SystemSinkVolumeLaw.unityBalance)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        func impliedMaster(uid: String, level: Float) -> Float {
+            SystemSinkVolumeLaw.masterScalar(
+                deviceScalar: level,
+                balance: balanceByUID[uid] ?? SystemSinkVolumeLaw.unityBalance
+            )
+        }
         if let currentDefault = try? DirectStereoOutput.readDefaultOutput(),
            let uid = DirectStereoOutput.readDeviceUID(currentDefault),
            !SystemSinkDevice.isSinkUID(uid),
            let level = AggregateDevice.readHardwareVolume(uid: uid) {
-            return level
+            return impliedMaster(uid: uid, level: level)
         }
         let targetLevels = devices.compactMap { device -> Float? in
             guard device.transport == .coreAudio,
                   routing[device.id]?.enabled ?? false,
                   let uid = device.coreAudioUID,
-                  !SystemSinkDevice.isSinkUID(uid)
+                  !SystemSinkDevice.isSinkUID(uid),
+                  let level = AggregateDevice.readHardwareVolume(uid: uid)
             else {
                 return nil
             }
-            return AggregateDevice.readHardwareVolume(uid: uid)
+            return impliedMaster(uid: uid, level: level)
         }
         return targetLevels.max()
     }

@@ -145,6 +145,25 @@ public enum SystemSinkVolumeLaw {
         return law.scalar(forDecibels: db)
     }
 
+    /// Inverse of `effectiveScalar`: the master that, composed with
+    /// `balance`, puts a device at `deviceScalar`.
+    ///
+    /// Clamped to 0…1, so a device sitting above what its balance allows
+    /// (someone moved it by hand) implies a full-scale master rather than an
+    /// impossible one. A silent device or a zero balance carries no
+    /// information about the master and returns `deviceScalar` unchanged.
+    public static func masterScalar(
+        deviceScalar: Float,
+        balance: Float,
+        law: ScalarDecibelLaw = appleBuiltInLaw
+    ) -> Float {
+        let level = max(0, min(1, deviceScalar))
+        let bal = max(0, min(1, balance))
+        if bal >= unityBalance || level <= 0 || bal <= 0 { return level }
+        let db = law.decibels(forScalar: level) - law.decibels(forScalar: bal)
+        return law.scalar(forDecibels: db)
+    }
+
     /// The full per-device decision.
     ///
     /// `muted` is the OR of the system mute and the device's own mute toggle:

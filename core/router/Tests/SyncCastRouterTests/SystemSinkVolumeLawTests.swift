@@ -196,4 +196,45 @@ final class SystemSinkVolumeLawTests: XCTestCase {
             XCTAssertEqual(payloads.count, 1, "exactly one payload per backend")
         }
     }
+    // MARK: - Seeding the master from a driven device
+
+    /// The sink's start seeds the master from a speaker we drive, whose level
+    /// already includes its per-row balance. Read raw, a speaker kept below
+    /// the others lowered the system volume by its offset on every start, and
+    /// with balances persisted that ratcheted toward silence.
+    func testMasterScalarInvertsEffectiveScalar() {
+        for master: Float in [0.3, 0.55, 0.8, 0.9, 1.0] {
+            for balance: Float in [0.6, 0.75, 0.88, 1.0] {
+                let device = SystemSinkVolumeLaw.effectiveScalar(
+                    masterScalar: master, balance: balance
+                )
+                guard device > 0 else { continue }
+                XCTAssertEqual(
+                    SystemSinkVolumeLaw.masterScalar(deviceScalar: device, balance: balance),
+                    master, accuracy: 1e-5,
+                    "master \(master) balance \(balance)"
+                )
+            }
+        }
+    }
+
+    func testMasterScalarIsStableAcrossRepeatedSeeds() {
+        var master: Float = 0.8
+        let balance: Float = 0.75
+        for _ in 0..<5 {
+            let device = SystemSinkVolumeLaw.effectiveScalar(
+                masterScalar: master, balance: balance
+            )
+            master = SystemSinkVolumeLaw.masterScalar(deviceScalar: device, balance: balance)
+        }
+        XCTAssertEqual(master, 0.8, accuracy: 1e-5)
+    }
+
+    func testMasterScalarEdges() {
+        XCTAssertEqual(SystemSinkVolumeLaw.masterScalar(deviceScalar: 0.7, balance: 1), 0.7)
+        XCTAssertEqual(SystemSinkVolumeLaw.masterScalar(deviceScalar: 0, balance: 0.5), 0)
+        XCTAssertEqual(SystemSinkVolumeLaw.masterScalar(deviceScalar: 0.7, balance: 0), 0.7)
+        // A device above what its balance allows implies full scale, never > 1.
+        XCTAssertEqual(SystemSinkVolumeLaw.masterScalar(deviceScalar: 1, balance: 0.5), 1)
+    }
 }
