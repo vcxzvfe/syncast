@@ -170,7 +170,7 @@ public enum DDCDisplayMatching {
 public final class DDCDisplayVolumeController: @unchecked Sendable {
     public static let shared = DDCDisplayVolumeController()
 
-    private struct Intent {
+    private struct Intent: Equatable {
         let volume: Float
         let muted: Bool
     }
@@ -184,6 +184,11 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
         /// emulated mute can't clobber the user's volume — see
         /// `DDCVolumeLevels`.
         var levels: DDCVolumeLevels
+        /// The last intent this binding's channel positively acknowledged.
+        /// nil on a fresh probe or rebind: whatever the panel held before
+        /// (sleep, replug, an OSD change) is not something we wrote, so the
+        /// next intent must go out even if it equals an earlier one.
+        var appliedIntent: Intent? = nil
     }
 
     private enum Capability {
@@ -222,8 +227,59 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     /// See `setOnPendingIntentDropped`. Guarded by `stateLock`; always
     /// invoked OUTSIDE the lock (on the DDC queue).
     private var onPendingIntentDropped: (@Sendable (String) -> Void)?
+    /// See `setOnIntentApplied`. Same locking and threading rules as
+    /// `onPendingIntentDropped`.
+    private var onIntentApplied: (@Sendable (String) -> Void)?
+    /// See `setOnDemoted`. Same locking and threading rules.
+    private var onDemoted: (@Sendable (String) -> Void)?
 
     public init() {}
+
+    /// Observer for a write the panel acknowledged.
+    ///
+    /// The Router needs this to hand a display back from software gain to
+    /// DDC without a loudness spike. While DDC was failing, the panel sat at
+    /// whatever level it last had and the Router attenuated the samples
+    /// instead. On recovery, dropping that attenuation to unity before the
+    /// panel has come down to the new level would play at the old panel level
+    /// for one I2C round trip. So the Router holds the attenuation until this
+    /// fires.
+    ///
+    /// Threading: fired on the DDC serial queue, never under `stateLock`.
+    public func setOnIntentApplied(
+        _ handler: (@Sendable (String) -> Void)?
+    ) {
+        stateLock.withLock { onIntentApplied = handler }
+    }
+
+    /// Observer for a binding that was `.supported` and has just been
+    /// demoted to unsupported (repeated write failures, or a revalidation
+    /// whose re-probe found nothing).
+    ///
+    /// `setOnPendingIntentDropped` only fires when a queued intent died
+    /// with the demotion. When the failing write was the last one queued,
+    /// nothing is dropped, yet the caller still believes the panel carries
+    /// the level it asked for. The sink path uses this to move the display
+    /// onto software gain at once instead of on the next volume change.
+    ///
+    /// Threading: fired on the DDC serial queue, never under `stateLock`.
+    public func setOnDemoted(_ handler: (@Sendable (String) -> Void)?) {
+        stateLock.withLock { onDemoted = handler }
+    }
+
+    /// True when this CoreAudio device is the kind of output a DDC/CI panel
+    /// can carry: HDMI or DisplayPort transport, on a machine where the DDC
+    /// transport exists at all. Says nothing about whether the panel answers
+    /// right now; that is what a probe is for. The Router uses it to decide
+    /// which software-gain outputs are worth re-probing.
+    public static func isDDCCandidate(uid: String) -> Bool {
+        guard DDCDisplayEnumerator.isSupported,
+              let deviceID = try? Capture.deviceID(forUID: uid)
+        else {
+            return false
+        }
+        return isHDMIOrDisplayPort(deviceID)
+    }
 
     /// Observer for intents that were ACCEPTED by `enqueueApply` (probe
     /// still in flight, or binding later demoted) and then dropped when
@@ -427,6 +483,21 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
         }
     }
 
+    /// The last volume/mute pair the panel acknowledged on the current
+    /// binding, exactly as it was passed to `enqueueApply`. nil while
+    /// nothing has been written since the latest probe or rebind, or when
+    /// the UID is not DDC-controlled.
+    public func appliedIntent(uid: String) -> (volume: Float, muted: Bool)? {
+        stateLock.withLock {
+            guard case .supported(let binding) = capabilities[uid],
+                  let intent = binding.appliedIntent
+            else {
+                return nil
+            }
+            return (intent.volume, intent.muted)
+        }
+    }
+
     // MARK: Bounded-wait API (safe to await from the Router actor)
 
     /// Upper bound for `waitForSettledCapabilities` so an actor caller can
@@ -567,7 +638,10 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
             return // Handle still live — binding stays as-is.
         }
         let fresh = Self.probeBinding(uid: uid)
-        let droppedHandler: (@Sendable (String) -> Void)? = stateLock.withLock {
+        let handlers: (
+            dropped: (@Sendable (String) -> Void)?,
+            demoted: (@Sendable (String) -> Void)?
+        )? = stateLock.withLock {
             guard case .supported(let stale) = capabilities[uid] else {
                 return nil
             }
@@ -576,18 +650,17 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
                 rebound.levels = stale.levels
                 capabilities[uid] = .supported(rebound)
                 consecutiveFailures[uid] = 0
-                return nil
+                return (nil, nil)
             }
             capabilities[uid] = .unsupported
             logDemotionOnce(uid: uid, displayName: stale.displayName)
             // An intent accepted while the binding still looked supported
             // dies with the demotion — report it (Codex P2).
-            if pending.removeValue(forKey: uid) != nil {
-                return onPendingIntentDropped
-            }
-            return nil
+            let dropped = pending.removeValue(forKey: uid) != nil
+            return (dropped ? onPendingIntentDropped : nil, onDemoted)
         }
-        droppedHandler?(uid)
+        handlers?.dropped?(uid)
+        handlers?.demoted?(uid)
     }
 
     /// Full fail-closed probe chain: CoreAudio identity -> conservative
@@ -639,33 +712,33 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
             }
             guard let (binding, intent) = work else { return }
             let outcome = Self.apply(binding: binding, intent: intent)
-            let droppedHandler: (@Sendable (String) -> Void)? = stateLock.withLock {
+            let handlers: [@Sendable (String) -> Void] = stateLock.withLock {
                 if outcome.ok {
                     completedWrites += 1
                     consecutiveFailures[uid] = 0
                     if case .supported(var updated) = capabilities[uid] {
                         updated.levels = outcome.levels
+                        updated.appliedIntent = intent
                         capabilities[uid] = .supported(updated)
                     }
-                    return nil
+                    return [onIntentApplied].compactMap { $0 }
                 }
                 failedWrites += 1
                 let failures = (consecutiveFailures[uid] ?? 0) + 1
                 consecutiveFailures[uid] = failures
                 guard failures >= Self.maxConsecutiveFailures else {
-                    return nil
+                    return []
                 }
                 capabilities[uid] = .unsupported
                 logDemotionOnce(uid: uid, displayName: binding.displayName)
                 // A NEWER intent may have been accepted (coalesced) while
                 // this failing transaction was in flight; the demotion
                 // discards it — report it (Codex P2).
-                if pending.removeValue(forKey: uid) != nil {
-                    return onPendingIntentDropped
-                }
-                return nil
+                let dropped = pending.removeValue(forKey: uid) != nil
+                return [dropped ? onPendingIntentDropped : nil, onDemoted]
+                    .compactMap { $0 }
             }
-            droppedHandler?(uid)
+            for handler in handlers { handler(uid) }
         }
     }
 

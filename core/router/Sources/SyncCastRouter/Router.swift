@@ -149,7 +149,24 @@ public actor Router {
     var sinkVolumeLaw = SystemSinkVolumeLaw.appleBuiltInLaw
     /// Per-UID backend verdicts for the sink path, refreshed on each apply so
     /// a device that starts rejecting writes is demoted mid-session.
-    private var sinkVolumeBackends: [String: SystemSinkVolumeLaw.Backend] = [:]
+    /// Internal (not private) for `Router+SinkDDCRecovery.swift`.
+    var sinkVolumeBackends: [String: SystemSinkVolumeLaw.Backend] = [:]
+    /// The backend `applySystemSinkDeviceVolume` last acted on per UID, so a
+    /// software-gain → DDC hand-back can be told apart from a steady state.
+    var sinkAppliedBackends: [String: SystemSinkVolumeLaw.Backend] = [:]
+    /// Displays just handed back from software gain to DDC whose first panel
+    /// write has not been acknowledged yet, with when the hand-back began.
+    /// Their software attenuation is held until the write lands — see
+    /// `Router+SinkDDCRecovery.swift`.
+    var sinkDDCAwaitingFirstWrite: [String: ContinuousClock.Instant] = [:]
+    /// Background re-probe loop for displays stuck on software gain.
+    var sinkDDCRecoveryTask: Task<Void, Never>?
+    /// Identifies the live recovery loop so a cancelled one cannot clear its
+    /// successor's handle on the way out.
+    var sinkDDCRecoveryGeneration = 0
+    /// `DDCDisplayVolumeController.isDDCCandidate` per UID, cached for the
+    /// life of one sink session (a transport type does not change).
+    var sinkDDCCandidateCache: [String: Bool] = [:]
     /// Sample rate / channel count the path was constructed with, so the sink
     /// path can build its pinned tap with the same contract as `capture`.
     private let sampleRate: Double
@@ -374,6 +391,15 @@ public actor Router {
         DDCDisplayVolumeController.shared.setOnPendingIntentDropped {
             [weak self] uid in
             Task { await self?.recordDroppedDDCVolumeIntent(uid: uid) }
+        }
+        // The sink path's half of DDC self-healing: a panel that stops
+        // answering moves to software gain at once, and one that answers
+        // again gets its level back without a loudness spike.
+        DDCDisplayVolumeController.shared.setOnDemoted { [weak self] uid in
+            Task { await self?.sinkDDCDemoted(uid: uid) }
+        }
+        DDCDisplayVolumeController.shared.setOnIntentApplied { [weak self] uid in
+            Task { await self?.sinkDDCIntentLanded(uid: uid) }
         }
     }
 
@@ -1728,14 +1754,14 @@ public actor Router {
     }
 
     /// CoreAudio UIDs the sink path currently renders to.
-    private func sinkOutputUIDs() -> [String] {
+    func sinkOutputUIDs() -> [String] {
         if !aggregateUIDByDeviceID.isEmpty {
             return Array(aggregateUIDByDeviceID.values)
         }
         return localOutputs.values.map(\.deviceUID)
     }
 
-    private func classifySinkVolumeBackend(
+    func classifySinkVolumeBackend(
         uid: String
     ) -> SystemSinkVolumeLaw.Backend {
         switch DirectStereoVolumeReadback.backend(
@@ -1920,6 +1946,7 @@ public actor Router {
         sinkCapture?.stop()
         sinkCapture = nil
         sinkVolumeBackends.removeAll()
+        resetSinkDDCRecovery()
         guard let sink = systemSink else { return nil }
         guard sink.stop() else {
             let status = sink.lastStopStatusText ?? sink.diagnostic
@@ -1954,8 +1981,9 @@ public actor Router {
     /// matches what macOS would have done natively), DDC/CI where a display
     /// answers it, and software gain — converted through the sink's dB law —
     /// for everything else. The per-device slider rides on top as a balance.
-    private func applySystemSinkVolumes() {
+    func applySystemSinkVolumes() {
         guard systemSinkPathIsLive else { return }
+        defer { scheduleSinkDDCRecoveryIfNeeded() }
         if let agg = aggregateDevice, let aggOut = localOutputs[agg.aggregateUID] {
             for (devID, uid) in aggregateUIDByDeviceID {
                 let route = routing[devID] ?? DeviceRouting(deviceID: devID)
@@ -1993,6 +2021,7 @@ public actor Router {
         )
         switch plan.backend {
         case .coreAudioHardware:
+            sinkAppliedBackends[uid] = .coreAudioHardware
             let muteOK = AggregateDevice.applyHardwareMute(uid: uid, muted: plan.muted)
             let target = DirectStereoOutput.plannedCoreAudioVolume(
                 volume: plan.hardwareScalar ?? 0,
@@ -2016,20 +2045,34 @@ public actor Router {
             )
         case .ddc:
             let normalized = Float(plan.ddcPercent ?? 0) / 100
+            if sinkAppliedBackends[uid] == .softwareGain {
+                // Hand-back from software gain: the panel still holds its old
+                // level. See `Router+SinkDDCRecovery.swift`.
+                sinkDDCAwaitingFirstWrite[uid] = ContinuousClock.now
+            }
+            sinkAppliedBackends[uid] = .ddc
             let accepted = DDCDisplayVolumeController.shared.enqueueApply(
                 uid: uid, volume: normalized, muted: plan.muted
             )
             // Software gain is the safety net, never a second attenuator: it
             // only engages when DDC refused outright.
             if accepted {
-                if let pair { output.setSoftwareGain(pair: pair, gain: 1.0) }
+                // Until the panel acknowledges its first write after a
+                // hand-back, keep the attenuation that was carrying the level:
+                // unity now would play at the panel's OLD level for one I2C
+                // round trip, and that level can be far louder.
+                if sinkDDCAwaitingFirstWrite[uid] == nil, let pair {
+                    output.setSoftwareGain(pair: pair, gain: 1.0)
+                }
                 return
             }
+            sinkDDCAwaitingFirstWrite.removeValue(forKey: uid)
             sinkVolumeBackends[uid] = .softwareGain
             applySystemSinkDeviceVolume(
                 uid: uid, route: route, output: output, pair: pair
             )
         case .softwareGain:
+            sinkAppliedBackends[uid] = .softwareGain
             // Software gain is the LAST attenuator on this path — the whole-
             // output gain is pinned to unity and both hardware backends have
             // already refused. A nil pair (the aggregate's subdevice map and

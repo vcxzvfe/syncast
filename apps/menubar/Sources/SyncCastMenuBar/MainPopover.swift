@@ -58,6 +58,7 @@ struct MainPopover: View {
             // just granted it in System Settings, the media-key event
             // tap installs immediately — no app restart.
             model.recheckVolumeKeyPermission()
+            model.refreshSystemSinkRowHints()
         }
     }
 
@@ -826,14 +827,15 @@ private struct DeviceRow: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
-                    // Sink path: say how this output's level is carried, since
-                    // "the slider is a balance under the system volume" is not
-                    // guessable from the control itself.
+                    // Sink path: the slider is a balance under the system
+                    // volume, so its "100%" is not this speaker's level. State
+                    // the actual level and what carries it.
                     if let hint = model.systemSinkVolumeHint(for: deviceID) {
                         Text(hint)
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     // Per-speaker delay trim. Whole-home only: in stereo the
                     // bridges do not run and the Scheduler is deliberately

@@ -551,24 +551,54 @@ extension AppModel {
         return FileManager.default.fileExists(atPath: repo.path) ? repo : nil
     }
 
-    /// Per-row note about HOW this output's level is being carried on the sink
-    /// path. Nil for the ordinary case (the device has a real hardware volume)
-    /// and outside the sink path, so no row grows a line it does not need.
+    /// Per-row line on the sink path: the level the output is ACTUALLY set to
+    /// and what carries it, or a warning when a display's DDC link is down.
+    /// Nil outside the sink path. See `SystemSinkRowHint`.
     func systemSinkVolumeHint(for deviceID: String) -> String? {
+        guard mode == .stereo,
+              AppModel.selectedStereoOutputPath == .sink,
+              streamingState == .running,
+              let device = devices.first(where: { $0.id == deviceID })
+        else {
+            return nil
+        }
+        let kind: SystemSinkRowHint.Kind
+        switch device.transport {
+        case .lanReceiver:
+            kind = .lanReceiver
+        case .coreAudio:
+            let backend = systemSink.backendsByDeviceID[deviceID]
+            let candidate = backend == .softwareGain
+                && device.coreAudioUID.map {
+                    DDCDisplayVolumeController.isDDCCandidate(uid: $0)
+                } == true
+            kind = .local(backend, isDisplayCandidate: candidate)
+        default:
+            return nil
+        }
+        let route = routing[deviceID] ?? DeviceRouting(deviceID: deviceID)
+        return SystemSinkRowHint.text(
+            kind: kind,
+            masterScalar: systemSink.status.masterVolume,
+            masterMuted: systemSink.status.masterMuted,
+            balance: route.volume,
+            deviceMuted: route.muted
+        )
+    }
+
+    /// Re-ask the Router which mechanism carries each output, so a display
+    /// whose DDC link came back (or dropped) since the last engine transition
+    /// shows the right line when the panel opens.
+    func refreshSystemSinkRowHints() {
         guard mode == .stereo,
               AppModel.selectedStereoOutputPath == .sink,
               streamingState == .running
         else {
-            return nil
+            return
         }
-        switch systemSink.backendsByDeviceID[deviceID] {
-        case .ddc:
-            return "跟随系统音量（DDC/CI） · follows system volume via DDC/CI"
-        case .softwareGain:
-            return "跟随系统音量（软件增益） · follows system volume, software gain"
-        case .coreAudioHardware, nil:
-            return nil
-        }
+        systemSink.refreshCapabilities(
+            router: router, uidByDeviceID: enabledCoreAudioUIDsByDeviceID()
+        )
     }
 
     /// Sink-path counterpart of `updateVolumeKeyEligibility`'s Direct Stereo
