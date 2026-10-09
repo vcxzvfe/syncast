@@ -1587,6 +1587,10 @@ final class AppModel {
             applyPersistedDeviceVolumes()
         } else {
             resetDeviceVolumesToUnity()
+            // The sink path keeps its own balance store; unity first, so a
+            // device with nothing stored there does not inherit whole-home's
+            // value.
+            applyPersistedDeviceVolumes()
         }
         // Force a full pipeline restart by stopping the engine, then
         // reconciling. The two modes have different audio paths
@@ -2321,8 +2325,23 @@ final class AppModel {
     /// the other.
     static let masterVolumeDefaultsKey = "syncast.masterVolumePercent"
 
+    /// Per-device balance on the system-sink Stereo path, keyed like
+    /// `deviceVolumeDefaultsKey`. A separate store, not a shared one: there
+    /// the row is a dB-domain balance under the system volume, in whole-home a
+    /// `VolumeCurve` position under the panel's own master, and a value
+    /// carried from one to the other is re-read under the wrong law.
+    static let sinkDeviceBalanceDefaultsKey = "syncast.sinkDeviceBalancePercent"
+
     private var persistedDeviceVolumes: [String: Int] =
-        AppModel.loadPersistedDeviceVolumes()
+        AppModel.loadPersistedDeviceVolumes(key: deviceVolumeDefaultsKey)
+    private var persistedSinkDeviceBalances: [String: Int] =
+        AppModel.loadPersistedDeviceVolumes(key: sinkDeviceBalanceDefaultsKey)
+
+    /// Which store, if any, owns `routing[*].volume` in the current mode.
+    enum DeviceVolumeStore: Equatable {
+        case wholeHome
+        case sinkBalance
+    }
 
     /// Whether per-device volume is OURS to remember in the current mode.
     ///
@@ -2338,7 +2357,42 @@ final class AppModel {
     /// In whole-home nothing else remembers it: the level lives in our own
     /// bridge gain and in OwnTone's per-output volume, both of which reset
     /// every session.
-    private var deviceVolumeIsPersistable: Bool { mode == .wholeHome }
+    ///
+    /// The system-sink Stereo path is the same case, not the Direct Stereo
+    /// one: the row is a balance under the system volume that nothing
+    /// mirrors back (both hardware-mirror writers are gated on Direct
+    /// Stereo), and macOS remembers only the system volume. Unpersisted, every
+    /// relaunch, wake rebuild or device re-appearance put every speaker back
+    /// at 100 % of the system volume and lost the user's mix between them.
+    var deviceVolumeStore: DeviceVolumeStore? {
+        Self.deviceVolumeStore(mode: mode, stereoPath: Self.selectedStereoOutputPath)
+    }
+
+    /// Pure form of `deviceVolumeStore`, for the tests: the stereo path is
+    /// fixed per process, so the live property cannot be driven across it.
+    static func deviceVolumeStore(
+        mode: Mode,
+        stereoPath: StereoOutputPathPolicy.Path
+    ) -> DeviceVolumeStore? {
+        switch mode {
+        case .wholeHome:
+            return .wholeHome
+        case .stereo where stereoPath == .sink:
+            return .sinkBalance
+        default:
+            return nil
+        }
+    }
+
+    private var deviceVolumeIsPersistable: Bool { deviceVolumeStore != nil }
+
+    private var persistedVolumesForCurrentStore: [String: Int] {
+        switch deviceVolumeStore {
+        case .wholeHome: return persistedDeviceVolumes
+        case .sinkBalance: return persistedSinkDeviceBalances
+        case nil: return [:]
+        }
+    }
 
     /// Whole-home master fader, 0…100.
     private(set) var masterVolumePercent: Int =
@@ -2467,9 +2521,9 @@ final class AppModel {
     /// a set also enforces.
     var equalizerEditorTarget: EqualizerTarget?
 
-    private static func loadPersistedDeviceVolumes() -> [String: Int] {
+    private static func loadPersistedDeviceVolumes(key: String) -> [String: Int] {
         guard let raw = UserDefaults.standard
-            .dictionary(forKey: deviceVolumeDefaultsKey)
+            .dictionary(forKey: key)
         else { return [:] }
         var out: [String: Int] = [:]
         for (key, value) in raw {
@@ -2487,10 +2541,25 @@ final class AppModel {
         )
     }
 
-    private func persistDeviceVolumes() {
-        UserDefaults.standard.set(
-            persistedDeviceVolumes, forKey: AppModel.deviceVolumeDefaultsKey
-        )
+    private func persistDeviceVolume(_ percent: Int, key: String) {
+        // Full scale is the default, so drop the key rather than storing
+        // it — an untouched speaker leaves no trace in the plist.
+        let value: Int? = percent == VolumeCurve.defaultPercent ? nil : percent
+        switch deviceVolumeStore {
+        case .wholeHome:
+            persistedDeviceVolumes[key] = value
+            UserDefaults.standard.set(
+                persistedDeviceVolumes, forKey: AppModel.deviceVolumeDefaultsKey
+            )
+        case .sinkBalance:
+            persistedSinkDeviceBalances[key] = value
+            UserDefaults.standard.set(
+                persistedSinkDeviceBalances,
+                forKey: AppModel.sinkDeviceBalanceDefaultsKey
+            )
+        case nil:
+            break
+        }
     }
 
     /// The slider position for a device, on the 0…100 percent grid.
@@ -2514,10 +2583,11 @@ final class AppModel {
     @discardableResult
     func applyPersistedDeviceVolumes() -> Bool {
         guard deviceVolumeIsPersistable else { return false }
+        let store = persistedVolumesForCurrentStore
         var changed = false
         for dev in devices {
             guard let key = dev.persistenceKey else { continue }
-            let stored = persistedDeviceVolumes[key] ?? VolumeCurve.defaultPercent
+            let stored = store[key] ?? VolumeCurve.defaultPercent
             // A device with no routing entry yet has nothing to re-seed INTO;
             // writing through the optional chain would no-op while still
             // reporting a change, queueing work on every discovery event.
@@ -2581,14 +2651,7 @@ final class AppModel {
         r.volume = Float(VolumeCurve.fraction(forPercent: clamped))
         routing[id] = r
         if deviceVolumeIsPersistable, let key = persistenceKey(for: id) {
-            // Full scale is the default, so drop the key rather than storing
-            // it — an untouched speaker leaves no trace in the plist.
-            if clamped == VolumeCurve.defaultPercent {
-                persistedDeviceVolumes.removeValue(forKey: key)
-            } else {
-                persistedDeviceVolumes[key] = clamped
-            }
-            persistDeviceVolumes()
+            persistDeviceVolume(clamped, key: key)
         }
         pushLocalVolumeImmediately(r)
         applyDirectStereoHardwareVolumeIfNeeded(for: id)

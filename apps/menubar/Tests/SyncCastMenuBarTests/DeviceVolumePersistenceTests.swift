@@ -15,16 +15,19 @@ import SyncCastRouter
 final class DeviceVolumePersistenceTests: XCTestCase {
     private let volumeKey = "syncast.deviceVolumePercent"
     private let masterKey = "syncast.masterVolumePercent"
+    private let sinkBalanceKey = "syncast.sinkDeviceBalancePercent"
 
     override func setUp() {
         super.setUp()
         UserDefaults.standard.removeObject(forKey: volumeKey)
         UserDefaults.standard.removeObject(forKey: masterKey)
+        UserDefaults.standard.removeObject(forKey: sinkBalanceKey)
     }
 
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: volumeKey)
         UserDefaults.standard.removeObject(forKey: masterKey)
+        UserDefaults.standard.removeObject(forKey: sinkBalanceKey)
         super.tearDown()
     }
 
@@ -190,23 +193,60 @@ final class DeviceVolumePersistenceTests: XCTestCase {
         XCTAssertFalse(second.applyPersistedDeviceVolumes())
     }
 
-    /// Stereo's slider is a MIRROR of the device's own hardware volume, which
-    /// macOS already persists and `applyDirectStereoVolumeSnapshot` writes
-    /// back into `routing` on every run. Keeping a second copy would restore a
-    /// stale value on launch only for the next hardware snapshot to overwrite
-    /// it — a visible slider jump and two authorities over one number.
-    func test_stereo_volume_is_not_persisted() {
+    /// Direct Stereo's slider is a MIRROR of the device's own hardware volume,
+    /// which macOS already persists and `applyDirectStereoVolumeSnapshot`
+    /// writes back into `routing` on every run. Keeping a second copy would
+    /// restore a stale value on launch only for the next hardware snapshot to
+    /// overwrite it — a visible slider jump and two authorities over one
+    /// number.
+    ///
+    /// The system-sink Stereo path is the opposite case: the row is a balance
+    /// under the system volume that nothing else remembers, so it has its own
+    /// store. Losing it reset every speaker to 100 % of the system volume on
+    /// every relaunch, wake rebuild or device re-appearance.
+    func test_store_per_mode_and_path() {
+        XCTAssertEqual(
+            AppModel.deviceVolumeStore(mode: .wholeHome, stereoPath: .direct),
+            .wholeHome
+        )
+        XCTAssertEqual(
+            AppModel.deviceVolumeStore(mode: .wholeHome, stereoPath: .sink),
+            .wholeHome
+        )
+        XCTAssertEqual(
+            AppModel.deviceVolumeStore(mode: .stereo, stereoPath: .sink),
+            .sinkBalance
+        )
+        XCTAssertNil(AppModel.deviceVolumeStore(mode: .stereo, stereoPath: .direct))
+        XCTAssertNil(AppModel.deviceVolumeStore(mode: .stereo, stereoPath: .capture))
+    }
+
+    func test_stereo_persists_only_on_the_sink_path_and_in_its_own_store() {
         let uid = "uid-stereo"
         let m = AppModel()
         m.mode = .stereo
         m.devices = [localDevice(id: "dev-1", uid: uid)]
         m.setDeviceVolumePercent(35, for: "dev-1")
 
-        // Still honoured in memory for this session…
+        // Honoured in memory for this session on every path…
         XCTAssertEqual(m.deviceVolumePercent(for: "dev-1"), 35)
-        // …but nothing is written, and nothing is re-seeded.
+        // …never in whole-home's store…
         XCTAssertNil(UserDefaults.standard.dictionary(forKey: volumeKey))
-        XCTAssertFalse(m.applyPersistedDeviceVolumes())
+        let sinkStore = UserDefaults.standard.dictionary(forKey: sinkBalanceKey)
+            as? [String: Int]
+        if m.deviceVolumeStore == .sinkBalance {
+            // …and in the sink path's own store, re-seeded under a fresh id.
+            XCTAssertEqual(sinkStore?["ca:\(uid)"], 35)
+            let next = AppModel()
+            next.mode = .stereo
+            next.devices = [localDevice(id: "dev-2", uid: uid)]
+            next.routing["dev-2"] = DeviceRouting(deviceID: "dev-2")
+            XCTAssertTrue(next.applyPersistedDeviceVolumes())
+            XCTAssertEqual(next.deviceVolumePercent(for: "dev-2"), 35)
+        } else {
+            XCTAssertNil(sinkStore)
+            XCTAssertFalse(m.applyPersistedDeviceVolumes())
+        }
     }
 
     /// A value stored while in whole-home must not be re-applied over the
