@@ -141,6 +141,36 @@ public final class LanReceiverLink: @unchecked Sendable {
     /// the log with the same line.
     public static let waitingLogIntervalSeconds: Double = 30
 
+    /// Service class for the audio datagrams. On real hardware a Time Machine
+    /// backup to the receiver's disk shared the sender's Wi-Fi uplink at
+    /// ~48 Mbit/s; as best-effort traffic the audio queued behind it, the
+    /// receiver's p95 jitter went from 12 to 58 ms and it dropped ~6 late
+    /// packets a second. `.interactiveVoice` puts the datagrams in the VO
+    /// access category and the highest host send queue, so they leave ahead
+    /// of bulk transfers. It does not mark DSCP (macOS leaves Wi-Fi DSCP
+    /// marking off by default), so the access point's hop to the receiver is
+    /// not covered — the congested queue was the sender's.
+    public static let audioServiceClass: NWParameters.ServiceClass = .interactiveVoice
+    /// Service class for the control channel. Its pings are the clock-offset
+    /// samples, and the receiver keeps the lowest-RTT one in a 16 s window: a
+    /// sustained upload that queues every ping leaves only biased samples.
+    /// `.signaling` (VI access category) is the class meant for call control.
+    public static let controlServiceClass: NWParameters.ServiceClass = .signaling
+
+    static func audioParameters() -> NWParameters {
+        let parameters = NWParameters.udp
+        parameters.includePeerToPeer = false
+        parameters.serviceClass = audioServiceClass
+        return parameters
+    }
+
+    static func controlParameters() -> NWParameters {
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = false
+        parameters.serviceClass = controlServiceClass
+        return parameters
+    }
+
     public let receiverUID: String
     private let endpoint: LanReceiverEndpoint
     /// Queue-confined like the rest of the connection state.
@@ -400,9 +430,7 @@ public final class LanReceiverLink: @unchecked Sendable {
             }
             nwEndpoint = .hostPort(host: NWEndpoint.Host(host), port: nwPort)
         }
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = false
-        let connection = NWConnection(to: nwEndpoint, using: parameters)
+        let connection = NWConnection(to: nwEndpoint, using: Self.controlParameters())
         control = connection
         mutateSnapshot { $0.stage = .connecting }
         connection.stateUpdateHandler = { [weak self] state in
@@ -727,9 +755,7 @@ public final class LanReceiverLink: @unchecked Sendable {
             fail("receiver advertised an unusable UDP port (\(port))")
             return
         }
-        let parameters = NWParameters.udp
-        parameters.includePeerToPeer = false
-        let connection = NWConnection(host: host, port: nwPort, using: parameters)
+        let connection = NWConnection(host: host, port: nwPort, using: Self.audioParameters())
         audio = connection
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, connection === self.audio else { return }
