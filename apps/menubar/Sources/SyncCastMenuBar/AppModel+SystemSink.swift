@@ -565,7 +565,9 @@ extension AppModel {
         let kind: SystemSinkRowHint.Kind
         switch device.transport {
         case .lanReceiver:
-            kind = .lanReceiver
+            kind = .lanReceiver(
+                hardwareVolume: lanStatus(for: deviceID)?.link.hasHardwareVolume
+            )
         case .coreAudio:
             let backend = systemSink.backendsByDeviceID[deviceID]
             let candidate = backend == .softwareGain

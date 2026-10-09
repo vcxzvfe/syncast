@@ -53,7 +53,9 @@ final class SystemSinkRowHintTests: XCTestCase {
         XCTAssertEqual(line(.local(.coreAudioHardware, isDisplayCandidate: false)), "实际 100% · 硬件音量")
         XCTAssertEqual(line(.local(.softwareGain, isDisplayCandidate: false)), "实际 100% · 软件增益")
         XCTAssertEqual(line(.local(nil, isDisplayCandidate: false)), "实际 100% · 跟随系统音量")
-        XCTAssertEqual(line(.lanReceiver), "实际 100% · 对端硬件音量")
+        XCTAssertEqual(line(.lanReceiver(hardwareVolume: true)), "实际 100% · 对端硬件音量")
+        XCTAssertEqual(line(.lanReceiver(hardwareVolume: false)), "实际 100% · 对端软件增益")
+        XCTAssertEqual(line(.lanReceiver(hardwareVolume: nil)), "实际 100% · 跟随系统音量")
     }
 
     func testMuteWins() {
@@ -67,7 +69,7 @@ final class SystemSinkRowHintTests: XCTestCase {
         )
         XCTAssertEqual(
             SystemSinkRowHint.text(
-                kind: .lanReceiver,
+                kind: .lanReceiver(hardwareVolume: true),
                 masterScalar: 0.9, masterMuted: false,
                 balance: 1, deviceMuted: true
             ),

@@ -27,14 +27,19 @@ import Foundation
 //      that failed never reached the panel.
 //   2. While any display that DDC could carry is on software gain, a
 //      background loop re-probes it on a backoff (`SinkDDCRecoveryPolicy`).
-//   3. When the panel answers again, the display goes back to `.ddc`. Its
-//      software attenuation is HELD until the panel acknowledges the first
-//      write (`sinkDDCIntentLanded`). Dropping to unity earlier would play at
-//      the panel's old level for one I2C round trip, and after a long
-//      fallback that level can be far louder than the current system volume.
-//   4. A hand-back whose write is never acknowledged returns to software gain
-//      after `SinkDDCRecoveryPolicy.firstWriteTimeoutSeconds`, so a held
-//      attenuation cannot outlive the attempt.
+//   3. When the panel answers again, the display goes back to `.ddc`, but
+//      keeps being attenuated in software, as during the fallback, until the
+//      panel acknowledges the CURRENT volume/mute intent
+//      (`sinkDDCIntentLanded`). Dropping to unity earlier would play at the
+//      panel's old level for one I2C round trip, and after a long fallback
+//      that level can be far louder than the current system volume. The
+//      software gain is recomputed on every apply during the wait, so a mute
+//      or a lower volume still lands at once, and an acknowledgement of an
+//      intent the user has since changed releases nothing.
+//   4. A hand-back the panel does not acknowledge within
+//      `SinkDDCRecoveryPolicy.firstWriteTimeoutSeconds` returns to software
+//      gain. Each hand-back carries its own deadline timer, independent of the
+//      re-probe loop's backoff.
 
 /// Pure timing for the sink path's DDC re-probe loop (unit-checkable).
 public enum SinkDDCRecoveryPolicy {
@@ -53,6 +58,18 @@ public enum SinkDDCRecoveryPolicy {
         }
         return backoffSeconds[attempt]
     }
+}
+
+/// One display's pending software-gain → DDC hand-back.
+struct SinkDDCHandBack {
+    struct Target: Equatable {
+        let volume: Float
+        let muted: Bool
+    }
+    let started: ContinuousClock.Instant
+    /// The intent most recently sent to the panel; only its acknowledgement
+    /// releases the software gain.
+    var target: Target?
 }
 
 extension Router {
@@ -74,12 +91,10 @@ extension Router {
     func scheduleSinkDDCRecoveryIfNeeded() {
         guard sinkDDCRecoveryTask == nil, systemSinkPathIsLive else { return }
         let stuck = sinkDDCRecoveryCandidates()
-        guard !stuck.isEmpty || !sinkDDCAwaitingFirstWrite.isEmpty else { return }
-        if !stuck.isEmpty {
-            RouterLog.write(
-                "[Router] system sink: DDC is not carrying \(Self.shortUIDs(stuck)); software gain holds the level (it cannot go above the panel's own) — re-probing in the background\n"
-            )
-        }
+        guard !stuck.isEmpty else { return }
+        RouterLog.write(
+            "[Router] system sink: DDC is not carrying \(Self.shortUIDs(stuck)); software gain holds the level (it cannot go above the panel's own) — re-probing in the background\n"
+        )
         sinkDDCRecoveryGeneration += 1
         let generation = sinkDDCRecoveryGeneration
         sinkDDCRecoveryTask = Task { [weak self] in
@@ -92,7 +107,7 @@ extension Router {
         sinkDDCRecoveryTask = nil
         sinkDDCRecoveryGeneration += 1
         sinkAppliedBackends.removeAll()
-        sinkDDCAwaitingFirstWrite.removeAll()
+        sinkDDCHandBacks.removeAll()
         sinkDDCCandidateCache.removeAll()
     }
 
@@ -104,23 +119,15 @@ extension Router {
         }
         var attempt = 0
         while !Task.isCancelled {
-            // While a hand-back is pending the loop only has to outlast its
-            // timeout, so it ticks at that pace instead of the probe backoff.
-            let delay = sinkDDCAwaitingFirstWrite.isEmpty
-                ? SinkDDCRecoveryPolicy.delaySeconds(attempt: attempt)
-                : SinkDDCRecoveryPolicy.firstWriteTimeoutSeconds
+            let delay = SinkDDCRecoveryPolicy.delaySeconds(attempt: attempt)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, sinkDDCRecoveryGeneration == generation,
                   systemSinkPathIsLive
             else {
                 return
             }
-            expireStaleSinkDDCHandBacks()
             let stuck = sinkDDCRecoveryCandidates()
-            if stuck.isEmpty {
-                if sinkDDCAwaitingFirstWrite.isEmpty { return }
-                continue
-            }
+            if stuck.isEmpty { return }
             attempt += 1
             let ddc = DDCDisplayVolumeController.shared
             ddc.refreshCapabilities(uids: stuck)
@@ -144,21 +151,29 @@ extension Router {
         }
     }
 
-    /// A hand-back whose first write was never acknowledged goes back to
-    /// software gain; the loop will try the panel again later.
-    private func expireStaleSinkDDCHandBacks() {
-        let now = ContinuousClock.now
-        let timeout = Duration.milliseconds(
-            Int(SinkDDCRecoveryPolicy.firstWriteTimeoutSeconds * 1000)
-        )
-        let expired = sinkDDCAwaitingFirstWrite
-            .filter { now - $0.value >= timeout }
-            .map(\.key)
-        guard !expired.isEmpty else { return }
-        for uid in expired {
-            sinkDDCAwaitingFirstWrite.removeValue(forKey: uid)
-            sinkVolumeBackends[uid] = .softwareGain
+    /// Start a hand-back and arm its own deadline.
+    func beginSinkDDCHandBack(uid: String) {
+        let handBack = SinkDDCHandBack(started: ContinuousClock.now, target: nil)
+        sinkDDCHandBacks[uid] = handBack
+        let started = handBack.started
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(
+                SinkDDCRecoveryPolicy.firstWriteTimeoutSeconds * 1_000_000_000
+            ))
+            await self?.expireSinkDDCHandBack(uid: uid, started: started)
         }
+    }
+
+    /// A hand-back the panel never acknowledged goes back to software gain;
+    /// the re-probe loop will try the panel again later. `started` ties the
+    /// timer to the hand-back that armed it, so a later hand-back of the same
+    /// display is never expired early.
+    private func expireSinkDDCHandBack(uid: String, started: ContinuousClock.Instant) {
+        guard sinkDDCHandBacks[uid]?.started == started else { return }
+        sinkDDCHandBacks.removeValue(forKey: uid)
+        guard systemSinkPathIsLive else { return }
+        sinkVolumeBackends[uid] = .softwareGain
+        let expired = [uid]
         RouterLog.write(
             "[Router] system sink: the panel never acknowledged the hand-back write for \(Self.shortUIDs(expired)); staying on software gain\n"
         )
@@ -168,21 +183,31 @@ extension Router {
     /// The DDC controller demoted a panel that was carrying a sink output.
     func sinkDDCDemoted(uid: String) {
         guard systemSinkPathIsLive, sinkVolumeBackends[uid] == .ddc else { return }
-        sinkDDCAwaitingFirstWrite.removeValue(forKey: uid)
+        sinkDDCHandBacks.removeValue(forKey: uid)
         sinkVolumeBackends[uid] = .softwareGain
         applySystemSinkVolumes()
     }
 
-    /// A panel acknowledged a write. Releases the held attenuation of a
-    /// hand-back; the re-apply this triggers writes the panel once more (the
-    /// same level, harmless), and that second acknowledgement finds nothing
-    /// waiting, so it stops there.
+    /// A panel acknowledged a write. Releases a hand-back's software gain
+    /// only when what the panel now holds is the intent most recently sent,
+    /// matched by enqueue sequence, not by value; an acknowledgement of an
+    /// older intent (the user moved the volume or muted while it was in
+    /// flight) releases nothing, and the newer write's own acknowledgement
+    /// will. The re-apply this triggers writes the panel
+    /// once more (the same level, harmless); that acknowledgement finds no
+    /// hand-back, so it stops there.
     func sinkDDCIntentLanded(uid: String) {
-        guard sinkDDCAwaitingFirstWrite.removeValue(forKey: uid) != nil,
-              systemSinkPathIsLive
+        guard systemSinkPathIsLive,
+              let handBack = sinkDDCHandBacks[uid],
+              let target = handBack.target,
+              let applied = DDCDisplayVolumeController.shared.appliedIntent(uid: uid),
+              applied.sequence == DDCDisplayVolumeController.shared
+                  .latestEnqueuedSequence(uid: uid),
+              SinkDDCHandBack.Target(volume: applied.volume, muted: applied.muted) == target
         else {
             return
         }
+        sinkDDCHandBacks.removeValue(forKey: uid)
         applySystemSinkVolumes()
     }
 

@@ -154,11 +154,10 @@ public actor Router {
     /// The backend `applySystemSinkDeviceVolume` last acted on per UID, so a
     /// software-gain → DDC hand-back can be told apart from a steady state.
     var sinkAppliedBackends: [String: SystemSinkVolumeLaw.Backend] = [:]
-    /// Displays just handed back from software gain to DDC whose first panel
-    /// write has not been acknowledged yet, with when the hand-back began.
-    /// Their software attenuation is held until the write lands — see
-    /// `Router+SinkDDCRecovery.swift`.
-    var sinkDDCAwaitingFirstWrite: [String: ContinuousClock.Instant] = [:]
+    /// Displays just handed back from software gain to DDC whose panel has
+    /// not yet acknowledged the CURRENT intent. They keep software gain until
+    /// it does — see `Router+SinkDDCRecovery.swift`.
+    var sinkDDCHandBacks: [String: SinkDDCHandBack] = [:]
     /// Background re-probe loop for displays stuck on software gain.
     var sinkDDCRecoveryTask: Task<Void, Never>?
     /// Identifies the live recovery loop so a cancelled one cannot clear its
@@ -2048,25 +2047,39 @@ public actor Router {
             if sinkAppliedBackends[uid] == .softwareGain {
                 // Hand-back from software gain: the panel still holds its old
                 // level. See `Router+SinkDDCRecovery.swift`.
-                sinkDDCAwaitingFirstWrite[uid] = ContinuousClock.now
+                beginSinkDDCHandBack(uid: uid)
             }
             sinkAppliedBackends[uid] = .ddc
+            sinkDDCHandBacks[uid]?.target = SinkDDCHandBack.Target(
+                volume: normalized, muted: plan.muted
+            )
             let accepted = DDCDisplayVolumeController.shared.enqueueApply(
                 uid: uid, volume: normalized, muted: plan.muted
             )
             // Software gain is the safety net, never a second attenuator: it
             // only engages when DDC refused outright.
             if accepted {
-                // Until the panel acknowledges its first write after a
-                // hand-back, keep the attenuation that was carrying the level:
-                // unity now would play at the panel's OLD level for one I2C
-                // round trip, and that level can be far louder.
-                if sinkDDCAwaitingFirstWrite[uid] == nil, let pair {
+                if sinkDDCHandBacks[uid] != nil {
+                    // Until the panel acknowledges the current intent, keep
+                    // carrying the level in software exactly as the fallback
+                    // did: unity now would play at the panel's OLD level for
+                    // one I2C round trip, and that level can be far louder.
+                    // Recomputed on every apply, so a mute or a lower volume
+                    // during the wait still takes effect at once.
+                    if let pair {
+                        output.setSoftwareGain(
+                            pair: pair,
+                            gain: plan.muted ? 0 : sinkVolumeLaw.amplitude(
+                                forScalar: normalized
+                            )
+                        )
+                    }
+                } else if let pair {
                     output.setSoftwareGain(pair: pair, gain: 1.0)
                 }
                 return
             }
-            sinkDDCAwaitingFirstWrite.removeValue(forKey: uid)
+            sinkDDCHandBacks.removeValue(forKey: uid)
             sinkVolumeBackends[uid] = .softwareGain
             applySystemSinkDeviceVolume(
                 uid: uid, route: route, output: output, pair: pair

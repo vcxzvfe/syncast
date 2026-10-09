@@ -26,8 +26,9 @@ enum SystemSinkRowHint {
         /// arrived yet.
         case local(SystemSinkVolumeLaw.Backend?, isDisplayCandidate: Bool)
         /// A LAN receiver: the master lands on the receiver's own hardware
-        /// volume, the balance on the samples sent to it.
-        case lanReceiver
+        /// volume when it reported one (software gain there otherwise; nil
+        /// until its hello_ack arrives), the balance on the samples sent to it.
+        case lanReceiver(hardwareVolume: Bool?)
     }
 
     static func text(
@@ -51,8 +52,12 @@ enum SystemSinkRowHint {
             via = "软件增益"
         case .local(nil, _):
             via = "跟随系统音量"
-        case .lanReceiver:
+        case .lanReceiver(hardwareVolume: true):
             via = "对端硬件音量"
+        case .lanReceiver(hardwareVolume: false):
+            via = "对端软件增益"
+        case .lanReceiver(hardwareVolume: nil):
+            via = "跟随系统音量"
         }
         if masterMuted || deviceMuted {
             return "实际 静音 · \(via)"

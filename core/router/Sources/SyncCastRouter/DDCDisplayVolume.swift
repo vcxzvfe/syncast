@@ -173,6 +173,8 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     private struct Intent: Equatable {
         let volume: Float
         let muted: Bool
+        /// Per-UID enqueue order; see `latestEnqueuedSequence(uid:)`.
+        let sequence: UInt64
     }
 
     private struct Binding {
@@ -217,6 +219,7 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     private let stateLock = OSAllocatedUnfairLock()
     private var capabilities: [String: Capability] = [:]
     private var pending: [String: Intent] = [:]
+    private var enqueueSequence: [String: UInt64] = [:]
     private var drainingUIDs: Set<String> = []
     private var consecutiveFailures: [String: Int] = [:]
     private var completedWrites = 0
@@ -413,9 +416,10 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     @discardableResult
     public func enqueueApply(uid: String, volume: Float, muted: Bool) -> Bool {
         guard DDCDisplayEnumerator.isSupported else { return false }
-        let intent = Intent(volume: volume, muted: muted)
         enum Action { case rejected, rejectedKickingReprobe, probe, drain, coalesced }
         let action: Action = stateLock.withLock {
+            let sequence = (enqueueSequence[uid] ?? 0) + 1
+            let intent = Intent(volume: volume, muted: muted, sequence: sequence)
             switch capabilities[uid] {
             case .unsupported:
                 // Self-heal for media-key-only usage: a UID demoted after
@@ -436,14 +440,17 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
                 capabilities[uid] = .probing
                 return .rejectedKickingReprobe
             case .supported:
+                enqueueSequence[uid] = sequence
                 pending[uid] = intent
                 if drainingUIDs.contains(uid) { return .coalesced }
                 drainingUIDs.insert(uid)
                 return .drain
             case .probing:
+                enqueueSequence[uid] = sequence
                 pending[uid] = intent
                 return .coalesced
             case nil:
+                enqueueSequence[uid] = sequence
                 pending[uid] = intent
                 capabilities[uid] = .probing
                 return .probe
@@ -484,18 +491,30 @@ public final class DDCDisplayVolumeController: @unchecked Sendable {
     }
 
     /// The last volume/mute pair the panel acknowledged on the current
-    /// binding, exactly as it was passed to `enqueueApply`. nil while
-    /// nothing has been written since the latest probe or rebind, or when
-    /// the UID is not DDC-controlled.
-    public func appliedIntent(uid: String) -> (volume: Float, muted: Bool)? {
+    /// binding, exactly as it was passed to `enqueueApply`, with its enqueue
+    /// sequence number. nil while nothing has been written since the latest
+    /// probe or rebind, or when the UID is not DDC-controlled.
+    public func appliedIntent(
+        uid: String
+    ) -> (volume: Float, muted: Bool, sequence: UInt64)? {
         stateLock.withLock {
             guard case .supported(let binding) = capabilities[uid],
                   let intent = binding.appliedIntent
             else {
                 return nil
             }
-            return (intent.volume, intent.muted)
+            return (intent.volume, intent.muted, intent.sequence)
         }
+    }
+
+    /// Sequence number of the newest intent `enqueueApply` accepted for this
+    /// UID. When it equals `appliedIntent(uid:)?.sequence` the panel holds
+    /// the newest intent and nothing newer is queued or in flight. Comparing
+    /// values alone cannot tell that: after low → high → low the panel's
+    /// acknowledgement of the FIRST low matches the newest intent while the
+    /// high write is still on its way.
+    public func latestEnqueuedSequence(uid: String) -> UInt64? {
+        stateLock.withLock { enqueueSequence[uid] }
     }
 
     // MARK: Bounded-wait API (safe to await from the Router actor)
