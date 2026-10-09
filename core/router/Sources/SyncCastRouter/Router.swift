@@ -1806,7 +1806,7 @@ public actor Router {
     ///   3. failing that, nil — leave the sink's stored level alone rather
     ///      than inventing a number.
     ///
-    /// Every level read here is a device WE drive, so it is the master with
+    /// A level read from an output we drive (enabled) is the master with
     /// that device's per-row balance already composed in
     /// (`SystemSinkVolumeLaw.effectiveScalar`). Each one is turned back into
     /// the master it implies (`SystemSinkVolumeLaw.masterScalar`) before it is
@@ -1815,10 +1815,19 @@ public actor Router {
     /// that speaker's offset, and since per-row balances persist on this path
     /// the system volume ratcheted toward silence across launches and wakes.
     private func systemSinkSeedVolume(devices: [Device]) -> Float? {
+        // Only ENABLED outputs: their hardware level is ours, with their
+        // balance in it. A disabled speaker's remembered balance is never
+        // applied, so its level (whatever the user set outside SyncCast) is
+        // taken raw; undoing a balance it never had would start every enabled
+        // output louder than the level the user was just listening at.
         let balanceByUID = Dictionary(
             devices.compactMap { device -> (String, Float)? in
-                guard let uid = device.coreAudioUID else { return nil }
-                return (uid, routing[device.id]?.volume ?? SystemSinkVolumeLaw.unityBalance)
+                guard let uid = device.coreAudioUID,
+                      let route = routing[device.id], route.enabled
+                else {
+                    return nil
+                }
+                return (uid, route.volume)
             },
             uniquingKeysWith: { first, _ in first }
         )
