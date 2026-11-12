@@ -386,6 +386,40 @@ local Stereo path at ≤ 100 ms rather than AirPlay's ~1.8 s.
   followed:
   [requirements_2026-09-06-lan-silence-timeline.md](requirements_2026-09-06-lan-silence-timeline.md).
 
+## 8f. PTP ports and macOS's own AirPlay (2026-11-12)
+
+OwnTone binds UDP 319/320 for AirPlay 2 PTP timing in `main()`
+(`ptpd_find_or_bind`), whether or not any receiver is in use, and keeps them
+for as long as it runs. macOS's own AirPlay sender (`AirPlayXPCHelper`, used
+by Apple Music, Control Center, Podcasts) needs the same ports through
+IOTimeSync. While another process holds them its peer add fails with
+`kIOReturnExclusiveAccess` (0xE00002C5), every `SetRate` then fails with
+-71976, and Music plays silence to HomePods, Macs and third-party AirPlay 2
+receivers alike, with no error shown. The reverse order is harmless: when
+macOS's PTP stack already holds the ports, OwnTone logs "only NTP will be
+available" and runs NTP-only.
+
+Two rules follow, both in `sidecar/.../device_manager.py`:
+
+1. **OwnTone lives only while something rides on it**: whole-home mode, or a
+   live AirPlay stream. Leaving whole-home or stopping a stereo stream stops
+   it. (It used to be left alive "for later", which is how a two-second
+   whole-home toggle broke Apple Music for the rest of the evening.)
+2. **macOS wins the ports.** While OwnTone runs, `system_airplay_watch.py`
+   streams AirPlayXPCHelper's log. On `Activating endpoint [..] '<name>' with
+   features ..` (anything but a control-only activation) the reader thread
+   SIGKILLs OwnTone at once: macOS adds its PTP peer about 600 ms later, and
+   freeing the ports inside that window lets its session start normally;
+   freeing them after the failed add does not rescue that session.
+   `kIOReturnExclusiveAccess` is kept as a late fallback. The sidecar then
+   reports `event.system_airplay_yield`, refuses to start OwnTone again until
+   the menubar explicitly re-enters whole-home (and for `YIELD_HOLD_S` even
+   then, so a request already in flight cannot take the ports back), and the
+   menubar follows it into Stereo with a status-strip notice. A displacement
+   pause (the user picked an AirPlay output in Control Center) is carried
+   into Stereo rather than retired, so SyncCast does not take the default
+   output back.
+
 ## 9. Build & distribution
 
 - Swift Packages built with the Xcode 15+ toolchain (`swift build`).

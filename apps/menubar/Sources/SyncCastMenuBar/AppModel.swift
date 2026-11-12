@@ -411,6 +411,30 @@ final class AppModel {
     /// user-visible behavior is "your last click is honored after the
     /// current transition finishes". Security Review C2.
     private var modeTransitioning: Bool = false
+    /// Read-only view of `modeTransitioning` for the extensions: a PTP
+    /// hand-over that lands mid-transition retries on the next poll instead
+    /// of being dropped by `setMode`'s single-flight guard.
+    var isModeTransitioning: Bool { modeTransitioning }
+
+    // MARK: - PTP hand-over to macOS AirPlay
+    //
+    // See `AppModel+SystemAirPlayYield.swift`. OwnTone holds the PTP ports;
+    // when macOS's own AirPlay sender (Apple Music, Control Center) needs
+    // them the sidecar lets OwnTone go and this model follows it out of
+    // whole-home.
+
+    /// One-line explanation shown in the status strip after a hand-over.
+    var systemAirPlayNotice: String?
+    @ObservationIgnored var systemAirPlayNoticeExpiresAt: Date?
+    @ObservationIgnored var lastHandledSystemAirPlayYieldSequence = 0
+    /// When the poll first saw the hand-over it has not handled yet. See
+    /// `systemAirPlayYieldSettleSeconds`.
+    @ObservationIgnored var systemAirPlayYieldFirstSeen: (sequence: Int, at: Date)?
+    /// True while `setMode` runs on behalf of a hand-over, so neither
+    /// auto-connect, the notice-clearing in `setMode`, nor the
+    /// displacement-pause retirement in `refreshSystemSinkPath` reads it as
+    /// the user changing mode.
+    @ObservationIgnored var systemAirPlayYieldApplying = false
 
     /// Debounce coalescer for `setAirplayDelay` — only the value 200 ms
     /// after the last drag fires the IPC + UserDefaults write.
@@ -701,6 +725,7 @@ final class AppModel {
                 await self.refreshChannelMatrixClipCounts()
                 await self.refreshLanReceiverStatuses()
                 await self.refreshPairingStates()
+                await self.refreshSystemAirPlayYield()
                 await self.logPeriodicHealthIfDue()
             }
         }
@@ -1527,6 +1552,11 @@ final class AppModel {
             return
         }
         SyncCastLog.log("setMode: \(mode.rawValue) → \(newMode.rawValue)")
+        if !systemAirPlayYieldApplying {
+            // The user is choosing a mode themselves; an older "SyncCast
+            // switched to Stereo for you" line would now be wrong.
+            clearSystemAirPlayNotice()
+        }
         // A mode switch the user made is an override; one auto-connect made
         // itself is filtered out inside `autoConnectNoteUserIntent`.
         autoConnectNoteUserIntent("mode → \(newMode.rawValue)")

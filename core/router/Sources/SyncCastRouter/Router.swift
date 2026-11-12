@@ -93,6 +93,13 @@ public actor Router {
     /// (`Router+Pairing.swift`).
     var pairingStatesStorage: [String: PairingState] = [:]
     var pairingErrorsStorage: [String: String] = [:]
+    /// Latest PTP hand-over to macOS's own AirPlay sender, pushed by the
+    /// sidecar as `event.system_airplay_yield`. Read by
+    /// `Router+SystemAirPlayYield.swift`; the counter gives every event a
+    /// sequence number so the UI's once-a-second poll handles each exactly
+    /// once.
+    var systemAirPlayYieldStorage: SystemAirPlayYield?
+    var systemAirPlayYieldCount = 0
 
     private let capture: any SystemAudioCapture
     private let stereoOutputPath: StereoOutputPathPolicy.Path
@@ -466,6 +473,15 @@ public actor Router {
                 Task { await self.recordPairingState(
                     deviceKey: deviceKey, stateStr: stateStr, reason: reason,
                 ) }
+            }
+            // macOS's own AirPlay sender (Apple Music, Control Center) needed
+            // the PTP ports, and the sidecar has already let OwnTone go. The
+            // UI has to follow it out of whole-home, which cannot run
+            // without OwnTone.
+            if method == "event.system_airplay_yield" {
+                // Decode here: `params` is not Sendable, the struct is.
+                let decoded = SystemAirPlayYield.fromWire(params, sequence: 0)
+                Task { await self.recordSystemAirPlayYield(decoded) }
             }
         }
         _ = try await client.call("sidecar.hello", params: ["v": 1, "router_pid": ProcessInfo.processInfo.processIdentifier])

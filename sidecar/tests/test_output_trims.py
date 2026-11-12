@@ -49,6 +49,7 @@ class _FakeOwnTone:
     calls: ClassVar[list[tuple[str, str, Any]]]
 
     def __init__(self) -> None:
+        self.stopped = False
         self.calls = []
         self.outputs: list[dict[str, Any]] = [
             {"id": FIFO_OUTPUT_ID, "name": "SyncCast Local Bridge",
@@ -77,6 +78,15 @@ class _FakeOwnTone:
 
     def set_output_volume(self, output_id: str, volume: float) -> None:
         self.calls.append(("volume", output_id, volume))
+
+    # Leaving whole-home now stops OwnTone (it would otherwise keep the PTP
+    # ports from macOS's own AirPlay sender). Not a REST call, so it is kept
+    # out of `calls`, whose order is what these tests assert.
+    def is_alive(self) -> bool:
+        return not self.stopped
+
+    async def stop(self) -> None:
+        self.stopped = True
 
 
 def _device(dev_id: str, name: str, airplay_device_id: str) -> Device:

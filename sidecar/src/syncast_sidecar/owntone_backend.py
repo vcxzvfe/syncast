@@ -46,6 +46,8 @@ from . import log
 
 logger = log.get("sidecar.owntone")
 
+LSOF_BINARY = "/usr/sbin/lsof"
+
 # Default ceiling for a loopback REST round trip to our own OwnTone. Every
 # ordinary endpoint answers in milliseconds; anything slower is a fault.
 REST_TIMEOUT_S = 2.0
@@ -290,6 +292,52 @@ class OwnToneBackend:
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+
+    def kill_now(self) -> bool:
+        """SIGKILL the child at once and return whether a live one was hit.
+
+        For the PTP hand-over (see system_airplay_watch): macOS needs UDP
+        319/320 within ~600 ms of activating an AirPlay endpoint, and a
+        graceful SIGTERM shutdown tears down sessions first. SIGKILL closes
+        the sockets as the process exits. Safe to call from any thread; it
+        touches only the Popen handle. The owner still runs ``stop()``
+        afterwards to close the FIFO fd and reap the child.
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return False
+        return True
+
+    def holds_ptp_port(self) -> bool | None:
+        """Whether this OwnTone owns UDP 319, the PTP event port.
+
+        OwnTone binds 319/320 once, in main(), before its REST port answers;
+        if they are taken (normally by macOS's own PTP stack after an AirPlay
+        session) it logs "only NTP will be available" and never tries again.
+        So once ``start()`` has returned the answer is fixed for this
+        process. ``None`` means lsof could not tell.
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            res = subprocess.run(  # noqa: S603 - fixed system binary, our child's pid
+                [LSOF_BINARY, "-nP", "-a", "-p", str(proc.pid), "-iUDP:319"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if res.returncode == 0 and res.stdout.strip():
+            return True
+        if res.returncode == 1:  # lsof: no matching open files
+            return False
+        return None
 
     @property
     def pid(self) -> int | None:

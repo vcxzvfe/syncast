@@ -624,8 +624,18 @@ extension AppModel {
         // other mode. Without this the engine would refuse to start in the
         // mode the user just picked, with a banner about the one they left.
         if let pausedIn = systemSinkPauseMode, pausedIn != mode {
-            systemSinkPausedByDisplacement = false
-            systemSinkPauseMode = nil
+            if systemAirPlayYieldApplying {
+                // Not a user action: SyncCast is following the sidecar out of
+                // whole-home because macOS's AirPlay took the PTP clock. When
+                // the user did that by picking an AirPlay output in Control
+                // Center, the displacement pause IS their choice; carry it into
+                // the new mode, or the Stereo reconcile grabs the default
+                // output straight back from the speaker they just picked.
+                systemSinkPauseMode = mode
+            } else {
+                systemSinkPausedByDisplacement = false
+                systemSinkPauseMode = nil
+            }
         }
         systemSink.refresh(router: router, eligible: eligible, reason: reason)
         if stereoSink {

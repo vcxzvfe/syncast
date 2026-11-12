@@ -237,7 +237,8 @@ extension AppModel {
     /// The user changed the selection or the mode themselves. Suppresses the
     /// rule for the rest of this trigger-presence episode.
     func autoConnectNoteUserIntent(_ reason: String) {
-        guard !autoConnectApplying, !autoConnectProfiles.isEmpty else { return }
+        guard !autoConnectApplying, !systemAirPlayYieldApplying,
+              !autoConnectProfiles.isEmpty else { return }
         autoConnectCoordinator.noteUserOverride()
         SyncCastLog.log("autoconnect: user override (\(reason)); rule stands down this episode")
     }

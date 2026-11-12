@@ -395,6 +395,13 @@ struct MainPopover: View {
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
+            if let notice = model.systemAirPlayNotice {
+                Text(notice)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 4)

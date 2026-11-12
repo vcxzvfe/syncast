@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -58,8 +59,22 @@ from .owntone_backend import (
     OWNTONE_OUTPUT_BUFFER_DURATION_MS,
     clamp_output_offset_ms,
 )
+from .system_airplay_watch import SystemAirPlayEvent, SystemAirPlayWatcher
 
 logger = log.get("sidecar.devices")
+
+# Builds the watcher that tells us when macOS's own AirPlay sender needs the
+# PTP ports OwnTone is holding. Injected so tests never spawn `log stream`.
+AirPlayWatchFactory = Callable[[Callable[[SystemAirPlayEvent], None]], Any]
+
+# After handing the PTP ports to macOS, refuse to start OwnTone again until the
+# menubar explicitly re-enters whole-home, and refuse even that for this long.
+# A `stream.start` or `mode.set` already in flight when the hand-over happened
+# would otherwise respawn OwnTone before macOS adds its peer (~600 ms after
+# activation) and take the ports straight back; the activation is not
+# replayed, so Music would stay silent. Five seconds covers that window plus
+# the menubar's one-second poll and its mode transition with room to spare.
+YIELD_HOLD_S = 5.0
 
 # Playout latency reported back to the menubar for a freshly-added AirPlay
 # output. Derived from OwnTone's real output buffer duration (the anchor an
@@ -227,6 +242,7 @@ class DeviceManager:
         owntone_config_template: Path | None = None,
         state_dir: Path | None = None,
         local_fifo_delay_ms: int = DEFAULT_LOCAL_FIFO_DELAY_MS,
+        system_airplay_watch_factory: AirPlayWatchFactory | None = None,
     ) -> None:
         self._notify = notify
         self._devices: dict[str, Device] = {}
@@ -310,6 +326,27 @@ class DeviceManager:
         # Optional PairingCoordinator, injected by the server after both
         # objects exist. None in tests and in any build without pairing.
         self._pairing: Any = None
+        # PTP hand-over to macOS (see system_airplay_watch). OwnTone holds
+        # UDP 319/320 for as long as it runs, so the watcher runs exactly as
+        # long as an OwnTone does. `_owntone_starting` covers the seconds
+        # between spawn and the REST port answering, when the ports are
+        # already bound but `_owntone` is not assigned yet.
+        self._airplay_watch_factory: AirPlayWatchFactory = (
+            system_airplay_watch_factory or SystemAirPlayWatcher
+        )
+        self._airplay_watch: Any = None
+        self._owntone_starting: Any = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Guards `_yield_in_flight` across the watcher thread and the loop.
+        # One pick in Music can activate several endpoints within
+        # milliseconds; only the first may schedule a hand-over.
+        self._yield_guard = threading.Lock()
+        self._yield_in_flight = False
+        self._yield_task: asyncio.Task[None] | None = None
+        # monotonic() of the last hand-over while OwnTone is barred from
+        # starting; None when it may start. See YIELD_HOLD_S.
+        self._yield_blocked_since: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -318,28 +355,8 @@ class DeviceManager:
 
     async def shutdown(self) -> None:
         async with self._get_lock():
-            await self._stop_streaming_unlocked()
-            # Retire any Layer-3 offset while OwnTone is still answering
-            # REST. It lives in `speakers.offset_ms` and outlives the
-            # process, so leaving it set would silently skew the next
-            # session (including a plain stereo one).
-            self._clear_airplay_offsets_unlocked()
+            await self._release_owntone_unlocked(reason="shutdown")
             self._devices.clear()
-            # Tear the broadcaster down BEFORE OwnTone — otherwise the
-            # broadcaster's read on the (now unreffed) fifo would have
-            # to wait for the OS to send EOF, adding ~seconds to shutdown.
-            if self._broadcaster is not None:
-                try:
-                    self._broadcaster.stop()
-                except Exception:  # noqa: BLE001
-                    logger.exception("broadcaster_stop_failed")
-                self._broadcaster = None
-            if self._owntone is not None:
-                try:
-                    await self._owntone.stop()
-                except Exception:  # noqa: BLE001
-                    logger.exception("owntone_stop_failed")
-                self._owntone = None
             self._mode = "stereo"
 
     # ---------- discovery ----------
@@ -550,6 +567,10 @@ class DeviceManager:
     async def stop_stream(self) -> dict[str, Any]:
         async with self._get_lock():
             await self._stop_streaming_unlocked()
+            if self._mode != "whole_home":
+                # Nothing outside whole-home rides OwnTone's clock, and a
+                # live OwnTone keeps macOS's own AirPlay off the PTP ports.
+                await self._release_owntone_unlocked(reason="stream stopped")
         return {"stopped": True}
 
     # ---------- whole-home mode ----------
@@ -560,12 +581,15 @@ class DeviceManager:
         Idempotent: re-entering the same mode is a no-op (returns
         ``applied=False``). Otherwise:
 
-          * ``stereo``      — stop the broadcast listener if running.
-                              OwnTone is left ALIVE if it's already up
-                              (other code paths may want it for legacy
-                              AirPlay-only streaming) but we don't bring
-                              it up just for this. We DO clear streaming
-                              state so a future ``stream.start`` is clean.
+          * ``stereo``      — stop the broadcast listener if running, and
+                              stop OwnTone unless an AirPlay stream is
+                              still live. OwnTone binds the PTP ports
+                              (UDP 319/320) for as long as it runs, and
+                              while it does macOS's own AirPlay sender
+                              cannot start a session: Apple Music to a
+                              HomePod plays silence. The old behaviour of
+                              leaving it alive "for later" is what broke
+                              Music after a 2-second whole-home toggle.
           * ``whole_home``  — ensure OwnTone is running (so the output
                               fifo has a writer), then start the
                               broadcaster. Future Swift bridges will
@@ -581,6 +605,7 @@ class DeviceManager:
             if mode == self._mode:
                 return {"applied": False, "mode": self._mode}
             if mode == "whole_home":
+                self._lift_yield_block_for_whole_home()
                 await self._ensure_owntone()
                 self._ensure_broadcaster()
                 if self._broadcaster is not None:
@@ -620,6 +645,8 @@ class DeviceManager:
                     except Exception:  # noqa: BLE001
                         logger.exception("broadcaster_stop_failed")
                     self._broadcaster = None
+                if not self._streaming:
+                    await self._release_owntone_unlocked(reason="stereo mode")
             self._mode = mode
         return {"applied": True, "mode": self._mode}
 
@@ -1077,6 +1104,12 @@ class DeviceManager:
     # ---------- internals ----------
 
     async def _ensure_owntone(self) -> None:
+        if self._yield_blocked_since is not None:
+            raise jsonrpc.RpcError(
+                jsonrpc.INTERNAL_ERROR,
+                "OwnTone stays off: macOS AirPlay is using the PTP clock "
+                "(re-enter whole-home to take it back)",
+            )
         # Health check: if we have a backend but the child died (crash,
         # OOM, external SIGTERM), drop the stale reference so we respawn.
         # Symptom this guards against: after one streaming session, OwnTone
@@ -1117,15 +1150,172 @@ class DeviceManager:
             state_dir=self._state_dir,
             config_template=self._owntone_config_template,
         )
+        # Watch BEFORE spawning: OwnTone binds the PTP ports in main(), long
+        # before its REST port answers and `start()` returns.
+        self._start_airplay_watch()
+        self._owntone_starting = backend
         try:
             await backend.start()
         except Exception as e:  # noqa: BLE001
+            self._owntone_starting = None
+            # Kill anything start() left half-running: it may hold the PTP
+            # ports with nobody tracking it.
+            backend.kill_now()
+            self._stop_airplay_watch()
             raise jsonrpc.RpcError(
                 jsonrpc.INTERNAL_ERROR, f"owntone start failed: {e}",
             ) from e
+        self._owntone_starting = None
         self._owntone = backend
+        # Diagnostics only. When macOS's own PTP stack already holds 319/320
+        # (it keeps them for a while after an AirPlay session) OwnTone runs
+        # NTP-only and cannot block macOS's peer add. The watcher stays on
+        # anyway: measured 2026-11-12, re-picking a HomePod in Music while an
+        # NTP-only OwnTone was alive gave SetRate failures (-71974, slow
+        # keep-alives) in 2 of 2 runs and in 0 of 3 runs without OwnTone. A
+        # needless hand-over costs one whole-home session; a missing one
+        # costs the user's music.
+        logger.info(
+            "owntone_ptp_ports", extra={"held": backend.holds_ptp_port()},
+        )
         if self._mode == "whole_home":
             self._ensure_broadcaster()
+
+    # ---------- PTP hand-over to macOS ----------
+
+    async def _release_owntone_unlocked(self, *, reason: str) -> None:
+        """Stop OwnTone and everything riding on it. Caller holds the lock.
+
+        This is what frees UDP 319/320 for macOS's own AirPlay sender. Safe
+        to call when OwnTone is already gone (killed by the hand-over, or
+        never started): every step checks before it acts.
+        """
+        await self._stop_streaming_unlocked()
+        backend = self._owntone
+        if backend is not None and backend.is_alive():
+            # Retire any Layer-3 offset while OwnTone still answers REST. It
+            # lives in `speakers.offset_ms` and outlives the process. A dead
+            # OwnTone cannot be asked; its rows stay recorded so the next
+            # live sweep still visits them.
+            self._clear_airplay_offsets_unlocked()
+        # Broadcaster BEFORE OwnTone — otherwise its read on the (now
+        # unreffed) fifo waits for the OS to send EOF, adding ~seconds.
+        if self._broadcaster is not None:
+            try:
+                self._broadcaster.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("broadcaster_stop_failed")
+            self._broadcaster = None
+        if backend is not None:
+            try:
+                await backend.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("owntone_stop_failed")
+            self._owntone = None
+            # Output ids are per OwnTone process; the next one reassigns them.
+            for dev in self._devices.values():
+                dev.owntone_output_id = None
+            self._fifo_output_id = None
+            logger.info("owntone_released", extra={"reason": reason})
+        self._stop_airplay_watch()
+
+    def _start_airplay_watch(self) -> None:
+        if self._airplay_watch is not None:
+            return
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        watcher = self._airplay_watch_factory(self._on_system_airplay_event)
+        if watcher.start():
+            self._airplay_watch = watcher
+
+    def _stop_airplay_watch(self) -> None:
+        watcher, self._airplay_watch = self._airplay_watch, None
+        if watcher is None:
+            return
+        try:
+            watcher.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("system_airplay_watch_stop_failed")
+
+    def _lift_yield_block_for_whole_home(self) -> None:
+        """An explicit whole-home request may take the PTP ports back.
+
+        Only after YIELD_HOLD_S: anything sooner is a request that was already
+        in flight when macOS took the ports, not a fresh choice.
+        """
+        since = self._yield_blocked_since
+        if since is None:
+            return
+        waited = self._clock() - since
+        if waited < YIELD_HOLD_S:
+            raise jsonrpc.RpcError(
+                jsonrpc.INTERNAL_ERROR,
+                f"macOS AirPlay took the PTP clock {waited:.1f} s ago; "
+                "whole-home stays off for now",
+            )
+        self._yield_blocked_since = None
+
+    def _on_system_airplay_event(self, event: SystemAirPlayEvent) -> None:
+        """macOS wants the PTP ports. Runs on the watcher's reader thread.
+
+        The ports must be free within ~600 ms of the activation line, so the
+        kill happens right here instead of waiting for the asyncio loop and
+        the device lock (a stream reconcile can hold that for seconds). The
+        rest of the teardown, and telling the menubar, is handed to the loop.
+        """
+        backend = self._owntone or self._owntone_starting
+        if backend is None:
+            return
+        with self._yield_guard:
+            if self._yield_in_flight:
+                return
+            if not backend.kill_now():
+                return
+            self._yield_in_flight = True
+            self._yield_blocked_since = self._clock()
+        logger.warning(
+            "yielded_ptp_to_system_airplay",
+            extra={
+                "kind": event.kind,
+                "endpoint": event.endpoint,
+                "features": list(event.features),
+            },
+        )
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            with self._yield_guard:
+                self._yield_in_flight = False
+            return
+        loop.call_soon_threadsafe(self._schedule_yield_teardown, event)
+
+    def _schedule_yield_teardown(self, event: SystemAirPlayEvent) -> None:
+        # Hold a reference: the loop keeps only a weak one to bare tasks.
+        self._yield_task = asyncio.ensure_future(self._finish_yield(event))
+
+    async def _finish_yield(self, event: SystemAirPlayEvent) -> None:
+        try:
+            async with self._get_lock():
+                previous_mode = self._mode
+                device_ids = list(self._active_stream_device_ids or ())
+                await self._release_owntone_unlocked(
+                    reason=f"system AirPlay {event.kind}",
+                )
+                # Whole-home cannot run without OwnTone (the local legs ride
+                # its clock), so the sidecar is in stereo now whatever the
+                # menubar thinks. The event below tells it to follow.
+                self._mode = "stereo"
+            self._notify("event.system_airplay_yield", {
+                "kind": event.kind,
+                "endpoint": event.endpoint,
+                "features": list(event.features),
+                "previous_mode": previous_mode,
+                "device_ids": device_ids,
+            })
+        finally:
+            with self._yield_guard:
+                self._yield_in_flight = False
 
     def _ensure_broadcaster(self) -> None:
         """Spin up the LocalFifoBroadcaster if not already running.
@@ -1715,7 +1905,7 @@ class DeviceManager:
             self._audio_reader = None
         if self._broadcaster is not None:
             self._broadcaster.reset()
-        if self._owntone is not None:
+        if self._owntone is not None and self._owntone.is_alive():
             try:
                 self._owntone.flush()
             except Exception:  # noqa: BLE001
