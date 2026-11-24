@@ -72,6 +72,13 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
     /// System volume (slider position, 0–100) to set once the rule has
     /// brought its outputs up on arrival. Nil leaves the volume alone.
     var arriveSystemVolumePercent: Int?
+    /// While audio is audibly playing out of the trigger device, hold the
+    /// display awake (`PlaybackAwakeController`). Optional so rules stored
+    /// before it existed decode as nil (= off).
+    var keepDisplayAwakeWhilePlaying: Bool?
+    /// Seconds of quiet before the display may sleep again; nil means
+    /// `PlaybackAwakeDefaults.releaseSeconds`.
+    var playbackAwakeReleaseSeconds: Int?
     /// UID → last known display name, for the UI while a device is absent.
     /// Purely cosmetic; never used for matching.
     var displayNames: [String: String]
@@ -83,6 +90,8 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
         memberUIDs: [String],
         onDisconnect: DisconnectAction = .off,
         arriveSystemVolumePercent: Int? = nil,
+        keepDisplayAwakeWhilePlaying: Bool? = nil,
+        playbackAwakeReleaseSeconds: Int? = nil,
         displayNames: [String: String] = [:]
     ) {
         self.id = id
@@ -91,7 +100,17 @@ struct AutoConnectProfile: Codable, Identifiable, Hashable, Sendable {
         self.memberUIDs = AutoConnect.dedupePreservingOrder(memberUIDs)
         self.onDisconnect = onDisconnect
         self.arriveSystemVolumePercent = arriveSystemVolumePercent.map(AutoConnect.clampPercent)
+        self.keepDisplayAwakeWhilePlaying = keepDisplayAwakeWhilePlaying
+        self.playbackAwakeReleaseSeconds = playbackAwakeReleaseSeconds
+            .map(PlaybackAwakeDefaults.clampReleaseSeconds)
         self.displayNames = displayNames
+    }
+
+    var keepsDisplayAwakeWhilePlaying: Bool { keepDisplayAwakeWhilePlaying == true }
+
+    var resolvedPlaybackAwakeReleaseSeconds: Int {
+        playbackAwakeReleaseSeconds.map(PlaybackAwakeDefaults.clampReleaseSeconds)
+            ?? Int(PlaybackAwakeDefaults.releaseSeconds)
     }
 
     /// Every UID that has to be present before the rule may fire.
@@ -267,6 +286,8 @@ enum AutoConnectProfileStore {
             )
             normalized.arriveSystemVolumePercent = profile.arriveSystemVolumePercent
                 .map(AutoConnect.clampPercent)
+            normalized.playbackAwakeReleaseSeconds = profile.playbackAwakeReleaseSeconds
+                .map(PlaybackAwakeDefaults.clampReleaseSeconds)
             guard normalized.isWellFormed, seenIDs.insert(normalized.id).inserted else {
                 continue
             }

@@ -486,6 +486,19 @@ final class AppModel {
     /// pending write can be dropped if the trigger comes straight back.
     @ObservationIgnored var autoConnectDeactivateTask: Task<Void, Never>?
 
+    // MARK: - Keep the display awake while playing (2026-11-24)
+    //
+    // Storage only; see `AppModel+PlaybackAwake.swift`.
+
+    /// Nil under XCTest and until bootstrap.
+    @ObservationIgnored var playbackAwake: PlaybackAwakeController?
+    /// The display-sleep assertion is held right now. Observed by the
+    /// auto-connect section.
+    var playbackAwakeHolding = false
+    /// Audio another app plays straight to the display cannot be measured
+    /// (the meter tap keeps delivering nothing). Shown as a hint.
+    var playbackAwakeMeterProblem = false
+
     /// Minimum spacing between accepted manual rescans.
     static let discoveryRescanCooldownSeconds: Double = 3.0
 
@@ -734,6 +747,7 @@ final class AppModel {
         //    are already plugged in, which is the "launch at login with the
         //    monitor already there" case.
         autoConnectBootstrap()
+        playbackAwakeBootstrap()
         SyncCastLog.log("[SyncCast] bootstrap complete".replacingOccurrences(of: "[SyncCast] ", with: ""))
 
         // SYNCAST_INITIAL_MODE=wholehome|stereo flips the engine into the
@@ -921,6 +935,7 @@ final class AppModel {
                 // change: a monitor coming back under a fresh `Device.id` is
                 // exactly the event the rule exists for.
                 autoConnectNoteDeviceChange()
+                playbackAwakeNoteDeviceChange()
             }
             switch event {
             case .appeared(let dev):

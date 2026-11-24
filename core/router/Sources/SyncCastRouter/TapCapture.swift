@@ -93,13 +93,36 @@ public final class TapCapture: @unchecked Sendable {
     /// therefore pure user intent, free for us to reuse as the master volume.
     private let tapDeviceUID: String?
 
+    /// When set, the tap hears ONLY these processes (CoreAudio process
+    /// objects), mixed down to stereo, whatever device they render to.
+    /// Mutually exclusive with `tapDeviceUID`, and with the exclusion list
+    /// (`setAdditionalExcludedProcesses` refuses on such a tap).
+    ///
+    /// The keep-awake meter uses this: it knows from
+    /// `kAudioProcessPropertyDevices` exactly which processes are rendering
+    /// to the display, so it does not have to guess which device to pin.
+    private let includedProcesses: [AudioObjectID]?
+
+    /// Accept whatever rate the tap delivers instead of failing when it is
+    /// not `sampleRate`. For a level meter, which never plays the ring and
+    /// cannot know in advance what rate a process mixdown will come in at.
+    private let allowsAnySampleRate: Bool
+
     public init(
         sampleRate: Double = 48_000,
         channelCount: Int = 2,
         ringCapacityFrames: Int = 1 << 18,
-        tapDeviceUID: String? = nil
+        tapDeviceUID: String? = nil,
+        includedProcesses: [AudioObjectID]? = nil,
+        allowsAnySampleRate: Bool = false
     ) {
+        precondition(
+            tapDeviceUID == nil || includedProcesses == nil,
+            "a tap is either pinned to a device or limited to processes, not both"
+        )
         self.tapDeviceUID = tapDeviceUID
+        self.includedProcesses = includedProcesses
+        self.allowsAnySampleRate = allowsAnySampleRate
         self.captureAnchors = CaptureAnchorPublisher(sampleRate: sampleRate)
         self.sampleRate = sampleRate
         self.channelCount = channelCount
@@ -141,8 +164,13 @@ public final class TapCapture: @unchecked Sendable {
             throw CaptureError.alreadyRunning
         }
 
-        let ownProcess = try Self.currentProcessObjectID()
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
+        let description: CATapDescription
+        if let includedProcesses {
+            description = CATapDescription(stereoMixdownOfProcesses: includedProcesses)
+        } else {
+            let ownProcess = try Self.currentProcessObjectID()
+            description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
+        }
         description.name = "SyncCast System Audio Tap"
         description.isPrivate = true
         // muteBehavior 0 = unmuted: the tap observes, it does not silence the
@@ -186,7 +214,7 @@ public final class TapCapture: @unchecked Sendable {
     /// the HAL refused the new description; the old exclusion list stays.
     @discardableResult
     public func setAdditionalExcludedProcesses(_ processes: [AudioObjectID]) -> Bool {
-        guard tapID != 0 else { return false }
+        guard tapID != 0, includedProcesses == nil else { return false }
         guard processes != additionalExcludedProcesses else { return true }
         guard let ownProcess = try? Self.currentProcessObjectID() else {
             return false
@@ -272,7 +300,7 @@ public final class TapCapture: @unchecked Sendable {
         guard isFloat, asbd.mBitsPerChannel == 32 else {
             throw CaptureError.unsupportedFormat(formatDescription)
         }
-        guard abs(asbd.mSampleRate - sampleRate) < 0.5 else {
+        guard allowsAnySampleRate || abs(asbd.mSampleRate - sampleRate) < 0.5 else {
             throw CaptureError.unsupportedFormat(formatDescription)
         }
         guard channels >= channelCount else {
@@ -391,7 +419,7 @@ public final class TapCapture: @unchecked Sendable {
     }
 
     public func diagnosticReport() -> String {
-        "pin=\(tapDeviceUID ?? "global") backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) stampless=\(debugAnchorsMissing) asbd={\(debugLastASBD)} last=\(debugLastReason)"
+        "pin=\(tapDeviceUID ?? (includedProcesses.map { "processes:\($0)" } ?? "global")) backend=\(backendName) seen=\(debugBuffersSeen) written=\(debugBuffersWritten) ticks=\(tickCount) peak=\(String(format: "%.4f", debugLastPeak))/\(String(format: "%.4f", debugMaxPeak)) stampless=\(debugAnchorsMissing) asbd={\(debugLastASBD)} last=\(debugLastReason)"
     }
 
     /// Host time of the first frame of a delivered block, in nanoseconds.

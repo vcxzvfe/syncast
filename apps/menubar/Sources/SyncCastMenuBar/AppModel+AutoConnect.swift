@@ -193,6 +193,21 @@ extension AppModel {
         autoConnectReplaceProfiles([profile], reason: "builtInVolume=\(percent.map(String.init) ?? "off")")
     }
 
+    /// 「播放时不让显示器熄屏」 for the rule's trigger device.
+    func autoConnectSetKeepDisplayAwake(_ on: Bool) {
+        guard var profile = autoConnectProfile, profile.keepsDisplayAwakeWhilePlaying != on else { return }
+        profile.keepDisplayAwakeWhilePlaying = on
+        autoConnectReplaceProfiles([profile], reason: "keepDisplayAwake=\(on)")
+    }
+
+    func autoConnectSetPlaybackAwakeReleaseMinutes(_ minutes: Int) {
+        guard var profile = autoConnectProfile else { return }
+        let seconds = PlaybackAwakeDefaults.clampReleaseSeconds(minutes * 60)
+        guard seconds != profile.resolvedPlaybackAwakeReleaseSeconds else { return }
+        profile.playbackAwakeReleaseSeconds = seconds
+        autoConnectReplaceProfiles([profile], reason: "playbackAwakeRelease=\(seconds)s")
+    }
+
     /// 「重新应用规则」: forget that the user overrode us, then evaluate.
     func autoConnectReapplyNow() {
         autoConnectCoordinator.resetSuppression()
@@ -209,6 +224,7 @@ extension AppModel {
         SyncCastLog.log(
             "autoconnect: rules \(reason) (count=\(autoConnectProfiles.count))"
         )
+        playbackAwakeSyncSettings(reason: "rule \(reason)")
     }
 
     // MARK: - Triggers into the coordinator

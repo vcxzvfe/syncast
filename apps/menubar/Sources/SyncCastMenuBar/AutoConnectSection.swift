@@ -134,6 +134,8 @@ struct AutoConnectSection: View {
             Spacer(minLength: 0)
         }
 
+        playbackAwakeOptions(profile)
+
         DisclosureGroup("断开时") {
             disconnectOptions(profile)
         }
@@ -152,6 +154,68 @@ struct AutoConnectSection: View {
                 .accessibilityIdentifier("autoConnectDeleteButton")
             Spacer(minLength: 0)
         }
+    }
+
+    /// 「有声音时不熄屏」. Its own switch, independent of the rule's master
+    /// switch: it acts on whatever is playing out of the trigger device, no
+    /// matter which route got it there. Off for a new rule.
+    @ViewBuilder
+    private func playbackAwakeOptions(_ profile: AutoConnectProfile) -> some View {
+        let trigger = model.autoConnectDisplayName(for: profile.triggerUID, in: profile)
+        Toggle(isOn: Binding(
+            get: { profile.keepsDisplayAwakeWhilePlaying },
+            set: { model.autoConnectSetKeepDisplayAwake($0) }
+        )) {
+            Text("有声音从 \(trigger) 放出时，不让它空闲熄屏")
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .toggleStyle(.checkbox)
+        .accessibilityIdentifier("autoConnectKeepDisplayAwakeToggle")
+
+        if profile.keepsDisplayAwakeWhilePlaying {
+            let minutes = profile.resolvedPlaybackAwakeReleaseSeconds / 60
+            HStack(spacing: 6) {
+                Stepper(
+                    value: Binding(
+                        get: { minutes },
+                        set: { model.autoConnectSetPlaybackAwakeReleaseMinutes($0) }
+                    ),
+                    in: PlaybackAwakeDefaults.releaseMinutesRange
+                ) {
+                    Text("声音停 \(minutes) 分钟后放开")
+                        .font(.system(size: 10).monospacedDigit())
+                }
+                .controlSize(.mini)
+                .accessibilityIdentifier("autoConnectPlaybackAwakeReleaseStepper")
+                Spacer(minLength: 0)
+                if model.playbackAwakeHolding {
+                    Text("正在保持亮屏")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.green)
+                }
+            }
+            .padding(.leading, 18)
+
+            if let hint = playbackAwakeHint {
+                Text(hint)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18)
+            }
+        }
+    }
+
+    /// What the keep-awake option cannot see right now, if anything.
+    private var playbackAwakeHint: String? {
+        if #unavailable(macOS 14.2) {
+            return "低于 macOS 14.2 时，只能检测经 SyncCast 播放的声音；别的 App 直接输出到显示器的声音测不到。"
+        }
+        if model.playbackAwakeMeterProblem {
+            return "测不到别的 App 直接输出到显示器的声音。请在「隐私与安全性」里允许 SyncCast 录制系统音频。"
+        }
+        return nil
     }
 
     /// What happens when the trigger goes away. Both options default OFF for a

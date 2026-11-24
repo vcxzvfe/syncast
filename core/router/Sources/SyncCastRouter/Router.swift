@@ -732,6 +732,64 @@ public actor Router {
         capture.backendName
     }
 
+    /// The ring holding what the router is capturing right now, for a level
+    /// meter that wants to know whether anything audible is being played.
+    ///
+    /// Nil whenever no capture is live: the router is not running, or it is
+    /// on Direct Stereo, where apps render straight into an aggregate and
+    /// nothing is captured. The menu bar meters those cases itself.
+    ///
+    /// The ring carries what the apps rendered, BEFORE the master volume, so
+    /// a caller that cares about "audible" must also consult the mute and
+    /// the volume of the default output.
+    public func playbackMeterRing() -> RingBuffer? {
+        guard state == .running else { return nil }
+        if let sinkCapture { return sinkCapture.ringBuffer }
+        // Stereo runs the process-wide capture only on the explicit
+        // ScreenCaptureKit path; whole-home always runs it.
+        if mode == .stereo, stereoOutputPath != .capture { return nil }
+        return capture.ringBuffer
+    }
+
+    /// The captured ring plus whether the router lets it be heard on one
+    /// particular output.
+    public struct PlaybackMeterSource: Sendable {
+        public let ring: RingBuffer
+        /// False when the router itself silences that output: its row is
+        /// muted, switched off or at zero, or the system volume the router
+        /// owns is muted or at zero. The ring is pre-volume, so this is the
+        /// only way a meter can tell "music on the laptop speakers only"
+        /// from "music on the display".
+        public let audibleOnOutput: Bool
+    }
+
+    public func playbackMeterSource(outputUID: String) -> PlaybackMeterSource? {
+        guard let ring = playbackMeterRing() else { return nil }
+        return PlaybackMeterSource(
+            ring: ring,
+            audibleOnOutput: playbackOutputAudible(uid: outputUID)
+        )
+    }
+
+    private func playbackOutputAudible(uid: String) -> Bool {
+        let ceiling = PlaybackRouteAudibility.silentVolumeCeiling
+        if systemSinkPathIsLive {
+            if sinkMasterMuted || sinkMasterVolume <= ceiling { return false }
+        } else if mode == .wholeHome {
+            // What the writer actually multiplies by: the sink's scalar and
+            // mute when the sink drives the system volume, else the panel
+            // fader (whose 0 % is true zero).
+            if wholeHomeMasterAmplitude <= ceiling { return false }
+        }
+        let deviceID = aggregateUIDByDeviceID.first(where: { $0.value == uid })?.key
+            ?? localOutputs.first(where: { $0.value.deviceUID == uid })?.key
+            ?? localBridges.first(where: { $0.value.deviceUID == uid })?.key
+        // An output the router is not driving is not the router's to
+        // silence; whoever renders to it is metered elsewhere.
+        guard let deviceID, let route = routing[deviceID] else { return true }
+        return PlaybackRouteAudibility.audible(route, wholeHome: mode == .wholeHome)
+    }
+
     public func airplayTimingEpochForDiagnostics() -> UInt64 {
         airplayTimingEpoch
     }
