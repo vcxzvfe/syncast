@@ -2025,8 +2025,18 @@ public actor Router {
         }
         sinkCapture = tap
         startScreenShareLoopGuard()
+        let tapNote: String
+        if let lateMs = tap.debugTapPublishedLateMs {
+            tapNote = " tap=adopted-late(+\(lateMs)ms)"
+        } else if tap.debugTapUIDMatchesDescription == false {
+            // The late-publish lookup assumes these are equal; say so if a
+            // macOS release ever breaks that, before it is needed.
+            tapNote = " tap=uid-differs-from-description"
+        } else {
+            tapNote = ""
+        }
         RouterLog.write(
-            "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\n"
+            "[Router] system sink active: \(sink.diagnostic) law=minDb\(sinkVolumeLaw.minDb)\(tapNote)\n"
         )
         reconcileLocalDriver(devices: devices)
         reconcileLanReceivers(devices: devices)

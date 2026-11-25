@@ -3516,6 +3516,7 @@ final class AppModel {
                 isStereo: Bool,
                 isWholeHome: Bool,
                 isRunning: Bool,
+                isError: Bool,
                 hasEnabledRouting: Bool,
                 modeName: String,
                 stateName: String,
@@ -3524,6 +3525,7 @@ final class AppModel {
                 let isStereo = self.mode == .stereo
                 let isWholeHome = self.mode == .wholeHome
                 let isRunning = self.streamingState == .running
+                let isError = self.streamingState == .error
                 let hasEnabledRouting = self.routing.values.contains(where: { $0.enabled })
                 let snap = self.devices.filter { dev in
                     dev.transport == .coreAudio &&
@@ -3533,6 +3535,7 @@ final class AppModel {
                     isStereo,
                     isWholeHome,
                     isRunning,
+                    isError,
                     hasEnabledRouting,
                     String(describing: self.mode),
                     String(describing: self.streamingState),
@@ -3560,6 +3563,16 @@ final class AppModel {
                 return
             }
             guard snapshot.isRunning else {
+                // An engine left in .error (a previous wake gave up with no
+                // capture, or a start failed) has nothing to rebuild, but a
+                // wake is the natural moment to try starting it again: the
+                // ordinary start arm does that, once, and a failure just
+                // leaves it in .error again.
+                if snapshot.isError && snapshot.hasEnabledRouting {
+                    SyncCastLog.log("AppModel: post-wake: engine is in error with outputs enabled — starting it again")
+                    self.reconcileEngine()
+                    return
+                }
                 SyncCastLog.log("AppModel: post-wake rebuild skipped (engine \(snapshot.stateName), nothing to recover)")
                 return
             }
@@ -3607,16 +3620,27 @@ final class AppModel {
                 }
                 // Codex Cycle 2 must-fix: re-snapshot device list each
                 // attempt. If a device reappears during backoff, the
-                // rebuild MUST include it, otherwise captureOK && allResolved
-                // can both go true while the rebuilt driver still uses
-                // the stale list missing the new device.
-                let allDevices = await MainActor.run { self.devices }
+                // rebuild MUST include it, otherwise success can be
+                // declared while the rebuilt driver still uses the stale
+                // list missing the new device.
+                let (allDevices, enabledUIDs) = await MainActor.run {
+                    (self.devices, self.enabledCoreAudioOutputUIDs())
+                }
                 let captureOK = await self.router.forceLocalDriverRebuild(devices: allDevices)
-                let allResolved = await Self.allUIDsResolveToLiveDeviceID(allTargetUIDs)
-                // Codex must-fix #3: success requires BOTH capture restart
-                // AND every target UID resolving. If only UIDs resolve but
-                // capture is dead, the driver is silent — must retry.
-                if captureOK && allResolved {
+                // Only outputs enabled NOW gate success: those are the ones
+                // the rebuild opened. Outputs that disappeared before the
+                // wake (`transientUIDs`) are reported, never waited for —
+                // see `PostWakeRecoveryPolicy` for the 2026-11-25 failure
+                // that waiting for an unplugged display produced.
+                let unresolved = await Self.unresolvedUIDs(enabledUIDs)
+                let verdict = PostWakeRecoveryPolicy.verdict(
+                    captureOK: captureOK,
+                    unresolvedEnabledUIDs: unresolved,
+                    attempt: attempt,
+                    maxAttempts: maxAttempts
+                )
+                switch verdict {
+                case .recovered:
                     if attempt > 0 {
                         SyncCastLog.log("AppModel: post-wake rebuild succeeded on retry attempt \(attempt + 1)/\(maxAttempts) (capture=ok, uids=live)")
                     } else {
@@ -3633,24 +3657,96 @@ final class AppModel {
                         self.refreshDirectStereoVolumeState(
                             reason: "post-wake rebuild"
                         )
+                        self.forgetOutputsStillAbsentAfterWake(transientUIDs)
+                    }
+                    return
+                case .retry:
+                    SyncCastLog.log("AppModel: post-wake attempt \(attempt + 1) incomplete — capture=\(captureOK ? "ok" : "FAIL"), unresolved=[\(unresolved.joined(separator: ","))]")
+                case .gaveUpPlaying(let stillUnresolved):
+                    SyncCastLog.log("AppModel: post-wake rebuild gave up after \(maxAttempts) attempts — capture is up, leaving the path running without [\(stillUnresolved.joined(separator: ","))], which never resolved")
+                    await MainActor.run {
+                        self.forgetOutputsStillAbsentAfterWake(transientUIDs)
+                    }
+                    return
+                case .gaveUpSilent:
+                    await self.stopAfterFailedWakeRecovery(attempts: maxAttempts)
+                    await MainActor.run {
+                        self.forgetOutputsStillAbsentAfterWake(transientUIDs)
                     }
                     return
                 }
-                SyncCastLog.log("AppModel: post-wake attempt \(attempt + 1) incomplete — capture=\(captureOK ? "ok" : "FAIL"), uids=\(allResolved ? "live" : "stale")")
             }
-            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(maxAttempts) attempts")
         }
     }
 
-    /// Verify each UID resolves to a non-zero `AudioDeviceID` via the
-    /// HAL `kAudioHardwarePropertyTranslateUIDToDevice` translator. If
-    /// any UID still maps to `kAudioObjectUnknown` (0), the post-wake
-    /// device republish hasn't completed and the rebuild can't be
-    /// trusted. Returns true only when all target UIDs resolve.
+    /// CoreAudio UIDs of the outputs currently enabled in `routing`.
+    private func enabledCoreAudioOutputUIDs() -> [String] {
+        devices
+            .filter { $0.transport == .coreAudio && (routing[$0.id]?.enabled ?? false) }
+            .compactMap(\.coreAudioUID)
+    }
+
+    /// The wake recovery could not get capture back. The router has already
+    /// unwound the sink and handed the default output back (see
+    /// `Router.forceLocalDriverRebuild`), so nothing is playing through
+    /// SyncCast; say so and stop the engine, instead of leaving it marked
+    /// `.running` with no path behind it. That half-state is what made the
+    /// 2026-11-25 failure permanent: the `(.running, true)` reconcile arm only
+    /// syncs outputs and never brings a sink path back, so not even the
+    /// auto-connect arrival at home could have recovered it. In `.error` the
+    /// next reconcile (an output toggled, the arrival rule, the next wake)
+    /// starts the engine from scratch.
+    private func stopAfterFailedWakeRecovery(attempts: Int) async {
+        guard mode == .stereo, streamingState == .running else {
+            SyncCastLog.log("AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture; engine already \(streamingState.rawValue), leaving it")
+            return
+        }
+        await router.stop()
+        streamingState = .error
+        lastError = "唤醒后没能恢复 SyncCast 输出，声音暂时直接走 macOS 默认输出；切换一下输出或下次唤醒会再试"
+        SyncCastLog.log(
+            "AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture — SyncCast stays off "
+            + "(default output now \(SystemDefaultOutput.currentUID() ?? "unknown")); "
+            + "it starts again on the next output change or wake"
+        )
+    }
+
+    /// Drop the remembered "enabled when it disappeared" outputs that are
+    /// still not back once a wake recovery has finished. They are only kept
+    /// for the wake handler; one that has not come back by now left for real,
+    /// and carrying it into every later wake only makes the log lie
+    /// (`transient=1` for a display unplugged days ago).
+    private func forgetOutputsStillAbsentAfterWake(_ remembered: [String]) {
+        let present = Set(devices.compactMap(\.coreAudioUID))
+        let absent = PostWakeRecoveryPolicy.stillAbsent(
+            remembered: Set(remembered).intersection(transientlyMissingEnabledCoreAudioUIDs),
+            presentNow: present
+        )
+        guard !absent.isEmpty else { return }
+        transientlyMissingEnabledCoreAudioUIDs.subtract(absent)
+        SyncCastLog.log("AppModel: post-wake: not waiting for [\(absent.joined(separator: ","))] (gone since before the wake); it rejoins if it comes back and is switched on")
+    }
+
+    /// An auto-connect rule has handled its members leaving: it switched the
+    /// routing over on purpose, so those outputs are no longer "enabled and
+    /// transiently missing" — the rule's arrival owns their return.
+    func forgetTransientlyMissingOutputs(_ uids: [String], reason: String) {
+        let dropped = transientlyMissingEnabledCoreAudioUIDs.intersection(uids)
+        guard !dropped.isEmpty else { return }
+        transientlyMissingEnabledCoreAudioUIDs.subtract(dropped)
+        SyncCastLog.log("AppModel: wake recovery will not wait for [\(dropped.sorted().joined(separator: ","))] (\(reason))")
+    }
+
+    /// The UIDs that do NOT resolve to a non-zero `AudioDeviceID` via the
+    /// HAL `kAudioHardwarePropertyTranslateUIDToDevice` translator. A UID
+    /// that still maps to `kAudioObjectUnknown` (0) means the post-wake
+    /// device republish hasn't completed and the rebuild can't be trusted
+    /// for that output.
     ///
     /// `nonisolated` per codex #3 — `AudioObjectGetPropertyData` blocks
     /// on coreaudiod IPC after wake, would stall the MainActor otherwise.
-    nonisolated private static func allUIDsResolveToLiveDeviceID(_ uids: [String]) async -> Bool {
+    nonisolated private static func unresolvedUIDs(_ uids: [String]) async -> [String] {
+        var unresolved: [String] = []
         for uid in uids {
             var addr = AudioObjectPropertyAddress(
                 mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
@@ -3671,10 +3767,10 @@ final class AppModel {
                 )
             }
             if status != noErr || deviceID == kAudioObjectUnknown {
-                return false
+                unresolved.append(uid)
             }
         }
-        return true
+        return unresolved
     }
 
     // No `deinit` cleanup for `sleepWakeObservers`: AppModel is

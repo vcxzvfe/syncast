@@ -332,6 +332,16 @@ extension AppModel {
                 + "restoreBuiltIn=\(restoreBuiltIn) "
                 + "volume=\(volumePercent.map { "\($0)%" } ?? "unchanged") (\(reason))"
             )
+            // The rule has decided its members LEFT (past its debounce), and
+            // is about to re-plan the routing for that. A member that was
+            // enabled when it vanished must stop counting as "transiently
+            // missing": the post-wake recovery would otherwise keep expecting
+            // it at every later wake, away from home included. Its return is
+            // this rule's arrival to handle.
+            forgetTransientlyMissingOutputs(
+                memberUIDs,
+                reason: "auto-connect rule \(profileID.uuidString.prefix(8)) handled them leaving"
+            )
             if let rule = autoConnectProfiles.first(where: { $0.id == profileID }),
                rule.onDisconnect.keepsBuiltIn {
                 autoConnectApplyKeepBuiltIn(memberUIDs: memberUIDs, action: rule.onDisconnect)

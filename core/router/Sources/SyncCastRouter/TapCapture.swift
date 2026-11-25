@@ -15,6 +15,9 @@ public final class TapCapture: @unchecked Sendable {
         case alreadyRunning
         case processObjectLookupFailed(OSStatus)
         case createTapFailed(OSStatus)
+        /// The HAL answered noErr but handed back no tap object, and the tap
+        /// did not show up under its UID within `latePublishTimeout` either.
+        case tapNotPublished(String)
         case tapUIDReadFailed(OSStatus)
         case tapFormatReadFailed(OSStatus)
         case unsupportedFormat(String)
@@ -27,6 +30,8 @@ public final class TapCapture: @unchecked Sendable {
             case .alreadyRunning: return "capture already running"
             case .processObjectLookupFailed(let s): return "process object lookup failed: OSStatus=\(s)"
             case .createTapFailed(let s): return "AudioHardwareCreateProcessTap failed: OSStatus=\(s)"
+            case .tapNotPublished(let uid):
+                return "AudioHardwareCreateProcessTap returned no tap object and tap \(uid) was not published within \(Int(TapCapture.latePublishTimeout * 1000)) ms (coreaudiod busy)"
             case .tapUIDReadFailed(let s): return "could not read tap UID: OSStatus=\(s)"
             case .tapFormatReadFailed(let s): return "could not read tap format: OSStatus=\(s)"
             case .unsupportedFormat(let s): return "unsupported tap format: \(s)"
@@ -56,6 +61,14 @@ public final class TapCapture: @unchecked Sendable {
     public private(set) var debugLastASBD: String = ""
     public private(set) var debugLastPeak: Float = 0
     public private(set) var debugMaxPeak: Float = 0
+    /// Set when the last `start()` had to wait for the HAL to publish the tap
+    /// (see `start()`): how long after `AudioHardwareCreateProcessTap` the
+    /// tap turned up. Nil when it came back directly.
+    public private(set) var debugTapPublishedLateMs: Int?
+    /// Whether the started tap's `kAudioTapPropertyUID` equals the
+    /// description's UUID, which is what the late-publish lookup relies on.
+    /// Nil before a successful start.
+    public private(set) var debugTapUIDMatchesDescription: Bool?
     /// Blocks whose `AudioTimeStamp` carried no usable host time. Non-zero
     /// means the LAN link is running on the fallback timeline for a device
     /// that was supposed to have hardware stamps.
@@ -183,13 +196,34 @@ public final class TapCapture: @unchecked Sendable {
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(description, &newTapID)
-        guard status == noErr, newTapID != kAudioObjectUnknown else {
+        guard status == noErr else {
             throw CaptureError.createTapFailed(status)
+        }
+        debugTapPublishedLateMs = nil
+        debugTapUIDMatchesDescription = nil
+        if newTapID == kAudioObjectUnknown {
+            // noErr with no object: coreaudiod created the tap, but this
+            // process's HAL proxy did not see it appear within its own 1 s
+            // wait. The unified log says so in as many words, e.g. on
+            // 2026-11-25 09:28:22 right after a wake:
+            //   "AudioHardwareCreateProcessTap: Tap object not found: 224221
+            //    with timeout 1001"
+            // That used to surface as "createTapFailed(OSStatus=0)" and leak
+            // the tap. Its UID is the description's UUID, so wait a little
+            // longer for it to be published and adopt it instead.
+            let uid = description.uuid.uuidString
+            let started = DispatchTime.now().uptimeNanoseconds
+            newTapID = await Self.awaitPublishedTap(uid: uid)
+            guard newTapID != kAudioObjectUnknown else {
+                throw CaptureError.tapNotPublished(uid)
+            }
+            debugTapPublishedLateMs = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
         }
         tapID = newTapID
 
         do {
             let tapUID = try Self.readCFStringProperty(tapID, kAudioTapPropertyUID)
+            debugTapUIDMatchesDescription = tapUID == description.uuid.uuidString
             let asbd = try Self.readTapFormat(tapID)
             try configure(format: asbd)
             let aggregate = try Self.createAggregateDevice(tapUID: tapUID)
@@ -450,6 +484,46 @@ public final class TapCapture: @unchecked Sendable {
         let blockNs = UInt64((Double(frames) / sampleRate * 1_000_000_000).rounded())
         guard nowNs > blockNs else { return nil }
         return nowNs - blockNs
+    }
+
+    /// How long `start()` keeps looking for a tap the HAL created but did not
+    /// hand back. On top of the HAL's own ~1 s wait.
+    static let latePublishTimeout: TimeInterval = 3.0
+    private static let latePublishPollNanoseconds: UInt64 = 100_000_000
+
+    /// Poll `kAudioHardwarePropertyTranslateUIDToTap` until the tap with this
+    /// UID exists in this process, or `latePublishTimeout` passes.
+    private static func awaitPublishedTap(uid: String) async -> AudioObjectID {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + UInt64(latePublishTimeout * 1_000_000_000)
+        while true {
+            let id = translateUIDToTap(uid)
+            if id != kAudioObjectUnknown { return id }
+            if DispatchTime.now().uptimeNanoseconds >= deadline { return id }
+            try? await Task.sleep(nanoseconds: latePublishPollNanoseconds)
+        }
+    }
+
+    private static func translateUIDToTap(_ uid: String) -> AudioObjectID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToTap,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let cfUID = uid as CFString
+        let status = withUnsafePointer(to: cfUID) { uidPtr -> OSStatus in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                UInt32(MemoryLayout<CFString>.size),
+                uidPtr,
+                &size,
+                &tap
+            )
+        }
+        return status == noErr ? tap : AudioObjectID(kAudioObjectUnknown)
     }
 
     private static func currentProcessObjectID() throws -> AudioObjectID {
