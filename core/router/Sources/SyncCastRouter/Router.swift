@@ -1996,10 +1996,15 @@ public actor Router {
         sinkMasterVolume = master.volume ?? sinkMasterVolume
         sinkMasterMuted = master.muted ?? false
 
+        // `adoptsLatePublishedTap`: this tap is private to this start call
+        // (it becomes `sinkCapture` only after `start()` returns), which is
+        // the case the late-publish wait is safe for. The wake rebuild hit
+        // "Tap object not found … timeout 1001" here on 2026-11-23/25.
         let tap = TapCapture(
             sampleRate: sampleRate,
             channelCount: channelCount,
-            tapDeviceUID: candidate.uid
+            tapDeviceUID: candidate.uid,
+            adoptsLatePublishedTap: true
         )
         tap.onUnexpectedStop = { [weak self] in
             Task { await self?.handleCaptureDied() }

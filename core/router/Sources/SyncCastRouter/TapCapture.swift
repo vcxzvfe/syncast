@@ -18,6 +18,9 @@ public final class TapCapture: @unchecked Sendable {
         /// The HAL answered noErr but handed back no tap object, and the tap
         /// did not show up under its UID within `latePublishTimeout` either.
         case tapNotPublished(String)
+        /// `stop()` was called while `start()` was waiting for a late tap.
+        /// The late tap, if it turned up, was destroyed rather than started.
+        case stoppedWhileStarting
         case tapUIDReadFailed(OSStatus)
         case tapFormatReadFailed(OSStatus)
         case unsupportedFormat(String)
@@ -32,6 +35,8 @@ public final class TapCapture: @unchecked Sendable {
             case .createTapFailed(let s): return "AudioHardwareCreateProcessTap failed: OSStatus=\(s)"
             case .tapNotPublished(let uid):
                 return "AudioHardwareCreateProcessTap returned no tap object and tap \(uid) was not published within \(Int(TapCapture.latePublishTimeout * 1000)) ms (coreaudiod busy)"
+            case .stoppedWhileStarting:
+                return "capture stopped while it was waiting for its tap to be published"
             case .tapUIDReadFailed(let s): return "could not read tap UID: OSStatus=\(s)"
             case .tapFormatReadFailed(let s): return "could not read tap format: OSStatus=\(s)"
             case .unsupportedFormat(let s): return "unsupported tap format: \(s)"
@@ -80,6 +85,16 @@ public final class TapCapture: @unchecked Sendable {
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
     private var running = false
+
+    /// `start()` is the only place that suspends (`awaitPublishedTap`), and
+    /// while it waits none of `tapID` / `aggregateID` / `running` is set yet:
+    /// without this, a `stop()` in that window would be a silent no-op and a
+    /// second `start()` would pass the entry guard, and the first call would
+    /// then go on to start the late tap anyway. `starting` closes the entry
+    /// guard; `stopGeneration` lets `stop()` cancel a start in flight.
+    private let lifecycleLock = NSLock()
+    private var starting = false
+    private var stopGeneration: UInt64 = 0
     private var isNonInterleaved = false
     private var sourceChannelCount = 0
 
@@ -121,13 +136,24 @@ public final class TapCapture: @unchecked Sendable {
     /// cannot know in advance what rate a process mixdown will come in at.
     private let allowsAnySampleRate: Bool
 
+    /// Wait for, and adopt, a tap the HAL created but did not hand back (see
+    /// `start()`). Only for a tap owned by a single start call, like the sink
+    /// path's, which builds a fresh `TapCapture` per start and publishes it
+    /// only once `start()` returns. A capture object that outlives its starts
+    /// (the router's `capture` backend, the keep-awake meter) keeps failing
+    /// fast: there a `stop()` and a new session can land during the wait, and
+    /// the late start would come back into an unwind that is no longer its
+    /// own.
+    private let adoptsLatePublishedTap: Bool
+
     public init(
         sampleRate: Double = 48_000,
         channelCount: Int = 2,
         ringCapacityFrames: Int = 1 << 18,
         tapDeviceUID: String? = nil,
         includedProcesses: [AudioObjectID]? = nil,
-        allowsAnySampleRate: Bool = false
+        allowsAnySampleRate: Bool = false,
+        adoptsLatePublishedTap: Bool = false
     ) {
         precondition(
             tapDeviceUID == nil || includedProcesses == nil,
@@ -136,6 +162,7 @@ public final class TapCapture: @unchecked Sendable {
         self.tapDeviceUID = tapDeviceUID
         self.includedProcesses = includedProcesses
         self.allowsAnySampleRate = allowsAnySampleRate
+        self.adoptsLatePublishedTap = adoptsLatePublishedTap
         self.captureAnchors = CaptureAnchorPublisher(sampleRate: sampleRate)
         self.sampleRate = sampleRate
         self.channelCount = channelCount
@@ -173,9 +200,14 @@ public final class TapCapture: @unchecked Sendable {
     }
 
     public func start() async throws {
-        guard !running, tapID == 0, aggregateID == 0, ioProcID == nil else {
-            throw CaptureError.alreadyRunning
+        let generation: UInt64 = try lifecycleLock.withLock {
+            guard !starting, !running, tapID == 0, aggregateID == 0, ioProcID == nil else {
+                throw CaptureError.alreadyRunning
+            }
+            starting = true
+            return stopGeneration
         }
+        defer { lifecycleLock.withLock { starting = false } }
 
         let description: CATapDescription
         if let includedProcesses {
@@ -201,6 +233,9 @@ public final class TapCapture: @unchecked Sendable {
         }
         debugTapPublishedLateMs = nil
         debugTapUIDMatchesDescription = nil
+        if newTapID == kAudioObjectUnknown, !adoptsLatePublishedTap {
+            throw CaptureError.createTapFailed(status)
+        }
         if newTapID == kAudioObjectUnknown {
             // noErr with no object: coreaudiod created the tap, but this
             // process's HAL proxy did not see it appear within its own 1 s
@@ -216,6 +251,11 @@ public final class TapCapture: @unchecked Sendable {
             newTapID = await Self.awaitPublishedTap(uid: uid)
             guard newTapID != kAudioObjectUnknown else {
                 throw CaptureError.tapNotPublished(uid)
+            }
+            let stoppedMeanwhile = lifecycleLock.withLock { stopGeneration != generation }
+            if stoppedMeanwhile {
+                AudioHardwareDestroyProcessTap(newTapID)
+                throw CaptureError.stoppedWhileStarting
             }
             debugTapPublishedLateMs = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
         }
@@ -283,6 +323,7 @@ public final class TapCapture: @unchecked Sendable {
     }
 
     public func stop() {
+        lifecycleLock.withLock { stopGeneration &+= 1 }
         if let procID = ioProcID, aggregateID != 0 {
             AudioDeviceStop(aggregateID, procID)
             AudioDeviceDestroyIOProcID(aggregateID, procID)
@@ -500,7 +541,16 @@ public final class TapCapture: @unchecked Sendable {
             let id = translateUIDToTap(uid)
             if id != kAudioObjectUnknown { return id }
             if DispatchTime.now().uptimeNanoseconds >= deadline { return id }
-            try? await Task.sleep(nanoseconds: latePublishPollNanoseconds)
+            // Keep the interval even when the calling task is cancelled (a
+            // newer wake): `Task.sleep` would then throw at once and turn this
+            // into a busy loop against a coreaudiod that is already behind.
+            // Finding the tap still matters after cancellation, so the caller
+            // can destroy it instead of leaking it.
+            do {
+                try await Task.sleep(nanoseconds: latePublishPollNanoseconds)
+            } catch {
+                usleep(useconds_t(latePublishPollNanoseconds / 1_000))
+            }
         }
     }
 

@@ -3589,6 +3589,10 @@ final class AppModel {
                 SyncCastLog.log("AppModel: post-wake rebuild skipped (no enabled outputs in routing)")
                 return
             }
+            // A route with only a LAN receiver is deliberately NOT rebuilt
+            // here: the sink rebuild replaces the tap but keeps the open LAN
+            // legs, which go on reading the old tap's ring (Codex review,
+            // 2026-11-25). Rebinding LAN legs on a rebuild is its own change.
             guard !allTargetUIDs.isEmpty else {
                 SyncCastLog.log("AppModel: post-wake rebuild skipped (no target UIDs — neither live nor transiently-missing)")
                 return
@@ -3633,6 +3637,14 @@ final class AppModel {
                 // see `PostWakeRecoveryPolicy` for the 2026-11-25 failure
                 // that waiting for an unplugged display produced.
                 let unresolved = await Self.unresolvedUIDs(enabledUIDs)
+                // A newer wake cancelled this task while the rebuild was in
+                // flight. Its own recovery owns the engine now; acting on this
+                // stale verdict could stop an engine that task just brought
+                // back.
+                if Task.isCancelled {
+                    SyncCastLog.log("AppModel: post-wake attempt \(attempt + 1) superseded by a newer wake; dropping its result")
+                    return
+                }
                 let verdict = PostWakeRecoveryPolicy.verdict(
                     captureOK: captureOK,
                     unresolvedEnabledUIDs: unresolved,
@@ -3701,14 +3713,37 @@ final class AppModel {
             SyncCastLog.log("AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture; engine already \(streamingState.rawValue), leaving it")
             return
         }
+        // `.stopping` while the router winds down, so a toggle or an
+        // auto-connect arrival that lands during the stop is not taken by the
+        // `(.running, true)` arm (which only syncs outputs) and then lost when
+        // the state flips to `.error`. Such a change is replayed below.
+        let routingBeforeStop = routing
+        streamingState = .stopping
         await router.stop()
         streamingState = .error
-        lastError = "唤醒后没能恢复 SyncCast 输出，声音暂时直接走 macOS 默认输出；切换一下输出或下次唤醒会再试"
-        SyncCastLog.log(
-            "AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture — SyncCast stays off "
-            + "(default output now \(SystemDefaultOutput.currentUID() ?? "unknown")); "
-            + "it starts again on the next output change or wake"
-        )
+        if await router.state == .error {
+            // The sink could not hand the default output back: macOS may still
+            // be pointed at the now-silent sink. Say that, not "it plays
+            // through the default output".
+            let error = await router.lastError ?? "unknown router stop failure"
+            lastError = "唤醒后没能恢复 SyncCast 输出，也没能把系统默认输出还回去：\(error)"
+            SyncCastLog.log(
+                "AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture, "
+                + "and stopping did not restore the default output: \(error) "
+                + "(default output now \(SystemDefaultOutput.currentUID() ?? "unknown"))"
+            )
+        } else {
+            lastError = "唤醒后没能恢复 SyncCast 输出，声音暂时直接走 macOS 默认输出；切换一下输出或下次唤醒会再试"
+            SyncCastLog.log(
+                "AppModel: post-wake rebuild gave up after \(attempts) attempts with no capture — SyncCast stays off "
+                + "(default output now \(SystemDefaultOutput.currentUID() ?? "unknown")); "
+                + "it starts again on the next output change or wake"
+            )
+        }
+        if routing != routingBeforeStop {
+            SyncCastLog.log("AppModel: outputs changed while stopping after the failed wake recovery; reconciling")
+            reconcileEngine()
+        }
     }
 
     /// Drop the remembered "enabled when it disappeared" outputs that are
