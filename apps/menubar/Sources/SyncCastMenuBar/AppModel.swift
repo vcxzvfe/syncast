@@ -115,6 +115,11 @@ final class AppModel {
             updateVolumeKeyEligibility(
                 reason: "streamingState → \(streamingState.rawValue)"
             )
+            // A displacement pause is only watched once the engine is at
+            // rest; this is the transition that gets it there.
+            refreshDisplacementResumeWatcher(
+                reason: "streamingState → \(streamingState.rawValue)"
+            )
         }
     }
     var lastError: String?
@@ -301,7 +306,22 @@ final class AppModel {
     /// it — the stereo sink path or either whole-home flavour; cleared by
     /// `resumeAfterSystemSinkDisplacement()` or by a mode change. Gates
     /// `reconcileEngineAsync`'s `shouldRun`.
-    var systemSinkPausedByDisplacement = false
+    var systemSinkPausedByDisplacement = false {
+        didSet {
+            guard oldValue != systemSinkPausedByDisplacement else { return }
+            if !systemSinkPausedByDisplacement { systemSinkPauseSinkUID = nil }
+            refreshDisplacementResumeWatcher(
+                reason: systemSinkPausedByDisplacement ? "paused" : "pause retired"
+            )
+        }
+    }
+    /// The sink the pause was taken on, when it has a volume control: a
+    /// volume-up on it while it is the default output again resumes (see
+    /// `DisplacementResumePolicy`). Nil when there is nothing to watch, which
+    /// leaves 「继续」 as the only way back.
+    var systemSinkPauseSinkUID: String?
+    /// The listener behind that. Idle unless a pause stands.
+    let displacementResumeWatcher = DisplacementResumeWatcher()
     /// Which mode the pause was taken in, so a mode switch (an explicit user
     /// action that re-establishes the default output) retires it. Nil whenever
     /// `systemSinkPausedByDisplacement` is false.
@@ -609,6 +629,7 @@ final class AppModel {
         volumeController.start()
         self.systemVolumeKeyController = volumeController
         updateVolumeKeyEligibility(reason: "init")
+        wireDisplacementResumeWatcher()
         // Seed the master fader once. The Router keeps the value even before
         // a writer exists and re-applies it to every writer it builds, so
         // this single push covers sidecar restarts too.

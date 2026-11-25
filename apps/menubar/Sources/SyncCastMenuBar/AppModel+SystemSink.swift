@@ -226,6 +226,7 @@ final class SystemSinkCoordinator {
         guard drivesSystemVolume, let uid = status.uid else { return false }
         let clamped = max(0, min(1, scalar))
         observer?.noteAppInitiatedWrite(uid: uid)
+        noteAppVolumeWrite(uid: uid, volume: clamped)
         guard AggregateDevice.applyHardwareVolume(uid: uid, volume: clamped) else {
             SyncCastLog.log(
                 "systemSink: device \(uid) refused a volume write of \(clamped)"
@@ -239,6 +240,31 @@ final class SystemSinkCoordinator {
             await router.setSystemSinkMaster(volume: clamped, muted: nil)
         }
         return true
+    }
+
+    /// A level SyncCast itself wrote to a sink, and when.
+    struct AppVolumeWrite: Equatable, Sendable {
+        let uid: String
+        let volume: Float
+        let at: Date
+    }
+
+    /// The most recent `AppVolumeWrite`, kept for listeners that outlive the
+    /// running path: the displacement-resume watcher reads it so the echo of
+    /// a level SyncCast wrote is never taken for the user pressing volume up.
+    @ObservationIgnored private(set) var lastAppVolumeWrite: AppVolumeWrite?
+
+    /// Record a write SyncCast is making to a sink's volume. Every in-app
+    /// writer of a sink's level calls this before writing.
+    func noteAppVolumeWrite(uid: String, volume: Float, at: Date = Date()) {
+        lastAppVolumeWrite = AppVolumeWrite(uid: uid, volume: volume, at: at)
+    }
+
+    /// A reading of `uid` was taken after the write: whatever is read from
+    /// here on is not that write's echo.
+    func consumeAppVolumeWrite(uid: String) {
+        guard lastAppVolumeWrite?.uid == uid else { return }
+        lastAppVolumeWrite = nil
     }
 
     /// Mute counterpart of `writeSystemVolume`. Writes the device's own Mute
@@ -471,7 +497,7 @@ extension AppModel {
             ?? systemSink.installedSinkName
             ?? SystemSinkDevice.syncCastDriverName
         if systemSinkPausedByDisplacement {
-            return "已暂停：输出被切到别处，选回「\(name)」后点继续 · paused, output moved away"
+            return displacementPauseLine(sinkName: name)
         }
         guard systemSink.status.active else {
             return "系统音量将由「\(name)」承载 · system volume via \(name)"
@@ -504,7 +530,7 @@ extension AppModel {
     var wholeHomeSinkStatusLine: String? {
         let name = systemSink.status.displayName ?? WholeHomeSinkOutput.displayName
         if systemSinkPausedByDisplacement {
-            return "已暂停：输出被切到别处，选回「\(name)」后点继续 · paused, output moved away"
+            return displacementPauseLine(sinkName: name)
         }
         guard systemSink.status.active else { return nil }
         guard systemSink.drivesSystemVolume else {
@@ -519,6 +545,20 @@ extension AppModel {
         return systemSink.status.masterMuted
             ? "系统音量：静音（输出「\(name)」） · system volume muted"
             : "系统音量 \(percent)%（输出「\(name)」） · system volume \(percent)%"
+    }
+
+    /// The paused line, in both modes. It names volume-up only when the pause
+    /// has a sink to watch, and then names that sink as the Sound menu shows
+    /// it: once whole-home is idle its status no longer carries a name, and
+    /// the fallback would send the user looking for the wrapped aggregate.
+    /// Without a sink to watch 「继续」 is the only way back.
+    func displacementPauseLine(sinkName fallbackName: String) -> String {
+        guard let uid = systemSinkPauseSinkUID else {
+            return "已暂停：输出被切到别处，选回「\(fallbackName)」后点继续 · paused, output moved away"
+        }
+        let name = DisplacementResumePolicy.sinkDisplayName(uid: uid) ?? fallbackName
+        return "已暂停：输出被切到别处，选回「\(name)」后按音量加或点继续"
+            + " · paused: pick \(name) again, then volume up or 继续"
     }
 
     /// Whether the popover should offer the driver-install button: only on the
@@ -686,6 +726,13 @@ extension AppModel {
         await systemSink.pollStatus(router: router, modeIsWholeHome: mode == .wholeHome)
         // The gate reads a status the poll above may have just changed.
         pushVolumeKeyEligibility()
+        // While paused: keep the volume-up listener on the sink (restarting it
+        // if the sink came back as a new audio object), and keep a full-scale
+        // sink one notch under full so a press registers. The watcher does
+        // both on its own when the default output changes; this is the
+        // backstop.
+        refreshDisplacementResumeWatcher(reason: "poll")
+        nudgeDisplacedSinkOffFullScaleIfNeeded()
         guard streamingState == .running, !systemSinkPausedByDisplacement,
               await router.systemSinkDisplaced
         else {
@@ -703,6 +750,12 @@ extension AppModel {
             reconcileEngine()
             return
         }
+        // Before the flag: its didSet starts the volume-up watcher on this UID
+        // once the engine is down. Read now, while the status still describes
+        // the running sink; after the stop the whole-home status forgets it.
+        systemSinkPauseSinkUID = DisplacementResumePolicy.pausedSinkUID(
+            status: systemSink.status
+        )
         systemSinkPausedByDisplacement = true
         systemSinkPauseMode = mode
         SyncCastLog.log(
@@ -715,11 +768,18 @@ extension AppModel {
 
     /// User-driven resume after a displacement stop. Deliberately manual, for
     /// the same reason the stop is: SyncCast must not fight the Sound menu.
-    func resumeAfterSystemSinkDisplacement() {
+    /// The user asks either with 「继续」 or by pressing volume up on the sink
+    /// once it is the default output again (`DisplacementResumePolicy`);
+    /// SyncCast never resumes on its own.
+    func resumeAfterSystemSinkDisplacement(
+        trigger: DisplacementResumeTrigger = .button
+    ) {
         guard systemSinkPausedByDisplacement else { return }
         systemSinkPausedByDisplacement = false
         systemSinkPauseMode = nil
-        SyncCastLog.log("systemSink: user asked to resume the sink path")
+        SyncCastLog.log(
+            "systemSink: user asked to resume the sink path (\(trigger.rawValue))"
+        )
         reconcileEngine()
     }
 }
